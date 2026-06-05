@@ -19,6 +19,7 @@ const realm = @import("engine/realm.zig");
 const d2cs = @import("realm/d2cs.zig");
 const headless = @import("runtime/headless.zig");
 const crash = @import("runtime/crash.zig");
+const halt_hook = @import("runtime/halt_hook.zig");
 const log = @import("log.zig");
 
 var use_realm: bool = false;
@@ -150,6 +151,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
                 headless.apply();
             }
             crash.install(); // log faulting addresses of engine access violations
+            halt_hook.install(); // log engine assert sites before exit
             if (hasFlag("d2gs-boot")) {
                 use_realm = hasFlag("realm");
                 command.allow_create = hasFlag("create-games");
