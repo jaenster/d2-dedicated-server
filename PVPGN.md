@@ -6,8 +6,11 @@ its D2CS dispatches games to. Two links:
 - **D2CS ↔ GS** (`src/realm/d2cs.zig`): the GS connects outbound to D2CS, auths,
   advertises capacity, and services game create/join. Protocol in
   `src/realm/protocol.zig` (from pvpgn-server `src/common/d2cs_d2gs_protocol.h`).
-- **D2DBS ↔ GS** (TODO): character load/save, driven by the engine's realm
-  callbacks (`fpGetDatabaseCharacter` / `fpSaveDatabaseCharacter`).
+- **D2DBS ↔ GS** (`src/realm/d2dbs.zig`): character fetch/save. `fetchCharSave`
+  works (GET_DATA 0x31, datatype CHARSAVE) — tested vs a mock D2DBS, retrieved a
+  512-byte save. Demo: `--d2dbs <ip:port> --fetch-char acct:char`. Source:
+  pvpgn-server `src/d2dbs/dbspacket.h`. Next: drive it from the engine's
+  `fpGetDatabaseCharacter` callback on player join + deliver bytes to the engine.
 
 ## Wire format
 8-byte little-endian header on every packet: `{ size:u16, type:u16, seqno:u32 }`,

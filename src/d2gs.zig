@@ -17,6 +17,7 @@ const server = @import("engine/server.zig");
 const command = @import("engine/command.zig");
 const realm = @import("engine/realm.zig");
 const d2cs = @import("realm/d2cs.zig");
+const d2dbs = @import("realm/d2dbs.zig");
 const headless = @import("runtime/headless.zig");
 const crash = @import("runtime/crash.zig");
 const halt_hook = @import("runtime/halt_hook.zig");
@@ -26,6 +27,12 @@ var use_realm: bool = false;
 var d2cs_host: [64]u8 = undefined; // null-terminated IPv4
 var d2cs_port: u16 = 0;
 var d2cs_enabled: bool = false;
+var d2dbs_host: [64]u8 = undefined;
+var d2dbs_port: u16 = 0;
+var d2dbs_enabled: bool = false;
+var fetch_acct: [32]u8 = undefined;
+var fetch_char: [32]u8 = undefined;
+var fetch_enabled: bool = false;
 
 const BOOL = win.BOOL; // enum(c_int){ FALSE, TRUE } in zig 0.16
 const HMODULE = win.HINSTANCE;
@@ -61,9 +68,10 @@ fn hasFlag(comptime flag: []const u8) bool {
     return false;
 }
 
-/// Parse `--d2cs <ip:port>` into d2cs_host/d2cs_port. Dotted-quad IPv4 only.
-fn parseD2cs() void {
-    const needle = "--d2cs ";
+/// Copy the whitespace-delimited token after `--<flag> ` into `out` (null-term).
+/// Returns its length, or null if the flag is absent.
+fn flagToken(comptime flag: []const u8, out: []u8) ?usize {
+    const needle = "--" ++ flag ++ " ";
     const cmd: [*:0]const u8 = GetCommandLineA();
     var i: usize = 0;
     var start: ?usize = null;
@@ -75,27 +83,94 @@ fn parseD2cs() void {
         start = i + needle.len;
         break;
     }
-    const s = start orelse return;
+    const s = start orelse return null;
     var k = s;
-    var host_len: usize = 0;
-    var port: u16 = 0;
-    var colon = false;
+    var n: usize = 0;
     while (cmd[k] != 0 and cmd[k] != ' ' and cmd[k] != '\t') : (k += 1) {
-        const c = cmd[k];
-        if (c == ':') {
-            colon = true;
-        } else if (!colon) {
-            if (host_len + 1 < d2cs_host.len) {
-                d2cs_host[host_len] = c;
-                host_len += 1;
-            }
-        } else if (c >= '0' and c <= '9') {
-            port = port *% 10 +% (c - '0');
+        if (n + 1 < out.len) {
+            out[n] = cmd[k];
+            n += 1;
         }
     }
-    d2cs_host[host_len] = 0;
-    d2cs_port = port;
-    d2cs_enabled = host_len > 0 and port != 0;
+    out[n] = 0;
+    return n;
+}
+
+/// Split "host:port" (or "a:b") into `left` (null-term) + parsed `right` number.
+fn splitColon(tok: []const u8, left: []u8, right: *u16) bool {
+    var ci: ?usize = null;
+    for (tok, 0..) |c, idx| {
+        if (c == ':') {
+            ci = idx;
+            break;
+        }
+    }
+    const c = ci orelse return false;
+    const llen = @min(c, left.len - 1);
+    @memcpy(left[0..llen], tok[0..llen]);
+    left[llen] = 0;
+    var n: u16 = 0;
+    for (tok[c + 1 ..]) |ch| {
+        if (ch >= '0' and ch <= '9') n = n *% 10 +% (ch - '0');
+    }
+    right.* = n;
+    return llen > 0 and n != 0;
+}
+
+/// Split "account:charname" into the two name buffers (both null-terminated).
+fn splitNames(tok: []const u8, a: []u8, b: []u8) bool {
+    var ci: ?usize = null;
+    for (tok, 0..) |c, idx| {
+        if (c == ':') {
+            ci = idx;
+            break;
+        }
+    }
+    const c = ci orelse return false;
+    const alen = @min(c, a.len - 1);
+    @memcpy(a[0..alen], tok[0..alen]);
+    a[alen] = 0;
+    const blen = @min(tok.len - c - 1, b.len - 1);
+    @memcpy(b[0..blen], tok[c + 1 ..][0..blen]);
+    b[blen] = 0;
+    return alen > 0 and blen > 0;
+}
+
+fn parseEndpoints() void {
+    var tmp: [96]u8 = undefined;
+    if (flagToken("d2cs", &tmp)) |len| {
+        var port: u16 = 0;
+        if (splitColon(tmp[0..len], &d2cs_host, &port)) {
+            d2cs_port = port;
+            d2cs_enabled = true;
+        }
+    }
+    if (flagToken("d2dbs", &tmp)) |len| {
+        var port: u16 = 0;
+        if (splitColon(tmp[0..len], &d2dbs_host, &port)) {
+            d2dbs_port = port;
+            d2dbs_enabled = true;
+        }
+    }
+    if (flagToken("fetch-char", &tmp)) |len| {
+        fetch_enabled = splitNames(tmp[0..len], &fetch_acct, &fetch_char);
+    }
+}
+
+/// One-shot D2DBS character fetch (test/demo for `--fetch-char`).
+fn fetchCharThread(_: ?*anyopaque) callconv(.winapi) DWORD {
+    if (!d2dbs.connectTo(@ptrCast(&d2dbs_host), d2dbs_port)) return 0;
+    const acct = std.mem.sliceTo(&fetch_acct, 0);
+    const name = std.mem.sliceTo(&fetch_char, 0);
+    log.print("d2dbs: fetching character...");
+    var save: [8192]u8 = undefined;
+    const got = d2dbs.fetchCharSave(acct, name, &save);
+    if (got > 0) {
+        log.hex("d2dbs: CHAR FETCHED ok, save bytes=0x", got);
+    } else {
+        log.print("d2dbs: char fetch returned no data");
+    }
+    return 0;
 }
 
 /// Server thread: bring the QServer up in dedicated mode, then pump forever.
@@ -132,6 +207,11 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // Connect to PvPGN's D2CS so it can dispatch game create/join to us.
     if (d2cs_enabled) d2cs.start(@ptrCast(&d2cs_host), d2cs_port);
 
+    // One-shot D2DBS character fetch demo (--d2dbs <ip:port> --fetch-char acct:char).
+    if (d2dbs_enabled and fetch_enabled) {
+        _ = CreateThread(null, 0, fetchCharThread, null, 0, null);
+    }
+
     while (true) {
         command.pump(); // run queued engine commands (create game, …) on this thread
         server.tick();
@@ -155,7 +235,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             if (hasFlag("d2gs-boot")) {
                 use_realm = hasFlag("realm");
                 command.allow_create = hasFlag("create-games");
-                parseD2cs();
+                parseEndpoints();
                 log.print("d2gs: --d2gs-boot set, spawning server thread");
                 _ = CreateThread(null, 0, serverThread, null, 0, null);
             } else {
