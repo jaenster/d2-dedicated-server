@@ -58,14 +58,19 @@ never loaded (the client app-mode entry normally calls `TXT_InitTxtFiles`
 `--create-games`) — and `CREATEGAMEREQ` then **spawns a real game** and returns
 `result=0, gameid` (tested under wine).
 
-### ⛔ Next layer: running the game / player entry
-Ticking a freshly-created **empty** game asserts (`ERROR_…Halt` → `ExitProcess(-1)`):
-the game's world (act/level/DRLG) isn't built — that happens when a player
-actually enters. So `--create-games` still ends in a halt once the game is ticked.
-Real progress needs a client to connect to `:4000` with a valid token, which
-requires implementing `fpFindPlayerToken` (token validation) so the engine sets
-up the act and the player enters. Gated behind `--create-games` (off by default →
-server stable through the protocol exchange).
+### ✅ Created games tick stably (empty, awaiting players)
+`UpdateClients` asserted because `ARENA_GetClientUpdateFlag` = `(eArenaFlags>>2)&1`
+was 0 — the game flags we passed lacked bit 2 (the client-update flag). With
+`ARENAFLAG_ClientUpdate (0x04)` set in `gameFlags()`, a created game now **ticks
+stably with no players** — the normal "game created, waiting for clients" state.
+(Diagnosed by hooking `ERROR_…_Halt` @0x408a60 to log the assert caller/line:
+`UpdateClients` @0x52d497, line 0xd31.)
+
+### ⛔ Next layer: player entry
+A client must connect to `:4000` with a valid token; the engine then validates it
+(`fpFindPlayerToken`), builds the act/level (DRLG), and the player enters. Needs
+the `fpFindPlayerToken` handler + a client speaking the D2 game protocol. Still
+gated behind `--create-games` until that's in.
 
 ### Remaining
 - ⏳ Player entry: implement `fpFindPlayerToken`; have a client join `:4000` so the

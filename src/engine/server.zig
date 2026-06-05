@@ -108,9 +108,13 @@ pub fn GAME_CreateBattleNetGame(
 
 /// eD2ArenaFlags bits used by GAME_CreateBattleNetGame.
 pub const ARENAFLAG_Expansion: u32 = 0x01; // TODO: confirm exact bit
+/// Bit 2 gates UpdateClients (ARENA_GetClientUpdateFlag = (eArenaFlags>>2)&1);
+/// must be set or ticking the game asserts. A normal (non-arena) game has it on.
+pub const ARENAFLAG_ClientUpdate: u32 = 0x04;
 pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
     _ = hardcore; // TODO: locate hardcore bit
     var f: u32 = @as(u32, difficulty) << 12;
+    f |= ARENAFLAG_ClientUpdate;
     if (expansion) f |= ARENAFLAG_Expansion;
     return f;
 }
