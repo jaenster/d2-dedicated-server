@@ -2,7 +2,7 @@
 //! game server by driving the engine's built-in QServer/D2Game code.
 //!
 //! Loaded into the live Game.exe process by a dbghelp.dll proxy that
-//! LoadLibrary's it via `-loaddll <winpath>`. Flags:
+//! LoadLibrary's it via `--loaddll <winpath>`. Flags:
 //!   --d2gs        attach + log (safe; proves injection)
 //!   --d2gs-boot   ALSO run the engine bootstrap + tick loop (calls into the
 //!                 real engine — only safe once init timing is confirmed; this
@@ -13,9 +13,9 @@
 
 const std = @import("std");
 const win = std.os.windows;
-const server = @import("d2_server.zig");
-const realm = @import("realm.zig");
-const headless = @import("headless.zig");
+const server = @import("engine/server.zig");
+const realm = @import("engine/realm.zig");
+const headless = @import("runtime/headless.zig");
 const log = @import("log.zig");
 
 var use_realm: bool = false;

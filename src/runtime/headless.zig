@@ -7,7 +7,7 @@
 const std = @import("std");
 const win = std.os.windows;
 const patch = @import("patch.zig");
-const log = @import("log.zig");
+const log = @import("../log.zig");
 
 extern "kernel32" fn GetModuleHandleA(name: ?[*:0]const u8) callconv(.winapi) ?win.HINSTANCE;
 extern "kernel32" fn GetProcAddress(h: win.HINSTANCE, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;

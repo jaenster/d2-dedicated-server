@@ -18,17 +18,17 @@ ROOT="$(pwd)"
 [ -f "$ROOT/.env" ] && set -a && . "$ROOT/.env" && set +a
 
 D2GS_TESTDIR="${D2GS_TESTDIR:-$ROOT/testgame}"
+D2GS_DBGHELP="${D2GS_DBGHELP:-$ROOT/zig-out/bin/dbghelp.dll}"  # our proxy, built below
 WINE="${WINE:-wine}"
 
 die() { echo "error: $1" >&2; exit 1; }
 [ -n "${D2GS_GAME_SRC:-}" ] || die "D2GS_GAME_SRC not set (a D2 install dir with d2data.mpq). See .env.example"
-[ -n "${D2GS_DBGHELP:-}" ]  || die "D2GS_DBGHELP not set (path to a dbghelp.dll proxy). See .env.example"
 [ -f "$D2GS_GAME_SRC/d2data.mpq" ] || die "no d2data.mpq under D2GS_GAME_SRC=$D2GS_GAME_SRC"
-[ -f "$D2GS_DBGHELP" ] || die "no dbghelp proxy at D2GS_DBGHELP=$D2GS_DBGHELP"
 command -v "$WINE" >/dev/null || die "wine not found (set WINE=/path/to/wine)"
 
-# Build
+# Build (produces zig-out/bin/{dbghelp,d2gs}.dll)
 zig build
+[ -f "$D2GS_DBGHELP" ] || die "no dbghelp proxy at $D2GS_DBGHELP (zig build should produce it)"
 
 # Assemble game dir: hardlink the big/static files (no copies), drop our DLLs.
 mkdir -p "$D2GS_TESTDIR"
@@ -56,12 +56,10 @@ pkill -9 -f '\\Game.exe' 2>/dev/null || true
 wineserver --kill 2>/dev/null || true
 sleep 1
 
+# Run in the foreground and stream the server's logs to this terminal (stdout),
+# like a normal Linux CLI process. WINEDEBUG=-all silences wine's own chatter so
+# only our logs show; override WINEDEBUG to debug. Ctrl-C to stop.
 cd "$D2GS_TESTDIR"
-echo "launching: Game.exe -w -nosound --headless -loaddll <d2gs> --d2gs$EXTRA"
-WINEDLLOVERRIDES="dbghelp=n" "$WINE" Game.exe -w -nosound --headless -loaddll "$DLL_WIN" --d2gs$EXTRA >/dev/null 2>&1 &
-
-sleep 10
-echo "=== d2gs_log.txt ==="
-cat "$D2GS_TESTDIR/d2gs_log.txt" 2>/dev/null || echo "(no log — DLL never attached)"
-echo ""
-if pgrep -f '\\Game.exe' >/dev/null; then echo "Game: RUNNING"; else echo "Game: DEAD"; fi
+echo "launching: Game.exe -w -nosound --headless --loaddll <d2gs> --d2gs$EXTRA   (ctrl-c to stop)"
+exec env WINEDEBUG="${WINEDEBUG:--all}" WINEDLLOVERRIDES="dbghelp=n" \
+    "$WINE" Game.exe -w -nosound --headless --loaddll "$DLL_WIN" --d2gs$EXTRA

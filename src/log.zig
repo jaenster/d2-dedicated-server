@@ -9,6 +9,8 @@ const OPEN_ALWAYS: u32 = 4;
 const FILE_APPEND_DATA: u32 = 4;
 const INVALID_HANDLE: ?win.HANDLE = @ptrFromInt(std.math.maxInt(usize));
 
+const STD_OUTPUT_HANDLE: u32 = @bitCast(@as(i32, -11));
+
 extern "kernel32" fn CreateFileA(
     name: [*:0]const u8,
     access: u32,
@@ -20,14 +22,34 @@ extern "kernel32" fn CreateFileA(
 ) callconv(.winapi) ?win.HANDLE;
 extern "kernel32" fn WriteFile(h: win.HANDLE, buf: [*]const u8, n: u32, written: *u32, ov: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn CloseHandle(h: win.HANDLE) callconv(.winapi) i32;
+extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) ?win.HANDLE;
+extern "kernel32" fn AllocConsole() callconv(.winapi) i32;
 
-pub fn print(msg: []const u8) void {
-    const h = CreateFileA("d2gs_log.txt", FILE_APPEND_DATA, FILE_SHARE_READ, null, OPEN_ALWAYS, 0, null) orelse return;
-    if (h == INVALID_HANDLE) return;
-    defer _ = CloseHandle(h);
+/// Ensure stdout is usable. If the process already has a stdout handle (wine
+/// passes the launching terminal's stdout through to the app), keep it — that's
+/// the one connected to the Linux tty/pipe. Only AllocConsole as a fallback when
+/// there's no handle at all (e.g. real Windows GUI subsystem with no console).
+pub fn initConsole() void {
+    const h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h == null or h == INVALID_HANDLE) _ = AllocConsole();
+}
+
+fn writeAll(h: win.HANDLE, msg: []const u8) void {
     var w: u32 = 0;
     _ = WriteFile(h, msg.ptr, @intCast(msg.len), &w, null);
     _ = WriteFile(h, "\n", 1, &w, null);
+}
+
+pub fn print(msg: []const u8) void {
+    // stdout — so `wine Game.exe ...` shows logs like a normal Linux CLI process.
+    if (GetStdHandle(STD_OUTPUT_HANDLE)) |out| {
+        if (out != INVALID_HANDLE) writeAll(out, msg);
+    }
+    // file — survives even when there's no console.
+    const h = CreateFileA("d2gs_log.txt", FILE_APPEND_DATA, FILE_SHARE_READ, null, OPEN_ALWAYS, 0, null) orelse return;
+    if (h == INVALID_HANDLE) return;
+    defer _ = CloseHandle(h);
+    writeAll(h, msg);
 }
 
 /// Append "<prefix>0xHEX\n".
