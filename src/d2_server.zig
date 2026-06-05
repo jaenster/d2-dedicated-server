@@ -1,0 +1,211 @@
+//! Bindings into 1.14d Game.exe's built-in dedicated-server engine.
+//!
+//! All addresses are absolute in the Game.exe 1.14d image (image base 0x00400000,
+//! no ASLR). We still rebase off the actual module base defensively in case the
+//! loader ever relocates the image.
+//!
+//! Source of truth: a decompiled/reconstructed map of retail 1.14d Game.exe
+//! (D2Game/Game/Server.cpp, Fog/QServer/*, D2Client/ClientModeInGame.cpp).
+//! Every address tagged `// VERIFIED` was cross-checked against the
+//! reconstruction or disassembly of the retail binary — see VERIFY.md.
+
+const std = @import("std");
+
+extern "kernel32" fn GetModuleHandleA(name: ?[*:0]const u8) callconv(.winapi) ?*anyopaque;
+
+/// 1.14d preferred image base. Reconstruction uses absolute addresses against this.
+const IMAGE_BASE: usize = 0x0040_0000;
+
+/// Resolve an absolute 1.14d address against the real loaded base.
+fn at(comptime abs_addr: usize) usize {
+    const base = @intFromPtr(GetModuleHandleA(null));
+    return base + (abs_addr - IMAGE_BASE);
+}
+
+/// All engine functions here are __stdcall (callconv `.x86_stdcall` in the recon).
+const StdcallConv = std.builtin.CallingConvention{ .x86_stdcall = .{} };
+
+fn stdcall(comptime abs_addr: usize, comptime Fn: type) *const Fn {
+    return @ptrFromInt(at(abs_addr));
+}
+
+// ── enums (src/d2_enums.h) ──────────────────────────────────────────────────
+pub const ConnectionType = enum(u32) {
+    server = 0, // CONNECTIONTYPE_SERVER       — dedicated D2GS path
+    singleplayer = 1,
+    singleplayer_uncapped = 2,
+};
+
+pub const GameType = enum(u32) {
+    singleplayer = 0,
+    singleplayer_uncapped = 1,
+    bnet_beta = 2,
+    bnet = 3, // GAMETYPE_BNET — realm / multi-game, token-driven
+    bnet_internal = 4,
+};
+
+// ── verified function bindings ──────────────────────────────────────────────
+// D2Game/Game/Server.cpp
+
+/// Allocate + wire the QServer (port 0xfa0 = 4000) with the D2Game packet
+/// dispatch callbacks. Stores the instance in the global `pQServer`.
+///   void QSERVER_CreateAndInit(eD2GSConnectionType, eD2GSGameType)
+pub fn QSERVER_CreateAndInit(conn: ConnectionType, game: GameType) void {
+    stdcall(0x0052b7a0, fn (u32, u32) callconv(StdcallConv) void)(@intFromEnum(conn), @intFromEnum(game)); // VERIFIED
+}
+
+/// Max players the QServer accepts.  void NET_SetPlayersCount(int)
+pub fn NET_SetPlayersCount(n: u32) void {
+    stdcall(0x0052b250, fn (u32) callconv(StdcallConv) void)(n); // VERIFIED
+}
+
+/// Toggle the QServer anti-hack throttle.  void NET_HACK_SetUseQServerHack(int)
+pub fn NET_HACK_SetUseQServerHack(on: u32) void {
+    stdcall(0x0052b280, fn (u32) callconv(StdcallConv) void)(on); // VERIFIED
+}
+
+/// Tick every live game once. `bLimitFrameSkip` matches the engine call (=1).
+/// Returns engine-defined status. This is the server heartbeat.
+///   int QSERVER_TickAllGames(int bLimitFrameSkip)
+pub fn QSERVER_TickAllGames(limit_frame_skip: u32) u32 {
+    return stdcall(0x0052fc20, fn (u32) callconv(StdcallConv) u32)(limit_frame_skip); // VERIFIED
+}
+
+/// Drain inbound packets queued by the QServer worker threads into game logic.
+///   void NET_D2GS_SERVER_HandleAnyIncomingPacket(void)
+pub fn NET_D2GS_SERVER_HandleAnyIncomingPacket() void {
+    stdcall(0x0052cfe0, fn () callconv(StdcallConv) void)(); // VERIFIED
+}
+
+/// Create a battle.net (realm) game instance. Normally driven by an inbound
+/// create-game token from D2CS; exposed for local testing.
+///   GAME* GAME_CreateBattleNetGame(name, pass, desc, flags, template, a6, a7, a8)
+pub fn GAME_CreateBattleNetGame(
+    name: ?[*:0]const u8,
+    pass: ?[*:0]const u8,
+    desc: ?[*:0]const u8,
+    flags: u32,
+    template_: u32,
+    a6: u32,
+    a7: u32,
+    a8: u32,
+) ?*anyopaque {
+    const f = stdcall(0x00530930, fn (u32, u32, u32, u32, u32, u32, u32, u32) callconv(StdcallConv) usize); // VERIFIED
+    const r = f(
+        @intFromPtr(name orelse null),
+        @intFromPtr(pass orelse null),
+        @intFromPtr(desc orelse null),
+        flags,
+        template_,
+        a6,
+        a7,
+        a8,
+    );
+    return if (r == 0) null else @ptrFromInt(r);
+}
+
+// ── realm communication (D2CS / D2DBS bridge) ───────────────────────────────
+// The GS calls back into this table to talk to the realm/database — same model
+// as the 1.13 D2GS↔D2CS↔D2DBS. We implement the slots we need and register the
+// table with SetupAsBnetServer; until then BattleNetServerService is null and
+// the realm system-message path no-ops. Layout: D2Client/D2BattleNetEventCallbackTable.h
+pub const BnetServerService = extern struct {
+    fpCloseGame: ?*const anyopaque = null, // 0x00
+    fpLeaveGame: ?*const anyopaque = null, // 0x04
+    fpGetDatabaseCharacter: ?*const anyopaque = null, // 0x08 (client*, charName, clientId, accountName)
+    fpSaveDatabaseCharacter: ?*const anyopaque = null, // 0x0C
+    fpServerLogMessage: ?*const anyopaque = null, // 0x10
+    fpEnterGame: ?*const anyopaque = null, // 0x14
+    fpFindPlayerToken: ?*const anyopaque = null, // 0x18 — validate the token D2CS issued
+    fpSaveDatabaseGuild: ?*const anyopaque = null, // 0x1C
+    fpUnlockDatabaseCharacter: ?*const anyopaque = null, // 0x20
+    fpReserved1: ?*const anyopaque = null, // 0x24
+    fpUpdateCharacterLadder: ?*const anyopaque = null, // 0x28
+    fpUpdateGameInformation: ?*const anyopaque = null, // 0x2C
+    fpReserved2_systemMsg: ?*const anyopaque = null, // 0x30
+    fpSetGameData: ?*const anyopaque = null, // 0x34
+    fpRelockDatabaseCharacter: ?*const anyopaque = null, // 0x38
+    fpLoadComplete: ?*const anyopaque = null, // 0x3C
+    fpReserved3: ?*const anyopaque = null, // 0x40
+    fpReserved4: ?*const anyopaque = null, // 0x44
+    fpReserved5: ?*const anyopaque = null, // 0x48
+    fpReserved6: ?*const anyopaque = null, // 0x4C
+    fpReserved7: ?*const anyopaque = null, // 0x50
+    fpGetDatabaseFileTime: ?*const anyopaque = null, // 0x54 — char timestamp for save-conflict resolution
+    fpReserved8: ?*const anyopaque = null, // 0x58
+    fpReserved9: ?*const anyopaque = null, // 0x5C
+    fpReserved10: ?*const anyopaque = null, // 0x60
+};
+
+/// Register the realm callback table → sets BattleNetServerService + IsBattleNetServer=1.
+/// Pass null to clear. void SetupAsBnetServer(D2BattleNetEventCallbackTable*)
+pub fn SetupAsBnetServer(table: ?*const BnetServerService) void {
+    stdcall(0x0052c0e0, fn (usize) callconv(StdcallConv) void)(@intFromPtr(table)); // VERIFIED 1.14d win:0052c0e0
+}
+
+/// Set the global QServer game-state pointer. HALTS if state is null; pass a
+/// nonzero cookie to skip the second (also-halting) path. Needed for realm mode.
+///   void QSERVER_SetGlobalInstance(D2QServerGameStateStrc*, int cookie)
+pub fn QSERVER_SetGlobalInstance(state: *anyopaque, cookie: u32) void {
+    stdcall(0x0052c0a0, fn (usize, u32) callconv(StdcallConv) void)(@intFromPtr(state), cookie); // VERIFIED 0052c0a0
+}
+
+/// Allocate the next free game token (1..0x400). uint32 QSERVER_GenerateToken()
+pub fn QSERVER_GenerateToken() u32 {
+    return stdcall(0x0052c170, fn () callconv(StdcallConv) u32)(); // VERIFIED 0052c170
+}
+
+/// Bind a token to a game-server id in the token table.
+///   void QSERVER_PutNewGameOnTokenList(uint32 gameServerId, uint16 token)
+pub fn QSERVER_PutNewGameOnTokenList(game_server_id: u32, token: u16) void {
+    stdcall(0x0052c110, fn (u32, u16) callconv(StdcallConv) void)(game_server_id, token); // VERIFIED 0052c110
+}
+
+/// Initialize the gQServerGameState struct (its game hashtable + crit-sections
+/// at +0x50). Operates on the static global directly. void QSERVER_InitializeServerState()
+pub fn QSERVER_InitializeServerState() void {
+    stdcall(0x00530690, fn () callconv(StdcallConv) void)(); // VERIFIED 0053 0690
+}
+
+// ── engine globals (static, retail addresses; base 0x400000, no ASLR) ────────
+// From zig-output/data/data_symbols.json.
+pub const globals = struct {
+    /// D2QServerGameStateStrc (104 bytes) — the server game-state struct.
+    pub const gQServerGameState: usize = 0x007a_0690;
+    /// u32 — server-running flag.
+    pub const gbQServerRunning: usize = 0x007a_0458;
+    /// D2QServerGameStateStrc* — set by SetGlobalInstance to &gQServerGameState.
+    pub const gpQServerGameState: usize = 0x0088_3d38;
+    /// D2BattleNetEventCallbackTable* — set by SetupAsBnetServer (realm table).
+    pub const BattleNetServerService: usize = 0x0088_3d50;
+};
+
+// NOTE: realm callbacks are __fastcall (ECX/EDX register args + stack, callee
+// cleanup), NOT stdcall — confirmed by disassembly. e.g. fpFindPlayerToken
+// (slot 0x18) = ECX, EDX, + 7 stack args (9 total), `ret 0x1c`, returns int
+// (nonzero = token valid). Implement BnetServerService slots with fastcall shims
+// (Zig x86 fastcall is unreliable — use the naked-asm shims in fastcall.zig).
+
+fn gptr(comptime abs_addr: usize, comptime T: type) *T {
+    return @ptrFromInt(at(abs_addr));
+}
+
+/// Full dedicated-realm bootstrap. Mirrors NET_QServer_StartServer @0x0044bc30's
+/// OBNET/LAN-host tail, minus the host-as-player-1 NET_D2GS_ConnectToServer, plus
+/// SetupAsBnetServer to enable realm mode. `realm` may be null to run open (no
+/// D2CS) — then BattleNetServerService stays null and the realm path no-ops.
+pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
+    if (realm) |t| SetupAsBnetServer(t);
+    QSERVER_CreateAndInit(.server, .bnet); // allocs pQServer, opens :4000 listener
+    NET_SetPlayersCount(8);
+    NET_HACK_SetUseQServerHack(0);
+    QSERVER_SetGlobalInstance(@ptrFromInt(at(globals.gQServerGameState)), 1); // cookie≠0 → no halt
+    gptr(globals.gbQServerRunning, u32).* = 1;
+    QSERVER_InitializeServerState();
+}
+
+/// One tick of the server: drain inbound packets + advance all games.
+pub fn tick() void {
+    NET_D2GS_SERVER_HandleAnyIncomingPacket();
+    _ = QSERVER_TickAllGames(1);
+}
