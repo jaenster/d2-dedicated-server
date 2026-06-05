@@ -11,6 +11,7 @@
 const std = @import("std");
 const p = @import("protocol.zig");
 const server = @import("../engine/server.zig");
+const command = @import("../engine/command.zig");
 const log = @import("../log.zig");
 
 // ── winsock (Game.exe already loaded ws2_32 + WSAStartup; we reuse it) ────────
@@ -98,20 +99,78 @@ fn handleEcho(body: []const u8) void {
     if (body.len > 0) _ = sendPacket(body);
 }
 
+fn sendCreateGameReply(result: u32, gameid: u32) void {
+    var r = std.mem.zeroes(p.CreateGameReply);
+    r.h = p.header(.creategame, @sizeOf(p.CreateGameReply), nextSeq());
+    r.result = result;
+    r.gameid = gameid;
+    _ = sendPacket(std.mem.asBytes(&r));
+}
+
+fn sendJoinGameReply(result: u32, gameid: u32) void {
+    var r = std.mem.zeroes(p.JoinGameReply);
+    r.h = p.header(.joingame, @sizeOf(p.JoinGameReply), nextSeq());
+    r.result = result;
+    r.gameid = gameid;
+    _ = sendPacket(std.mem.asBytes(&r));
+}
+
+/// CREATEGAMEREQ: ladder/expansion/difficulty/hardcore byte flags, then
+/// gamename/gamepass/gamedesc/acct/char/ip cstrs (null-terminated in `body`).
+fn handleCreateGame(body: []const u8) void {
+    if (body.len < 5) {
+        sendCreateGameReply(1, 0);
+        return;
+    }
+    var off: usize = 4;
+    const name = p.readCStr(body, &off);
+    const pass = p.readCStr(body, &off);
+    const desc = p.readCStr(body, &off);
+
+    const ladder = body[0];
+    const expansion = body[1] != 0;
+    const difficulty: u3 = @truncate(body[2]);
+    const hardcore = body[3] != 0;
+    const flags = server.gameFlags(difficulty, expansion, hardcore);
+
+    // Enqueue for the tick thread (engine isn't safe to call from here directly).
+    // The engine writes the server token (= gameid).
+    const game_id = command.createGame(name, pass, desc, flags, ladder);
+    if (game_id != 0) {
+        sendCreateGameReply(0, game_id);
+        log.hex("d2cs: CREATEGAME spawned, gameid=0x", game_id);
+    } else {
+        sendCreateGameReply(1, 0);
+        log.print("d2cs: CREATEGAME failed");
+    }
+}
+
+/// JOINGAMEREQ: gameid, token, then charname/acct/ip cstrs. Register the token so
+/// the engine's fpFindPlayerToken / SERVER_IsTokenValid accept the joining client.
 fn handleJoinGame(body: []const u8) void {
-    if (body.len < @sizeOf(p.JoinGameReq) - p.HEADER_LEN) return;
-    const j: *const p.JoinGameReq = @ptrCast(@alignCast(body.ptr - p.HEADER_LEN));
-    // Register the token so the engine's fpFindPlayerToken / SERVER_IsTokenValid
-    // accept the incoming client. TODO: map gameid -> game-server id properly.
-    server.QSERVER_PutNewGameOnTokenList(j.gameid, @truncate(j.token));
-    log.hex("d2cs: JOINGAME token=0x", j.token);
+    if (body.len < 8) {
+        sendJoinGameReply(1, 0);
+        return;
+    }
+    const gameid = std.mem.readInt(u32, body[0..4], .little);
+    const token = std.mem.readInt(u32, body[4..8], .little);
+    // Token registration is part of the (gated) game path: PutNewGameOnTokenList
+    // indexes a fixed table and halts on an unmanaged token, so only touch the
+    // engine when creation is enabled and a game actually exists.
+    if (command.allow_create) {
+        server.QSERVER_PutNewGameOnTokenList(gameid, @truncate(token));
+        sendJoinGameReply(0, gameid);
+        log.hex("d2cs: JOINGAME registered token=0x", token);
+    } else {
+        sendJoinGameReply(1, gameid); // not available yet
+    }
 }
 
 fn dispatch(t: p.Type, body: []const u8) void {
     switch (t) {
         .authreq => sendAuthReply(),
         .echo => handleEcho(body),
-        .creategame => log.print("d2cs: CREATEGAME (TODO: GAME_CreateBattleNetGame + reply)"),
+        .creategame => handleCreateGame(body),
         .joingame => handleJoinGame(body),
         .control => log.print("d2cs: CONTROL"),
         else => {},

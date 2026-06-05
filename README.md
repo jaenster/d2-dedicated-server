@@ -94,6 +94,7 @@ streaming logs to your terminal. `dbghelp.dll` defaults to the one we build
 | `--d2gs-boot` | run the engine bootstrap + tick loop |
 | `--realm` | bootstrap in realm mode (registers the realm callback table) |
 | `--d2cs <ip:port>` | connect to PvPGN's D2CS for game create/join (see [`PVPGN.md`](PVPGN.md)) |
+| `--create-games` | (WIP) actually call the engine to create games — currently faults; see PVPGN.md |
 
 ## Layout
 

@@ -42,9 +42,26 @@ its D2CS dispatches games to. Two links:
 
 ## Status
 - ✅ Connect + auth handshake (`AUTHREPLY` + `SETGSINFO`) — tested against a mock
-  D2CS under wine (GS sends 0x11/0x12 correctly).
-- ⏳ Confirm the exact `version`/`checksum` the real PvPGN D2CS requires, and
-  whether `sign[128]` verification is enabled (we send zeros).
-- ⏳ CREATEGAME/JOINGAME → engine wiring (create game, reply, token register).
+  D2CS under wine.
+- ✅ Full protocol exchange is **stable**: `CREATEGAMEREQ`→`CREATEGAMEREPLY` and
+  `JOINGAMEREQ`→`JOINGAMEREPLY` are parsed and answered; the server stays alive
+  through the whole sequence.
+- ✅ CREATEGAME/JOINGAME → engine **wiring** done (parse strings/flags, call
+  `GAME_CreateBattleNetGame` on the tick thread via a serialized command queue,
+  return the engine's server token as gameid; JOINGAME registers the token).
+
+### ⛔ Blocker: game-data init
+`GAME_CreateBattleNetGame` **faults** in our server-only boot — its
+`RollSeed` / `AllocObjectControl` / `AllocQuestControl` read D2Common excel data
+tables that the dedicated bootstrap hasn't initialized (the host path reaches
+them via the client message loop we skip). `QSERVER_PutNewGameOnTokenList` also
+halts on an unmanaged token. So the engine calls are **gated behind
+`--create-games`** (off by default → CREATE/JOIN reply "failed" but the server
+stays stable). Next: find + call the server-side data-table / game-subsystem init
+so creation succeeds, then re-enable by default.
+
+### Remaining
+- ⏳ Server-side game-data init (the blocker above) — then real game create/join.
+- ⏳ Confirm real-realm `version`/`checksum`; whether `sign[128]` is verified.
 - ⏳ D2DBS link for character fetch/save (realm callbacks).
-- ⏳ DNS (currently dotted-quad IPv4 only).
+- ⏳ DNS (dotted-quad IPv4 only for now).

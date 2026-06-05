@@ -77,31 +77,42 @@ pub fn NET_D2GS_SERVER_HandleAnyIncomingPacket() void {
     stdcall(0x0052cfe0, fn () callconv(StdcallConv) void)(); // VERIFIED
 }
 
-/// Create a battle.net (realm) game instance. Normally driven by an inbound
-/// create-game token from D2CS; exposed for local testing.
-///   GAME* GAME_CreateBattleNetGame(name, pass, desc, flags, template, a6, a7, a8)
+/// Create a battle.net (realm) game in the engine. Requires gpQServerGameState
+/// (set by the bootstrap). `flags` (eD2ArenaFlags) encodes difficulty in bits
+/// 12-14, expansion via ARENAFLAG_Expansion, gametype in bit 21. `p_game_id` is
+/// an OUT pointer that receives the server token (the gameid) — must NOT be null.
+/// Returns 1 on success (and *p_game_id set), 0 on failure.
+///   BOOL GAME_CreateBattleNetGame(name, pass, desc, flags, template, reserved, ladder, WORD* pGameId)
 pub fn GAME_CreateBattleNetGame(
     name: ?[*:0]const u8,
     pass: ?[*:0]const u8,
     desc: ?[*:0]const u8,
     flags: u32,
     template_: u32,
-    a6: u32,
-    a7: u32,
-    a8: u32,
-) ?*anyopaque {
-    const f = stdcall(0x00530930, fn (u32, u32, u32, u32, u32, u32, u32, u32) callconv(StdcallConv) usize); // VERIFIED
-    const r = f(
+    reserved: u32,
+    ladder: u32,
+    p_game_id: *u16,
+) u32 {
+    const f = stdcall(0x00530930, fn (u32, u32, u32, u32, u32, u32, u32, *u16) callconv(StdcallConv) u32); // VERIFIED
+    return f(
         @intFromPtr(name orelse null),
         @intFromPtr(pass orelse null),
         @intFromPtr(desc orelse null),
         flags,
         template_,
-        a6,
-        a7,
-        a8,
+        reserved,
+        ladder,
+        p_game_id,
     );
-    return if (r == 0) null else @ptrFromInt(r);
+}
+
+/// eD2ArenaFlags bits used by GAME_CreateBattleNetGame.
+pub const ARENAFLAG_Expansion: u32 = 0x01; // TODO: confirm exact bit
+pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
+    _ = hardcore; // TODO: locate hardcore bit
+    var f: u32 = @as(u32, difficulty) << 12;
+    if (expansion) f |= ARENAFLAG_Expansion;
+    return f;
 }
 
 // ── realm communication (D2CS / D2DBS bridge) ───────────────────────────────
