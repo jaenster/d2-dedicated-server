@@ -15,10 +15,14 @@ const std = @import("std");
 const win = std.os.windows;
 const server = @import("engine/server.zig");
 const realm = @import("engine/realm.zig");
+const d2cs = @import("realm/d2cs.zig");
 const headless = @import("runtime/headless.zig");
 const log = @import("log.zig");
 
 var use_realm: bool = false;
+var d2cs_host: [64]u8 = undefined; // null-terminated IPv4
+var d2cs_port: u16 = 0;
+var d2cs_enabled: bool = false;
 
 const BOOL = win.BOOL; // enum(c_int){ FALSE, TRUE } in zig 0.16
 const HMODULE = win.HINSTANCE;
@@ -54,6 +58,43 @@ fn hasFlag(comptime flag: []const u8) bool {
     return false;
 }
 
+/// Parse `--d2cs <ip:port>` into d2cs_host/d2cs_port. Dotted-quad IPv4 only.
+fn parseD2cs() void {
+    const needle = "--d2cs ";
+    const cmd: [*:0]const u8 = GetCommandLineA();
+    var i: usize = 0;
+    var start: ?usize = null;
+    outer: while (cmd[i] != 0) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (cmd[i + j] != needle[j]) continue :outer;
+        }
+        start = i + needle.len;
+        break;
+    }
+    const s = start orelse return;
+    var k = s;
+    var host_len: usize = 0;
+    var port: u16 = 0;
+    var colon = false;
+    while (cmd[k] != 0 and cmd[k] != ' ' and cmd[k] != '\t') : (k += 1) {
+        const c = cmd[k];
+        if (c == ':') {
+            colon = true;
+        } else if (!colon) {
+            if (host_len + 1 < d2cs_host.len) {
+                d2cs_host[host_len] = c;
+                host_len += 1;
+            }
+        } else if (c >= '0' and c <= '9') {
+            port = port *% 10 +% (c - '0');
+        }
+    }
+    d2cs_host[host_len] = 0;
+    d2cs_port = port;
+    d2cs_enabled = host_len > 0 and port != 0;
+}
+
 /// Server thread: bring the QServer up in dedicated mode, then pump forever.
 /// Runs on its own thread so DllMain returns promptly and the host finishes its
 /// (headless) init before we touch engine globals.
@@ -76,6 +117,9 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     }
     log.print("d2gs: entering tick loop (listening on :4000)");
 
+    // Connect to PvPGN's D2CS so it can dispatch game create/join to us.
+    if (d2cs_enabled) d2cs.start(@ptrCast(&d2cs_host), d2cs_port);
+
     while (true) {
         server.tick();
         Sleep(10); // ~100 Hz; D2 logic runs at 25 fps, tune later
@@ -95,6 +139,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             }
             if (hasFlag("d2gs-boot")) {
                 use_realm = hasFlag("realm");
+                parseD2cs();
                 log.print("d2gs: --d2gs-boot set, spawning server thread");
                 _ = CreateThread(null, 0, serverThread, null, 0, null);
             } else {
