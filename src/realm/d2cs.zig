@@ -154,16 +154,15 @@ fn handleJoinGame(body: []const u8) void {
     }
     const gameid = std.mem.readInt(u32, body[0..4], .little);
     const token = std.mem.readInt(u32, body[4..8], .little);
-    // Token registration is part of the (gated) game path: PutNewGameOnTokenList
-    // indexes a fixed table and halts on an unmanaged token, so only touch the
-    // engine when creation is enabled and a game actually exists.
-    if (command.allow_create) {
-        server.QSERVER_PutNewGameOnTokenList(gameid, @truncate(token));
-        sendJoinGameReply(0, gameid);
-        log.hex("d2cs: JOINGAME registered token=0x", token);
-    } else {
-        sendJoinGameReply(1, gameid); // not available yet
-    }
+    // The game's own token was registered by GAME_CreateBattleNetGame. This join
+    // token authorizes a client to enter `gameid`; it's validated later when the
+    // client connects to :4000 (engine calls fpFindPlayerToken). So we just ack
+    // here and (TODO) remember token->game for that callback. Do NOT call
+    // PutNewGameOnTokenList — that registers a new game and would index a fixed
+    // table out of range for an arbitrary join token.
+    _ = token;
+    sendJoinGameReply(if (command.allow_create) 0 else 1, gameid);
+    log.hex("d2cs: JOINGAME ack for gameid=0x", gameid);
 }
 
 fn dispatch(t: p.Type, body: []const u8) void {
