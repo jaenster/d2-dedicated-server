@@ -1,11 +1,11 @@
 const std = @import("std");
 
-// Builds d2gs.dll — an injected payload that drives 1.14d Game.exe's built-in
-// QServer/D2Game engine as a headless dedicated game server.
-//
-// It is loaded into the real Game.exe process via a dbghelp.dll proxy (Game.exe
-// loads dbghelp for crash dumps), which LoadLibrary's injected DLLs listed on the
-// command line. Run the game with `--headless` so the client renderer never spins up.
+// Builds two DLLs (both x86-windows, run under wine on Linux):
+//   dbghelp.dll — injection foothold. Game.exe loads dbghelp for its crash
+//                 handler; our proxy forwards the real exports and LoadLibrary's
+//                 the DLLs passed via `-loaddll <winpath>`.
+//   d2gs.dll    — the payload that drives 1.14d's built-in QServer/D2Game engine
+//                 as a headless dedicated game server.
 pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86,
@@ -14,14 +14,25 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    const dll = b.addLibrary(.{
+    const dbghelp = b.addLibrary(.{
         .linkage = .dynamic,
-        .name = "d2gs",
+        .name = "dbghelp",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/dbghelp.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    b.installArtifact(dll);
+    b.installArtifact(dbghelp);
+
+    const d2gs = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "d2gs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/d2gs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(d2gs);
 }

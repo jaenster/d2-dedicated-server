@@ -13,8 +13,8 @@
 //! and `ret`s the exact stack-arg byte count (see [[zig-fastcall-callbacks]] /
 //! REALM.md). Wrong arg count corrupts the stack — confirm each per call site.
 
-const server = @import("d2_server.zig");
-const fastcall = @import("fastcall.zig");
+const server = @import("server.zig");
+const fastcall = @import("../runtime/fastcall.zig");
 
 /// The table we register via SetupAsBnetServer. All-null for now.
 pub var table: server.BnetServerService = .{};
