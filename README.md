@@ -32,6 +32,20 @@ Game.exe  --(loads)-->  dbghelp.dll (proxy)  --(LoadLibrary)-->  d2gs.dll
 zig build            # -> zig-out/bin/d2gs.dll  (x86-windows-gnu)
 ```
 
+## Game files
+
+This repo ships **no game data** — you bring your own legit Diablo II 1.14d.
+Either point `D2GS_GAME_SRC` at your full install, or build a slim test dir from
+your own copy:
+
+```
+D2_INSTALL="/path/to/Diablo II" tools/make-minimal.sh   # -> ./testgame-min
+```
+
+`make-minimal.sh` copies the real files (`Game.exe`, `d2data.mpq`, `d2exp.mpq`,
+`Patch_D2.mpq`, DLLs) from *your* install and fills the unused media archives
+with empty stub MPQs. See [`LEGAL.md`](LEGAL.md).
+
 ## Run
 
 Set `D2GS_GAME_SRC` (a D2 install with `d2data.mpq`) and `D2GS_DBGHELP` (a
@@ -73,3 +87,9 @@ A working proof of concept: inject → headless → boot the built-in QServer in
 dedicated mode → listen on `:4000` and tick, on the unmodified retail 1.14d
 `Game.exe`. Realm mode enables the callback path; the callback table is being
 filled in (see `REALM.md`).
+
+## License & legal
+
+Code: [MIT](LICENSE). No Blizzard game files are distributed here — bring your
+own legit copy of Diablo II. Unofficial, not affiliated with Blizzard. See
+[`LEGAL.md`](LEGAL.md).
