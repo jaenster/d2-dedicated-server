@@ -14,6 +14,7 @@
 const std = @import("std");
 const win = std.os.windows;
 const server = @import("engine/server.zig");
+const command = @import("engine/command.zig");
 const realm = @import("engine/realm.zig");
 const d2cs = @import("realm/d2cs.zig");
 const headless = @import("runtime/headless.zig");
@@ -121,6 +122,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     if (d2cs_enabled) d2cs.start(@ptrCast(&d2cs_host), d2cs_port);
 
     while (true) {
+        command.pump(); // run queued engine commands (create game, …) on this thread
         server.tick();
         Sleep(10); // ~100 Hz; D2 logic runs at 25 fps, tune later
     }
@@ -139,6 +141,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             }
             if (hasFlag("d2gs-boot")) {
                 use_realm = hasFlag("realm");
+                command.allow_create = hasFlag("create-games");
                 parseD2cs();
                 log.print("d2gs: --d2gs-boot set, spawning server thread");
                 _ = CreateThread(null, 0, serverThread, null, 0, null);

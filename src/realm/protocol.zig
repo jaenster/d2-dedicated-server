@@ -88,6 +88,39 @@ pub const SetGsInfo = extern struct {
     gameflag: u32,
 };
 
+/// CREATEGAMEREPLY (0x20). result: 0=ok, 1=fail.
+pub const CreateGameReply = extern struct {
+    h: Header,
+    result: u32,
+    gameid: u32,
+};
+
+/// JOINGAMEREPLY (0x21). result: 0=ok, 1=fail, 2=full.
+pub const JoinGameReply = extern struct {
+    h: Header,
+    result: u32,
+    gameid: u32,
+};
+
+/// UPDATEGAMEINFO (0x22). flag: 0=update, 1=enter, 2=leave; then charname cstr.
+pub const UpdateGameInfo = extern struct {
+    h: Header,
+    flag: u32,
+    gameid: u32,
+    charlevel: u32,
+    charclass: u32,
+};
+
+/// Read the i-th null-terminated string from a packet body, starting at `off`.
+/// Returns the slice (without the null) and advances `off` past the terminator.
+pub fn readCStr(body: []const u8, off: *usize) []const u8 {
+    const start = off.*;
+    var i = start;
+    while (i < body.len and body[i] != 0) : (i += 1) {}
+    off.* = if (i < body.len) i + 1 else i;
+    return body[start..i];
+}
+
 /// Build a header in-place for a packet of total length `size` and given type.
 pub fn header(t: Type, size: u16, seqno: u32) Header {
     return .{ .size = size, .type = @intFromEnum(t), .seqno = seqno };
