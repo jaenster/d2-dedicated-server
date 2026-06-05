@@ -50,18 +50,26 @@ its D2CS dispatches games to. Two links:
   `GAME_CreateBattleNetGame` on the tick thread via a serialized command queue,
   return the engine's server token as gameid; JOINGAME registers the token).
 
-### ⛔ Blocker: game-data init
-`GAME_CreateBattleNetGame` **faults** in our server-only boot — its
-`RollSeed` / `AllocObjectControl` / `AllocQuestControl` read D2Common excel data
-tables that the dedicated bootstrap hasn't initialized (the host path reaches
-them via the client message loop we skip). `QSERVER_PutNewGameOnTokenList` also
-halts on an unmanaged token. So the engine calls are **gated behind
-`--create-games`** (off by default → CREATE/JOIN reply "failed" but the server
-stays stable). Next: find + call the server-side data-table / game-subsystem init
-so creation succeeds, then re-enable by default.
+### ✅ Game creation works
+The blocker was uninitialized data tables: `GAME_CreateBattleNetGame`'s
+`RollSeed`/`Alloc*Control` read D2Common excel tables that the server-only boot
+never loaded (the client app-mode entry normally calls `TXT_InitTxtFiles`
+@0x619300). We now call `TXT_InitTxtFiles(0, 0, 1)` in the bootstrap (under
+`--create-games`) — and `CREATEGAMEREQ` then **spawns a real game** and returns
+`result=0, gameid` (tested under wine).
+
+### ⛔ Next layer: running the game / player entry
+Ticking a freshly-created **empty** game asserts (`ERROR_…Halt` → `ExitProcess(-1)`):
+the game's world (act/level/DRLG) isn't built — that happens when a player
+actually enters. So `--create-games` still ends in a halt once the game is ticked.
+Real progress needs a client to connect to `:4000` with a valid token, which
+requires implementing `fpFindPlayerToken` (token validation) so the engine sets
+up the act and the player enters. Gated behind `--create-games` (off by default →
+server stable through the protocol exchange).
 
 ### Remaining
-- ⏳ Server-side game-data init (the blocker above) — then real game create/join.
+- ⏳ Player entry: implement `fpFindPlayerToken`; have a client join `:4000` so the
+  engine builds the game world (then ticking is valid).
+- ⏳ D2DBS link for character fetch/save (`fpGetDatabaseCharacter` / `…Save`).
 - ⏳ Confirm real-realm `version`/`checksum`; whether `sign[128]` is verified.
-- ⏳ D2DBS link for character fetch/save (realm callbacks).
 - ⏳ DNS (dotted-quad IPv4 only for now).

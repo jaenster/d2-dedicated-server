@@ -18,6 +18,7 @@ const command = @import("engine/command.zig");
 const realm = @import("engine/realm.zig");
 const d2cs = @import("realm/d2cs.zig");
 const headless = @import("runtime/headless.zig");
+const crash = @import("runtime/crash.zig");
 const log = @import("log.zig");
 
 var use_realm: bool = false;
@@ -116,6 +117,15 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         log.print("d2gs: bootstrap (open mode, no realm)");
         server.bootstrapRealmServer(null);
     }
+    // Load the D2Common data tables (items/monsters/skills/levels/…) that game
+    // creation needs. The client app-mode entry normally does this; our server
+    // boot must do it explicitly. Only when game creation is enabled.
+    if (command.allow_create) {
+        log.print("d2gs: loading data tables (TXT_InitTxtFiles)...");
+        server.TXT_InitTxtFiles(0, 0, 1);
+        log.print("d2gs: data tables loaded");
+    }
+
     log.print("d2gs: entering tick loop (listening on :4000)");
 
     // Connect to PvPGN's D2CS so it can dispatch game create/join to us.
@@ -139,6 +149,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             if (hasFlag("headless")) {
                 headless.apply();
             }
+            crash.install(); // log faulting addresses of engine access violations
             if (hasFlag("d2gs-boot")) {
                 use_realm = hasFlag("realm");
                 command.allow_create = hasFlag("create-games");

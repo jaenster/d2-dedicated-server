@@ -178,6 +178,16 @@ pub fn QSERVER_InitializeServerState() void {
     stdcall(0x00530690, fn () callconv(StdcallConv) void)(); // VERIFIED 0053 0690
 }
 
+/// Load + compile all D2Common data tables (txt/bin) — items, monsters, missiles,
+/// skills, levels, etc. Game creation (RollSeed/Alloc*Control) needs these. The
+/// client app-mode entry normally calls this; for a server-only boot we call it
+/// ourselves. pMemory=0 is what retail passes (memory manager uses its pool id).
+/// Depends on the memory managers + string tables already being initialized.
+///   void TXT_InitTxtFiles(D2PoolManagerStrc*, int nZero2, int bGametypeIsOBNetHost)
+pub fn TXT_InitTxtFiles(p_mem: usize, n_zero2: u32, b_obnet_host: u32) void {
+    stdcall(0x00619300, fn (usize, u32, u32) callconv(StdcallConv) void)(p_mem, n_zero2, b_obnet_host); // VERIFIED 0061 9300
+}
+
 // ── engine globals (static, retail addresses; base 0x400000, no ASLR) ────────
 // From zig-output/data/data_symbols.json.
 pub const globals = struct {
