@@ -15,9 +15,35 @@
 
 const server = @import("server.zig");
 const fastcall = @import("../runtime/fastcall.zig");
+const log = @import("../log.zig");
 
-/// The table we register via SetupAsBnetServer. All-null for now.
+/// The table we register via SetupAsBnetServer.
 pub var table: server.BnetServerService = .{};
+
+// ── fpGetDatabaseCharacter (slot 0x08) ───────────────────────────────────────
+// Called when a client joins: the GS asks the realm for the character's save.
+// __fastcall: ECX=&pClient->pRealm, EDX=szPlayerName, +nClientId, +pAccountName
+// (ret 0x8). Normally fetches from D2DBS then delivers via
+// CLIENT_OnDatabaseCharacterReceived @0x5306e0. FIRST PASS: just log the request
+// (proves the callback fires on a real join, with the real char/account) — the
+// d2dbs fetch + delivery is wired next, once we've seen a real join.
+fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize) callconv(.c) usize {
+    _ = ecx;
+    log.print("realm: fpGetDatabaseCharacter — client joining");
+    log.hex("realm:   clientId=0x", client_id);
+    log.cstr("realm:   char=", edx);
+    log.cstr("realm:   account=", account);
+    // TODO: d2dbs.fetchCharSave(account, char) -> CLIENT_OnDatabaseCharacterReceived(...)
+    return 0;
+}
+
+pub const getDatabaseCharShim = fastcall.Callback2(2, getDatabaseCharImpl).shim;
+
+/// Populate the realm callback table. Call before SetupAsBnetServer (i.e. before
+/// bootstrapRealmServer). Currently wires the char-request logger.
+pub fn init() void {
+    table.fpGetDatabaseCharacter = @ptrCast(&getDatabaseCharShim);
+}
 
 // ── fpFindPlayerToken (slot 0x18) ────────────────────────────────────────────
 // __fastcall: ECX + EDX + 7 stack args, callee-cleanup ret 0x1c, returns int

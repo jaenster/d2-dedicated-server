@@ -188,6 +188,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // we register the (currently all-null, safe) realm table to enable realm mode;
     // otherwise we run open (no D2CS), which the POC already proved listens on :4000.
     if (use_realm) {
+        realm.init(); // populate the callback table before SetupAsBnetServer
         log.print("d2gs: bootstrap (realm mode, IsBattleNetServer=1)");
         server.bootstrapRealmServer(&realm.table);
     } else {
