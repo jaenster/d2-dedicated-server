@@ -63,6 +63,13 @@ pub fn writeJump(addr: usize, target: usize) bool {
     return writeBytesProtected(addr, &[5]BYTE{ 0xE9, rb[0], rb[1], rb[2], rb[3] });
 }
 
+/// 5-byte CALL (E8) from `addr` to `target`.
+pub fn writeCall(addr: usize, target: usize) bool {
+    const rel = calcRelAddr(addr, target, 5);
+    const rb: [4]u8 = @bitCast(rel);
+    return writeBytesProtected(addr, &[5]BYTE{ 0xE8, rb[0], rb[1], rb[2], rb[3] });
+}
+
 /// NOP fill.
 pub fn writeNops(addr: usize, len: usize) bool {
     return fillBytesProtected(addr, 0x90, len);

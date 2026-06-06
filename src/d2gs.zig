@@ -21,6 +21,7 @@ const d2dbs = @import("realm/d2dbs.zig");
 const headless = @import("runtime/headless.zig");
 const crash = @import("runtime/crash.zig");
 const halt_hook = @import("runtime/halt_hook.zig");
+const autoenter = @import("test/autoenter.zig");
 const log = @import("log.zig");
 
 var use_realm: bool = false;
@@ -232,7 +233,11 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             }
             crash.install(); // log faulting addresses of engine access violations
             halt_hook.install(); // log engine assert sites before exit
-            if (hasFlag("d2gs-boot")) {
+            if (hasFlag("test-enter")) {
+                // Drive the real client through the menus into a game with a
+                // character and verify it loads (no server bootstrap).
+                autoenter.install();
+            } else if (hasFlag("d2gs-boot")) {
                 use_realm = hasFlag("realm");
                 command.allow_create = hasFlag("create-games");
                 parseEndpoints();
