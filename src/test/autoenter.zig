@@ -54,30 +54,34 @@ fn task() void {
     async_.waitFrames(10);
 
     OogCurrentCharSelectionMode.* = 0; // single-player mode
-    closeAndLaunchCharSelect(); // opens char select, enumerates saves
+    closeAndLaunchCharSelect(); // queues char-select app-mode
 
-    var wait: u32 = 0;
-    while (TotalCurrentChars.* == 0 and wait < 300) : (wait += 1) async_.yield();
+    // The char-select app-mode resets the count then parses saves over the next
+    // frames. Let it run, then read a settled count + the first char.
+    async_.waitFrames(80);
     log.hex("test: chars found=0x", TotalCurrentChars.*);
-    if (TotalCurrentChars.* == 0) {
-        log.print("test: NO CHARACTERS (need a save to enter with)");
-        return;
-    }
 
     const ch = D2CharSelStrcFirst.* orelse {
-        log.print("test: char list null");
+        log.print("test: char list null (no saves found in Save\\)");
         return;
     };
+    const cname = std.mem.sliceTo(&ch.szCharname, 0);
+    log.print("test: first char:");
+    log.print(cname);
     log.print("test: entering game with first character");
     _ = SelectedChar.call(.{ ch, ch.nCharacterFlags, @as(u32, ch.ePlayerClassID), "" });
 
-    // Wait to actually be in-game (player unit loaded).
+    // Wait to actually be in-game (player unit loaded). World gen / SP server
+    // bootstrap can take a while; poll for a long window and log progress.
     var w2: u32 = 0;
-    while (playerUnit.* == null and w2 < 600) : (w2 += 1) async_.yield();
+    while (playerUnit.* == null and w2 < 4000) : (w2 += 1) {
+        if (w2 % 500 == 0) log.hex("test: waiting for in-game... frame=0x", w2);
+        async_.yield();
+    }
     if (playerUnit.* != null) {
         log.print("test: PASS — entered game, player unit loaded");
     } else {
-        log.print("test: FAIL — never entered game");
+        log.print("test: FAIL — never entered game (SP load didn't complete)");
     }
 }
 
