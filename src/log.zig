@@ -80,3 +80,24 @@ pub fn hex(prefix: []const u8, value: usize) void {
     }
     print(line[0..n]);
 }
+
+/// Log "<prefix><null-terminated C string at ptr>". Safe on null/garbage-ish ptr
+/// (bounded scan). ptr may be 0.
+pub fn cstr(prefix: []const u8, ptr: usize) void {
+    var line: [160]u8 = undefined;
+    var n: usize = 0;
+    for (prefix) |c| {
+        if (n >= line.len) break;
+        line[n] = c;
+        n += 1;
+    }
+    if (ptr != 0) {
+        const s: [*]const u8 = @ptrFromInt(ptr);
+        var i: usize = 0;
+        while (i < 64 and s[i] != 0 and n < line.len) : (i += 1) {
+            line[n] = s[i];
+            n += 1;
+        }
+    }
+    print(line[0..n]);
+}
