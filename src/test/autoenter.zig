@@ -69,30 +69,38 @@ fn task() void {
     log.print("test: first char:");
     log.print(cname);
     log.print("test: entering game with first character");
+    // Sets nScreenToShow=1, gnSelectedCharGameState=1, nGAMETYPE=SINGLEPLAYER and
+    // clears the message-loop flag so the app-mode loop advances to game-load.
+    // The task ENDS here (like aether) — we must not keep the fiber alive during
+    // the transition; verification happens in the frame callback below.
     _ = SelectedChar.call(.{ ch, ch.nCharacterFlags, @as(u32, ch.ePlayerClassID), "" });
-
-    // Wait to actually be in-game (player unit loaded). World gen / SP server
-    // bootstrap can take a while; poll for a long window and log progress.
-    var w2: u32 = 0;
-    while (playerUnit.* == null and w2 < 4000) : (w2 += 1) {
-        if (w2 % 500 == 0) log.hex("test: waiting for in-game... frame=0x", w2);
-        async_.yield();
-    }
-    if (playerUnit.* != null) {
-        log.print("test: PASS — entered game, player unit loaded");
-    } else {
-        log.print("test: FAIL — never entered game (SP load didn't complete)");
-    }
+    log.print("test: SelectedChar done, awaiting game load (verifying in frame loop)");
 }
 
 var started: bool = false;
+var verified: bool = false;
+var verify_frames: u32 = 0;
 
 fn frame() void {
     if (!started) {
         started = true;
         async_.spawn(&task);
+        return;
     }
-    _ = async_.tick();
+    if (async_.isActive()) {
+        _ = async_.tick();
+        return;
+    }
+    // Task finished (SelectedChar issued) — let the engine load the game, then verify.
+    if (verified) return;
+    verify_frames += 1;
+    if (playerUnit.* != null) {
+        verified = true;
+        log.print("test: PASS — entered game, player unit loaded");
+    } else if (verify_frames == 100000) {
+        // generous: the SP load (world gen + disk) takes real time across many frames
+        log.print("test: FAIL — never entered game (SP load didn't complete)");
+    }
 }
 
 /// Install the auto-enter test: hook the loops and drive the menus on the game thread.
