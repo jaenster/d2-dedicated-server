@@ -57,6 +57,20 @@ var save_buf: [16384]u8 = undefined;
 var load_filetime: [2]u32 = .{ 0, 0 }; // a zeroed FILETIME (load-time placeholder)
 var load_filetimes: [2]u32 = undefined; // { &load_filetime, unk0x194 }
 
+// Pending character delivery. fpGetDatabaseCharacter is meant to be async (the
+// real d2dbs reply arrives as a SEPARATE event); delivering synchronously from
+// inside the callback runs OnDatabaseCharacterReceived before SrvJoinGame's
+// ClientSetDwSaveTo1 and leaves the join half-set-up. So the callback fetches the
+// save and queues it here, and the tick loop (pumpDelivery) delivers it once the
+// engine's join call stack has fully unwound.
+const Pending = struct {
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    client_id: u32 = 0,
+    container: ?*anyopaque = null,
+    len: u32 = 0, // 0 = fetch failed (refuse the join)
+};
+var pending: Pending = .{};
+
 // ── fpGetDatabaseCharacter (slot 0x08) ───────────────────────────────────────
 // Called when a client joins (NET_D2GS_SERVER_SrvJoinGame): the GS asks the realm
 // for the character's save. __fastcall: ECX=&pClient->pRealm, EDX=szPlayerName,
@@ -94,28 +108,48 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
         d2dbs.disconnect();
     }
 
-    if (save_len == 0 or save_len > 0xFFFF) {
-        log.print("realm:   char fetch FAILED — disconnecting client");
-        // CsResult != 0 → engine logs the load error and disconnects cleanly
-        // (avoids the half-built-client cleanup crash).
-        _ = OnDatabaseCharacterReceived(@intCast(client_id), &save_buf, 0, 0, 1, 0, &load_filetimes, container);
-        return 0;
-    }
-
+    // Queue the delivery for the tick loop; do NOT call OnDatabaseCharacterReceived
+    // synchronously here (see Pending).
     load_filetimes = .{ @truncate(@intFromPtr(&load_filetime)), 0 };
-    const len: u32 = @intCast(save_len);
-    log.hex("realm:   delivering save bytes=0x", save_len);
-    _ = OnDatabaseCharacterReceived(@intCast(client_id), &save_buf, len, len, 0, 0, &load_filetimes, container);
-    log.print("realm:   char delivered (SendStateCommand 2)");
+    pending.client_id = @intCast(client_id);
+    pending.container = container;
+    pending.len = if (save_len > 0 and save_len <= 0xFFFF) @intCast(save_len) else 0;
+    pending.ready.store(true, .release);
+    log.hex("realm:   save fetched, queued for delivery bytes=0x", save_len);
     return 0;
+}
+
+/// Deliver a queued character save to the engine, OUTSIDE the join call stack.
+/// Call once per server tick. len==0 means the fetch failed → refuse the join.
+pub fn pumpDelivery() void {
+    if (!pending.ready.swap(false, .acquire)) return;
+    if (pending.len == 0) {
+        log.print("realm:   char fetch FAILED — refusing join");
+        _ = OnDatabaseCharacterReceived(pending.client_id, &save_buf, 0, 0, 1, 0, &load_filetimes, pending.container);
+        return;
+    }
+    _ = OnDatabaseCharacterReceived(pending.client_id, &save_buf, pending.len, pending.len, 0, 0, &load_filetimes, pending.container);
+    log.print("realm:   char delivered (SendStateCommand 2)");
 }
 
 pub const getDatabaseCharShim = fastcall.Callback2(2, getDatabaseCharImpl).shim;
 
+// ── fpLeaveGame (slot 0x04) ──────────────────────────────────────────────────
+// Called from CleanUpClient when a client leaves/disconnects. The engine
+// IsBadCodePtr-checks it (a null pointer reads as a bad code pointer and HALTS),
+// so it MUST be a valid function even if we do nothing with the leave yet. It is
+// __fastcall with ECX=&pClient->pRealm, EDX + 18 stack args (counted at the call
+// site) and its return is ignored — so a stack-balancing no-op (`ret 0x48`,
+// 18*4 bytes of callee cleanup) is a safe stub.
+fn leaveGameStub() callconv(.naked) void {
+    asm volatile ("ret $0x48");
+}
+
 /// Populate the realm callback table. Call before SetupAsBnetServer (i.e. before
-/// bootstrapRealmServer). Wires the char loader + token validation.
+/// bootstrapRealmServer). Wires the char loader + token validation + leave.
 pub fn init() void {
     table.fpGetDatabaseCharacter = @ptrCast(&getDatabaseCharShim);
+    table.fpLeaveGame = @ptrCast(&leaveGameStub);
     enableTokenValidation(); // register fpFindPlayerToken (engine IsBadCodePtr-checks it)
 }
 
