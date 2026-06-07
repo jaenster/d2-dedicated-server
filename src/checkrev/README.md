@@ -3,7 +3,7 @@
 Builds `ver-IX86-1.dll`, the small library the 1.14d client downloads (inside a
 version MPQ, over BNFTP) and calls to prove its version during the Battle.net
 version check. `realmd` serves this DLL to the client; this is the **producer**
-side of that handshake (the server/BNFTP side is `../realmd/bnftp.zig`).
+side of that handshake (the server/BNFTP side is `../realm/server/bnftp.zig`).
 
 ## What it is
 

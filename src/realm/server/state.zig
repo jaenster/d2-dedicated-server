@@ -39,7 +39,9 @@ pub const Game = struct {
     name: [max_name + 1]u8 = [_]u8{0} ** (max_name + 1),
     name_len: u8 = 0,
     gameid: u32 = 0, // engine server token (= the token the client passes to the GS)
-    gs_ip: [4]u8 = .{ 0, 0, 0, 0 }, // d2gs address the client connects to (:4000)
+    gs_ip: [4]u8 = .{ 0, 0, 0, 0 }, // d2gs address the client connects to
+    gs_port: u16 = 4000, // d2gs game port the client connects to
+    gsid: u32 = 0, // which GS in the fleet hosts this game
     in_use: bool = false,
 
     pub fn name_slice(g: *const Game) []const u8 {
@@ -54,10 +56,10 @@ pub const State = struct {
     games: [512]Game = [_]Game{.{}} ** 512,
 
     /// Mint a session for `account`, returning its id (0 on failure).
-    pub fn createSession(st: *State, account: []const u8) u64 {
+    pub fn mintSession(st: *State, account: []const u8) u64 {
         if (shared) {
             const id = (@as(u64, instance_hash) << 32) | shared_ctr.fetchAdd(1, .monotonic);
-            return if (store.putSession(id, account)) id else 0;
+            return if (store.saveSession(id, account)) id else 0;
         }
         st.lock.lock();
         defer st.lock.unlock();
@@ -77,8 +79,8 @@ pub const State = struct {
     /// Copy the session's account name for `id` into `out`; returns its slice,
     /// or null if no such session. (Copies under lock so callers can't race a
     /// concurrent free.)
-    pub fn accountFor(st: *State, id: u64, out: []u8) ?[]const u8 {
-        if (shared) return store.getSession(id, out);
+    pub fn accountForSession(st: *State, id: u64, out: []u8) ?[]const u8 {
+        if (shared) return store.accountForSession(id, out);
         st.lock.lock();
         defer st.lock.unlock();
         for (&st.sessions) |*s| {
@@ -92,8 +94,8 @@ pub const State = struct {
     }
 
     /// Register (or replace, by name) a hosted game. Returns false if full.
-    pub fn addGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8) bool {
-        if (shared) return store.putGame(name, gameid, gs_ip);
+    pub fn registerGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32) bool {
+        if (shared) return store.registerGame(name, gameid, gs_ip, gs_port, gsid);
         st.lock.lock();
         defer st.lock.unlock();
         var slot: ?*Game = null;
@@ -110,6 +112,8 @@ pub const State = struct {
         g.name_len = n;
         g.gameid = gameid;
         g.gs_ip = gs_ip;
+        g.gs_port = gs_port;
+        g.gsid = gsid;
         g.in_use = true;
         return true;
     }
@@ -117,8 +121,8 @@ pub const State = struct {
     /// Look up a game by name; copies the record out under lock.
     pub fn findGame(st: *State, name: []const u8) ?Game {
         if (shared) {
-            const rec = store.getGame(name) orelse return null;
-            var g = Game{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .in_use = true };
+            const rec = store.findGame(name) orelse return null;
+            var g = Game{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .in_use = true };
             const n: u8 = @intCast(@min(name.len, max_name));
             @memcpy(g.name[0..n], name[0..n]);
             g.name_len = n;
@@ -132,14 +136,24 @@ pub const State = struct {
         return null;
     }
 
-    /// Remove a game by engine gameid (called on CLOSEGAME). In shared mode we
-    /// look it up by name; the gameid path only applies to the in-memory table.
+    /// Remove a game by engine gameid (called on CLOSEGAME).
     pub fn removeGameById(st: *State, gameid: u32) void {
-        if (shared) return; // games expire from the shared store; id->name reverse index TODO
+        if (shared) return store.removeGameById(gameid); // store's games-by-id reverse index
         st.lock.lock();
         defer st.lock.unlock();
         for (&st.games) |*g| {
             if (g.in_use and g.gameid == gameid) g.in_use = false;
+        }
+    }
+
+    /// Expire every game hosted by a GS that just disconnected, so clients stop being
+    /// routed to a dead server and creators can reuse the names.
+    pub fn expireGamesByGs(st: *State, gsid: u32) void {
+        if (shared) return store.expireGamesByGs(gsid); // store's games-by-gs index
+        st.lock.lock();
+        defer st.lock.unlock();
+        for (&st.games) |*g| {
+            if (g.in_use and g.gsid == gsid) g.in_use = false;
         }
     }
 };
