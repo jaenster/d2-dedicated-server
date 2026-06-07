@@ -33,13 +33,38 @@ binary (no wine).
                      └────────────────── the client connects directly ───┘
 ```
 
-- **realm server** (`src/realmd/`, native): one binary replacing pvpgn's
-  bnetd + d2cs + d2dbs, plus a GS-link the injected server connects to. File-backed
-  state survives restarts; multi-instance over a shared dir. See
-  [`src/realmd/README.md`](src/realmd/README.md).
-- **game server** (`src/d2gs.zig` + `src/engine/` + `src/realm/`): the injected DLL
-  that boots `Game.exe` as a headless dedicated server and bridges it to realmd via
+- **realm server** (`src/realm/server/`, native; the `realmd` binary): one binary
+  replacing pvpgn's bnetd + d2cs + d2dbs, plus a GS-link the injected server connects to.
+  Pluggable persistence (fs/redis/pg) survives restarts; multi-instance. See
+  [`src/realm/server/README.md`](src/realm/server/README.md).
+- **game server** (`src/d2gs.zig` + `src/engine/` + `src/realm/client/`): the injected
+  DLL that boots `Game.exe` as a headless dedicated server and bridges it to realmd via
   the engine's realm callback table. See [`src/engine/README.md`](src/engine/README.md).
+- **shared realm contract** (`src/realm/shared/`): the d2cs↔d2gs wire protocol both ends
+  import (the `realm_shared` module), so client and server agree on the wire by construction.
+
+## Architecture
+
+The full model lives in [`docs/architecture/`](docs/architecture/) (LikeC4) and can
+be browsed live with `npx likec4 start docs/architecture`. Rendered views:
+
+**Landscape** — native D2 modules + the d2gs project parts:
+
+![Landscape](docs/architecture/img/index.png)
+
+**GS fleet** — realmd's `gslink` keeps a registry of *many* game servers. A GS
+connects out (`:6115`), self-reports its public `<ip>:4000` + `gsid` + capacity
+(ADDRINFO); `CREATE` routes to the least-loaded GS, `JOIN` to the owning `gsid`.
+The persistence facade dispatches to `fs` / `redis` (ephemeral) / `pg` (durable):
+
+![GS fleet](docs/architecture/img/gs_fleet.png)
+
+**Kubernetes topology** — stateless realmd behind a LoadBalancer (`/readyz`-gated)
+with Redis + Postgres backends, and a GS StatefulSet whose pods bind `hostPort 4000`
+on their Node IP. The player logs in via the LB, then talks game traffic *directly*
+to `nodeIP:4000`:
+
+![Kubernetes topology](docs/architecture/img/k8s_deploy.png)
 
 ## How injection works
 
@@ -72,6 +97,11 @@ wine Game.exe ... --loaddll Z:\path\d2gs.dll --loaddll Z:\path\yourmod.dll --d2g
 
 Each runs in-process with full access to the engine at its fixed addresses (image
 base `0x00400000`, no ASLR). `d2gs.dll` is just the first such DLL.
+
+In the **container**, drop mod DLLs in `/mods` (each `--loaddll`'d after `d2gs.dll`)
+or list them in `D2GS_EXTRA_DLLS`; overlay extra **data** (mod MPQs, or a loose
+`data/` tree with `D2GS_EXTRA_ARGS="-direct -txt"`) by mounting it at `/moddata` —
+it's merged onto the read-only game install in a writable work dir at startup.
 
 ## Build
 
@@ -111,8 +141,11 @@ a real 1.14d install via `E2E_GAME_SRC`).
 | `--d2gs-boot` | run the engine bootstrap + tick loop (the dedicated server) |
 | `--realm` | bootstrap in realm mode (register the realm callback table) |
 | `--create-games` | load data tables so the engine can create games |
-| `--d2cs <ip:port>` | connect to realmd's gs-link for create/join dispatch |
-| `--d2dbs <ip:port>` | fetch character saves from realmd's d2dbs |
+| `--realmd <host>` | connect to one realm server, deriving gs-link (`:6115`) + d2dbs (`:6114`); DNS ok. Env: `REALMD_HOST` |
+| `--d2cs <ip:port>` | connect to realmd's gs-link for create/join dispatch (overrides `--realmd`) |
+| `--d2dbs <ip:port>` | fetch character saves from realmd's d2dbs (overrides `--realmd`) |
+| `--gs-addr <ip:port>` | public address clients dial for this GS's games (self-reported to realmd). Env: `D2GS_GS_ADDR` |
+| `--max-games <n>` | capacity this GS advertises to realmd. Env: `D2GS_MAX_GAMES` |
 | `--bypass-checkrev` | (client) skip the bnet version check |
 | `--screenshot` | (client) take a screenshot every 3s (headed debugging) |
 | `--auto-login <acct:pass>` | (client) drive login → char select → create a game |
@@ -127,9 +160,11 @@ src/
   dbghelp.zig    dbghelp.dll proxy — injection foothold (--loaddll loader)
   d2gs.zig       d2gs.dll entry — DllMain, flag parsing, server thread + tick loop
   log.zig        logger (stdout + file)
-  realmd/        the realm server (bnetd + d2cs + d2dbs + gs-link)   [README]
+  realm/         the realm link — both ends + their shared contract       [README]
+    shared/      d2cs<->d2gs wire protocol (the realm_shared module)
+    client/      GS-side clients of the realm (d2cs/d2dbs, join context)  [README]
+    server/      the realm server / realmd binary (bnetd+d2cs+d2dbs+gs-link, store, health) [README]
   engine/        bindings into Game.exe's own engine + realm callback table [README]
-  realm/         GS-side of the realm link (d2cs/d2dbs clients, join context) [README]
   runtime/       in-process machinery: byte-patches, hooks, fastcall, diagnostics [README]
   test/          client-driving test harnesses (auto-login/join, screenshots) [README]
   checkrev/      CheckRevision.dll producer for the version-check MPQ          [README]

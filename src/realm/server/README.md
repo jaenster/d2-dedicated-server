@@ -1,4 +1,4 @@
-# src/realmd — the realm server
+# src/realm/server — the realm server (`realmd` binary)
 
 A clean-room **Battle.net / Diablo II realm server** in Zig, one native binary
 that replaces PvPGN's `bnetd` + `d2cs` + `d2dbs` (plus a GS-link the injected game
@@ -19,6 +19,19 @@ source. MIT-licensed.
 | 6115 | `gslink.zig` | GS-facing control: the injected server registers + receives create/join dispatch |
 
 `main.zig` binds all four and serves each on its own thread.
+
+## Architecture
+
+`gslink` fronts a fleet of game servers (registry + capacity-aware routing); the
+store facade dispatches to `fs` / `redis` / `pg`. Full model in
+[`../../docs/architecture/`](../../docs/architecture/):
+
+![GS fleet](../../docs/architecture/img/gs_fleet.png)
+
+Kubernetes deployment topology (LoadBalancer-fronted realmd + Redis/Postgres +
+GS StatefulSet with `hostPort 4000`):
+
+![Kubernetes topology](../../docs/architecture/img/k8s_deploy.png)
 
 ## Files
 
@@ -47,9 +60,21 @@ source. MIT-licensed.
 
 ## Config (env)
 
-`REALMD_BIND`, `REALMD_BNET_PORT`/`D2CS_PORT`/`D2DBS_PORT`/`GS_PORT`,
+Core: `REALMD_BIND`, `REALMD_BNET_PORT`/`D2CS_PORT`/`D2DBS_PORT`/`GS_PORT`,
 `REALMD_DATA_DIR`, `REALMD_REALM_NAME`, `REALMD_REALM_ADDR`, `REALMD_GS_ADDR`,
 `REALMD_INSTANCE`, `REALMD_SHARED`, `REALMD_CAPTURE` (hexdump mode).
+
+Persistence (DDD facade → fs | redis | pg; no adapters): `REALMD_STORE` sets both
+backends at once; `REALMD_DURABLE_STORE` (character saves) and
+`REALMD_EPHEMERAL_STORE` (sessions + games) override each — the common cloud split is
+`durable=pg`, `ephemeral=redis`. `REALMD_REDIS_ADDR` (`host:port`), `REALMD_PG_DSN`
+(`postgres://…`). A redis/pg ephemeral backend is treated as shared (no `REALMD_SHARED`
+needed).
+
+Health / lifecycle: `REALMD_HEALTH_PORT` (default 8080; `/healthz` liveness, `/readyz`
+readiness = store reachable + GS present + not draining), `REALMD_REQUIRE_GS` (gate
+`/readyz` on ≥1 registered GS), `REALMD_LOG_JSON` (JSON log lines),
+`REALMD_SHUTDOWN_GRACE_MS` (SIGTERM drain window before exit).
 
 ## Run
 

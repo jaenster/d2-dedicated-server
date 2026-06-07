@@ -1,0 +1,81 @@
+// Kubernetes deployment topology for the cloud-native d2gs realm.
+//
+// Maps the logical model (diablo2.c4) onto k8s objects: a stateless realmd
+// front behind a LoadBalancer, Redis (ephemeral) + Postgres (durable), and a
+// GS StatefulSet whose pods bind hostPort 4000 on their Node IP. The player
+// logs in via the LB, then talks game traffic DIRECTLY to nodeIP:4000.
+//
+// View it with:  npx likec4 start docs/architecture
+
+deployment {
+
+  // External player — its own deployment node (the internet side of the LB).
+  service lb_player 'Player' {
+    description 'Unmodified D2 client on the internet'
+  }
+
+  cluster prod 'Kubernetes cluster' {
+
+    // realmd front: stateless, /readyz-gated, fronted by a LoadBalancer Service.
+    service realmd_lb 'realmd Service (LoadBalancer)' {
+      description 'Exposes :6112-6115; routes to ready realmd pods only'
+    }
+    workload realmd_deploy 'realmd Deployment' {
+      description '2 replicas, stateless front, /readyz gated, SIGTERM drain'
+      instanceOf d2gs.realmd.bncs
+      instanceOf d2gs.realmd.rd2cs
+      instanceOf d2gs.realmd.gslink
+      instanceOf d2gs.realmd.health
+    }
+
+    // Backing stores.
+    service redis_svc 'Redis Service' {
+      description 'Ephemeral sessions + games (native TTL)'
+      instanceOf d2gs.realmd.store_redis
+    }
+    service pg_svc 'Postgres Service' {
+      description 'Durable character saves'
+      instanceOf d2gs.realmd.store_pg
+    }
+
+    // GS fleet as a StatefulSet — each pod is hostPort 4000 on its Node IP.
+    workload gs_set 'GS StatefulSet' {
+      description 'Stable per-pod identity; each pod hostPort 4000 -> Node IP'
+
+      pod gs_pod_a 'gs-0 pod (Node A)' {
+        description 'hostPort 4000 bound to Node A IP; registers out to realmd over gslink'
+        instanceOf d2gs.gameserver
+      }
+      pod gs_pod_b 'gs-1 pod (Node B)' {
+        description 'hostPort 4000 bound to Node B IP; registers out to realmd over gslink'
+        instanceOf d2gs.gameserver
+      }
+    }
+  }
+
+  // Player login goes through the LoadBalancer to realmd.
+  lb_player -> realmd_lb 'login/realm (:6112-6115)'
+  realmd_lb -> realmd_deploy 'to ready pods'
+
+  // realmd -> backing stores.
+  realmd_deploy -> redis_svc 'ephemeral (sessions+games)'
+  realmd_deploy -> pg_svc 'durable (chars)'
+
+  // GS pods register OUT to realmd's gslink (:6115); realmd routes create/join.
+  gs_pod_a -> realmd_deploy 'gslink register (:6115) + ADDRINFO nodeIP:4000'
+  gs_pod_b -> realmd_deploy 'gslink register (:6115) + ADDRINFO nodeIP:4000'
+
+  // The player talks game traffic DIRECTLY to the chosen Node IP : hostPort 4000.
+  lb_player -> gs_pod_a 'game traffic direct (nodeIP:4000)'
+  lb_player -> gs_pod_b 'game traffic direct (nodeIP:4000)'
+}
+
+views {
+
+  // The full k8s topology: LB front, stores, GS StatefulSet, direct game path.
+  deployment view k8s_deploy {
+    title 'Kubernetes deployment topology'
+    include *
+    autoLayout TopBottom
+  }
+}

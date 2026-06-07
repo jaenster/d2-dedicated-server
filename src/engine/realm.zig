@@ -16,8 +16,8 @@
 const std = @import("std");
 const server = @import("server.zig");
 const fastcall = @import("../runtime/fastcall.zig");
-const d2dbs = @import("../realm/d2dbs.zig");
-const joinctx = @import("../realm/joinctx.zig");
+const d2dbs = @import("../realm/client/d2dbs.zig");
+const joinctx = @import("../realm/client/joinctx.zig");
 const log = @import("../log.zig");
 
 /// The table we register via SetupAsBnetServer.

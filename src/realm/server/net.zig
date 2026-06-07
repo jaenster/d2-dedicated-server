@@ -17,6 +17,8 @@ extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn getpeername(fd: c_int, addr: *anyopaque, len: *c_uint) c_int;
+extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
+extern "c" fn inet_addr(cp: [*:0]const u8) c_uint;
 
 /// The connected peer's IPv4 address (network-order octets), or zeros on error.
 pub fn peerIp(fd: Socket) [4]u8 {
@@ -61,6 +63,59 @@ pub fn listenTcp(bind_ip: []const u8, port: u16) !Socket {
     if (bind(fd, &addr, @sizeOf(posix.sockaddr.in)) != 0) return error.BindFailed;
     if (listen(fd, 128) != 0) return error.ListenFailed;
     return fd;
+}
+
+const addrinfo = extern struct {
+    flags: c_int,
+    family: c_int,
+    socktype: c_int,
+    protocol: c_int,
+    addrlen: c_uint,
+    canonname: ?[*:0]u8,
+    addr: ?*posix.sockaddr.in,
+    next: ?*addrinfo,
+};
+extern "c" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const addrinfo, res: **addrinfo) c_int;
+extern "c" fn freeaddrinfo(res: *addrinfo) void;
+
+/// Resolve `host` (dotted-quad or DNS name) to a network-order IPv4. Null on failure.
+fn resolve(host: [:0]const u8) ?u32 {
+    const direct = inet_addr(host.ptr);
+    if (direct != 0xffff_ffff) return direct;
+    var hints = std.mem.zeroes(addrinfo);
+    hints.family = posix.AF.INET;
+    hints.socktype = posix.SOCK.STREAM;
+    var res: *addrinfo = undefined;
+    if (getaddrinfo(host.ptr, null, &hints, &res) != 0) return null;
+    defer freeaddrinfo(res);
+    var cur: ?*addrinfo = res;
+    while (cur) |a| : (cur = a.next) {
+        if (a.family == posix.AF.INET) {
+            if (a.addr) |sa| return sa.addr;
+        }
+    }
+    return null;
+}
+
+/// Open an outbound TCP connection to host:port. `host` is dotted-quad or a DNS name
+/// (resolved here). Returns the connected socket; error on resolve/connect failure.
+pub fn connectTcp(host: [:0]const u8, port: u16) !Socket {
+    const ip = resolve(host) orelse return error.ResolveFailed;
+    const fd = socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = close(fd);
+    var addr = std.mem.zeroes(posix.sockaddr.in);
+    addr.family = posix.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, port);
+    addr.addr = ip;
+    if (@hasField(posix.sockaddr.in, "len")) addr.len = @sizeOf(posix.sockaddr.in);
+    if (connect(fd, &addr, @sizeOf(posix.sockaddr.in)) != 0) return error.ConnectFailed;
+    return fd;
+}
+
+/// Close a socket fd (for outbound connections opened with connectTcp).
+pub fn closeSocket(fd: Socket) void {
+    _ = close(fd);
 }
 
 /// Accept forever; spawn a detached thread per connection running `handler`.

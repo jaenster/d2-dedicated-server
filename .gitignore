@@ -2,6 +2,7 @@
 testgame/
 zig-out/
 .zig-cache/
+zig-pkg/
 .claude/
 .idea/
 testgame-min/

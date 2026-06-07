@@ -39,7 +39,37 @@ pub const Config = struct {
     /// When set, every listener hexdumps raw bytes instead of speaking the
     /// protocol — used to reverse the exact wire format the real client sends.
     capture: bool = false,
+
+    /// Port for the HTTP health endpoint (k8s liveness/readiness probes).
+    health_port: u16 = 8080,
+    /// Emit structured JSON log lines instead of `[tag] msg`.
+    log_json: bool = false,
+    /// /readyz only goes green once at least one game server has registered.
+    require_gs: bool = false,
+    /// How long to keep serving (reporting not-ready) after SIGTERM before exit.
+    shutdown_grace_ms: u32 = 5000,
+
+    /// Persistence backends. `durable` serves character saves (the store of record);
+    /// `ephemeral` serves sessions + games (short-lived, TTL'd). They are independent
+    /// so Postgres and Redis are co-equal (durable=pg, ephemeral=redis is the common
+    /// split). REALMD_STORE sets both; REALMD_DURABLE_STORE / REALMD_EPHEMERAL_STORE
+    /// override each. Values: fs | redis | pg.
+    durable_store: Backend = .fs,
+    ephemeral_store: Backend = .fs,
+    /// "host:port" for the Redis backend (DNS name ok).
+    redis_addr: []const u8 = "redis:6379",
+    /// libpq-style DSN for the Postgres backend.
+    pg_dsn: []const u8 = "",
 };
+
+pub const Backend = enum { fs, redis, pg };
+
+fn parseBackend(s: []const u8, current: Backend) Backend {
+    if (std.mem.eql(u8, s, "fs")) return .fs;
+    if (std.mem.eql(u8, s, "redis")) return .redis;
+    if (std.mem.eql(u8, s, "pg")) return .pg;
+    return current;
+}
 
 fn env(name: [*:0]const u8) ?[]const u8 {
     const v = getenv(name) orelse return null;
@@ -65,5 +95,18 @@ pub fn fromEnv() Config {
     if (env("REALMD_DATA_DIR")) |v| c.data_dir = v;
     if (env("REALMD_SHARED")) |_| c.shared = true;
     if (env("REALMD_CAPTURE")) |_| c.capture = true;
+    c.health_port = envPort("REALMD_HEALTH_PORT", c.health_port);
+    if (env("REALMD_LOG_JSON")) |_| c.log_json = true;
+    if (env("REALMD_REQUIRE_GS")) |_| c.require_gs = true;
+    if (env("REALMD_SHUTDOWN_GRACE_MS")) |v| c.shutdown_grace_ms = std.fmt.parseInt(u32, v, 10) catch c.shutdown_grace_ms;
+    // REALMD_STORE sets both backends; the granular vars override each.
+    if (env("REALMD_STORE")) |v| {
+        c.durable_store = parseBackend(v, c.durable_store);
+        c.ephemeral_store = parseBackend(v, c.ephemeral_store);
+    }
+    if (env("REALMD_DURABLE_STORE")) |v| c.durable_store = parseBackend(v, c.durable_store);
+    if (env("REALMD_EPHEMERAL_STORE")) |v| c.ephemeral_store = parseBackend(v, c.ephemeral_store);
+    if (env("REALMD_REDIS_ADDR")) |v| c.redis_addr = v;
+    if (env("REALMD_PG_DSN")) |v| c.pg_dsn = v;
     return c;
 }
