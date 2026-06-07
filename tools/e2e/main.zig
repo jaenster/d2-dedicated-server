@@ -161,6 +161,47 @@ fn scFleetCapacity() Result {
     return .{ .name = name, .status = .pass, .msg = msg("spread a={d} b={d}, 3rd rejected (result={d})", .{ gs_a.creates, gs_b.creates, r3 }) };
 }
 
+fn scLobbyChatAtoB() Result {
+    const name = "lobby_chat_a_to_b";
+    const acct_a = "ChatAlice";
+    const acct_b = "ChatBob";
+    const channel = "Diablo II";
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login(acct_a) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChat() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+
+    var b = rc.RealmClient{};
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.login(acct_b) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChat() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.setBnetTimeout(2000); // never block forever on a missing event
+
+    // Let B's join propagate before A talks, so A already sees B in-channel.
+    _ = net.usleep(100_000);
+    a.chatCommand("hello B") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+
+    // B reads events, skipping the CHANNEL/SHOWUSER/JOIN noise, until the TALK.
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const ev = b.readChatEvent() catch |e| return fail(name, "B no TALK event ({s})", .{@errorName(e)});
+        if (ev.eid != rc.EID_TALK) continue;
+        if (!std.mem.eql(u8, ev.username, acct_a))
+            return fail(name, "TALK from {s}, want {s}", .{ ev.username, acct_a });
+        if (!std.mem.eql(u8, ev.text, "hello B"))
+            return fail(name, "TALK text '{s}', want 'hello B'", .{ev.text});
+        return .{ .name = name, .status = .pass, .msg = msg("B received TALK from {s}: '{s}'", .{ ev.username, ev.text }) };
+    }
+    return fail(name, "no EID_TALK among first 8 events B received", .{});
+}
+
 fn fail(name: []const u8, comptime fmt: []const u8, args: anytype) Result {
     return .{ .name = name, .status = .fail, .msg = msg(fmt, args) };
 }
@@ -222,7 +263,7 @@ pub fn main() !void {
         scFleetCapacity(),
         skip("create_account_real_auth", "SKIP: not implemented yet — bnetd accepts any password (no real credential verification)"),
         skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
-        skip("lobby_chat_a_to_b", "SKIP: not implemented yet — realm lobby is intentionally not a chat channel; no A->B message relay exists"),
+        scLobbyChatAtoB(),
     };
 
     if (child) |pid| {

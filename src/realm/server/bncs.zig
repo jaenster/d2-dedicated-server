@@ -17,6 +17,7 @@ const proto = @import("proto.zig");
 const protocol = @import("bncs_protocol.zig");
 const state = @import("state.zig");
 const bnftp = @import("bnftp.zig");
+const chat = @import("chat.zig");
 
 // Set by main() before serving.
 pub var realm_name: []const u8 = "TypeGuru";
@@ -38,7 +39,20 @@ comptime {
     _ = protocol.has;
 }
 const SID_JOINCHANNEL = 0x0c;
+const SID_CHATEVENT = 0x0f;
 const SID_CHATCOMMAND = 0x0e;
+
+// SID_CHATEVENT event ids (S->C).
+const EID_SHOWUSER = 0x01;
+const EID_JOIN = 0x02;
+const EID_LEAVE = 0x03;
+const EID_WHISPER = 0x04;
+const EID_TALK = 0x05;
+const EID_CHANNEL = 0x07;
+const EID_INFO = 0x12;
+const EID_ERROR = 0x13;
+
+const default_channel = "Diablo II";
 const SID_GETFILETIME = 0x33;
 const SID_PING = 0x25;
 const SID_LOGONRESPONSE2 = 0x3a;
@@ -63,6 +77,19 @@ const Conn = struct {
     client_token: u32 = 0,
     account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     account_len: u8 = 0,
+    in_channel: bool = false,
+    channel: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
+    channel_len: u8 = 0,
+
+    fn setChannel(c: *Conn, name: []const u8) void {
+        const n: u8 = @intCast(@min(name.len, chat.max_channel));
+        @memcpy(c.channel[0..n], name[0..n]);
+        c.channel_len = n;
+        c.in_channel = true;
+    }
+    fn channelName(c: *Conn) []const u8 {
+        return c.channel[0..c.channel_len];
+    }
 
     fn setAccount(c: *Conn, name: []const u8) void {
         const n: u8 = @intCast(@min(name.len, state.max_name));
@@ -135,6 +162,11 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
             return;
         }
     }
+    // If this connection was in a chat channel, leave it and tell the others.
+    if (c.in_channel) {
+        chat.leave(fd);
+        broadcastEvent(&c, EID_LEAVE, c.accountName(), "");
+    }
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }
 
@@ -147,7 +179,8 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         SID_CREATEACCOUNT2 => onCreateAccount(c, tag, body),
         SID_ENTERCHAT => onEnterChat(c, tag, body),
         SID_GETCHANNELLIST => onGetChannelList(c),
-        SID_JOINCHANNEL => log.line(tag, "join channel (ignored)", .{}),
+        SID_JOINCHANNEL => onJoinChannel(c, tag, body),
+        SID_CHATCOMMAND => onChatCommand(c, tag, body),
         SID_QUERYREALMS2 => onQueryRealms(c, tag),
         SID_LOGONREALMEX => onLogonRealm(c, tag, body),
         SID_GETFILETIME => onGetFileTime(c, tag, body),
@@ -235,6 +268,112 @@ fn onGetChannelList(c: *Conn) void {
     var w = startPacket(&buf, SID_GETCHANNELLIST);
     w.putStr(""); // empty list terminator
     finish(c, &w);
+}
+
+// --- chat channels ----------------------------------------------------------
+
+// Build a SID_CHATEVENT into `buf` and return its on-wire slice. Body (S->C):
+// u32 EventID, u32 userFlags, u32 ping, u32 ip(0), u32 acctNumber(0),
+// u32 regAuthority(0), cstr username, cstr text.
+fn buildChatEvent(buf: []u8, eid: u32, username: []const u8, text: []const u8) []u8 {
+    var w = startPacket(buf, SID_CHATEVENT);
+    w.putU32(eid);
+    w.putU32(0); // user flags
+    w.putU32(0); // ping
+    w.putU32(0); // ip
+    w.putU32(0); // account number
+    w.putU32(0); // registration authority
+    w.putStr(username);
+    w.putStr(text);
+    w.patchU16(2, @intCast(w.pos));
+    return w.slice();
+}
+
+// Send a CHATEVENT directly to this connection.
+fn sendEvent(c: *Conn, eid: u32, username: []const u8, text: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const bytes = buildChatEvent(&buf, eid, username, text);
+    _ = net.writeAll(c.fd, bytes);
+}
+
+const BcastCtx = struct { eid: u32, username: []const u8, text: []const u8 };
+
+fn bcastCb(ctx: *const BcastCtx, m: *chat.Member) void {
+    var buf: [512]u8 = undefined;
+    const bytes = buildChatEvent(&buf, ctx.eid, ctx.username, ctx.text);
+    chat.sendTo(m, bytes);
+}
+
+// Broadcast a CHATEVENT to every OTHER member in this connection's channel.
+fn broadcastEvent(c: *Conn, eid: u32, username: []const u8, text: []const u8) void {
+    const ctx = BcastCtx{ .eid = eid, .username = username, .text = text };
+    chat.forEachInChannel(c.channelName(), c.fd, &ctx, bcastCb);
+}
+
+const ShowUserCtx = struct { c: *Conn };
+
+// On join, the joiner gets an EID_SHOWUSER for each existing member.
+fn showUserCb(ctx: *const ShowUserCtx, m: *chat.Member) void {
+    sendEvent(ctx.c, EID_SHOWUSER, m.nameSlice(), "");
+}
+
+fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    _ = r.getU32(); // flags
+    var channel = r.getStr();
+    if (channel.len == 0) channel = default_channel;
+    const acct = c.accountName();
+    log.line(tag, "join channel '{s}' as {s}", .{ channel, acct });
+
+    c.setChannel(channel);
+    _ = chat.join(c.fd, acct, channel);
+
+    // Tell the joiner which channel they're in, then list existing members.
+    sendEvent(c, EID_CHANNEL, channel, "");
+    const ctx = ShowUserCtx{ .c = c };
+    chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
+
+    // Tell everyone else this user joined.
+    broadcastEvent(c, EID_JOIN, acct, "");
+}
+
+fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
+    if (!c.in_channel) return; // talking before joining a channel: ignore
+    var r = proto.Reader.init(body);
+    const text = r.getStr();
+    const acct = c.accountName();
+
+    if (parseWhisper(text)) |w| {
+        log.line(tag, "{s} whispers {s}: {s}", .{ acct, w.target, w.msg });
+        var buf: [512]u8 = undefined;
+        const bytes = buildChatEvent(&buf, EID_WHISPER, acct, w.msg);
+        _ = chat.whisper(w.target, bytes);
+        // Confirmation echo back to sender (D2 shows the whisper you sent).
+        sendEvent(c, EID_WHISPER, w.target, w.msg);
+        return;
+    }
+    if (text.len > 0 and text[0] == '/') {
+        // Unknown slash command: acknowledge minimally, don't broadcast.
+        sendEvent(c, EID_INFO, acct, "");
+        return;
+    }
+
+    log.line(tag, "{s} talks: {s}", .{ acct, text });
+    broadcastEvent(c, EID_TALK, acct, text); // to the others
+    sendEvent(c, EID_TALK, acct, text); // echo to self (D2 shows own talk)
+}
+
+const Whisper = struct { target: []const u8, msg: []const u8 };
+
+fn parseWhisper(text: []const u8) ?Whisper {
+    const rest = if (std.mem.startsWith(u8, text, "/w "))
+        text[3..]
+    else if (std.mem.startsWith(u8, text, "/whisper "))
+        text[9..]
+    else
+        return null;
+    const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+    return .{ .target = rest[0..sp], .msg = rest[sp + 1 ..] };
 }
 
 fn onQueryRealms(c: *Conn, tag: []const u8) void {

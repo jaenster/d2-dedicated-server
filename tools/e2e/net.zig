@@ -12,7 +12,18 @@ extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
+extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: c_uint) c_int;
 pub extern "c" fn usleep(usec: c_uint) c_int;
+
+/// Set SO_RCVTIMEO on `fd` so reads fail (instead of blocking forever) after
+/// `ms` milliseconds — keeps a missing chat event from hanging the harness.
+pub fn setRecvTimeout(fd: Socket, ms: u32) void {
+    const tv = posix.timeval{
+        .sec = @intCast(ms / 1000),
+        .usec = @intCast((ms % 1000) * 1000),
+    };
+    _ = setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &tv, @sizeOf(posix.timeval));
+}
 
 /// Connect to 127.0.0.1:port. Loopback only — the harness never talks off-box.
 pub fn connectLocal(port: u16) !Socket {
