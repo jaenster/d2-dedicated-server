@@ -19,13 +19,14 @@
 //! IO from realmd's thread-per-peer workers.
 const std = @import("std");
 const pg = @import("pg");
-const Spinlock = @import("lock.zig").Spinlock;
-const types = @import("store_types.zig");
-const fs = @import("persist_fs.zig");
+const Spinlock = @import("realm_infra").lock.Spinlock;
+const types = @import("realm_infra").types;
+const fs = @import("fs.zig");
 
 const Name = types.Name;
 const GameRec = types.GameRec;
 const Route = types.Route;
+const TokenRoute = types.TokenRoute;
 
 // Routes are tiny, high-churn and source-IP keyed — route them to the always-present
 // filesystem backend (with its TTL) rather than carry a parallel SQL table.
@@ -34,6 +35,14 @@ pub fn recordRoute(client_ip: [4]u8, gs_ip: [4]u8, gs_port: u16, ttl_s: u32) boo
 }
 pub fn lookupRoute(client_ip: [4]u8) ?Route {
     return fs.lookupRoute(client_ip);
+}
+
+// Token routes are likewise tiny and high-churn — delegate to the fs backend.
+pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {
+    return fs.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s);
+}
+pub fn lookupTokenRoute(token: u16) ?TokenRoute {
+    return fs.lookupTokenRoute(token);
 }
 
 // Accounts are durable, low-volume and simple — route them to the always-present
@@ -294,6 +303,11 @@ pub fn findGame(name: []const u8) ?GameRec {
         .gs_port = @truncate(@as(u32, @bitCast(port))),
         .gsid = @truncate(@as(u64, @bitCast(gsid))),
     };
+}
+
+pub fn snapshotGames(out: []types.NamedGame) usize {
+    _ = out;
+    return 0; // TODO: SELECT active games for pg shared-mode /admin/games
 }
 
 pub fn removeGameById(gameid: u32) void {

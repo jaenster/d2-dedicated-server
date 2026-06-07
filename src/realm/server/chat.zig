@@ -4,8 +4,8 @@
 //! registry is guarded by a spinlock and each member has its own send_lock so a
 //! slow/blocked peer can't tear a packet sent by another thread.
 const std = @import("std");
-const net = @import("net.zig");
-const Spinlock = @import("lock.zig").Spinlock;
+const net = @import("realm_infra").net;
+const Spinlock = @import("realm_infra").lock.Spinlock;
 
 pub const max_name = 16;
 pub const max_channel = 32;

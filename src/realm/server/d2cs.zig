@@ -10,8 +10,8 @@
 //! the proof that the front is stateless over shared state — i.e. that a second
 //! realmd instance could resolve it too once the session table is a shared Store.
 const std = @import("std");
-const net = @import("net.zig");
-const log = @import("log.zig");
+const net = @import("realm_infra").net;
+const log = @import("realm_infra").log;
 const proto = @import("proto.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
@@ -35,6 +35,18 @@ const MCP_CHARLIST2 = 0x19;
 // is how long that route stays valid.
 pub var game_ip: ?[4]u8 = null;
 pub var route_ttl_s: u32 = 60;
+
+// Realm-global game-token counter. realmd OWNS the u16 token it hands the client, so a
+// process-global atomic makes it unique per CREATE/JOIN within this instance — two
+// clients behind one public IP get distinct tokens, which is what makes the qqserver's
+// token translation NAT-proof. NOTE: for multi-instance uniqueness this wants a redis
+// INCR / instance-id namespacing (same as session ids); the atomic is fine for now.
+var token_ctr = std.atomic.Value(u16).init(1);
+
+/// Mint the next realm-global game token (wraps at u16; fine for the test/MVP).
+fn mintToken() u16 {
+    return token_ctr.fetchAdd(1, .monotonic);
+}
 
 const DConn = struct {
     fd: net.Socket,
@@ -283,8 +295,12 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     const rr = routed.?;
     _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid);
-    log.line(tag, "create game '{s}' (account={s}) -> gameid={d} gs=0x{x}@{d}.{d}.{d}.{d}:{d}", .{ name, c.accountName(), rr.gameid, rr.gsid, rr.ip[0], rr.ip[1], rr.ip[2], rr.ip[3], rr.port });
-    w.putU16(@truncate(rr.gameid)); // game token (client passes to the GS)
+    // Mint a realm-global token and record {token -> GS addr + real gameid} so the
+    // qqserver can translate the client's token to the engine's gameid and splice.
+    const token = mintToken();
+    _ = store.recordTokenRoute(token, rr.ip, rr.port, rr.gameid, route_ttl_s);
+    log.line(tag, "create game '{s}' (account={s}) -> gameid={d} token=0x{x} gs=0x{x}@{d}.{d}.{d}.{d}:{d}", .{ name, c.accountName(), rr.gameid, token, rr.gsid, rr.ip[0], rr.ip[1], rr.ip[2], rr.ip[3], rr.port });
+    w.putU16(token); // game token (client presents this to the qqserver)
     w.putU16(0); // unknown
     w.putU32(0); // result: success
     finish(c, &w);
@@ -316,14 +332,16 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
     if (g.gsid != 0) _ = gslink.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName());
-    // Record {this client's source IP → the real GS} so a qqserver fronting game
-    // traffic can splice the connection to the right backend. Additive/harmless when
-    // no qqserver is deployed (nothing reads the route).
-    _ = store.recordRoute(net.peerIp(c.fd), g.gs_ip, g.gs_port, route_ttl_s);
+    // Mint a realm-global token for this joining client and record {token -> the real
+    // GS + engine gameid}. The qqserver reads the token from the client's first packet
+    // and translates it — NAT-proof, since the token is unique even when two clients
+    // share one public IP. (Source-IP recordRoute is no longer used by the gateway.)
+    const token = mintToken();
+    _ = store.recordTokenRoute(token, g.gs_ip, g.gs_port, g.gameid, route_ttl_s);
     // Advertise the qqserver's public IP when configured, else the GS IP (back-compat).
     const advertised_ip = game_ip orelse g.gs_ip;
-    log.line(tag, "join game '{s}' (account={s}) gameid={d} gs={d}.{d}.{d}.{d} -> client dials {d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3], advertised_ip[0], advertised_ip[1], advertised_ip[2], advertised_ip[3] });
-    w.putU16(@truncate(g.gameid)); // game token
+    log.line(tag, "join game '{s}' (account={s}) gameid={d} token=0x{x} gs={d}.{d}.{d}.{d} -> client dials {d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, token, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3], advertised_ip[0], advertised_ip[1], advertised_ip[2], advertised_ip[3] });
+    w.putU16(token); // game token
     w.putU16(0); // unknown
     w.putBytes(&advertised_ip); // d2gs / qqserver IP (in_addr, network order)
     w.putU32(0); // game hash

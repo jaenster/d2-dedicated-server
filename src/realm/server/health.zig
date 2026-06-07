@@ -10,7 +10,7 @@
 //! Readiness reflects real dependencies (store + GS), not just "process alive", so a
 //! pod that can't reach its database or has no game server is not sent traffic.
 const std = @import("std");
-const net = @import("net.zig");
+const net = @import("realm_infra").net;
 const gslink = @import("gslink.zig");
 const store = @import("store.zig");
 const shutdown = @import("shutdown.zig");

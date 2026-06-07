@@ -13,8 +13,8 @@
 //! 4-byte header. The very first byte on the socket is a protocol selector
 //! (0x01 = game/BNCS), consumed once.
 const std = @import("std");
-const net = @import("net.zig");
-const log = @import("log.zig");
+const net = @import("realm_infra").net;
+const log = @import("realm_infra").log;
 const proto = @import("proto.zig");
 const protocol = @import("bncs_protocol.zig");
 const state = @import("state.zig");
