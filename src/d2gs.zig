@@ -21,7 +21,12 @@ const d2dbs = @import("realm/d2dbs.zig");
 const headless = @import("runtime/headless.zig");
 const crash = @import("runtime/crash.zig");
 const halt_hook = @import("runtime/halt_hook.zig");
+const checkrev_patch = @import("runtime/checkrev_patch.zig");
+const gamecrashfix = @import("runtime/gamecrashfix.zig");
+const multiinstance = @import("runtime/multiinstance.zig");
 const autoenter = @import("test/autoenter.zig");
+const autologin = @import("test/autologin.zig");
+const screenshot = @import("test/screenshot.zig");
 const log = @import("log.zig");
 
 var use_realm: bool = false;
@@ -188,6 +193,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // we register the (currently all-null, safe) realm table to enable realm mode;
     // otherwise we run open (no D2CS), which the POC already proved listens on :4000.
     if (use_realm) {
+        if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         realm.init(); // populate the callback table before SetupAsBnetServer
         log.print("d2gs: bootstrap (realm mode, IsBattleNetServer=1)");
         server.bootstrapRealmServer(&realm.table);
@@ -234,6 +240,24 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             }
             crash.install(); // log faulting addresses of engine access violations
             halt_hook.install(); // log engine assert sites before exit
+            gamecrashfix.apply(); // d2bs null-deref guard (avoids the crash UI)
+            multiinstance.apply(); // allow GS + client to run at once
+            // Client-side: bypass the Battle.net version check so a real client
+            // can reach our realm without a signed version MPQ.
+            if (hasFlag("bypass-checkrev")) checkrev_patch.apply();
+            if (hasFlag("screenshot")) screenshot.install();
+            if (hasFlag("suppress-halts")) halt_hook.enableSuppress();
+            // Drive the bnet login form: --auto-login <account>:<password>.
+            {
+                var tmp: [160]u8 = undefined;
+                if (flagToken("auto-login", &tmp)) |len| {
+                    var acct: [64]u8 = undefined;
+                    var pass: [64]u8 = undefined;
+                    if (splitNames(tmp[0..len], &acct, &pass)) {
+                        autologin.install(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0));
+                    }
+                }
+            }
             if (hasFlag("test-enter")) {
                 // Drive the real client through the menus into a game with a
                 // character and verify it loads (no server bootstrap).
