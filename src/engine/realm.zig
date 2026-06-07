@@ -145,11 +145,27 @@ fn leaveGameStub() callconv(.naked) void {
     asm volatile ("ret $0x48");
 }
 
+// ── fpGetDatabaseFileTime (slot 0x54) ────────────────────────────────────────
+// CalculateGetFlags @0x569d80 calls this through the table WITHOUT an
+// IsBadCodePtr guard (it only checks IsBattleNetServer), so a null pointer is a
+// straight call-to-zero crash during the char load. __fastcall ECX = FILETIME*
+// out (no stack args). It supplies the char's stored save timestamp for
+// save-conflict/rollback checks; a zeroed filetime ("oldest") makes any loaded
+// save count as current, which is what we want for a fresh realm load.
+fn getFileTimeStub() callconv(.naked) void {
+    asm volatile (
+        \\movl $0, (%ecx)
+        \\movl $0, 4(%ecx)
+        \\ret
+    );
+}
+
 /// Populate the realm callback table. Call before SetupAsBnetServer (i.e. before
 /// bootstrapRealmServer). Wires the char loader + token validation + leave.
 pub fn init() void {
     table.fpGetDatabaseCharacter = @ptrCast(&getDatabaseCharShim);
     table.fpLeaveGame = @ptrCast(&leaveGameStub);
+    table.fpGetDatabaseFileTime = @ptrCast(&getFileTimeStub);
     enableTokenValidation(); // register fpFindPlayerToken (engine IsBadCodePtr-checks it)
 }
 
