@@ -312,6 +312,29 @@ fn waitPort(port: u16, deadline_ms: u32) bool {
     return false;
 }
 
+/// A single REALMD_* env override (name/value) applied before fork+execve.
+const EnvVar = struct { name: [*:0]const u8, value: [*:0]const u8 };
+
+/// fork+execve a realmd child, applying `envs` to our environ first (the child
+/// inherits the augmented environ). Returns the child pid. Waits up to 10s for
+/// `wait_port` to listen; exits the harness if it never comes up.
+fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
+    for (envs) |e| _ = setenv(e.name, e.value, 1);
+    const pid = fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        const argv = [_:null]?[*:0]const u8{bin.ptr};
+        _ = execve(bin.ptr, &argv, environ);
+        std.process.exit(127); // execve only returns on failure
+    }
+    if (!waitPort(wait_port, 10_000)) {
+        _ = kill(pid, 9);
+        std.debug.print("ERROR: realmd did not start listening on {d} in time.\n", .{wait_port});
+        std.process.exit(2);
+    }
+    return pid;
+}
+
 /// fork+execve realmd with REALMD_DATA_DIR/REALMD_HEALTH_PORT set in our env
 /// (inherited by the child). Returns the child pid, or null on existing realmd.
 fn maybeStartRealmd() !?c_int {
@@ -391,6 +414,81 @@ fn scMultiGameOneGs() Result {
     return .{ .name = name, .status = .pass, .msg = msg("one GS hosts 3 games (creates={d}), all tracked under gsid 0xd2d2", .{gs.creates}) };
 }
 
+// Two realmd instances (A, B) sharing one data dir (REALMD_SHARED) keep sessions
+// in a shared store: a session minted on A's bnetd must resolve on B's d2cs.
+// Instance A: bnet 16112 / d2cs 16113 / d2dbs 16114 / gs 16115 / health 16118.
+// Instance B: 17112 / 17113 / 17114 / 17115 / 17118, SAME data dir, instance "B".
+fn scMultiInstance() Result {
+    const name = "multi_instance";
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+
+    // Shared data dir, fresh each run (isolation: accounts/sessions persist on fs).
+    const data_dir = "/tmp/e2e-realmd-shared";
+    var rmbuf: [256]u8 = undefined;
+    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+        _ = system(cmd.ptr);
+    } else |_| {}
+    _ = mkdir(data_dir, 0o755);
+
+    const envs_a = [_]EnvVar{
+        .{ .name = "REALMD_SHARED", .value = "1" },
+        .{ .name = "REALMD_INSTANCE", .value = "A" },
+        .{ .name = "REALMD_DATA_DIR", .value = data_dir },
+        .{ .name = "REALMD_BNET_PORT", .value = "16112" },
+        .{ .name = "REALMD_D2CS_PORT", .value = "16113" },
+        .{ .name = "REALMD_D2DBS_PORT", .value = "16114" },
+        .{ .name = "REALMD_GS_PORT", .value = "16115" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
+    };
+    const a_pid = spawnRealmd(bin, &envs_a, 16112) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
+
+    const envs_b = [_]EnvVar{
+        .{ .name = "REALMD_SHARED", .value = "1" },
+        .{ .name = "REALMD_INSTANCE", .value = "B" },
+        .{ .name = "REALMD_DATA_DIR", .value = data_dir },
+        .{ .name = "REALMD_BNET_PORT", .value = "17112" },
+        .{ .name = "REALMD_D2CS_PORT", .value = "17113" },
+        .{ .name = "REALMD_D2DBS_PORT", .value = "17114" },
+        .{ .name = "REALMD_GS_PORT", .value = "17115" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "17118" },
+    };
+    const b_pid = spawnRealmd(bin, &envs_b, 17112) catch |e| {
+        _ = kill(a_pid, 15);
+        _ = waitpid(a_pid, null, 0);
+        return fail(name, "spawn B {s}", .{@errorName(e)});
+    };
+    defer {
+        _ = kill(a_pid, 15);
+        _ = kill(b_pid, 15);
+        _ = waitpid(a_pid, null, 0);
+        _ = waitpid(b_pid, null, 0);
+    }
+
+    // Mint a session on instance A (bnetd 16112 -> d2cs handoff lives in shared store).
+    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16113 };
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("MultiInst") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterRealm() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    if (a.sessionId() < 1) return fail(name, "A minted no session", .{});
+
+    // Resolve A's session on instance B's d2cs (17113). Copy A's session fields
+    // into B's client so its STARTUP carries A's cookie/status/lo/hi/account.
+    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17113 };
+    defer b.close();
+    b.cookie = a.cookie;
+    b.status = a.status;
+    b.lo = a.lo;
+    b.hi = a.hi;
+    b.account = a.account;
+    b.connectD2cs() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    const su = b.startup() catch |e| return fail(name, "B startup {s}", .{@errorName(e)});
+    if (su != 0) return fail(name, "B failed to resolve A's session (startup result=0x{x})", .{su});
+
+    return .{ .name = name, .status = .pass, .msg = msg("session id={d} minted on A resolved on B's d2cs (startup=0)", .{a.sessionId()}) };
+}
+
 pub fn main() !void {
     const child = try maybeStartRealmd();
 
@@ -404,6 +502,7 @@ pub fn main() !void {
         scCreateAccountRealAuth(),
         skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
         scLobbyChatAtoB(),
+        scMultiInstance(),
     };
 
     if (child) |pid| {
