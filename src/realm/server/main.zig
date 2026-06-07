@@ -98,6 +98,16 @@ pub fn main() !void {
             log.line("realmd", "WARNING gs_addr '{s}' is not an IPv4; ignoring", .{cfg.gs_addr});
         }
     }
+    // qqserver: advertise its public address on JOINGAME and record routes for it.
+    d2cs.route_ttl_s = cfg.route_ttl_s;
+    if (cfg.game_addr.len > 0) {
+        if (parseIp4(cfg.game_addr)) |ip| {
+            d2cs.game_ip = ip;
+            log.line("realmd", "qqserver gateway: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.qq_port, cfg.route_ttl_s });
+        } else {
+            log.line("realmd", "WARNING game_addr '{s}' is not an IPv4; ignoring (advertising GS IP directly)", .{cfg.game_addr});
+        }
+    }
 
     const bnet_fd = try net.listenTcp(cfg.bind, cfg.bnet_port);
     const d2cs_fd = try net.listenTcp(cfg.bind, cfg.d2cs_port);

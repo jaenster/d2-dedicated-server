@@ -1,9 +1,11 @@
 // Kubernetes deployment topology for the cloud-native d2gs realm.
 //
 // Maps the logical model (diablo2.c4) onto k8s objects: a stateless realmd
-// front behind a LoadBalancer, Redis (ephemeral) + Postgres (durable), and a
-// GS StatefulSet whose pods bind hostPort 4000 on their Node IP. The player
-// logs in via the LB, then talks game traffic DIRECTLY to nodeIP:4000.
+// front behind a LoadBalancer, Redis (ephemeral) + Postgres (durable), the
+// qqserver game-traffic gateway behind its own LoadBalancer, and a GS
+// StatefulSet of INTERNAL (ClusterIP) pods. The player logs in via the realmd
+// LB, then talks game traffic to the qqserver LB, which splices each connection
+// (routed by source IP) through to the owning GS pod.
 //
 // View it with:  npx likec4 start docs/architecture
 
@@ -28,9 +30,19 @@ deployment {
       instanceOf d2gs.realmd.health
     }
 
+    // qqserver game-traffic gateway: its own LoadBalancer + Deployment. The single
+    // public :4000; splices each connection (routed by source IP) to a GS pod.
+    service qqserver_lb 'qqserver Service (LoadBalancer)' {
+      description 'The one public :4000 for game traffic'
+    }
+    workload qqserver_deploy 'qqserver Deployment' {
+      description '1..N stateless gateway pods; route by source IP, splice to the GS'
+      instanceOf d2gs.qqserver
+    }
+
     // Backing stores.
     service redis_svc 'Redis Service' {
-      description 'Ephemeral sessions + games (native TTL)'
+      description 'Ephemeral sessions + games + route map (native TTL)'
       instanceOf d2gs.realmd.store_redis
     }
     service pg_svc 'Postgres Service' {
@@ -38,16 +50,17 @@ deployment {
       instanceOf d2gs.realmd.store_pg
     }
 
-    // GS fleet as a StatefulSet — each pod is hostPort 4000 on its Node IP.
+    // GS fleet as a StatefulSet — INTERNAL pods (ClusterIP); reached only by the
+    // qqserver. No public/hostPort exposure needed anymore.
     workload gs_set 'GS StatefulSet' {
-      description 'Stable per-pod identity; each pod hostPort 4000 -> Node IP'
+      description 'Stable per-pod identity; internal ClusterIP :4000 (reached via the qqserver)'
 
-      pod gs_pod_a 'gs-0 pod (Node A)' {
-        description 'hostPort 4000 bound to Node A IP; registers out to realmd over gslink'
+      pod gs_pod_a 'gs-0 pod' {
+        description 'Internal :4000; registers out to realmd over gslink (ADDRINFO = its cluster IP)'
         instanceOf d2gs.gameserver
       }
-      pod gs_pod_b 'gs-1 pod (Node B)' {
-        description 'hostPort 4000 bound to Node B IP; registers out to realmd over gslink'
+      pod gs_pod_b 'gs-1 pod' {
+        description 'Internal :4000; registers out to realmd over gslink (ADDRINFO = its cluster IP)'
         instanceOf d2gs.gameserver
       }
     }
@@ -57,17 +70,21 @@ deployment {
   lb_player -> realmd_lb 'login/realm (:6112-6115)'
   realmd_lb -> realmd_deploy 'to ready pods'
 
-  // realmd -> backing stores.
-  realmd_deploy -> redis_svc 'ephemeral (sessions+games)'
+  // realmd -> backing stores (writes the route map into redis on JOINGAME).
+  realmd_deploy -> redis_svc 'ephemeral (sessions+games+routes)'
   realmd_deploy -> pg_svc 'durable (chars)'
 
   // GS pods register OUT to realmd's gslink (:6115); realmd routes create/join.
-  gs_pod_a -> realmd_deploy 'gslink register (:6115) + ADDRINFO nodeIP:4000'
-  gs_pod_b -> realmd_deploy 'gslink register (:6115) + ADDRINFO nodeIP:4000'
+  gs_pod_a -> realmd_deploy 'gslink register (:6115) + ADDRINFO (cluster IP)'
+  gs_pod_b -> realmd_deploy 'gslink register (:6115) + ADDRINFO (cluster IP)'
 
-  // The player talks game traffic DIRECTLY to the chosen Node IP : hostPort 4000.
-  lb_player -> gs_pod_a 'game traffic direct (nodeIP:4000)'
-  lb_player -> gs_pod_b 'game traffic direct (nodeIP:4000)'
+  // The player talks game traffic to the qqserver LB; the gateway looks up the
+  // route by source IP and splices to the owning internal GS pod.
+  lb_player -> qqserver_lb 'game traffic (:4000)'
+  qqserver_lb -> qqserver_deploy 'to gateway pods'
+  qqserver_deploy -> redis_svc 'lookup route by source IP'
+  qqserver_deploy -> gs_pod_a 'splice to owning GS (internal :4000)'
+  qqserver_deploy -> gs_pod_b 'splice to owning GS (internal :4000)'
 }
 
 views {

@@ -21,6 +21,17 @@ extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn system(cmd: [*:0]const u8) c_int;
 extern "c" var environ: [*:null]const ?[*:0]const u8;
 
+// libc socket bits for the echo server (mirrors net.zig's approach). We bind to an
+// ephemeral port (port 0) and read it back with getsockname so the FakeGS can advertise it.
+const posix = std.posix;
+extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
+extern "c" fn bind(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
+extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
+extern "c" fn accept(fd: c_int, addr: ?*anyopaque, len: ?*c_uint) c_int;
+extern "c" fn getsockname(fd: c_int, addr: *anyopaque, len: *c_uint) c_int;
+extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: c_uint) c_int;
+const cclose = @extern(*const fn (c_int) callconv(.c) c_int, .{ .name = "close" });
+
 fn envOr(name: [*:0]const u8, default: [:0]const u8) [:0]const u8 {
     if (getenv(name)) |v| return std.mem.span(v);
     return default;
@@ -489,6 +500,168 @@ fn scMultiInstance() Result {
     return .{ .name = name, .status = .pass, .msg = msg("session id={d} minted on A resolved on B's d2cs (startup=0)", .{a.sessionId()}) };
 }
 
+// A tiny echo TCP server standing in for a real backend GS :4000 game port. Binds an
+// ephemeral port (read back via getsockname) and accepts connections in a loop, each on
+// its own thread, echoing whatever it reads. Looping (not one-shot) matters: the qqserver
+// port-probe opens a throwaway connection that the qqserver splices through to us, so the
+// real test connection must still get its own accept. `got`/`got_len` capture the first
+// non-empty payload so the scenario can assert bytes reached the backend.
+const c_read = @extern(*const fn (c_int, [*]u8, usize) callconv(.c) isize, .{ .name = "read" });
+const c_write = @extern(*const fn (c_int, [*]const u8, usize) callconv(.c) isize, .{ .name = "write" });
+
+const EchoServer = struct {
+    listen_fd: c_int = -1,
+    port: u16 = 0,
+    thread: ?std.Thread = null,
+    got: [256]u8 = undefined,
+    got_len: usize = 0,
+
+    fn start(self: *EchoServer) !void {
+        const fd = socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        if (fd < 0) return error.SocketFailed;
+        const one: c_int = 1;
+        _ = setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one, @sizeOf(c_int));
+        var addr = std.mem.zeroes(posix.sockaddr.in);
+        addr.family = posix.AF.INET;
+        addr.port = 0; // ephemeral
+        addr.addr = std.mem.nativeToBig(u32, 0x7f00_0001); // 127.0.0.1
+        if (@hasField(posix.sockaddr.in, "len")) addr.len = @sizeOf(posix.sockaddr.in);
+        if (bind(fd, &addr, @sizeOf(posix.sockaddr.in)) != 0) return error.BindFailed;
+        if (listen(fd, 8) != 0) return error.ListenFailed;
+        var sn = std.mem.zeroes(posix.sockaddr.in);
+        var l: c_uint = @sizeOf(posix.sockaddr.in);
+        if (getsockname(fd, &sn, &l) != 0) return error.SockNameFailed;
+        self.listen_fd = fd;
+        self.port = std.mem.bigToNative(u16, sn.port);
+        self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+    }
+
+    // Accept forever; each connection echoed on a detached thread. The loop ends when
+    // stop() closes the listen fd and accept() errors.
+    fn acceptLoop(self: *EchoServer) void {
+        while (true) {
+            const cfd = accept(self.listen_fd, null, null);
+            if (cfd < 0) return;
+            const t = std.Thread.spawn(.{}, echoConn, .{ self, cfd }) catch {
+                _ = cclose(cfd);
+                continue;
+            };
+            t.detach();
+        }
+    }
+
+    fn echoConn(self: *EchoServer, cfd: c_int) void {
+        defer _ = cclose(cfd);
+        var buf: [256]u8 = undefined;
+        while (true) {
+            const n = c_read(cfd, &buf, buf.len);
+            if (n <= 0) return;
+            const un: usize = @intCast(n);
+            if (@atomicLoad(usize, &self.got_len, .seq_cst) == 0) {
+                @memcpy(self.got[0..un], buf[0..un]);
+                @atomicStore(usize, &self.got_len, un, .seq_cst);
+            }
+            _ = c_write(cfd, &buf, un); // echo back
+        }
+    }
+
+    fn received(self: *EchoServer) []const u8 {
+        const n = @atomicLoad(usize, &self.got_len, .seq_cst);
+        return self.got[0..n];
+    }
+
+    fn stop(self: *EchoServer) void {
+        if (self.listen_fd >= 0) _ = cclose(self.listen_fd);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+};
+
+/// fork+execve the qqserver binary (REALMD_QQSERVER_BIN, default ./zig-out/bin/qqserver)
+/// sharing the harness realmd's REALMD_DATA_DIR (so it reads the same fs route store) and
+/// listening on REALMD_QQ_PORT. Waits up to 10s for the port; exits the harness if it
+/// never comes up. Mirrors spawnRealmd.
+fn spawnQqserver(qq_port: u16) !c_int {
+    const bin = envOr("REALMD_QQSERVER_BIN", "./zig-out/bin/qqserver");
+    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+    var pbuf: [8]u8 = undefined;
+    const portz = std.fmt.bufPrintZ(&pbuf, "{d}", .{qq_port}) catch return error.BadPort;
+    _ = setenv("REALMD_DATA_DIR", data_dir, 1);
+    _ = setenv("REALMD_QQ_PORT", portz.ptr, 1);
+    const pid = fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        const argv = [_:null]?[*:0]const u8{bin.ptr};
+        _ = execve(bin.ptr, &argv, environ);
+        std.process.exit(127);
+    }
+    if (!waitPort(qq_port, 10_000)) {
+        _ = kill(pid, 9);
+        std.debug.print("ERROR: qqserver did not start listening on {d} in time.\n", .{qq_port});
+        std.process.exit(2);
+    }
+    return pid;
+}
+
+// Prove the full gateway path: realmd records a route on JOINGAME and the qqserver
+// splices the client's game connection to the right backend by source IP.
+//   1. an echo server stands in for the backend GS game port (ephemeral port P)
+//   2. a FakeGS registers with ip=127.0.0.1 / gs_port=P, so the game record points at P
+//   3. a client create+joins from 127.0.0.1 — realmd recordRoute(127.0.0.1 -> 127.0.0.1:P)
+//   4. spawn the qqserver on :14000 sharing the same fs data dir
+//   5. connect to :14000, send "PING-QQ" — assert the echo server got it AND it comes back
+fn scQqserverRouting() Result {
+    const name = "qqserver_routing";
+    const QQ_PORT: u16 = 14000;
+
+    var echo = EchoServer{};
+    echo.start() catch |e| return fail(name, "echo start {s}", .{@errorName(e)});
+    defer echo.stop();
+
+    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gs_port = echo.port, .maxgame = 10, .gameid = 77 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("QqGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const cg = c.createGame("qqgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    // The join records the route {127.0.0.1 -> 127.0.0.1:echo.port}.
+    const jg = c.joinGame("qqgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
+
+    const qq_pid = spawnQqserver(QQ_PORT) catch |e| return fail(name, "spawn qqserver {s}", .{@errorName(e)});
+    defer {
+        _ = kill(qq_pid, 15);
+        _ = waitpid(qq_pid, null, 0);
+    }
+
+    // Connect to the qqserver as the client's game traffic; it routes by our source IP.
+    const fd = net.connectLocal(QQ_PORT) catch |e| return fail(name, "connect qq {s}", .{@errorName(e)});
+    defer net.closeSocket(fd);
+    net.writeAll(fd, "PING-QQ") catch |e| return fail(name, "send {s}", .{@errorName(e)});
+
+    var back: [16]u8 = undefined;
+    net.readFull(fd, back[0..7]) catch |e| return fail(name, "no echo back through qq ({s})", .{@errorName(e)});
+    if (!std.mem.eql(u8, back[0..7], "PING-QQ")) return fail(name, "echo mismatch '{s}'", .{back[0..7]});
+
+    // Backend must have actually seen the bytes (proves the splice reached the GS port).
+    var waited: u32 = 0;
+    while (echo.received().len == 0 and waited < 1000) : (waited += 20) _ = net.usleep(20_000);
+    const got = echo.received();
+    if (!std.mem.eql(u8, got, "PING-QQ")) return fail(name, "backend GS saw '{s}', want 'PING-QQ'", .{got});
+
+    return .{ .name = name, .status = .pass, .msg = msg("route recorded on join, qqserver spliced 127.0.0.1 -> backend :{d}, echo round-tripped", .{echo.port}) };
+}
+
 pub fn main() !void {
     const child = try maybeStartRealmd();
 
@@ -499,6 +672,7 @@ pub fn main() !void {
         scFleetCapacity(),
         scAdminApi(),
         scMultiGameOneGs(),
+        scQqserverRouting(),
         scCreateAccountRealAuth(),
         skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
         scLobbyChatAtoB(),
