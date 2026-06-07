@@ -60,10 +60,42 @@ fn readyReason() ?[]const u8 {
     return null; // ready
 }
 
+/// Case-insensitive scan of the header block for `Content-Length`, returns its value (0 if absent).
+fn contentLength(headers: []const u8) usize {
+    var i: usize = 0;
+    while (i + 15 <= headers.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(headers[i .. i + 15], "content-length:")) {
+            var j = i + 15;
+            while (j < headers.len and (headers[j] == ' ' or headers[j] == '\t')) j += 1;
+            var v: usize = 0;
+            while (j < headers.len and headers[j] >= '0' and headers[j] <= '9') : (j += 1) v = v * 10 + (headers[j] - '0');
+            return v;
+        }
+    }
+    return 0;
+}
+
+/// Read a full HTTP request: loop until we have the header terminator (\r\n\r\n) plus
+/// the Content-Length body bytes. A single readSome can return just the head (the body
+/// arrives in a later TCP segment) — which silently truncated POST bodies before.
+fn readRequest(fd: net.Socket, buf: []u8) usize {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = net.readSome(fd, buf[total..]);
+        if (n == 0) break;
+        total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |hdr_end| {
+            const body_start = hdr_end + 4;
+            if (total - body_start >= contentLength(buf[0..hdr_end])) break;
+        }
+    }
+    return total;
+}
+
 pub fn handle(fd: net.Socket, tag: []const u8) void {
     _ = tag;
     var buf: [2048]u8 = undefined;
-    const n = net.readSome(fd, &buf);
+    const n = readRequest(fd, &buf);
     if (n == 0) return;
     const req = buf[0..n];
     const path = parsePath(req);

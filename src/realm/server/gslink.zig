@@ -308,28 +308,38 @@ pub const CreateResult = struct { gsid: u32, gameid: u32, ip: [4]u8, port: u16 }
 /// GS's id + the engine gameid + the address clients dial, or null if no GS could
 /// host it (none registered, all full, or the GS refused).
 pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, ladder: u8, expansion: bool, difficulty: u8, hardcore: bool) ?CreateResult {
-    const g = registry.pickForCreate() orelse return null;
-    g.req_lock.lock();
-    defer g.req_lock.unlock();
-    g.reply_done.store(false, .release);
+    // Retry across GSes: a GS that just dropped its control connection can linger in
+    // the registry for a moment before its handler deregisters it. If the send fails,
+    // that GS is dead — unregister it (so we don't pick it again) and try the next.
+    var attempts: usize = 0;
+    while (attempts < max_gs) : (attempts += 1) {
+        const g = registry.pickForCreate() orelse return null;
+        g.req_lock.lock();
+        g.reply_done.store(false, .release);
 
-    var buf: [512]u8 = undefined;
-    var pos: usize = 8;
-    buf[pos] = ladder;
-    buf[pos + 1] = @intFromBool(expansion);
-    buf[pos + 2] = difficulty;
-    buf[pos + 3] = @intFromBool(hardcore);
-    pos += 4;
-    pos = putCStr(&buf, pos, name);
-    pos = putCStr(&buf, pos, pass);
-    pos = putCStr(&buf, pos, desc);
-    writeHeader(buf[0..8], @intCast(pos), TYPE_CREATEGAME, nextSeq(g));
-    if (!sendPacket(g, buf[0..pos])) return null;
-
-    const r = awaitReply(g);
-    if (!r.ok or r.gameid == 0) return null;
-    _ = g.live_games.fetchAdd(1, .monotonic);
-    return .{ .gsid = g.gsid, .gameid = r.gameid, .ip = g.ip(), .port = g.port };
+        var buf: [512]u8 = undefined;
+        var pos: usize = 8;
+        buf[pos] = ladder;
+        buf[pos + 1] = @intFromBool(expansion);
+        buf[pos + 2] = difficulty;
+        buf[pos + 3] = @intFromBool(hardcore);
+        pos += 4;
+        pos = putCStr(&buf, pos, name);
+        pos = putCStr(&buf, pos, pass);
+        pos = putCStr(&buf, pos, desc);
+        writeHeader(buf[0..8], @intCast(pos), TYPE_CREATEGAME, nextSeq(g));
+        if (!sendPacket(g, buf[0..pos])) {
+            g.req_lock.unlock();
+            g.registered.store(false, .release); // dead GS; its handler frees the slot
+            continue;
+        }
+        const r = awaitReply(g);
+        g.req_lock.unlock();
+        if (!r.ok or r.gameid == 0) return null; // the GS actively refused — a real no
+        _ = g.live_games.fetchAdd(1, .monotonic);
+        return .{ .gsid = g.gsid, .gameid = r.gameid, .ip = g.ip(), .port = g.port };
+    }
+    return null;
 }
 
 /// Best-effort: tell the GS that owns `gsid` a client is joining `gameid`, so it can
