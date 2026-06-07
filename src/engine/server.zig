@@ -77,6 +77,15 @@ pub fn NET_D2GS_SERVER_HandleAnyIncomingPacket() void {
     stdcall(0x0052cfe0, fn () callconv(StdcallConv) void)(); // VERIFIED
 }
 
+/// Dispatch queued outbound packets to clients (the per-frame flush) + cleanup.
+/// The real cooperative server loop calls this after QSERVER_TickAllGames; without
+/// it, packets queued via SendPacket_Helper (game flags, the state command, game
+/// data, pongs) never reach the socket and a joining client times out.
+///   int QSERVER_DispatchAndCleanup(uint* pnParam, int nParam)  — call (0,0)
+pub fn QSERVER_DispatchAndCleanup(pn: usize, n: u32) void {
+    _ = stdcall(0x0052fd90, fn (usize, u32) callconv(StdcallConv) u32)(pn, n); // VERIFIED 0052fd90
+}
+
 /// Create a battle.net (realm) game in the engine. Requires gpQServerGameState
 /// (set by the bootstrap). `flags` (eD2ArenaFlags) encodes difficulty in bits
 /// 12-14, expansion via ARENAFLAG_Expansion, gametype in bit 21. `p_game_id` is
@@ -106,16 +115,20 @@ pub fn GAME_CreateBattleNetGame(
     );
 }
 
-/// eD2ArenaFlags bits used by GAME_CreateBattleNetGame.
-pub const ARENAFLAG_Expansion: u32 = 0x01; // TODO: confirm exact bit
+// eD2ArenaFlags bits used by GAME_CreateBattleNetGame (VERIFIED from the
+// eD2ArenaFlags enum). GAME_CreateBattleNetGame sets pGame->bExpansion =
+// (flags & ARENAFLAG_Expansion) != 0; a char with the expansion status bit can
+// only join an expansion game (else error 0x18), so this bit MUST be right.
 /// Bit 2 gates UpdateClients (ARENA_GetClientUpdateFlag = (eArenaFlags>>2)&1);
-/// must be set or ticking the game asserts. A normal (non-arena) game has it on.
+/// must be set or ticking the game asserts.
 pub const ARENAFLAG_ClientUpdate: u32 = 0x04;
+pub const ARENAFLAG_Hardcore: u32 = 0x800; // 2048
+pub const ARENAFLAG_Expansion: u32 = 0x10_0000; // 1048576
 pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
-    _ = hardcore; // TODO: locate hardcore bit
-    var f: u32 = @as(u32, difficulty) << 12;
+    var f: u32 = @as(u32, difficulty) << 12; // difficulty in bits 12-14
     f |= ARENAFLAG_ClientUpdate;
     if (expansion) f |= ARENAFLAG_Expansion;
+    if (hardcore) f |= ARENAFLAG_Hardcore;
     return f;
 }
 
@@ -229,8 +242,11 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     QSERVER_InitializeServerState();
 }
 
-/// One tick of the server: drain inbound packets + advance all games.
+/// One tick of the server: drain inbound packets, advance all games, then flush
+/// queued outbound packets to clients. Mirrors QSERVER_CooperativeThreadMain.
 pub fn tick() void {
     NET_D2GS_SERVER_HandleAnyIncomingPacket();
-    _ = QSERVER_TickAllGames(1);
+    if (QSERVER_TickAllGames(1) != 0) {
+        QSERVER_DispatchAndCleanup(0, 0);
+    }
 }
