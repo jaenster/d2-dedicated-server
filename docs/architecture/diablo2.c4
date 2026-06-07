@@ -285,6 +285,14 @@ model {
       #ours
       description 'Headless Game.exe + d2gs.dll. Connects out to gslink (:6115), ADDRINFO self-reports <ip>:4000 + gsid + maxgame; serves game traffic on :4000.'
     }
+
+    // qqserver — a SEPARATE binary (src/realm/server/qqserver.zig): the cloud-native
+    // game-traffic gateway. A QServer-of-QServers — one public :4000 that splices each
+    // client connection through to the owning GS, so GS pods stay internal.
+    qqserver = process 'qqserver (game gateway)' {
+      #ours
+      description 'Token/route-aware TCP splice proxy. One public :4000; routes each connection by SOURCE IP using the route map realmd writes on JOINGAME, then splices to the GS internal :4000. Reads the same store as realmd.'
+    }
   }
 
   // ---- how our parts attach to the native game ----
@@ -305,12 +313,17 @@ model {
   gslink -> gameserver 'routes CREATE (least-loaded) / JOIN (by gsid)'
   dll -> gameserver 'is one fleet member'
 
+  // ---- qqserver: the game-traffic gateway (separate binary) ----
+  rd2cs -> db 'records route (client-ip -> GS) on JOINGAME'
+  qqserver -> db 'looks up route by source IP'
+  qqserver -> gameserver 'splices to the owning GS (internal :4000)'
+
   // ---- the player join flow ----
   player -> d2client 'plays via a normal D2 client'
   d2client -> bncs 'BNCS login'
   d2client -> bnftp 'version/MPQ gate'
   d2client -> rd2cs 'pick realm / join game'
-  d2client -> gameserver 'game traffic direct to <ip>:4000 (D2Net)'
+  d2client -> qqserver 'game traffic (:4000, D2Net) — gateway splices to the GS'
 }
 
 views {

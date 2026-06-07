@@ -29,6 +29,13 @@ const MCP_CHARDELETE = 0x0a;
 const MCP_MOTD = 0x12;
 const MCP_CHARLIST2 = 0x19;
 
+// Set from main() (mirrors gslink.gs_ip_override). When `game_ip` is set, JOINGAME
+// advertises the qqserver's public IP to the client instead of the GS's own IP; the
+// real GS address is recorded as a route for the qqserver to splice to. `route_ttl_s`
+// is how long that route stays valid.
+pub var game_ip: ?[4]u8 = null;
+pub var route_ttl_s: u32 = 60;
+
 const DConn = struct {
     fd: net.Socket,
     session: u64 = 0,
@@ -309,10 +316,16 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
     if (g.gsid != 0) _ = gslink.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName());
-    log.line(tag, "join game '{s}' (account={s}) gameid={d} gs={d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3] });
+    // Record {this client's source IP → the real GS} so a qqserver fronting game
+    // traffic can splice the connection to the right backend. Additive/harmless when
+    // no qqserver is deployed (nothing reads the route).
+    _ = store.recordRoute(net.peerIp(c.fd), g.gs_ip, g.gs_port, route_ttl_s);
+    // Advertise the qqserver's public IP when configured, else the GS IP (back-compat).
+    const advertised_ip = game_ip orelse g.gs_ip;
+    log.line(tag, "join game '{s}' (account={s}) gameid={d} gs={d}.{d}.{d}.{d} -> client dials {d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3], advertised_ip[0], advertised_ip[1], advertised_ip[2], advertised_ip[3] });
     w.putU16(@truncate(g.gameid)); // game token
     w.putU16(0); // unknown
-    w.putBytes(&g.gs_ip); // d2gs IP (in_addr, network order)
+    w.putBytes(&advertised_ip); // d2gs / qqserver IP (in_addr, network order)
     w.putU32(0); // game hash
     w.putU32(0); // result: success
     finish(c, &w);

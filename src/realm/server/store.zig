@@ -17,6 +17,7 @@ const types = @import("store_types.zig");
 
 pub const Name = types.Name;
 pub const GameRec = types.GameRec;
+pub const Route = types.Route;
 pub const max_chars = types.max_chars;
 
 pub const Backend = enum { fs, redis, pg };
@@ -175,6 +176,26 @@ pub fn expireGamesByGs(gsid: u32) void {
         .redis => redis.expireGamesByGs(gsid),
         .pg => pg.expireGamesByGs(gsid),
     }
+}
+
+// ── routes (ephemeral) ───────────────────────────────────────────────────────
+// {client source IP → backend GS addr}, recorded by realmd on JOINGAME and looked
+// up by the qqserver per connection to splice game traffic to the right GS.
+
+pub fn recordRoute(client_ip: [4]u8, gs_ip: [4]u8, gs_port: u16, ttl_s: u32) bool {
+    return switch (ephemeral) {
+        .fs => fs.recordRoute(client_ip, gs_ip, gs_port, ttl_s),
+        .redis => redis.recordRoute(client_ip, gs_ip, gs_port, ttl_s),
+        .pg => pg.recordRoute(client_ip, gs_ip, gs_port, ttl_s),
+    };
+}
+
+pub fn lookupRoute(client_ip: [4]u8) ?Route {
+    return switch (ephemeral) {
+        .fs => fs.lookupRoute(client_ip),
+        .redis => redis.lookupRoute(client_ip),
+        .pg => pg.lookupRoute(client_ip),
+    };
 }
 
 // ── health ───────────────────────────────────────────────────────────────────

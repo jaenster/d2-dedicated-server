@@ -27,6 +27,17 @@ pub const Config = struct {
     /// GS is behind NAT). Empty = use the control connection's peer IP.
     gs_addr: []const u8 = "",
 
+    /// Public address of the qqserver game-traffic gateway, advertised to clients on
+    /// JOINGAME instead of the GS's own IP (dotted-quad). Empty = advertise the GS IP
+    /// directly (back-compat, no qqserver deployed).
+    game_addr: []const u8 = "",
+    /// TTL (seconds) for the {client-ip → GS} routes realmd records on JOINGAME for
+    /// the qqserver to consume.
+    route_ttl_s: u32 = 60,
+    /// Public port the qqserver listens on for game traffic (consumed by the qqserver
+    /// binary; parsed here so realmd and qqserver share one config surface).
+    qq_port: u16 = 4000,
+
     /// Directory for durable data (character saves). A shared volume here is
     /// what lets multiple instances see the same characters.
     data_dir: []const u8 = "realmd-data",
@@ -95,6 +106,9 @@ pub fn fromEnv() Config {
     c.d2dbs_port = envPort("REALMD_D2DBS_PORT", c.d2dbs_port);
     c.gs_port = envPort("REALMD_GS_PORT", c.gs_port);
     if (env("REALMD_GS_ADDR")) |v| c.gs_addr = v;
+    if (env("REALMD_GAME_ADDR")) |v| c.game_addr = v;
+    if (env("REALMD_ROUTE_TTL_S")) |v| c.route_ttl_s = std.fmt.parseInt(u32, v, 10) catch c.route_ttl_s;
+    c.qq_port = envPort("REALMD_QQ_PORT", c.qq_port);
     if (env("REALMD_REALM_NAME")) |v| c.realm_name = v;
     if (env("REALMD_REALM_ADDR")) |v| c.realm_addr = v;
     if (env("REALMD_DATA_DIR")) |v| c.data_dir = v;

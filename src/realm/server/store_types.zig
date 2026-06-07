@@ -17,3 +17,10 @@ pub const GameRec = struct {
     gs_port: u16 = 4000,
     gsid: u32 = 0,
 };
+
+/// The backend GS a client's game traffic should be spliced to — keyed by the client's
+/// source IP, recorded by realmd on JOINGAME and looked up by the qqserver per connection.
+pub const Route = struct {
+    gs_ip: [4]u8,
+    gs_port: u16 = 4000,
+};
