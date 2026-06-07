@@ -82,6 +82,14 @@ pub fn connectTo(host: [*:0]const u8, port: u16) bool {
     return true;
 }
 
+/// Close the D2DBS connection (if open). Safe to call when already closed.
+pub fn disconnect() void {
+    if (sock != INVALID_SOCKET) {
+        _ = closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+}
+
 /// Fetch a character's save bytes into `out`. Returns the number of bytes written
 /// (0 on failure). The reply also carries createtime / allowladder (logged).
 pub fn fetchCharSave(account: []const u8, charname: []const u8, out: []u8) usize {

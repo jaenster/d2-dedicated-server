@@ -1,0 +1,185 @@
+//! Auto-login harness: drive the real client through the Battle.net login form
+//! programmatically (fill account + password edit-boxes, click LOG ON), so the
+//! realm login phase can be tested without manual GUI input.
+//!
+//! Mechanism reversed from d2bs-ejt (1.14d). Controls live in a linked list at
+//! D2WIN_FirstControl; each Control has type/pos/size and an edit-box text buffer.
+//! We set text via D2WIN_SetControlText and click the button by posting mouse
+//! messages to the game window (same as d2bs SendMouseClick). See [[d2-ui-controls]].
+const std = @import("std");
+const fastcall = @import("../runtime/fastcall.zig");
+const log = @import("../log.zig");
+
+extern "kernel32" fn CreateThread(a: ?*anyopaque, st: usize, f: *const fn (?*anyopaque) callconv(.winapi) u32, p: ?*anyopaque, fl: u32, id: ?*u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+
+const Control = extern struct {
+    dwType: u32, // 0x00  (1=editbox, 6=button)
+    f04: u32, // 0x04
+    dwDisabled: u32, // 0x08
+    dwPosX: u32, // 0x0C
+    dwPosY: u32, // 0x10
+    dwSizeX: u32, // 0x14
+    dwSizeY: u32, // 0x18
+    pad: [0x3C - 0x1C]u8, // 0x1C..0x3C
+    pNext: ?*Control, // 0x3C
+};
+
+const FirstControl: *?*Control = @ptrFromInt(0x007D55BC);
+const SetControlText = fastcall.fastcall_call(0x004FF5A0, fn (*Control, [*:0]const u16) usize);
+const GetHwnd: *const fn () callconv(.winapi) ?*anyopaque = @ptrFromInt(0x004F59A0);
+
+extern "user32" fn PostMessageA(hwnd: ?*anyopaque, msg: u32, wparam: usize, lparam: usize) callconv(.winapi) i32;
+
+const CONTROL_EDITBOX: u32 = 0x01;
+const CONTROL_TEXTBOX: u32 = 0x04;
+const CONTROL_BUTTON: u32 = 0x06;
+const WM_LBUTTONDOWN: u32 = 0x201;
+const WM_LBUTTONUP: u32 = 0x202;
+
+// The LOG ON button on the bnet login screen (d2bs: CONTROL_BUTTON 5288 @ this rect).
+const LOGON_X: u32 = 264;
+const LOGON_Y: u32 = 484;
+const LOGON_W: u32 = 272;
+const LOGON_H: u32 = 35;
+
+var account: [64]u16 = undefined;
+var password: [64]u16 = undefined;
+var game_name = [_]u16{ 'r', 'e', 'a', 'l', 'm', 't', 'e', 's', 't', 0 };
+
+fn toUtf16(out: *[64]u16, s: []const u8) void {
+    var i: usize = 0;
+    while (i < s.len and i < 63) : (i += 1) out[i] = s[i];
+    out[i] = 0;
+}
+
+const max_walk = 64; // bound the walk so a transient/corrupt list can't run off
+
+fn findButton(px: u32, py: u32) ?*Control {
+    var c = FirstControl.*;
+    var n: usize = 0;
+    while (c) |ctrl| : (c = ctrl.pNext) {
+        if (n >= max_walk) break;
+        n += 1;
+        if (ctrl.dwType == CONTROL_BUTTON and ctrl.dwPosX == px and ctrl.dwPosY == py) return ctrl;
+    }
+    return null;
+}
+
+/// Collect up to 2 edit-boxes (account, password) from the control list.
+fn findEditboxes(out: *[2]*Control) usize {
+    var found: usize = 0;
+    var c = FirstControl.*;
+    var n: usize = 0;
+    while (c) |ctrl| : (c = ctrl.pNext) {
+        if (n >= max_walk) break;
+        n += 1;
+        if (ctrl.dwType == CONTROL_EDITBOX and found < 2) {
+            out[found] = ctrl;
+            found += 1;
+        }
+    }
+    return found;
+}
+
+fn click(x: u32, y: u32) void {
+    const lp: usize = x | (y << 16);
+    _ = PostMessageA(GetHwnd(), WM_LBUTTONDOWN, 0, lp);
+    _ = PostMessageA(GetHwnd(), WM_LBUTTONUP, 0, lp);
+}
+
+// d2bs click point for a control: x = posX + sizeX/2, y = posY - sizeY/2.
+fn clickCtrl(ctrl: *Control) void {
+    click(ctrl.dwPosX + ctrl.dwSizeX / 2, ctrl.dwPosY -% ctrl.dwSizeY / 2);
+}
+
+/// Poll up to ~max_500ms*0.5s for a CONTROL_BUTTON at (px,py).
+fn waitForButton(px: u32, py: u32, max_500ms: usize) ?*Control {
+    var i: usize = 0;
+    while (i < max_500ms) : (i += 1) {
+        Sleep(500);
+        if (findButton(px, py)) |b| return b;
+    }
+    return null;
+}
+
+/// First character slot (a CONTROL_TEXTBOX with text) on the char-select screen.
+fn firstCharSlot() ?*Control {
+    var c = FirstControl.*;
+    var n: usize = 0;
+    while (c) |ctrl| : (c = ctrl.pNext) {
+        if (n >= max_walk) break;
+        n += 1;
+        if (ctrl.dwType == CONTROL_TEXTBOX and ctrl.dwSizeX > 40 and ctrl.dwSizeY > 40) return ctrl;
+    }
+    return null;
+}
+
+/// Poll for the bnet login screen, then fill the form and click LOG ON. Runs on
+/// its own thread so we never patch the game loops (patching the OOG loop breaks
+/// the version-check flow that runs in it). Reading/writing controls from here is
+/// safe enough: at the login screen the control list is stable.
+fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
+    Sleep(8000); // let the version check + bnet flow settle before touching controls
+
+    // 1) LOGIN — fill account/password, click LOG IN.
+    if (waitForButton(LOGON_X, LOGON_Y, 60)) |_| {
+        var boxes: [2]*Control = undefined;
+        if (findEditboxes(&boxes) >= 2) {
+            var acc_box = boxes[0];
+            var pass_box = boxes[1];
+            if (acc_box.dwPosY > pass_box.dwPosY) {
+                const t = acc_box;
+                acc_box = pass_box;
+                pass_box = t;
+            }
+            _ = SetControlText.call(.{ acc_box, @as([*:0]const u16, @ptrCast(&account)) });
+            _ = SetControlText.call(.{ pass_box, @as([*:0]const u16, @ptrCast(&password)) });
+            Sleep(300);
+            click(LOGON_X + LOGON_W / 2, LOGON_Y - LOGON_H / 2);
+            log.print("autologin: logged in");
+        }
+    }
+
+    // 2) CHARACTER SELECT — select the first character, click OK (627,572).
+    if (waitForButton(627, 572, 60)) |ok| {
+        if (firstCharSlot()) |slot| {
+            clickCtrl(slot);
+            Sleep(500);
+            log.print("autologin: selected character");
+        }
+        clickCtrl(ok);
+        log.print("autologin: clicked OK (entering realm)");
+    }
+
+    // 3) LOBBY -> CREATE GAME tab (533,469).
+    if (waitForButton(533, 469, 60)) |create_tab| {
+        clickCtrl(create_tab);
+        log.print("autologin: opened Create Game");
+        Sleep(800);
+        // 4) CREATE FORM — type a game name in the first edit-box, click CREATE.
+        var boxes: [2]*Control = undefined;
+        if (findEditboxes(&boxes) >= 1) {
+            _ = SetControlText.call(.{ boxes[0], @as([*:0]const u16, @ptrCast(&game_name)) });
+            Sleep(300);
+            log.print("autologin: typed game name");
+        }
+        // CREATE button (bottom-right of the create form).
+        if (waitForButton(432, 433, 10)) |btn| {
+            clickCtrl(btn);
+            log.print("autologin: clicked CREATE game");
+        } else if (findButton(594, 433)) |btn| {
+            clickCtrl(btn);
+            log.print("autologin: clicked CREATE game (alt)");
+        }
+    }
+    return 0;
+}
+
+/// Install the auto-login harness with the given credentials (no game patching).
+pub fn install(acct: []const u8, pass: []const u8) void {
+    toUtf16(&account, acct);
+    toUtf16(&password, pass);
+    _ = CreateThread(null, 0, pollThread, null, 0, null);
+    log.print("autologin: poll thread started (driving bnet login)");
+}

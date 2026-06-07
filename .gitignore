@@ -5,3 +5,9 @@ zig-out/
 .claude/
 .idea/
 testgame-min/
+
+# Vendored / moved-in tools — live here for convenience, not committed
+tools/ghidra2cpp/
+tools/reconstruct-ts/
+tools/vermpq/
+tools/realmd-test/

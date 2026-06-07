@@ -12,6 +12,7 @@ const std = @import("std");
 const p = @import("protocol.zig");
 const server = @import("../engine/server.zig");
 const command = @import("../engine/command.zig");
+const joinctx = @import("joinctx.zig");
 const log = @import("../log.zig");
 
 // ── winsock (Game.exe already loaded ws2_32 + WSAStartup; we reuse it) ────────
@@ -145,8 +146,9 @@ fn handleCreateGame(body: []const u8) void {
     }
 }
 
-/// JOINGAMEREQ: gameid, token, then charname/acct/ip cstrs. Register the token so
-/// the engine's fpFindPlayerToken / SERVER_IsTokenValid accept the joining client.
+/// JOINGAMEREQ: gameid, token, charname\0, account\0. We cache the
+/// token/char/account mapping so fpGetDatabaseCharacter can fetch the right save
+/// (the engine's join path carries the char + token but never the account).
 fn handleJoinGame(body: []const u8) void {
     if (body.len < 8) {
         sendJoinGameReply(1, 0);
@@ -154,13 +156,18 @@ fn handleJoinGame(body: []const u8) void {
     }
     const gameid = std.mem.readInt(u32, body[0..4], .little);
     const token = std.mem.readInt(u32, body[4..8], .little);
-    // The game's own token was registered by GAME_CreateBattleNetGame. This join
-    // token authorizes a client to enter `gameid`; it's validated later when the
-    // client connects to :4000 (engine calls fpFindPlayerToken). So we just ack
-    // here and (TODO) remember token->game for that callback. Do NOT call
-    // PutNewGameOnTokenList — that registers a new game and would index a fixed
-    // table out of range for an arbitrary join token.
-    _ = token;
+    var off: usize = 8;
+    const charname = p.readCStr(body, &off);
+    const account = p.readCStr(body, &off);
+    // The game's own token was registered by GAME_CreateBattleNetGame; this join
+    // token authorizes a client to enter `gameid`, validated when the client
+    // connects to :4000 (engine calls fpFindPlayerToken). We don't touch the
+    // engine token table here — just remember who is joining so we can resolve
+    // the account when the engine asks us for the character save.
+    if (charname.len > 0 and account.len > 0) {
+        joinctx.remember(token, charname, account);
+        log.print("d2cs: JOINGAME cached char/account for fetch");
+    }
     sendJoinGameReply(if (command.allow_create) 0 else 1, gameid);
     log.hex("d2cs: JOINGAME ack for gameid=0x", gameid);
 }

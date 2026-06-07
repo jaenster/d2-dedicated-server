@@ -1,0 +1,88 @@
+# realmd on Kubernetes — multiple instances in tandem over a shared volume.
+#
+# Each pod is a stateless protocol front; all durable/cross-connection state
+# (sessions, games, character saves) lives on the shared PVC, so any pod resolves
+# what another created and pods can restart freely. REALMD_INSTANCE is the pod
+# name, giving each instance the distinct id that keeps minted session ids unique.
+#
+# NOTE: the shared PVC must be ReadWriteMany (e.g. Longhorn RWX / NFS). If your
+# cluster has no RWX provider, run a single replica with RWO instead.
+#
+#   kubectl apply -f deploy/realmd.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: realmd
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: realmd-data
+  namespace: realmd
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: longhorn   # set to your RWX class
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: realmd
+  namespace: realmd
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: realmd }
+  template:
+    metadata:
+      labels: { app: realmd }
+    spec:
+      containers:
+        - name: realmd
+          image: realmd:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 6112, name: bnetd }
+            - { containerPort: 6113, name: d2cs }
+            - { containerPort: 6114, name: d2dbs }
+            - { containerPort: 6115, name: gslink }
+          env:
+            - name: REALMD_SHARED
+              value: "1"
+            - name: REALMD_INSTANCE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name } # unique per pod
+            - name: REALMD_DATA_DIR
+              value: /data
+            - name: REALMD_REALM_NAME
+              value: "TypeGuru"
+            # The public IPv4 clients dial for d2cs (bnetd advertises it). Set to
+            # the realm's external LoadBalancer IP.
+            - name: REALMD_REALM_ADDR
+              value: "127.0.0.1"
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: realmd-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: realmd
+  namespace: realmd
+spec:
+  type: LoadBalancer
+  # Preserve the game server's source IP on the gs-link so the GS address handed
+  # to clients is correct (no SNAT). Drop if your LB doesn't support it.
+  externalTrafficPolicy: Local
+  selector: { app: realmd }
+  ports:
+    - { port: 6112, targetPort: 6112, name: bnetd }
+    - { port: 6113, targetPort: 6113, name: d2cs }
+    - { port: 6114, targetPort: 6114, name: d2dbs }
+    - { port: 6115, targetPort: 6115, name: gslink }
