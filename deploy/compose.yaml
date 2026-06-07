@@ -1,0 +1,70 @@
+# Local cloud-native stack — the same realmd image + backends as k8s, on one host.
+#
+#   docker compose -f deploy/compose.yaml up --build
+#
+# Brings up realmd (durable=Postgres for char saves, ephemeral=Redis for sessions+games)
+# behind published ports, so a real 1.14d client (or the smoke tests) can hit it on
+# localhost. The game server runs separately under wine (it needs the proprietary game
+# files) — see the commented `gs` service / deploy/gs.yaml.
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: realmd
+      POSTGRES_PASSWORD: realmd
+      POSTGRES_DB: realmd
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "realmd"]
+      interval: 3s
+      retries: 10
+
+  realmd:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: realmd
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      REALMD_DURABLE_STORE: pg
+      REALMD_EPHEMERAL_STORE: redis
+      REALMD_DATA_DIR: /data
+      REALMD_REDIS_ADDR: redis:6379
+      REALMD_PG_DSN: postgres://realmd:realmd@postgres:5432/realmd
+      REALMD_LOG_JSON: "1"
+      # The address bnetd advertises to the client for d2cs. For a client on the host,
+      # this must be reachable from the host — 127.0.0.1 works with the published ports.
+      REALMD_REALM_ADDR: "127.0.0.1"
+    volumes:
+      - realmd-data:/data
+    ports:
+      - "6112:6112"  # bnetd
+      - "6113:6113"  # d2cs
+      - "6114:6114"  # d2dbs
+      - "6115:6115"  # gs-link (the wine GS connects here)
+      - "18080:8080" # health (8080 is often taken on the host)
+
+  # The headless wine game server needs the proprietary D2 install mounted, so it's not
+  # built/run by default here. Either run it under wine on the host (./run.sh-style,
+  # pointing --realmd at 127.0.0.1) or uncomment + mount your install:
+  #
+  # gs:
+  #   build: { context: .., dockerfile: deploy/Dockerfile, target: gs }
+  #   depends_on: { realmd: { condition: service_started } }
+  #   environment:
+  #     REALMD_HOST: realmd
+  #     D2GS_GS_ADDR: "127.0.0.1:4000"
+  #   volumes:
+  #     - /path/to/your/d2-1.14d-install:/game:ro
+  #   ports: ["4000:4000"]
+
+volumes:
+  realmd-data:
