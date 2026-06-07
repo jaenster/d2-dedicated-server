@@ -1,20 +1,27 @@
-# d2-dedicated-server — Diablo II 1.14d as a headless dedicated game server + realm
+# d2-dedicated-server — headless, cloud-native Diablo II 1.14d dedicated game server + realm
 
-Turns the single-binary Diablo II 1.14d `Game.exe` into a **dedicated game server**,
-the way older versions do with the split DLLs — except in 1.14d the whole server
-engine (`Fog::QServer` + `D2Game::Game::Server`) is statically linked inside
+A **self-hosted, open-source Diablo II dedicated game server** for retail **1.14d**,
+plus a clean-room **Battle.net realm server** — a modern, **cloud-native PvPGN
+replacement** you run with Docker / Kubernetes. All in **Zig**.
+
+Turns the single-binary Diablo II 1.14d `Game.exe` into a **headless dedicated game
+server**, the way older versions do with the split DLLs — except in 1.14d the whole
+server engine (`Fog::QServer` + `D2Game::Game::Server`) is statically linked inside
 `Game.exe`. We don't reimplement it; we **drive the real engine** from an injected
-Zig DLL. The repo also ships a clean-room **realm server** (`realmd`) that replaces
-PvPGN, so the unmodified retail client can log in and play end to end.
+Zig DLL. The bundled realm server (`realmd`) replaces **PvPGN** (bnetd + d2cs + d2dbs),
+so the **unmodified retail client** logs in and plays end to end — no client mods.
 
 > **Status: a real 1.14d client logs into the realm, creates/joins a game on the
 > headless server, and the character spawns in-world — including two clients in
 > the same game (multiplayer).** See [Status](#status).
 
-Built for **Linux deployment**: the Windows `Game.exe` runs under wine, fully
-headless — no GUI, no X, no display. Logs stream to **stdout** like a normal
-daemon (`docker logs` / journald / your terminal just work). `realmd` is a native
-binary (no wine).
+Built for **containers and Kubernetes**: the Windows `Game.exe` runs under wine, fully
+headless — no GUI, no X, no display — and `realmd` ships as a few-MB static binary.
+A capacity-aware **game-server fleet** registers with the realm; state lives in
+**Postgres + Redis** (or just the filesystem); health/readiness probes and graceful
+shutdown make it a first-class **cloud-native** workload. Logs stream to **stdout**
+(JSON optional) — `docker logs` / journald / `kubectl logs` just work. One
+`docker compose up` runs the whole stack locally; manifests in [`deploy/`](deploy/).
 
 ## The pieces
 
@@ -200,19 +207,26 @@ src/
   dbghelp.zig    dbghelp.dll proxy — injection foothold (--loaddll loader)
   d2gs.zig       d2gs.dll entry — DllMain, flag parsing, server thread + tick loop
   log.zig        logger (stdout + file)
-  realm/         the realm link — both ends + their shared contract       [README]
+  realm/         the realm link — both ends + their shared contract        [README]
     shared/      d2cs<->d2gs wire protocol (the realm_shared module)
-    client/      GS-side clients of the realm (d2cs/d2dbs, join context)  [README]
-    server/      the realm server / realmd binary (bnetd+d2cs+d2dbs+gs-link, store, health) [README]
+    client/      GS-side clients of the realm (d2cs/d2dbs, join context)   [README]
+    server/      realm server / realmd binary: bnetd+d2cs+d2dbs+gs-link,
+                 pluggable store (fs/redis/pg), health, graceful shutdown   [README]
   engine/        bindings into Game.exe's own engine + realm callback table [README]
   runtime/       in-process machinery: byte-patches, hooks, fastcall, diagnostics [README]
   test/          client-driving test harnesses (auto-login/join, screenshots) [README]
-  checkrev/      CheckRevision.dll producer for the version-check MPQ          [README]
-tools/realmd-test/  protocol smoke tests + the full create/join e2e test
+  checkrev/      CheckRevision.dll producer for the version-check MPQ       [README]
+deploy/
+  Dockerfile         multi-target image: `--target realmd` (scratch) | `--target gs` (wine)
+  compose.yaml       local stack — realmd + Postgres + Redis (+ `gs` profile)
+  realmd.yaml        k8s — realmd Deployment + redis/pg + probes + LoadBalancer
+  gs.yaml            k8s — game-server StatefulSet (hostPort 4000 + node IP)
+  gs-entrypoint.sh   headless-wine launcher (assembles game dir, loads mods)
+docs/architecture/   LikeC4 model (diablo2.c4 + cloud.c4) + exported diagrams (img/)
 ```
 
 Each `src/*` directory has its own `README.md`. Other docs:
-[`REALM.md`](REALM.md), [`VERIFY.md`](VERIFY.md), [`LEGAL.md`](LEGAL.md).
+[`REALM.md`](REALM.md), [`REALMD.md`](REALMD.md), [`VERIFY.md`](VERIFY.md), [`LEGAL.md`](LEGAL.md).
 
 ## Status
 
