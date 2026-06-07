@@ -4,7 +4,13 @@
 //! dependency and is fine for log contention.)
 const std = @import("std");
 
+extern "c" fn time(t: ?*c_long) c_long; // unix seconds (std.time.timestamp went through Io in 0.16)
+
 var held = std.atomic.Value(bool).init(false);
+
+/// Emit structured JSON lines (`{"ts","tag","msg"}`) instead of `[tag] msg` when
+/// set (REALMD_LOG_JSON) — for log collectors that parse JSON. Set by main().
+pub var json: bool = false;
 
 fn lock() void {
     while (held.swap(true, .acquire)) std.atomic.spinLoopHint();
@@ -13,12 +19,26 @@ fn unlock() void {
     held.store(false, .release);
 }
 
-/// `[tag] <formatted line>`.
+/// `[tag] <formatted line>`, or a JSON object when `json` is set.
 pub fn line(tag: []const u8, comptime fmt: []const u8, args: anytype) void {
     lock();
     defer unlock();
-    std.debug.print("[{s}] ", .{tag});
-    std.debug.print(fmt ++ "\n", args);
+    if (json) {
+        var buf: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
+        std.debug.print("{{\"ts\":{d},\"tag\":\"{s}\",\"msg\":\"", .{ time(null), tag });
+        for (msg) |c| switch (c) {
+            '"' => std.debug.print("\\\"", .{}),
+            '\\' => std.debug.print("\\\\", .{}),
+            '\n' => std.debug.print("\\n", .{}),
+            '\t' => std.debug.print("\\t", .{}),
+            else => std.debug.print("{c}", .{c}),
+        };
+        std.debug.print("\"}}\n", .{});
+    } else {
+        std.debug.print("[{s}] ", .{tag});
+        std.debug.print(fmt ++ "\n", args);
+    }
 }
 
 /// Hex+ASCII dump of a byte slice (protocol discovery / capture mode).

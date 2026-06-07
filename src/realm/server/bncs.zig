@@ -14,7 +14,7 @@ const std = @import("std");
 const net = @import("net.zig");
 const log = @import("log.zig");
 const proto = @import("proto.zig");
-const protocol = @import("protocol.zig");
+const protocol = @import("bncs_protocol.zig");
 const state = @import("state.zig");
 const bnftp = @import("bnftp.zig");
 
@@ -256,7 +256,7 @@ fn onLogonRealm(c: *Conn, tag: []const u8, body: []const u8) void {
     const title = r.getStr();
 
     const acct = c.accountName();
-    const sid = state.global.createSession(acct);
+    const sid = state.global.mintSession(acct);
     const cookie = nextToken();
     log.line(tag, "realm logon account={s} realm={s} session={d}", .{ acct, title, sid });
 

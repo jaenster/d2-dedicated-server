@@ -14,6 +14,13 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
+    // realm_shared — the shared realm package (wire protocol + enums) imported by BOTH
+    // the GS-side client (in d2gs.dll) and the realm server (realmd), so the two ends
+    // agree on the wire by construction. Target-less: it compiles in each importer's context.
+    const realm_shared = b.createModule(.{
+        .root_source_file = b.path("src/realm/shared/shared.zig"),
+    });
+
     const dbghelp = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "dbghelp",
@@ -34,6 +41,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    d2gs.root_module.addImport("realm_shared", realm_shared);
     b.installArtifact(d2gs);
 
     // ver-IX86-1.dll — the CheckRevision module packed into the version-check MPQ
@@ -49,6 +57,12 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(checkrev);
 
+    // `zig build dlls` — install ONLY the injected DLLs (no realmd, no pg fetch).
+    // Used by the game-server container image, which needs the DLLs but not realmd.
+    const dlls_step = b.step("dlls", "Build only the injected DLLs (dbghelp + d2gs)");
+    dlls_step.dependOn(&b.addInstallArtifact(dbghelp, .{}).step);
+    dlls_step.dependOn(&b.addInstallArtifact(d2gs, .{}).step);
+
     // realmd — the realm server (bnetd+d2cs+d2dbs in one binary). Native host
     // target by default (dev on macOS/Linux); cross-compile for deploy with
     // `-Dtarget=x86_64-linux-musl` for a static Linux binary.
@@ -56,13 +70,25 @@ pub fn build(b: *std.Build) void {
     const realmd = b.addExecutable(.{
         .name = "realmd",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/realmd/main.zig"),
+            .root_source_file = b.path("src/realm/server/main.zig"),
             .target = realmd_target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
+    // pg.zig — pure-Zig Postgres client for the optional Postgres store backend.
+    // Lazy: only fetched when a step actually builds realmd, so `zig build dlls`
+    // (the game-server image) never pulls it.
+    if (b.lazyDependency("pg", .{ .target = realmd_target, .optimize = optimize })) |pg_dep| {
+        realmd.root_module.addImport("pg", pg_dep.module("pg"));
+    }
+    realmd.root_module.addImport("realm_shared", realm_shared);
     b.installArtifact(realmd);
+
+    // `zig build realmd-bin` — install ONLY the realmd binary (no windows DLLs).
+    // Used by the realmd container image.
+    const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
+    realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
 
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());

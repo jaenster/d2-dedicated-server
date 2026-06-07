@@ -16,8 +16,8 @@ const win = std.os.windows;
 const server = @import("engine/server.zig");
 const command = @import("engine/command.zig");
 const realm = @import("engine/realm.zig");
-const d2cs = @import("realm/d2cs.zig");
-const d2dbs = @import("realm/d2dbs.zig");
+const d2cs = @import("realm/client/d2cs.zig");
+const d2dbs = @import("realm/client/d2dbs.zig");
 const headless = @import("runtime/headless.zig");
 const crash = @import("runtime/crash.zig");
 const halt_hook = @import("runtime/halt_hook.zig");
@@ -41,6 +41,12 @@ var d2dbs_enabled: bool = false;
 var fetch_acct: [32]u8 = undefined;
 var fetch_char: [32]u8 = undefined;
 var fetch_enabled: bool = false;
+// Public game address clients dial (self-reported to D2CS) + advertised capacity +
+// this GS's stable fleet id. Set from --gs-addr/--max-games (or env) in parseEndpoints.
+var gs_public_ip: [4]u8 = .{ 0, 0, 0, 0 };
+var gs_public_port: u16 = 4000;
+var gs_max_games: u32 = 100;
+var gsid: u32 = 0;
 
 const BOOL = win.BOOL; // enum(c_int){ FALSE, TRUE } in zig 0.16
 const HMODULE = win.HINSTANCE;
@@ -58,6 +64,61 @@ extern "kernel32" fn CreateThread(
     id: ?*DWORD,
 ) callconv(.winapi) ?win.HANDLE;
 extern "kernel32" fn Sleep(ms: DWORD) callconv(.winapi) void;
+extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: DWORD) callconv(.winapi) DWORD;
+extern "kernel32" fn GetComputerNameA(buf: [*]u8, size: *DWORD) callconv(.winapi) BOOL;
+
+/// Copy the value of env var `name` into `out` (null-terminated). Length, or null
+/// if unset / too large. Lets k8s configure the GS via env in addition to flags.
+fn envToken(name: [*:0]const u8, out: []u8) ?usize {
+    const n = GetEnvironmentVariableA(name, out.ptr, @intCast(out.len));
+    if (n == 0 or n >= out.len) return null;
+    return n;
+}
+
+/// Parse a dotted-quad "a.b.c.d" into network-order octets. Null if malformed.
+fn parseDottedQuad(s: []const u8) ?[4]u8 {
+    var oct: [4]u8 = undefined;
+    var idx: usize = 0;
+    var cur: u16 = 0;
+    var seen = false;
+    for (s) |c| {
+        if (c >= '0' and c <= '9') {
+            cur = cur * 10 + (c - '0');
+            if (cur > 255) return null;
+            seen = true;
+        } else if (c == '.') {
+            if (!seen or idx >= 3) return null;
+            oct[idx] = @intCast(cur);
+            idx += 1;
+            cur = 0;
+            seen = false;
+        } else return null;
+    }
+    if (!seen or idx != 3) return null;
+    oct[3] = @intCast(cur);
+    return oct;
+}
+
+fn fnv1a(s: []const u8) u32 {
+    var h: u32 = 2166136261;
+    for (s) |c| {
+        h ^= c;
+        h *%= 16777619;
+    }
+    return h;
+}
+
+/// A stable per-GS id for the fleet: hash of the pod/host name (unique per k8s pod),
+/// falling back to the public ip:port if the name is unavailable.
+fn computeGsId() u32 {
+    var buf: [256]u8 = undefined;
+    var sz: DWORD = @intCast(buf.len);
+    if (GetComputerNameA(&buf, &sz).toBool() and sz > 0) return fnv1a(buf[0..sz]);
+    var fb: [6]u8 = undefined;
+    fb[0..4].* = gs_public_ip;
+    std.mem.writeInt(u16, fb[4..6], gs_public_port, .little);
+    return fnv1a(&fb);
+}
 
 /// Matches `--flag` anywhere in the command line (token-aware).
 fn hasFlag(comptime flag: []const u8) bool {
@@ -144,6 +205,13 @@ fn splitNames(tok: []const u8, a: []u8, b: []u8) bool {
     return alen > 0 and blen > 0;
 }
 
+/// Copy a host string into a fixed null-terminated buffer.
+fn setHost(dst: []u8, host: []const u8) void {
+    const n = @min(host.len, dst.len - 1);
+    @memcpy(dst[0..n], host[0..n]);
+    dst[n] = 0;
+}
+
 fn parseEndpoints() void {
     var tmp: [96]u8 = undefined;
     if (flagToken("d2cs", &tmp)) |len| {
@@ -163,6 +231,59 @@ fn parseEndpoints() void {
     if (flagToken("fetch-char", &tmp)) |len| {
         fetch_enabled = splitNames(tmp[0..len], &fetch_acct, &fetch_char);
     }
+
+    // Single-host convenience: `--realmd <host>` (or REALMD_HOST) points the GS at one
+    // realm server, deriving the gslink control port (6115) and d2dbs port (6114).
+    // Explicit --d2cs/--d2dbs above still win. `<host>` may be a DNS name (resolved at
+    // connect) — e.g. a k8s Service like realmd.realmd.svc.cluster.local.
+    {
+        var hbuf: [80]u8 = undefined;
+        const got = flagToken("realmd", &hbuf) orelse envToken("REALMD_HOST", &hbuf);
+        if (got) |len| {
+            const host = hbuf[0..len];
+            if (!d2cs_enabled) {
+                setHost(&d2cs_host, host);
+                d2cs_port = 6115;
+                d2cs_enabled = true;
+            }
+            if (!d2dbs_enabled) {
+                setHost(&d2dbs_host, host);
+                d2dbs_port = 6114;
+                d2dbs_enabled = true;
+            }
+        }
+    }
+
+    // Public game address clients dial — flag, then env (k8s passes it via env).
+    {
+        const got = flagToken("gs-addr", &tmp) orelse envToken("D2GS_GS_ADDR", &tmp);
+        if (got) |len| {
+            var port: u16 = 0;
+            var ipbuf: [64]u8 = undefined;
+            if (splitColon(tmp[0..len], &ipbuf, &port)) {
+                if (parseDottedQuad(std.mem.sliceTo(&ipbuf, 0))) |oct| {
+                    gs_public_ip = oct;
+                    gs_public_port = port;
+                }
+            }
+        }
+    }
+    // Advertised capacity — flag, then env.
+    {
+        const got = flagToken("max-games", &tmp) orelse envToken("D2GS_MAX_GAMES", &tmp);
+        if (got) |len| {
+            var v: u32 = 0;
+            var any = false;
+            for (tmp[0..len]) |c| {
+                if (c >= '0' and c <= '9') {
+                    v = v * 10 + (c - '0');
+                    any = true;
+                }
+            }
+            if (any and v > 0) gs_max_games = v;
+        }
+    }
+    gsid = computeGsId();
 }
 
 /// One-shot D2DBS character fetch (test/demo for `--fetch-char`).
@@ -217,7 +338,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     log.print("d2gs: entering tick loop (listening on :4000)");
 
     // Connect to PvPGN's D2CS so it can dispatch game create/join to us.
-    if (d2cs_enabled) d2cs.start(@ptrCast(&d2cs_host), d2cs_port);
+    if (d2cs_enabled) d2cs.start(@ptrCast(&d2cs_host), d2cs_port, gs_public_ip, gs_public_port, gs_max_games, gsid);
 
     // One-shot D2DBS character fetch demo (--d2dbs <ip:port> --fetch-char acct:char).
     if (d2dbs_enabled and fetch_enabled) {

@@ -1,0 +1,94 @@
+# d2gs game-server fleet on Kubernetes.
+#
+# Clients connect DIRECTLY to a game server at <ip>:4000 for game traffic (the realm
+# only hands them the IP; the port is the fixed D2 game port 4000). So each GS pod
+# needs a client-routable address. The portable plain-k8s pattern: hostPort 4000 +
+# the node's own IP (downward API status.hostIP) reported to realmd as D2GS_GS_ADDR.
+# Pod anti-affinity keeps one GS per node so the hostPort never collides.
+#
+# Each GS dials the realmd Service by DNS (REALMD_HOST) — the d2gs.dll resolves it
+# (getaddrinfo) and registers over the gs-link, self-reporting D2GS_GS_ADDR.
+#
+# Game files are proprietary: populate the d2-gamefiles PVC with a real 1.14d install
+# (ReadOnlyMany) before scaling up. NOTE: a node must allow hostPort 4000 and be
+# reachable by clients on that port (firewall/NodePort range aside — hostPort is a
+# direct node bind).
+#
+#   docker build -f deploy/Dockerfile --target gs -t d2gs:latest .
+#   kubectl apply -f deploy/gs.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: d2-gamefiles
+  namespace: realmd
+spec:
+  accessModes: ["ReadOnlyMany"]   # populated once with a real D2 1.14d install
+  resources:
+    requests:
+      storage: 4Gi
+  # storageClassName: longhorn
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: d2gs
+  namespace: realmd
+spec:
+  serviceName: d2gs
+  replicas: 2
+  selector:
+    matchLabels: { app: d2gs }
+  template:
+    metadata:
+      labels: { app: d2gs }
+    spec:
+      # One GS per node: hostPort 4000 is a node-level bind, so two pods on a node
+      # would collide. This also gives each pod a distinct node IP to advertise.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: d2gs }
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: d2gs
+          image: d2gs:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 4000, hostPort: 4000, name: game }
+          env:
+            # The realm server Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
+            - name: REALMD_HOST
+              value: realmd.realmd.svc.cluster.local
+            # Node IP → the public address clients dial for this pod's games.
+            - name: NODE_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.hostIP }
+            - name: D2GS_GS_ADDR
+              value: "$(NODE_IP):4000"
+            - name: D2GS_MAX_GAMES
+              value: "50"
+            # Optional: extra server-mod DLLs to load after d2gs.dll (space-separated;
+            # unix paths under a mounted /mods are converted to Z:\ automatically).
+            # - name: D2GS_EXTRA_DLLS
+            #   value: "/mods/mymod.dll"
+            # Optional: extra Game.exe flags — e.g. load the loose /moddata data/ tree.
+            # - name: D2GS_EXTRA_ARGS
+            #   value: "-direct -txt"
+          volumeMounts:
+            - { name: game, mountPath: /game, readOnly: true }
+            - { name: wine, mountPath: /wine }
+            - { name: work, mountPath: /work }
+            # Server-mod DLLs: each *.dll is --loaddll'd after d2gs.dll.
+            # - { name: mods, mountPath: /mods, readOnly: true }
+            # Extra data files (MPQs / loose data/ tree) overlaid onto the game dir.
+            # - { name: moddata, mountPath: /moddata, readOnly: true }
+      volumes:
+        - name: game
+          persistentVolumeClaim:
+            claimName: d2-gamefiles
+        - name: wine
+          emptyDir: {}     # wine prefix re-inits per start; make it a PVC to persist
+        - name: work
+          emptyDir: {}

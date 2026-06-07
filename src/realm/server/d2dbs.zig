@@ -54,7 +54,7 @@ fn onGet(fd: net.Socket, tag: []const u8, seq: u32, body: []const u8) void {
     const charname = r.getStr();
 
     var save: [8192]u8 = undefined;
-    const n = store.getChar(account, charname, &save);
+    const n = store.getCharD2s(account, charname, &save);
     log.line(tag, "GET {s}/{s} -> {d} bytes", .{ account, charname, n });
 
     var out: [9000]u8 = undefined;
@@ -83,7 +83,7 @@ fn onSave(fd: net.Socket, tag: []const u8, seq: u32, body: []const u8) void {
     const take = @min(datalen, avail);
     const data = body[r.pos..][0..take];
 
-    const ok = store.saveChar(account, charname, data);
+    const ok = store.saveCharD2s(account, charname, data);
     log.line(tag, "SAVE {s}/{s} {d} bytes -> {s}", .{ account, charname, take, if (ok) "ok" else "FAIL" });
 
     var out: [16]u8 = undefined;

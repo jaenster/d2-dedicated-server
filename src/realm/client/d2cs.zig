@@ -6,14 +6,14 @@
 //!
 //! Status: WIP. Framing + handshake + dispatch loop are implemented; the auth
 //! constants (version/checksum) and the create/join engine wiring still need to
-//! be matched against the live PvPGN realm (see PVPGN.md).
+//! be matched against the live realm.
 
 const std = @import("std");
-const p = @import("protocol.zig");
-const server = @import("../engine/server.zig");
-const command = @import("../engine/command.zig");
+const p = @import("realm_shared").protocol;
+const server = @import("../../engine/server.zig");
+const command = @import("../../engine/command.zig");
 const joinctx = @import("joinctx.zig");
-const log = @import("../log.zig");
+const log = @import("../../log.zig");
 
 // ── winsock (Game.exe already loaded ws2_32 + WSAStartup; we reuse it) ────────
 const SOCKET = usize;
@@ -38,12 +38,35 @@ extern "ws2_32" fn htons(v: u16) callconv(.winapi) u16;
 extern "ws2_32" fn inet_addr(cp: [*:0]const u8) callconv(.winapi) u32;
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
+// getaddrinfo (Win32 ADDRINFOA, 32-bit layout) so the GS can dial D2CS by DNS name
+// (e.g. a k8s Service) instead of a dotted-quad only.
+const addrinfo = extern struct {
+    flags: i32,
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+    addrlen: usize,
+    canonname: ?[*:0]u8,
+    addr: ?*sockaddr_in,
+    next: ?*addrinfo,
+};
+extern "ws2_32" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const addrinfo, res: **addrinfo) callconv(.winapi) i32;
+extern "ws2_32" fn freeaddrinfo(res: *addrinfo) callconv(.winapi) void;
+
 const INADDR_NONE: u32 = 0xffff_ffff;
 
 // pvpgn d2gs identity — TODO: confirm against the realm's pvpgn build / d2cs.conf.
 const D2GS_VERSION: u32 = 0x01;
 const D2GS_CHECKSUM: u32 = 0x00;
-const MAX_GAMES: u32 = 100;
+
+/// Game capacity this GS advertises to D2CS (SETGSINFO maxgame). Set by start().
+pub var max_games: u32 = 100;
+/// Public address clients dial for game traffic, self-reported via ADDRINFO. Behind
+/// a k8s Service the control-conn peer IP is SNAT'd, so the GS must announce its own.
+pub var public_ip: [4]u8 = .{ 0, 0, 0, 0 };
+pub var public_port: u16 = 4000;
+/// Stable id keying this GS in a fleet (hash of the pod/host name). Set by start().
+pub var gsid: u32 = 0;
 
 var sock: SOCKET = INVALID_SOCKET;
 var seqno: u32 = 0;
@@ -85,10 +108,20 @@ fn sendAuthReply() void {
 
     var info = std.mem.zeroes(p.SetGsInfo);
     info.h = p.header(.setgsinfo, @sizeOf(p.SetGsInfo), nextSeq());
-    info.maxgame = MAX_GAMES;
+    info.maxgame = max_games;
     info.gameflag = 0;
     _ = sendPacket(std.mem.asBytes(&info));
     log.print("d2cs: sent SETGSINFO");
+
+    // Tell D2CS the public address clients must dial + our fleet id (our extension).
+    var ai = std.mem.zeroes(p.AddrInfo);
+    ai.h = p.header(.addrinfo, @sizeOf(p.AddrInfo), nextSeq());
+    ai.maxgame = max_games;
+    ai.gsid = gsid;
+    ai.ip = public_ip;
+    ai.port = public_port;
+    _ = sendPacket(std.mem.asBytes(&ai));
+    log.print("d2cs: sent ADDRINFO");
 }
 
 fn handleEcho(body: []const u8) void {
@@ -183,6 +216,26 @@ fn dispatch(t: p.Type, body: []const u8) void {
     }
 }
 
+/// Resolve `host` to a network-order IPv4. Tries inet_addr (dotted-quad), then
+/// getaddrinfo (DNS) so a k8s Service name works. Null if it can't be resolved.
+fn resolveHost(host: [*:0]const u8) ?u32 {
+    const direct = inet_addr(host);
+    if (direct != INADDR_NONE) return direct;
+    var hints = std.mem.zeroes(addrinfo);
+    hints.family = AF_INET;
+    hints.socktype = SOCK_STREAM;
+    var res: *addrinfo = undefined;
+    if (getaddrinfo(host, null, &hints, &res) != 0) return null;
+    defer freeaddrinfo(res);
+    var cur: ?*addrinfo = res;
+    while (cur) |a| : (cur = a.next) {
+        if (a.family == AF_INET) {
+            if (a.addr) |sa| return sa.addr;
+        }
+    }
+    return null;
+}
+
 /// Connect + run the protocol loop once. Returns on disconnect.
 fn run(addr: u32, port: u16) void {
     sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -211,28 +264,34 @@ fn run(addr: u32, port: u16) void {
     log.print("d2cs: disconnected");
 }
 
-const Args = struct { addr: u32, port: u16 };
+const Args = struct { host: [*:0]const u8, port: u16 };
 var args: Args = undefined;
 
 fn threadMain(_: ?*anyopaque) callconv(.winapi) u32 {
     var wsa: [512]u8 = undefined;
     _ = WSAStartup(0x0202, &wsa);
     while (true) {
-        run(args.addr, args.port);
+        // Resolve every attempt so a re-pointed Service / changed pod IP is picked up.
+        if (resolveHost(args.host)) |addr| {
+            run(addr, args.port);
+        } else {
+            log.print("d2cs: host resolve failed");
+        }
         Sleep(5000); // reconnect backoff
     }
 }
 
 extern "kernel32" fn CreateThread(a: ?*anyopaque, st: usize, f: *const fn (?*anyopaque) callconv(.winapi) u32, p_: ?*anyopaque, fl: u32, id: ?*u32) callconv(.winapi) ?*anyopaque;
 
-/// Start the D2CS client thread. `host` is a dotted-quad IPv4 string (DNS TODO).
-pub fn start(host: [*:0]const u8, port: u16) void {
-    const a = inet_addr(host);
-    if (a == INADDR_NONE) {
-        log.print("d2cs: bad host (dotted-quad IPv4 only for now)");
-        return;
-    }
-    args = .{ .addr = a, .port = port };
+/// Start the D2CS client thread. `host` may be a dotted-quad IPv4 or a DNS name
+/// (resolved on the thread). `pub_ip`:`pub_port` is the public game address clients
+/// dial; `maxgame` the advertised capacity; `gs_id` this GS's stable fleet id.
+pub fn start(host: [*:0]const u8, port: u16, pub_ip: [4]u8, pub_port: u16, maxgame: u32, gs_id: u32) void {
+    args = .{ .host = host, .port = port };
+    public_ip = pub_ip;
+    public_port = pub_port;
+    max_games = maxgame;
+    gsid = gs_id;
     _ = CreateThread(null, 0, threadMain, null, 0, null);
     log.print("d2cs: client thread started");
 }

@@ -30,6 +30,7 @@ pub const Type = enum(u16) {
     joingame = 0x21, // D2CS -> GS req / GS -> D2CS reply
     updategameinfo = 0x22, // GS -> D2CS
     closegame = 0x23, // GS -> D2CS
+    addrinfo = 0x24, // GS -> D2CS (self-reported public addr + id; our extension)
     _,
 };
 
@@ -86,6 +87,19 @@ pub const SetGsInfo = extern struct {
     h: Header,
     maxgame: u32,
     gameflag: u32,
+};
+
+/// ADDRINFO (0x24, our extension): the GS self-reports the public address clients
+/// must dial for game traffic (`ip`:`port`), plus a stable `gsid` so D2CS can key a
+/// fleet of game servers. Needed because behind a k8s Service the GS's control-conn
+/// peer IP is SNAT'd and useless as the client-facing address. Field order is chosen
+/// so there is no internal padding (offsets: maxgame@8 gsid@12 ip@16 port@20).
+pub const AddrInfo = extern struct {
+    h: Header,
+    maxgame: u32,
+    gsid: u32,
+    ip: [4]u8, // network-order IPv4 octets
+    port: u16, // host-order port the client dials (the GS game port, e.g. 4000)
 };
 
 /// CREATEGAMEREPLY (0x20). result: 0=ok, 1=fail.

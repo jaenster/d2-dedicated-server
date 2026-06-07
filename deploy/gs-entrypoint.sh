@@ -1,0 +1,79 @@
+#!/bin/sh
+# Headless Diablo II 1.14d dedicated game server under wine.
+#
+# Mounts (only /game is required):
+#   /game     pristine D2 1.14d install, READ-ONLY (proprietary; never baked in)
+#   /moddata  extra DATA files overlaid onto the game dir: replacement / additional
+#             MPQs (e.g. a mod's patch_d2.mpq, loaded over the base) and/or a loose
+#             data/ tree (the engine reads that only with -direct -txt, see below)
+#   /mods     server-mod DLLs — each *.dll is --loaddll'd after d2gs.dll
+#   /wine     wine prefix (persist on a volume to skip re-init)
+#   /work     scratch: the assembled game dir + the d2gs log
+#
+# Env read by d2gs.dll:   REALMD_HOST, D2GS_GS_ADDR, D2GS_MAX_GAMES
+# Env read by this script: D2GS_EXTRA_DLLS (more --loaddll), D2GS_EXTRA_ARGS (extra
+#   Game.exe flags — e.g. "-direct -txt" to load the loose /moddata data/ tree).
+set -e
+
+export WINEPREFIX="${WINEPREFIX:-/wine}"
+export WINEDEBUG="${WINEDEBUG:--all}"
+# Truly headless: no X display, and wine's GUI bits disabled so nothing draws or pops a
+# dialog (the engine is byte-patched to never render). mscoree/mshtml are the Mono/Gecko
+# installers; winemenubuilder writes desktop menus. dbghelp=n,b loads our proxy.
+export DISPLAY=
+WINE_HEADLESS_OVERRIDES="mscoree=d;mshtml=d;winemenubuilder.exe=d"
+
+[ -f /game/Game.exe ] || { echo "FATAL: mount a D2 1.14d install at /game (no Game.exe found)"; exit 1; }
+
+# One-time wine prefix init. The overrides keep wineboot from trying to fetch/install
+# Gecko + Mono (no UI, no network).
+if [ ! -f "$WINEPREFIX/system.reg" ]; then
+  echo "initialising wine prefix at $WINEPREFIX ..."
+  WINEDLLOVERRIDES="$WINE_HEADLESS_OVERRIDES" wineboot --init >/dev/null 2>&1 || true
+  wineserver -w 2>/dev/null || true
+fi
+export WINEDLLOVERRIDES="dbghelp=n,b;$WINE_HEADLESS_OVERRIDES"
+
+# Assemble a WRITABLE game dir. D2 loads its data (MPQs; with -direct -txt also a loose
+# data/ tree) AND Game.exe's crash-handler dbghelp from the EXE's own directory — but
+# /game is a read-only pristine mount. So symlink the base install into /work/game,
+# drop our dbghelp proxy beside it, then overlay any mod data (copies win over the
+# symlinks → they replace base files / add new MPQs). This keeps /game untouched.
+GAME_DIR=/work/game
+rm -rf "$GAME_DIR"; mkdir -p "$GAME_DIR"
+for f in /game/* /game/.[!.]*; do
+  [ -e "$f" ] || continue
+  ln -sf "$f" "$GAME_DIR/$(basename "$f")"
+done
+cp -f /opt/d2gs/dbghelp.dll "$GAME_DIR/dbghelp.dll"
+if [ -d /moddata ]; then
+  echo "overlaying mod data from /moddata ..."
+  cp -a /moddata/. "$GAME_DIR/"
+fi
+cd "$GAME_DIR"   # writable cwd: d2gs log lands here; data + DLLs load from here
+
+# loaddll args: d2gs.dll FIRST (it drives the engine), then mods hook on top of it:
+#   * every *.dll mounted at /mods (alphabetical)
+#   * then each entry in $D2GS_EXTRA_DLLS (unix /path -> Z:\path; Z:\... passed through)
+set -- -w -nosound --headless --loaddll 'Z:\opt\d2gs\d2gs.dll'
+if [ -d /mods ]; then
+  for dll in /mods/*.dll; do
+    [ -e "$dll" ] || continue
+    set -- "$@" --loaddll "$(printf 'Z:%s' "$dll" | tr '/' '\\')"
+    echo "  + mod dll $dll"
+  done
+fi
+for dll in $D2GS_EXTRA_DLLS; do
+  case "$dll" in
+    /*) win=$(printf 'Z:%s' "$dll" | tr '/' '\\') ;;
+    *)  win="$dll" ;;
+  esac
+  set -- "$@" --loaddll "$win"
+  echo "  + mod dll $win"
+done
+set -- "$@" --d2gs --d2gs-boot --realm --create-games
+# Extra engine flags (e.g. -direct -txt for the loose /moddata data/ tree).
+[ -n "$D2GS_EXTRA_ARGS" ] && set -- "$@" $D2GS_EXTRA_ARGS
+
+echo "starting headless GS: realm=${REALMD_HOST:-<unset>} gs_addr=${D2GS_GS_ADDR:-<peer-ip>} max_games=${D2GS_MAX_GAMES:-100}"
+exec wine "$GAME_DIR/Game.exe" "$@"

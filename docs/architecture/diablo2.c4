@@ -1,0 +1,354 @@
+// Diablo II 1.14d architecture — the native game (reverse-engineered module graph)
+// plus the d2gs project's own parts (injected DLL + clean-room realm backend).
+//
+// View it with:  npx likec4 start docs/architecture
+// (or the LikeC4 VS Code extension)
+
+specification {
+
+  element domain {
+    style {
+      color muted
+      opacity 10%
+    }
+  }
+
+  // A statically-linked module that was originally a separate DLL pre-1.14d.
+  element module {
+    style {
+      shape rectangle
+    }
+  }
+
+  // One of our own components (Zig).
+  element component {
+    style {
+      shape rectangle
+      color green
+    }
+  }
+
+  // A separate process / binary.
+  element process {
+    style {
+      shape rectangle
+      color blue
+    }
+  }
+
+  element actor {
+    style {
+      shape person
+    }
+  }
+
+  element store {
+    style {
+      shape cylinder
+      color green
+    }
+  }
+
+  tag native
+  tag ours
+  tag foundation
+
+  // Deployment topology (k8s) — used by cloud.c4.
+  deploymentNode cluster {
+    style {
+      opacity 10%
+    }
+  }
+  deploymentNode service {
+    style {
+      shape rectangle
+      color blue
+    }
+  }
+  deploymentNode workload {
+    style {
+      shape rectangle
+      color green
+    }
+  }
+  deploymentNode pod {
+    style {
+      shape rectangle
+    }
+  }
+}
+
+model {
+
+  player = actor 'Player' {
+    description 'Runs a normal D2 client and joins a hosted game'
+  }
+
+  // ---------------------------------------------------------------------------
+  // The native Diablo II domain — the modules inside 1.14d Game.exe.
+  // In 1.14d these are statically linked into one binary; pre-1.14 they were
+  // the D2*.dll / Storm.dll / Fog.dll files. Edges = real call/data deps.
+  // ---------------------------------------------------------------------------
+  diablo2 = domain 'Diablo II (native, 1.14d Game.exe)' {
+
+    gameexe = module 'Game.exe entry' {
+      #native
+      description 'Process entry / glue that wires up the client and game subsystems'
+    }
+
+    // -- gameplay / top layer --
+    d2client = module 'D2Client' {
+      #native
+      description 'Client-side: input, HUD/UI orchestration, rendering, local sim'
+    }
+    d2game = module 'D2Game' {
+      #native
+      description 'Server-side game logic: world, AI, quests, drops (what d2gs drives)'
+    }
+
+    // -- shared mid layer --
+    d2common = module 'D2Common' {
+      #native
+      description 'Shared game data + logic: units, items, skills, inventory, DRLG, DataTbls. The base everything builds on.'
+    }
+
+    // -- subsystems --
+    d2win = module 'D2Win' {
+      #native
+      description 'UI widgets / windowing'
+    }
+    d2net = module 'D2Net' {
+      #native
+      description 'Game network layer'
+    }
+    d2sound = module 'D2Sound' {
+      #native
+      description 'Audio'
+    }
+    d2cmp = module 'D2CMP' {
+      #native
+      description 'Cel / sprite (DC6) compression'
+    }
+    d2lang = module 'D2Lang' {
+      #native
+      description 'String tables / localization'
+    }
+    d2opengl = module 'D2OpenGL' {
+      #native
+      description 'OpenGL render backend (mac path)'
+    }
+
+    // -- foundation --
+    fog = module 'Fog' {
+      #native
+      #foundation
+      description 'OS abstraction: memory pools, async, registry, file'
+    }
+    storm = module 'Storm' {
+      #native
+      #foundation
+      description 'Blizzard base lib: MPQ archives, networking, memory'
+    }
+
+    // native dependency edges (top -> bottom)
+    gameexe -> d2client 'hosts client'
+    gameexe -> d2game 'hosts game server'
+
+    d2client -> d2common 'game data/logic'
+    d2client -> d2win 'UI'
+    d2client -> d2net 'netplay'
+    d2client -> d2sound 'audio'
+    d2client -> d2cmp 'sprites'
+    d2client -> d2lang 'strings'
+    d2client -> d2opengl 'render'
+
+    d2game -> d2common 'game data/logic'
+    d2game -> d2net 'netplay'
+
+    d2win -> d2lang 'strings'
+    d2win -> d2cmp 'sprites'
+
+    d2common -> fog 'memory/file'
+    d2common -> storm 'archives'
+    d2net -> storm 'sockets'
+    d2sound -> fog
+    d2cmp -> fog
+    d2opengl -> fog
+
+    fog -> storm 'base services'
+  }
+
+  // CheckRevision.dll — separate native module, used for the version gate.
+  checkrevision = module 'CheckRevision.dll' {
+    #native
+    description '1.14d version-check DLL (CheckRevision export)'
+  }
+
+  // ---------------------------------------------------------------------------
+  // The d2gs domain — our code. A headless dedicated-server driver injected into
+  // Game.exe, plus a clean-room realm backend (pvpgn replacement).
+  // ---------------------------------------------------------------------------
+  d2gs = domain 'd2gs (our project)' {
+
+    dbghelp = component 'dbghelp.dll proxy' {
+      #ours
+      description 'DLL-search-order proxy loaded by Game.exe; LoadLibrary-injects d2gs.dll'
+    }
+
+    dll = component 'd2gs.dll' {
+      #ours
+      description 'Injected payload: boots Game.exe as a headless dedicated server'
+
+      runtime = component 'runtime (hooks)' {
+        #ours
+        description 'headless, halt_hook, gamecrashfix, checkrev_patch, gameloop, multiinstance, fastcall shims'
+      }
+      engine = component 'engine' {
+        #ours
+        description 'server.zig boots QServer; realm.zig wires GS realm callbacks (fpGetDatabaseCharacter); command.zig'
+      }
+      realmclient = component 'realm client' {
+        #ours
+        description 'In-process d2cs/d2dbs client (realm/client/*.zig): session + character DB to the backend'
+      }
+    }
+
+    realmd = process 'realmd' {
+      #ours
+      description 'Clean-room Zig pvpgn replacement — one binary, multi-instance'
+
+      bncs = component 'bncs (bnetd)' {
+        #ours
+        description 'Battle.net chat/login (BNCS)'
+      }
+      bnftp = component 'bnftp' {
+        #ours
+        description 'BNFTP MPQ / checkrev file transfer'
+      }
+      rd2cs = component 'd2cs' {
+        #ours
+        description 'Realm: char select, game create/join sessions'
+      }
+      rd2dbs = component 'd2dbs' {
+        #ours
+        description 'Character database service'
+      }
+      gslink = component 'gslink' {
+        #ours
+        description 'GS fleet registry: each GS connects out (:6115) + AUTHREQ/REPLY/SETGSINFO/ADDRINFO (self-reports <ip>:4000, gsid, maxgame). Routes CREATE to least-loaded GS, JOIN to the owning gsid; expires games on GS disconnect.'
+      }
+
+      // 12-factor app surface for k8s.
+      health = component 'health' {
+        #ours
+        description 'HTTP :8080 — /healthz liveness, /readyz readiness (store reachability + GS presence + draining)'
+      }
+      shutdown = component 'shutdown' {
+        #ours
+        description 'SIGTERM -> drain -> exit (graceful k8s termination)'
+      }
+
+      // Persistence facade (DDD, no adapters): domain ops dispatch by switch to a
+      // backend. Two independent selections — durable (chars) + ephemeral (sessions+games).
+      db = store 'store facade' {
+        #ours
+        description 'Domain ops (getCharD2s/saveCharD2s, mintSession/accountForSession, registerGame/findGame). Switch-dispatched: fs | redis | pg.'
+      }
+      store_fs = store 'fs backend' {
+        #ours
+        description 'Filesystem (default): chars/<account>/<char>.d2s + session/game records; shared dir for multi-instance'
+      }
+      store_redis = store 'redis backend' {
+        #ours
+        description 'Ephemeral sessions + games with native TTL'
+      }
+      store_pg = store 'pg backend' {
+        #ours
+        description 'Postgres: durable character saves'
+      }
+
+      rd2dbs -> db 'reads/writes'
+      rd2cs -> db 'sessions / games'
+      gslink -> db 'registerGame / findGame'
+      db -> store_fs 'durable+ephemeral (default)'
+      db -> store_redis 'ephemeral (sessions+games)'
+      db -> store_pg 'durable (chars)'
+      health -> db 'readiness probe'
+      health -> gslink 'GS presence'
+      shutdown -> gslink 'drain games'
+      gslink -> rd2cs 'announces games'
+    }
+
+    // The headless game-server fleet — gslink keeps a registry of MANY of these.
+    // Each connects OUT to gslink, self-reports <ip>:4000 + gsid + capacity.
+    gameserver = process 'd2gs game server (fleet, 1..N)' {
+      #ours
+      description 'Headless Game.exe + d2gs.dll. Connects out to gslink (:6115), ADDRINFO self-reports <ip>:4000 + gsid + maxgame; serves game traffic on :4000.'
+    }
+  }
+
+  // ---- how our parts attach to the native game ----
+  dbghelp -> dll 'LoadLibrary injects'
+  runtime -> gameexe 'patches/hooks the live process'
+  runtime -> checkrevision 'patches version gate'
+  engine -> d2game 'boots QServer + drives the tick loop'
+  engine -> d2common 'reads game/character data'
+  engine -> realmclient 'GS realm callbacks'
+
+  // ---- realm wiring (game server <-> backend) ----
+  realmclient -> rd2cs 'realm session'
+  realmclient -> rd2dbs 'fetch/store characters'
+  gslink -> dll 'drives game lifecycle'
+
+  // ---- GS fleet registration + routing ----
+  gameserver -> gslink 'connects out (:6115): AUTHREQ/REPLY/SETGSINFO/ADDRINFO'
+  gslink -> gameserver 'routes CREATE (least-loaded) / JOIN (by gsid)'
+  dll -> gameserver 'is one fleet member'
+
+  // ---- the player join flow ----
+  player -> d2client 'plays via a normal D2 client'
+  d2client -> bncs 'BNCS login'
+  d2client -> bnftp 'version/MPQ gate'
+  d2client -> rd2cs 'pick realm / join game'
+  d2client -> gameserver 'game traffic direct to <ip>:4000 (D2Net)'
+}
+
+views {
+
+  view index {
+    title 'Landscape — native D2 + d2gs'
+    include *
+    autoLayout TopBottom
+  }
+
+  // The question that started this: how the native modules layer.
+  view native of diablo2 {
+    title 'Diablo II native module dependencies'
+    include *
+    autoLayout TopBottom
+  }
+
+  // Our parts and how they hook into the native game + each other.
+  view d2gs_overview of d2gs {
+    title 'd2gs — injected server driver + realm backend'
+    include *
+    include diablo2, gameexe, d2game, d2common, checkrevision
+    autoLayout LeftRight
+  }
+
+  // End-to-end: a player getting into a hosted game (login at realmd,
+  // then game traffic direct to the chosen GS).
+  view join_flow {
+    title 'Player join flow'
+    include player, d2client, bncs, bnftp, rd2cs, rd2dbs, gslink, gameserver, dll, engine, d2game
+    autoLayout LeftRight
+  }
+
+  // The GS fleet: realmd's gslink fronts many game servers; CREATE routes to the
+  // least-loaded, JOIN to the owning gsid, and the client talks game traffic direct.
+  view gs_fleet {
+    title 'GS fleet — gslink registry + routing'
+    include player, d2client, rd2cs, gslink, gameserver, dll, db, store_fs, store_redis, store_pg, health, shutdown
+    autoLayout LeftRight
+  }
+}

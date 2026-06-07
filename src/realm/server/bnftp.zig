@@ -64,7 +64,7 @@ pub fn handle(fd: net.Socket, tag: []const u8, initial: []const u8) void {
     const from: u32 = @min(start_pos, total);
     const data = file[from..];
     if (total == 0) {
-        log.line(tag, "BNFTP '{s}' NOT FOUND (replying size 0) — drop the file in {s}/bnftp/", .{ fname, store.data_dir });
+        log.line(tag, "BNFTP '{s}' NOT FOUND (replying size 0) — drop the file in <data_dir>/bnftp/", .{fname});
     } else {
         log.line(tag, "BNFTP serving '{s}' ({d} bytes, from offset {d})", .{ fname, total, from });
     }
