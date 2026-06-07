@@ -65,7 +65,20 @@ pub fn listenTcp(bind_ip: []const u8, port: u16) !Socket {
     return fd;
 }
 
-const addrinfo = extern struct {
+// struct addrinfo — the order of ai_addr vs ai_canonname DIFFERS by OS: Linux/glibc/musl
+// put ai_addr first, BSD/darwin put ai_canonname first. Getting this wrong makes
+// `addr` alias the canonname pointer → a garbage sockaddr → connect hangs. (Bit us in
+// the static-musl container while it worked on the macOS dev box.)
+const addrinfo = if (@import("builtin").target.os.tag == .linux) extern struct {
+    flags: c_int,
+    family: c_int,
+    socktype: c_int,
+    protocol: c_int,
+    addrlen: c_uint,
+    addr: ?*posix.sockaddr.in,
+    canonname: ?[*:0]u8,
+    next: ?*addrinfo,
+} else extern struct {
     flags: c_int,
     family: c_int,
     socktype: c_int,
