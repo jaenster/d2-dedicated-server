@@ -46,6 +46,21 @@ const LOGON_H: u32 = 35;
 var account: [64]u16 = undefined;
 var password: [64]u16 = undefined;
 var game_name = [_]u16{ 'r', 'e', 'a', 'l', 'm', 't', 'e', 's', 't', 0 };
+var want_join: bool = false; // join an existing game instead of creating one
+
+/// Dump every button's rect (posX|posY<<16, sizeX|sizeY<<16) — used to discover
+/// screen coordinates (e.g. the JOIN tab) we haven't mapped yet.
+fn dumpButtons() void {
+    var c = FirstControl.*;
+    var n: usize = 0;
+    while (c) |ctrl| : (c = ctrl.pNext) {
+        if (n >= max_walk) break;
+        n += 1;
+        if (ctrl.dwType != CONTROL_BUTTON) continue;
+        log.hex("autologin: btn posXY=0x", ctrl.dwPosX | (ctrl.dwPosY << 16));
+        log.hex("autologin:     sizeXY=0x", ctrl.dwSizeX | (ctrl.dwSizeY << 16));
+    }
+}
 
 fn toUtf16(out: *[64]u16, s: []const u8) void {
     var i: usize = 0;
@@ -152,34 +167,75 @@ fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
         log.print("autologin: clicked OK (entering realm)");
     }
 
-    // 3) LOBBY -> CREATE GAME tab (533,469).
+    // 3) LOBBY — the CREATE tab (533,469) is present once the lobby is up.
     if (waitForButton(533, 469, 60)) |create_tab| {
-        clickCtrl(create_tab);
-        log.print("autologin: opened Create Game");
-        Sleep(800);
-        // 4) CREATE FORM — type a game name in the first edit-box, click CREATE.
-        var boxes: [2]*Control = undefined;
-        if (findEditboxes(&boxes) >= 1) {
-            _ = SetControlText.call(.{ boxes[0], @as([*:0]const u16, @ptrCast(&game_name)) });
-            Sleep(300);
-            log.print("autologin: typed game name");
-        }
-        // CREATE button (bottom-right of the create form).
-        if (waitForButton(432, 433, 10)) |btn| {
-            clickCtrl(btn);
-            log.print("autologin: clicked CREATE game");
-        } else if (findButton(594, 433)) |btn| {
-            clickCtrl(btn);
-            log.print("autologin: clicked CREATE game (alt)");
+        if (want_join) {
+            // JOIN an existing game. Dump the lobby buttons first so we can map the
+            // JOIN tab coords, then drive the join form.
+            log.print("autologin: lobby reached (join mode) — buttons:");
+            dumpButtons();
+            // JOIN tab sits right of the CREATE tab (533,469) at (652,469).
+            if (findButton(652, 469)) |join_tab| {
+                clickCtrl(join_tab);
+                log.print("autologin: opened Join Game");
+                Sleep(800);
+                dumpButtons(); // join form buttons
+                var boxes: [2]*Control = undefined;
+                if (findEditboxes(&boxes) >= 1) {
+                    _ = SetControlText.call(.{ boxes[0], @as([*:0]const u16, @ptrCast(&game_name)) });
+                    Sleep(300);
+                    log.print("autologin: typed game name to join");
+                }
+                // JOIN GAME action button: the wide one at (594,433) (same slot the
+                // CREATE button uses), fall back to (433,433).
+                if (findButton(594, 433) orelse findButton(433, 433)) |btn| {
+                    clickCtrl(btn);
+                    log.print("autologin: clicked JOIN game");
+                }
+            }
+        } else {
+            clickCtrl(create_tab);
+            log.print("autologin: opened Create Game");
+            Sleep(800);
+            // 4) CREATE FORM — type a game name in the first edit-box, click CREATE.
+            var boxes: [2]*Control = undefined;
+            if (findEditboxes(&boxes) >= 1) {
+                _ = SetControlText.call(.{ boxes[0], @as([*:0]const u16, @ptrCast(&game_name)) });
+                Sleep(300);
+                log.print("autologin: typed game name");
+            }
+            // CREATE button (bottom-right of the create form).
+            if (waitForButton(432, 433, 10)) |btn| {
+                clickCtrl(btn);
+                log.print("autologin: clicked CREATE game");
+            } else if (findButton(594, 433)) |btn| {
+                clickCtrl(btn);
+                log.print("autologin: clicked CREATE game (alt)");
+            }
         }
     }
     return 0;
 }
 
-/// Install the auto-login harness with the given credentials (no game patching).
-pub fn install(acct: []const u8, pass: []const u8) void {
+fn startThread(acct: []const u8, pass: []const u8) void {
     toUtf16(&account, acct);
     toUtf16(&password, pass);
     _ = CreateThread(null, 0, pollThread, null, 0, null);
-    log.print("autologin: poll thread started (driving bnet login)");
+}
+
+/// Auto-login + CREATE a game with the default name.
+pub fn install(acct: []const u8, pass: []const u8) void {
+    want_join = false;
+    startThread(acct, pass);
+    log.print("autologin: poll thread started (create)");
+}
+
+/// Auto-login + JOIN an existing game by name.
+pub fn installJoin(acct: []const u8, pass: []const u8, game: []const u8) void {
+    want_join = true;
+    var i: usize = 0;
+    while (i < game.len and i < 63) : (i += 1) game_name[i] = game[i];
+    game_name[i] = 0;
+    startThread(acct, pass);
+    log.print("autologin: poll thread started (join)");
 }

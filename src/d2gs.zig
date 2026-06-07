@@ -261,6 +261,17 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
                     if (splitNames(tmp[0..len], &acct, &pass)) {
                         autologin.install(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0));
                     }
+                } else if (flagToken("auto-join", &tmp)) |len| {
+                    // acct:pass:gamename
+                    var acct: [64]u8 = undefined;
+                    var rest: [96]u8 = undefined;
+                    if (splitNames(tmp[0..len], &acct, &rest)) {
+                        var pass: [64]u8 = undefined;
+                        var game: [64]u8 = undefined;
+                        if (splitNames(std.mem.sliceTo(&rest, 0), &pass, &game)) {
+                            autologin.installJoin(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0), std.mem.sliceTo(&game, 0));
+                        }
+                    }
                 }
             }
             if (hasFlag("test-enter")) {
