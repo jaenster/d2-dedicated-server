@@ -350,6 +350,47 @@ fn maybeStartRealmd() !?c_int {
     return pid;
 }
 
+// Verify ONE GS hosts MULTIPLE concurrent games: a single FakeGS accepts 3 creates
+// and realmd tracks all 3 against that one gsid. This is the realmd side of the
+// multi-game-per-GS model (capacity, routing, tracking); the engine actually ticking
+// N real games needs the GS under wine and is out of scope for the clientless harness.
+fn scMultiGameOneGs() Result {
+    const name = "multi_game_one_gs";
+    var gs = FakeGS{ .gsid = 0xD2D2, .ip = .{ 127, 0, 0, 1 }, .maxgame = 10, .next_gameid = 500 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("MultiGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const names3 = [_][]const u8{ "mg_one", "mg_two", "mg_three" };
+    for (names3) |gn| {
+        const cg = c.createGame(gn, "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (cg.result != 0) return fail(name, "create {s} result={d}", .{ gn, cg.result });
+    }
+    if (gs.creates != 3) return fail(name, "one GS must host 3 games, saw creates={d}", .{gs.creates});
+
+    // realmd tracks all 3 under the one gsid — confirm via the admin API.
+    var rxbuf: [4096]u8 = undefined;
+    const r = net.httpRequest(HEALTH_PORT, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "admin games {s}", .{@errorName(e)});
+    if (r.status != 200) return fail(name, "admin games status={d}", .{r.status});
+    for (names3) |gn| {
+        if (std.mem.indexOf(u8, r.body, gn) == null) return fail(name, "game {s} not in /admin/games", .{gn});
+    }
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, r.body, idx, "0xd2d2")) |p| : (idx = p + 1) count += 1;
+    if (count < 3) return fail(name, "expected 3 games on gsid 0xd2d2, found {d}", .{count});
+    return .{ .name = name, .status = .pass, .msg = msg("one GS hosts 3 games (creates={d}), all tracked under gsid 0xd2d2", .{gs.creates}) };
+}
+
 pub fn main() !void {
     const child = try maybeStartRealmd();
 
@@ -359,6 +400,7 @@ pub fn main() !void {
         scCreateJoinGame(),
         scFleetCapacity(),
         scAdminApi(),
+        scMultiGameOneGs(),
         scCreateAccountRealAuth(),
         skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
         scLobbyChatAtoB(),
