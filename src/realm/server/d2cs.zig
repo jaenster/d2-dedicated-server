@@ -136,7 +136,7 @@ fn onStartup(c: *DConn, tag: []const u8, body: []const u8) void {
 
     var namebuf: [state.max_name + 1]u8 = undefined;
     var result: u32 = 0x0a; // "unable to identify" until proven
-    if (state.global.accountFor(sid, &namebuf)) |acct| {
+    if (state.global.accountForSession(sid, &namebuf)) |acct| {
         c.session = sid;
         c.setAccount(acct);
         result = 0x00;
@@ -170,7 +170,7 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
         // Pull class + level from the .d2s (class@0x28, level@0x2b) for the
         // statstring the client renders the list from.
         var save: [1024]u8 = undefined;
-        const n = store.getChar(c.accountName(), names[i].slice(), &save);
+        const n = store.getCharD2s(c.accountName(), names[i].slice(), &save);
         const class: u8 = if (n > 0x2b) save[0x28] else 1;
         const level: u8 = if (n > 0x2b) save[0x2b] else 1;
 
@@ -258,18 +258,20 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     }
     // MVP flags: expansion (LOD), normal difficulty, softcore, non-ladder.
-    const gameid = gslink.createGame(name, pass, desc, 0, true, 0, false);
-    if (gameid == 0) {
-        log.line(tag, "create game '{s}' -> GS refused", .{name});
+    // The registry picks the least-loaded GS with capacity and gives us its address.
+    const routed = gslink.createGameRouted(name, pass, desc, 0, true, 0, false);
+    if (routed == null) {
+        log.line(tag, "create game '{s}' -> GS refused / all full", .{name});
         w.putU16(0);
         w.putU16(0);
         w.putU32(0x1e); // result: a game with that name failed
         finish(c, &w);
         return;
     }
-    _ = state.global.addGame(name, gameid, gslink.gameServerIp());
-    log.line(tag, "create game '{s}' (account={s}) -> gameid={d}", .{ name, c.accountName(), gameid });
-    w.putU16(@truncate(gameid)); // game token (client passes to the GS)
+    const rr = routed.?;
+    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid);
+    log.line(tag, "create game '{s}' (account={s}) -> gameid={d} gs=0x{x}@{d}.{d}.{d}.{d}:{d}", .{ name, c.accountName(), rr.gameid, rr.gsid, rr.ip[0], rr.ip[1], rr.ip[2], rr.ip[3], rr.port });
+    w.putU16(@truncate(rr.gameid)); // game token (client passes to the GS)
     w.putU16(0); // unknown
     w.putU32(0); // result: success
     finish(c, &w);
@@ -298,9 +300,9 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     const g = game.?;
     // The client connects to the GS directly using the IP in the game record, so
-    // we don't need a *local* GS link — any instance can serve a join. If we DO
-    // host this GS, best-effort notify it (its handler just acks).
-    if (gslink.ready()) _ = gslink.joinGame(g.gameid, g.gameid, c.charName(), c.accountName());
+    // any realmd instance can serve a join. Best-effort notify the GS that owns this
+    // game (by its fleet id) so it can prefetch the joining account's character.
+    if (g.gsid != 0) _ = gslink.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName());
     log.line(tag, "join game '{s}' (account={s}) gameid={d} gs={d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3] });
     w.putU16(@truncate(g.gameid)); // game token
     w.putU16(0); // unknown

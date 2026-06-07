@@ -8,8 +8,8 @@
 //! (fpGetDatabaseCharacter), we fetch it here and hand the bytes to the engine.
 
 const std = @import("std");
-const p = @import("protocol.zig");
-const log = @import("../log.zig");
+const p = @import("realm_shared").protocol;
+const log = @import("../../log.zig");
 
 const SOCKET = usize;
 const INVALID_SOCKET: SOCKET = ~@as(SOCKET, 0);
@@ -31,6 +31,38 @@ extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: i32, flags: i32) callc
 extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
 extern "ws2_32" fn htons(v: u16) callconv(.winapi) u16;
 extern "ws2_32" fn inet_addr(cp: [*:0]const u8) callconv(.winapi) u32;
+
+const addrinfo = extern struct {
+    flags: i32,
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+    addrlen: usize,
+    canonname: ?[*:0]u8,
+    addr: ?*sockaddr_in,
+    next: ?*addrinfo,
+};
+extern "ws2_32" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const addrinfo, res: **addrinfo) callconv(.winapi) i32;
+extern "ws2_32" fn freeaddrinfo(res: *addrinfo) callconv(.winapi) void;
+
+/// Resolve `host` (dotted-quad or DNS name) to a network-order IPv4. Null on failure.
+fn resolveHost(host: [*:0]const u8) ?u32 {
+    const direct = inet_addr(host);
+    if (direct != INADDR_NONE) return direct;
+    var hints = std.mem.zeroes(addrinfo);
+    hints.family = AF_INET;
+    hints.socktype = SOCK_STREAM;
+    var res: *addrinfo = undefined;
+    if (getaddrinfo(host, null, &hints, &res) != 0) return null;
+    defer freeaddrinfo(res);
+    var cur: ?*addrinfo = res;
+    while (cur) |a| : (cur = a.next) {
+        if (a.family == AF_INET) {
+            if (a.addr) |sa| return sa.addr;
+        }
+    }
+    return null;
+}
 
 const TYPE_SAVE: u16 = 0x30;
 const TYPE_GET: u16 = 0x31;
@@ -64,11 +96,10 @@ fn recvAll(buf: []u8) bool {
 pub fn connectTo(host: [*:0]const u8, port: u16) bool {
     var wsa: [512]u8 = undefined;
     _ = WSAStartup(0x0202, &wsa);
-    const addr = inet_addr(host);
-    if (addr == INADDR_NONE) {
-        log.print("d2dbs: bad host (dotted-quad IPv4 only)");
+    const addr = resolveHost(host) orelse {
+        log.print("d2dbs: host resolve failed");
         return false;
-    }
+    };
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) return false;
     const sa = sockaddr_in{ .family = AF_INET, .port = htons(port), .addr = addr };

@@ -1,33 +1,20 @@
-# src/realm — the game server's side of the realm link
+# `realm/` — the realm link, both ends + what they share
 
-The injected game server (`d2gs.dll`) talks to `realmd` over two outbound links.
-This directory is the **GS side** of that conversation (it is compiled into
-`d2gs.dll`, runs under wine in `Game.exe`). The realm server itself lives in
-[`../realmd`](../realmd); the engine callback table that invokes these lives in
-[`../engine`](../engine).
+The realm is what the D2 client logs into and what dispatches games to the headless
+game servers. This package holds **both sides of that link plus the contract between
+them**, so the wire format is defined once:
 
-## Files
+- **`shared/`** — the package both ends depend on (the `realm_shared` Zig module, wired
+  in `build.zig`). `protocol.zig` = the d2cs↔d2gs control wire format (8-byte LE header,
+  message `Type` enum, `AddrInfo`, …). Defining it here means the client and server agree
+  on the wire *by construction* rather than by two hand-kept copies.
+- **`client/`** — the **GS side**: the injected `d2gs.dll`'s clients of the realm —
+  `d2cs.zig` (dials the gs-link, AUTHREPLY/SETGSINFO/ADDRINFO + create/join), `d2dbs.zig`
+  (fetches/saves character data), `joinctx.zig` (token→account map for the engine's
+  character fetch). Consumed by `src/d2gs.zig` and `src/engine/realm.zig`.
+- **`server/`** — the **realm server** itself (the `realmd` binary; clean-room pvpgn
+  replacement): bnetd / d2cs / d2dbs / gs-link, the persistence facade + backends, health
+  and graceful-shutdown. See [`server/README.md`](server/README.md).
 
-- `protocol.zig` — the d2cs↔d2gs / d2dbs wire types: 8-byte LE header
-  `{size:u16, type:u16, seqno:u32}` + the AUTH/SETGSINFO/CREATEGAME/JOINGAME and
-  GET_DATA/SAVE_DATA bodies. Shared shape with `realmd/`'s view of the same link.
-- `d2cs.zig` — outbound client to realmd's **gs-link** (port 6115). Completes the
-  auth handshake (AUTHREPLY + SETGSINFO), then services CREATEGAME (drives the
-  engine to make a game on the tick thread) and JOINGAME. JOINGAME carries the
-  account+char, which it stashes in `joinctx` so the char load can find the right
-  save.
-- `d2dbs.zig` — outbound client to realmd's **d2dbs** (port 6114).
-  `fetchCharSave(account, char)` pulls the `.d2s` bytes the engine needs when a
-  client joins; `connectTo`/`disconnect` bracket a per-fetch connection.
-- `joinctx.zig` — the account bridge. The engine's dedicated-server join path
-  carries the char name + token but **never the account**, so realmd sends it over
-  the gs-link at JOINGAME time and we cache it here (keyed by char name / token).
-  `fpGetDatabaseCharacter` resolves the account from this cache and writes it back
-  into the client struct.
-
-## Why this exists
-
-In retail the realm callbacks are an opaque integration point. We implement just
-enough of the GS↔realm protocol to: register the GS, accept create/join requests,
-and fetch character saves — so a real client can actually enter a game served by
-our headless engine.
+Naming: `realmd` = the server *daemon*; `realm/client` = the GS's *link to* it;
+`engine/realm.zig` = the engine-facing realm callback table (separate concern).

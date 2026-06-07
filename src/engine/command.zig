@@ -14,7 +14,7 @@ const Kind = enum(u32) { none = 0, create_game = 1 };
 
 /// Gate for the (still-crashing) game-creation path. GAME_CreateBattleNetGame
 /// faults because the server-only boot hasn't initialized the game-data
-/// prerequisites its RollSeed/Alloc*Control read (see PVPGN.md). Off by default
+/// prerequisites its RollSeed/Alloc*Control read. Off by default
 /// so the server stays stable; `--create-games` flips it on for development.
 pub var allow_create: bool = false;
 
