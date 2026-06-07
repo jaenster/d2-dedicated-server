@@ -291,7 +291,7 @@ model {
     // client connection through to the owning GS, so GS pods stay internal.
     qqserver = process 'qqserver (game gateway)' {
       #ours
-      description 'Token/route-aware TCP splice proxy. One public :4000; routes each connection by SOURCE IP using the route map realmd writes on JOINGAME, then splices to the GS internal :4000. Reads the same store as realmd.'
+      description 'Stateless token-translation TCP proxy ("QServer-of-QServers"). One public :4000; reads the u16 token from the client GAMELOGON (0x68), looks up token -> (GS, real gameid) in the shared map realmd writes, rewrites the token to the GS gameid, and splices to the GS internal :4000. Token is realm-globally-unique (shared counter), so any front pod behind any LB IP resolves any token: fully stateless, no affinity. Write-once infra.'
     }
   }
 
@@ -314,9 +314,9 @@ model {
   dll -> gameserver 'is one fleet member'
 
   // ---- qqserver: the game-traffic gateway (separate binary) ----
-  rd2cs -> db 'records route (client-ip -> GS) on JOINGAME'
-  qqserver -> db 'looks up route by source IP'
-  qqserver -> gameserver 'splices to the owning GS (internal :4000)'
+  rd2cs -> db 'mints a unique token (shared counter); records token -> (GS, real gameid)'
+  qqserver -> db 'looks up token -> (GS, real gameid)'
+  qqserver -> gameserver 'rewrites token to the GS gameid; splices (internal :4000)'
 
   // ---- the player join flow ----
   player -> d2client 'plays via a normal D2 client'
@@ -349,11 +349,12 @@ views {
     autoLayout LeftRight
   }
 
-  // End-to-end: a player getting into a hosted game (login at realmd,
-  // then game traffic direct to the chosen GS).
+  // End-to-end: a player getting into a hosted game. Login at realmd, then ALL game
+  // traffic goes to the qqserver — the only game endpoint the client ever sees — which
+  // translates the token and splices through to the real GS behind it.
   view join_flow {
     title 'Player join flow'
-    include player, d2client, bncs, bnftp, rd2cs, rd2dbs, gslink, gameserver, dll, engine, d2game
+    include player, d2client, bncs, bnftp, rd2cs, rd2dbs, gslink, qqserver, gameserver, dll, engine, d2game, db
     autoLayout LeftRight
   }
 

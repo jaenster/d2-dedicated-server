@@ -12,13 +12,14 @@
 //! and serialise fs ops behind one spinlock — these are infrequent and it keeps the
 //! shared Io single-op-at-a-time, which is simplest and safe.
 const std = @import("std");
-const Spinlock = @import("lock.zig").Spinlock;
-const types = @import("store_types.zig");
+const Spinlock = @import("realm_infra").lock.Spinlock;
+const types = @import("realm_infra").types;
 
 const Dir = std.Io.Dir;
 const Name = types.Name;
 const GameRec = types.GameRec;
 const Route = types.Route;
+const TokenRoute = types.TokenRoute;
 
 extern "c" fn time(t: ?*c_long) c_long;
 
@@ -338,6 +339,11 @@ fn parseGame(val: []const u8) ?GameRec {
 }
 
 /// Look up the game name for an engine gameid and delete that game + its indexes.
+pub fn snapshotGames(out: []types.NamedGame) usize {
+    _ = out;
+    return 0; // TODO: enumerate the games dir for fs shared-mode /admin/games
+}
+
 pub fn removeGameById(gameid: u32) void {
     var idkey: [16]u8 = undefined;
     const ik = std.fmt.bufPrint(&idkey, "{x}", .{gameid}) catch return;
@@ -437,6 +443,53 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
     if (i != 4) return null;
     const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
     return .{ .gs_ip = ip, .gs_port = gs_port };
+}
+
+// ── token routes (ephemeral, TTL) ────────────────────────────────────────────
+// Keyed by the realm-global token (hex) → "a.b.c.d port gameid". The qqserver reads
+// the token from the client's first GAMELOGON packet, looks this up, and splices to
+// the GS — rewriting the in-packet token to `gameid` first. NAT-proof: globally unique
+// tokens never collide for two clients sharing a public IP.
+
+fn tokenRouteKey(buf: []u8, token: u16) []const u8 {
+    return std.fmt.bufPrint(buf, "{x:0>4}", .{token}) catch unreachable;
+}
+
+pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {
+    var kb: [16]u8 = undefined;
+    const key = tokenRouteKey(&kb, token);
+    var vb: [128]u8 = undefined;
+    const hlen = ttlHeader(&vb, ttl_s);
+    const body = std.fmt.bufPrint(vb[hlen..], "{d}.{d}.{d}.{d} {d} {d}", .{ gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, real_gameid }) catch return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    return writeSmall("troutes", key, vb[0 .. hlen + body.len]);
+}
+
+pub fn lookupTokenRoute(token: u16) ?TokenRoute {
+    var kb: [16]u8 = undefined;
+    const key = tokenRouteKey(&kb, token);
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var vb: [128]u8 = undefined;
+    const raw = readSmall("troutes", key, &vb) orelse return null;
+    const val = unexpiredPayload(raw) orelse {
+        deleteSmall("troutes", key);
+        return null;
+    };
+    var it = std.mem.splitScalar(u8, val, ' ');
+    const iptxt = it.next() orelse return null;
+    var ip: [4]u8 = undefined;
+    var ipit = std.mem.splitScalar(u8, iptxt, '.');
+    var i: usize = 0;
+    while (ipit.next()) |o| : (i += 1) {
+        if (i >= 4) return null;
+        ip[i] = std.fmt.parseInt(u8, o, 10) catch return null;
+    }
+    if (i != 4) return null;
+    const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
+    const gameid: u32 = if (it.next()) |t| (std.fmt.parseInt(u32, t, 10) catch return null) else return null;
+    return .{ .gs_ip = ip, .gs_port = gs_port, .gameid = gameid };
 }
 
 // ── housekeeping ─────────────────────────────────────────────────────────────

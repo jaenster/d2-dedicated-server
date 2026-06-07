@@ -10,14 +10,16 @@
 //! The common production split is durable=pg, ephemeral=redis. BNFTP assets are static
 //! files and always come from the filesystem.
 const std = @import("std");
-const fs = @import("persist_fs.zig");
-const redis = @import("persist_redis.zig");
-const pg = @import("persist_pg.zig");
-const types = @import("store_types.zig");
+const adapter = @import("realm_adapter");
+const fs = adapter.fs;
+const redis = adapter.redis;
+const pg = adapter.pg;
+const types = @import("realm_infra").types;
 
 pub const Name = types.Name;
 pub const GameRec = types.GameRec;
 pub const Route = types.Route;
+pub const TokenRoute = types.TokenRoute;
 pub const max_chars = types.max_chars;
 
 pub const Backend = enum { fs, redis, pg };
@@ -178,6 +180,18 @@ pub fn expireGamesByGs(gsid: u32) void {
     }
 }
 
+pub const NamedGame = types.NamedGame;
+
+/// Enumerate active games from the shared store (for /admin/games when shared). fs/pg are
+/// TODO; redis walks its global game index.
+pub fn snapshotGames(out: []types.NamedGame) usize {
+    return switch (ephemeral) {
+        .fs => fs.snapshotGames(out),
+        .redis => redis.snapshotGames(out),
+        .pg => pg.snapshotGames(out),
+    };
+}
+
 // ── routes (ephemeral) ───────────────────────────────────────────────────────
 // {client source IP → backend GS addr}, recorded by realmd on JOINGAME and looked
 // up by the qqserver per connection to splice game traffic to the right GS.
@@ -195,6 +209,28 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
         .fs => fs.lookupRoute(client_ip),
         .redis => redis.lookupRoute(client_ip),
         .pg => pg.lookupRoute(client_ip),
+    };
+}
+
+// ── token routes (ephemeral) ─────────────────────────────────────────────────
+// {realm-global token → backend GS addr + engine gameid}, recorded by realmd on
+// CREATE/JOIN and looked up by the qqserver from the token in the client's first
+// GAMELOGON packet. NAT-proof: the token is unique across the realm so two clients
+// behind one public IP never collide (unlike the source-IP route map above).
+
+pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {
+    return switch (ephemeral) {
+        .fs => fs.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s),
+        .redis => redis.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s),
+        .pg => pg.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s),
+    };
+}
+
+pub fn lookupTokenRoute(token: u16) ?TokenRoute {
+    return switch (ephemeral) {
+        .fs => fs.lookupTokenRoute(token),
+        .redis => redis.lookupTokenRoute(token),
+        .pg => pg.lookupTokenRoute(token),
     };
 }
 

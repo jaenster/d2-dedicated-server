@@ -21,6 +21,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/realm/shared/shared.zig"),
     });
 
+    // realm_infra — shared host-side infrastructure (net/log/config/lock/store types) for
+    // the NATIVE binaries (realmd + qqserver). Deliberately NOT given to the x86-windows
+    // DLL, so libc-socket / POSIX code never enters that build.
+    const realm_infra = b.createModule(.{
+        .root_source_file = b.path("src/realm/shared/infra.zig"),
+    });
+
     const dbghelp = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "dbghelp",
@@ -67,6 +74,19 @@ pub fn build(b: *std.Build) void {
     // target by default (dev on macOS/Linux); cross-compile for deploy with
     // `-Dtarget=x86_64-linux-musl` for a static Linux binary.
     const realmd_target = b.standardTargetOptions(.{});
+
+    // realm_adapter — the concrete persistence backends (fs/redis/pg) behind the store
+    // facade, imported by realmd. Includes the Postgres client, so the pg dependency lives
+    // here (lazy, only fetched when a step builds realmd). The qqserver does NOT use this:
+    // it talks to redis directly with its own async client, so it never pulls pg.
+    const realm_adapter = b.createModule(.{
+        .root_source_file = b.path("src/realm/adapter/adapters.zig"),
+    });
+    realm_adapter.addImport("realm_infra", realm_infra);
+    if (b.lazyDependency("pg", .{ .target = realmd_target, .optimize = optimize })) |pg_dep| {
+        realm_adapter.addImport("pg", pg_dep.module("pg"));
+    }
+
     const realmd = b.addExecutable(.{
         .name = "realmd",
         .root_module = b.createModule(.{
@@ -76,13 +96,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    // pg.zig — pure-Zig Postgres client for the optional Postgres store backend.
-    // Lazy: only fetched when a step actually builds realmd, so `zig build dlls`
-    // (the game-server image) never pulls it.
-    if (b.lazyDependency("pg", .{ .target = realmd_target, .optimize = optimize })) |pg_dep| {
-        realmd.root_module.addImport("pg", pg_dep.module("pg"));
-    }
     realmd.root_module.addImport("realm_shared", realm_shared);
+    realmd.root_module.addImport("realm_infra", realm_infra);
+    realmd.root_module.addImport("realm_adapter", realm_adapter);
     b.installArtifact(realmd);
 
     // `zig build realmd-bin` — install ONLY the realmd binary (no windows DLLs).
@@ -90,22 +106,20 @@ pub fn build(b: *std.Build) void {
     const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
     realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
 
-    // qqserver — the cloud-native game-traffic gateway: a source-IP-routed TCP splice
-    // proxy fronting the GS fleet. Same native target + store deps as realmd (it imports
-    // store.zig → persist_pg → needs the lazy "pg" module), folded into the default install.
+    // qqserver — the cloud-native game-traffic gateway: a token-translating, fully
+    // non-blocking poll() splice proxy fronting the GS fleet. ZERO heap, bare libc sockets,
+    // and its OWN async redis client (route lookups over a non-blocking redis connection in
+    // the same poll loop) — so it imports neither the adapter modules nor the pg dependency.
     const qqserver = b.addExecutable(.{
         .name = "qqserver",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/realm/server/qqserver.zig"),
+            .root_source_file = b.path("src/realm/qqserver/main.zig"),
             .target = realmd_target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    if (b.lazyDependency("pg", .{ .target = realmd_target, .optimize = optimize })) |pg_dep| {
-        qqserver.root_module.addImport("pg", pg_dep.module("pg"));
-    }
-    qqserver.root_module.addImport("realm_shared", realm_shared);
+    qqserver.root_module.addImport("realm_infra", realm_infra);
     b.installArtifact(qqserver);
 
     // `zig build qqserver` — build + install ONLY the qqserver binary.

@@ -10,8 +10,8 @@
 //!   SAVE_DATA 0x30 req:  datatype:u16, account\0, char\0, datalen:u16, <bytes>
 //!   SAVE_DATA 0x30 reply: result:u32
 const std = @import("std");
-const net = @import("net.zig");
-const log = @import("log.zig");
+const net = @import("realm_infra").net;
+const log = @import("realm_infra").log;
 const proto = @import("proto.zig");
 const store = @import("store.zig");
 
