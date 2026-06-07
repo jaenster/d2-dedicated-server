@@ -1,4 +1,6 @@
 .env
+deploy/compose.local.yaml
+deploy/compose.override.yaml
 testgame/
 zig-out/
 .zig-cache/
