@@ -11,6 +11,10 @@ pub const HOST_D2DBS: u16 = 6114;
 pub const HOST_GS: u16 = 6115;
 
 // BNCS opcodes
+const SID_ENTERCHAT = 0x0A;
+const SID_JOINCHANNEL = 0x0C;
+const SID_CHATEVENT = 0x0F;
+const SID_CHATCOMMAND = 0x0E;
 const SID_LOGONRESPONSE2 = 0x3A;
 const SID_LOGONREALMEX = 0x3E;
 const SID_AUTH_INFO = 0x50;
@@ -110,6 +114,20 @@ pub fn ctlRecv(fd: Socket, buf: []u8) !Ctl {
 fn dec14(b0: u8, b1: u8) u16 {
     return (@as(u16, b1) & 0x7F) * 128 + (@as(u16, b0) & 0x7F);
 }
+
+pub const ChatEvent = struct {
+    eid: u32,
+    username: []const u8, // slice into RealmClient.rxbuf (valid until next recv)
+    text: []const u8,
+};
+
+// SID_CHATEVENT event ids.
+pub const EID_SHOWUSER = 0x01;
+pub const EID_JOIN = 0x02;
+pub const EID_LEAVE = 0x03;
+pub const EID_WHISPER = 0x04;
+pub const EID_TALK = 0x05;
+pub const EID_CHANNEL = 0x07;
 
 pub const CharEntry = struct {
     name: []const u8, // slice into the caller's recv buffer
@@ -214,6 +232,63 @@ pub const RealmClient = struct {
         self.lo = net.rdU32(r.body, 8);
         self.hi = net.rdU32(r.body, 12);
         if (self.status != 0) return error.RealmLogonStatus;
+    }
+
+    /// SID_ENTERCHAT — announce ourselves into chat. Server replies with our
+    /// unique/account name (consumed, not validated here).
+    pub fn enterChat(self: *RealmClient) !void {
+        const fd = self.bnet.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.cstr(self.account); // username
+        w.cstr(""); // statstring
+        try bncsSend(fd, SID_ENTERCHAT, w.slice());
+        const r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_ENTERCHAT) return error.EnterChatBadId;
+    }
+
+    /// SID_JOINCHANNEL — body is u32 flags + cstr channel name.
+    pub fn joinChannel(self: *RealmClient, channel: []const u8) !void {
+        const fd = self.bnet.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(0); // flags
+        w.cstr(channel);
+        try bncsSend(fd, SID_JOINCHANNEL, w.slice());
+    }
+
+    /// SID_CHATCOMMAND — body is cstr text (channel talk or /w whisper).
+    pub fn chatCommand(self: *RealmClient, text: []const u8) !void {
+        const fd = self.bnet.?;
+        var body: [256]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.cstr(text);
+        try bncsSend(fd, SID_CHATCOMMAND, w.slice());
+    }
+
+    /// Read one SID_CHATEVENT. Body: u32 eid, u32 flags, u32 ping, u32 ip,
+    /// u32 acctNumber, u32 regAuthority, cstr username, cstr text. The username
+    /// and text are sliced into self.rxbuf (valid until the next recv).
+    pub fn readChatEvent(self: *RealmClient) !ChatEvent {
+        const fd = self.bnet.?;
+        const r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_CHATEVENT) return error.NotChatEvent;
+        const b = r.body;
+        const eid = net.rdU32(b, 0);
+        var off: usize = 24; // 6 u32s
+        const ustart = off;
+        while (off < b.len and b[off] != 0) off += 1;
+        const username = b[ustart..off];
+        off += 1; // NUL
+        const tstart = off;
+        while (off < b.len and b[off] != 0) off += 1;
+        const text = b[tstart..off];
+        return .{ .eid = eid, .username = username, .text = text };
+    }
+
+    /// Give bnet reads a deadline so a missing event fails instead of hanging.
+    pub fn setBnetTimeout(self: *RealmClient, ms: u32) void {
+        net.setRecvTimeout(self.bnet.?, ms);
     }
 
     pub fn connectD2cs(self: *RealmClient) !void {
