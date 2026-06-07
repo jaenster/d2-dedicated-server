@@ -1,0 +1,347 @@
+//! Clientless wire-protocol clients for realmd: BNCS (bnetd), MCP (d2cs),
+//! d2dbs/gs-link control framing — raw TCP, no wine/Game.exe. Ported from
+//! tools/e2e/realmclient.py; the Python encodes the exact wire formats.
+const std = @import("std");
+const net = @import("net.zig");
+const Socket = net.Socket;
+
+pub const HOST_BNET: u16 = 6112;
+pub const HOST_D2CS: u16 = 6113;
+pub const HOST_D2DBS: u16 = 6114;
+pub const HOST_GS: u16 = 6115;
+
+// BNCS opcodes
+const SID_LOGONRESPONSE2 = 0x3A;
+const SID_LOGONREALMEX = 0x3E;
+const SID_AUTH_INFO = 0x50;
+const SID_AUTH_CHECK = 0x51;
+
+// MCP opcodes
+const MCP_STARTUP = 0x01;
+const MCP_CREATEGAME = 0x03;
+const MCP_JOINGAME = 0x04;
+const MCP_CHARLIST2 = 0x19;
+
+// d2dbs opcodes
+pub const DBS_SAVE = 0x30;
+pub const DBS_GET = 0x31;
+pub const DBS_DATATYPE_CHARSAVE = 0x01;
+
+// gs-link control opcodes
+pub const GS_AUTHREQ = 0x10;
+pub const GS_AUTHREPLY = 0x11;
+pub const GS_SETGSINFO = 0x12;
+pub const GS_ADDRINFO = 0x24;
+pub const GS_CREATEGAME = 0x20;
+pub const GS_JOINGAME = 0x21;
+
+pub const CLASS_NAMES = [_][]const u8{
+    "Amazon", "Sorceress", "Necromancer", "Paladin",
+    "Barbarian", "Druid", "Assassin",
+};
+
+// --- BNCS framing: <BBH ff,id,len> + body ---
+fn bncsSend(fd: Socket, id: u8, body: []const u8) !void {
+    var hdr: [4]u8 = undefined;
+    var w = net.Writer.init(&hdr);
+    w.u8v(0xFF);
+    w.u8v(id);
+    w.u16v(@intCast(4 + body.len));
+    try net.writeAll(fd, w.slice());
+    try net.writeAll(fd, body);
+}
+
+/// Read a BNCS packet body into `buf`; returns (id, body slice into buf).
+fn bncsRecv(fd: Socket, buf: []u8) !struct { id: u8, body: []const u8 } {
+    var hdr: [4]u8 = undefined;
+    try net.readFull(fd, &hdr);
+    if (hdr[0] != 0xFF) return error.BadBncsHeader;
+    const id = hdr[1];
+    const ln = net.rdU16(&hdr, 2);
+    const blen = ln - 4;
+    try net.readFull(fd, buf[0..blen]);
+    return .{ .id = id, .body = buf[0..blen] };
+}
+
+// --- MCP framing: <HB len,id> + body ---
+fn mcpSend(fd: Socket, id: u8, body: []const u8) !void {
+    var hdr: [3]u8 = undefined;
+    var w = net.Writer.init(&hdr);
+    w.u16v(@intCast(3 + body.len));
+    w.u8v(id);
+    try net.writeAll(fd, w.slice());
+    try net.writeAll(fd, body);
+}
+
+fn mcpRecv(fd: Socket, buf: []u8) !struct { id: u8, body: []const u8 } {
+    var hdr: [3]u8 = undefined;
+    try net.readFull(fd, &hdr);
+    const ln = net.rdU16(&hdr, 0);
+    const id = hdr[2];
+    const blen = ln - 3;
+    try net.readFull(fd, buf[0..blen]);
+    return .{ .id = id, .body = buf[0..blen] };
+}
+
+// --- gs-link / d2dbs control framing: <HHI size,type,seq> + body ---
+pub fn ctlSend(fd: Socket, typ: u16, body: []const u8) !void {
+    var hdr: [8]u8 = undefined;
+    var w = net.Writer.init(&hdr);
+    w.u16v(@intCast(8 + body.len));
+    w.u16v(typ);
+    w.u32v(1); // seq
+    try net.writeAll(fd, w.slice());
+    try net.writeAll(fd, body);
+}
+
+pub const Ctl = struct { typ: u16, seq: u32, body: []const u8 };
+
+pub fn ctlRecv(fd: Socket, buf: []u8) !Ctl {
+    var hdr: [8]u8 = undefined;
+    try net.readFull(fd, &hdr);
+    const size = net.rdU16(&hdr, 0);
+    const typ = net.rdU16(&hdr, 2);
+    const seq = net.rdU32(&hdr, 4);
+    const blen = size - 8;
+    try net.readFull(fd, buf[0..blen]);
+    return .{ .typ = typ, .seq = seq, .body = buf[0..blen] };
+}
+
+fn dec14(b0: u8, b1: u8) u16 {
+    return (@as(u16, b1) & 0x7F) * 128 + (@as(u16, b0) & 0x7F);
+}
+
+pub const CharEntry = struct {
+    name: []const u8, // slice into the caller's recv buffer
+    class_id: i32 = -1,
+    level: u32 = 0,
+    flags: u16 = 0,
+};
+
+/// Decode a CHARLIST2 statstring. Layout (CharSel.cpp):
+///   [0..2) 14-bit realm count; [13] class byte (class_id=byte-1);
+///   [25] level; [26..28) 14-bit flags (0x04 = expansion).
+fn decodeStatstring(ss: []const u8, e: *CharEntry) void {
+    if (ss.len > 13) e.class_id = @as(i32, ss[13]) - 1;
+    if (ss.len > 25) e.level = ss[25];
+    if (ss.len >= 28) e.flags = dec14(ss[26], ss[27]);
+}
+
+// ---------------------------------------------------------------------------
+// RealmClient: bnetd handshake -> d2cs session
+// ---------------------------------------------------------------------------
+pub const RealmClient = struct {
+    bnet: ?Socket = null,
+    d2cs: ?Socket = null,
+    realm_name: []const u8 = "TypeGuru",
+    account: []const u8 = "",
+    server_token: u32 = 0,
+    cookie: u32 = 0,
+    status: u32 = 0,
+    lo: u32 = 0,
+    hi: u32 = 0,
+    rxbuf: [4096]u8 = undefined,
+
+    pub fn sessionId(self: *RealmClient) u64 {
+        return @as(u64, self.lo) | (@as(u64, self.hi) << 32);
+    }
+
+    pub fn connectBnet(self: *RealmClient) !void {
+        const fd = try net.connectLocal(HOST_BNET);
+        try net.writeAll(fd, &[_]u8{0x01}); // protocol selector
+        self.bnet = fd;
+    }
+
+    pub fn auth(self: *RealmClient) !void {
+        const fd = self.bnet.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(0);
+        w.u32v(0x49583836);
+        w.u32v(0x44325850);
+        w.u32v(0x0E);
+        w.zeros(20); // five u32 zeros
+        w.bytes("US\x00US\x00");
+        try bncsSend(fd, SID_AUTH_INFO, w.slice());
+
+        var r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_AUTH_INFO) return error.AuthInfoBadId;
+        const logon_type = net.rdU32(r.body, 0);
+        self.server_token = net.rdU32(r.body, 4);
+        if (logon_type != 0) return error.UnexpectedLogonType;
+
+        var cbuf: [16]u8 = undefined;
+        var cw = net.Writer.init(&cbuf);
+        cw.u32v(1);
+        cw.u32v(0);
+        cw.u32v(0);
+        cw.u32v(0);
+        // followed by "\x00i\x00o\x00"
+        var c2: [21]u8 = undefined;
+        @memcpy(c2[0..16], cw.slice());
+        @memcpy(c2[16..21], "\x00i\x00o\x00");
+        try bncsSend(fd, SID_AUTH_CHECK, &c2);
+        r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_AUTH_CHECK or net.rdU32(r.body, 0) != 0) return error.AuthCheckFailed;
+    }
+
+    pub fn login(self: *RealmClient, acct: []const u8) !void {
+        const fd = self.bnet.?;
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(1);
+        w.u32v(self.server_token);
+        w.zeros(20);
+        w.cstr(acct);
+        try bncsSend(fd, SID_LOGONRESPONSE2, w.slice());
+        const r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_LOGONRESPONSE2 or net.rdU32(r.body, 0) != 0) return error.LogonFailed;
+        self.account = acct;
+    }
+
+    pub fn enterRealm(self: *RealmClient) !void {
+        const fd = self.bnet.?;
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(1);
+        w.zeros(20);
+        w.cstr(self.realm_name);
+        try bncsSend(fd, SID_LOGONREALMEX, w.slice());
+        const r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_LOGONREALMEX) return error.RealmExBadId;
+        self.cookie = net.rdU32(r.body, 0);
+        self.status = net.rdU32(r.body, 4);
+        self.lo = net.rdU32(r.body, 8);
+        self.hi = net.rdU32(r.body, 12);
+        if (self.status != 0) return error.RealmLogonStatus;
+    }
+
+    pub fn connectD2cs(self: *RealmClient) !void {
+        const fd = try net.connectLocal(HOST_D2CS);
+        try net.writeAll(fd, &[_]u8{0x01});
+        self.d2cs = fd;
+    }
+
+    /// MCP_STARTUP -> result (0 = identified).
+    pub fn startup(self: *RealmClient) !u32 {
+        const fd = self.d2cs.?;
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(self.cookie);
+        w.u32v(self.status);
+        w.u32v(self.lo);
+        w.u32v(self.hi);
+        w.zeros(48);
+        w.cstr(self.account);
+        try mcpSend(fd, MCP_STARTUP, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_STARTUP) return error.StartupBadId;
+        return net.rdU32(r.body, 0);
+    }
+
+    /// MCP_CHARLIST2 -> total; fills `out` with up to out.len entries, returns
+    /// (total, count). Names/statstrings are sliced from `dst` (caller-owned).
+    pub fn charList(self: *RealmClient, out: []CharEntry, dst: []u8) !struct { total: u32, count: usize } {
+        const fd = self.d2cs.?;
+        var rq: [4]u8 = undefined;
+        std.mem.writeInt(u32, &rq, 64, .little);
+        try mcpSend(fd, MCP_CHARLIST2, &rq);
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_CHARLIST2) return error.CharListBadId;
+        const b = r.body;
+        const total = net.rdU32(b, 2);
+        const ret = net.rdU16(b, 6);
+        // copy body into dst so name slices outlive rxbuf reuse
+        @memcpy(dst[0..b.len], b);
+        const body = dst[0..b.len];
+        var off: usize = 8;
+        var count: usize = 0;
+        var i: usize = 0;
+        while (i < ret and count < out.len) : (i += 1) {
+            off += 4; // expiration u32
+            const nstart = off;
+            while (off < body.len and body[off] != 0) off += 1;
+            const name = body[nstart..off];
+            off += 1; // NUL
+            const sstart = off;
+            while (off < body.len and body[off] != 0) off += 1;
+            const ss = body[sstart..off];
+            off += 1;
+            var e = CharEntry{ .name = name };
+            decodeStatstring(ss, &e);
+            out[count] = e;
+            count += 1;
+        }
+        return .{ .total = total, .count = count };
+    }
+
+    /// MCP_CREATEGAME -> (token, result).
+    pub fn createGame(self: *RealmClient, name: []const u8, desc: []const u8) !struct { token: u16, result: u32 } {
+        const fd = self.d2cs.?;
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u16v(7);
+        w.u32v(0);
+        w.u8v(1);
+        w.u8v(0);
+        w.u8v(8); // max_players
+        w.cstr(name);
+        w.cstr(""); // password
+        w.cstr(desc);
+        try mcpSend(fd, MCP_CREATEGAME, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_CREATEGAME) return error.CreateGameBadId;
+        // <HHHI reqid,token,unk,result>
+        const token = net.rdU16(r.body, 2);
+        const result = net.rdU32(r.body, 6);
+        return .{ .token = token, .result = result };
+    }
+
+    /// MCP_JOINGAME -> (token, gs_ip octets, result).
+    pub fn joinGame(self: *RealmClient, name: []const u8) !struct { token: u16, ip: [4]u8, result: u32 } {
+        const fd = self.d2cs.?;
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u16v(8);
+        w.cstr(name);
+        w.cstr(""); // password
+        try mcpSend(fd, MCP_JOINGAME, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_JOINGAME) return error.JoinGameBadId;
+        // <HHHIII reqid,token,unk,ip,gh,result>
+        const token = net.rdU16(r.body, 2);
+        const ip_le = net.rdU32(r.body, 6);
+        const result = net.rdU32(r.body, 14);
+        var ip: [4]u8 = undefined;
+        std.mem.writeInt(u32, &ip, ip_le, .little);
+        return .{ .token = token, .ip = ip, .result = result };
+    }
+
+    pub fn close(self: *RealmClient) void {
+        if (self.bnet) |fd| net.closeSocket(fd);
+        if (self.d2cs) |fd| net.closeSocket(fd);
+        self.bnet = null;
+        self.d2cs = null;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// d2dbs character-save store
+// ---------------------------------------------------------------------------
+/// SAVE_DATA 0x30 -> result (0 = ok).
+pub fn d2dbsSave(acct: []const u8, char: []const u8, d2s: []const u8) !u32 {
+    const fd = try net.connectLocal(HOST_D2DBS);
+    defer net.closeSocket(fd);
+    var body: [4096]u8 = undefined;
+    var w = net.Writer.init(&body);
+    w.u16v(DBS_DATATYPE_CHARSAVE);
+    w.cstr(acct);
+    w.cstr(char);
+    w.u16v(@intCast(d2s.len));
+    w.bytes(d2s);
+    try ctlSend(fd, DBS_SAVE, w.slice());
+    var rx: [4096]u8 = undefined;
+    const c = try ctlRecv(fd, &rx);
+    if (c.typ != DBS_SAVE) return error.SaveReplyType;
+    return net.rdU32(c.body, 0);
+}
