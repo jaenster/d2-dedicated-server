@@ -25,6 +25,16 @@ const fs = @import("persist_fs.zig");
 
 const Name = types.Name;
 const GameRec = types.GameRec;
+const Route = types.Route;
+
+// Routes are tiny, high-churn and source-IP keyed — route them to the always-present
+// filesystem backend (with its TTL) rather than carry a parallel SQL table.
+pub fn recordRoute(client_ip: [4]u8, gs_ip: [4]u8, gs_port: u16, ttl_s: u32) bool {
+    return fs.recordRoute(client_ip, gs_ip, gs_port, ttl_s);
+}
+pub fn lookupRoute(client_ip: [4]u8) ?Route {
+    return fs.lookupRoute(client_ip);
+}
 
 // Accounts are durable, low-volume and simple — route them to the always-present
 // filesystem backend rather than carry a parallel SQL schema.

@@ -16,6 +16,7 @@ extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const
 extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
+extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
 extern "c" fn getpeername(fd: c_int, addr: *anyopaque, len: *c_uint) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn inet_addr(cp: [*:0]const u8) c_uint;
@@ -129,6 +130,13 @@ pub fn connectTcp(host: [:0]const u8, port: u16) !Socket {
 /// Close a socket fd (for outbound connections opened with connectTcp).
 pub fn closeSocket(fd: Socket) void {
     _ = close(fd);
+}
+
+/// Half-close both directions (SHUT_RDWR=2) so a peer's blocked read returns 0 and a
+/// pending write fails — used to unblock a splice pump without closing the fd (which
+/// could be reused under the other pump thread). Idempotent.
+pub fn shutdownSocket(fd: Socket) void {
+    _ = shutdown(fd, 2);
 }
 
 /// Accept forever; spawn a detached thread per connection running `handler`.

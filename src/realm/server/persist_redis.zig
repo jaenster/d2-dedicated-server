@@ -26,6 +26,7 @@ const fs = @import("persist_fs.zig");
 
 const Name = types.Name;
 const GameRec = types.GameRec;
+const Route = types.Route;
 
 const prefix = "realmd:";
 
@@ -475,6 +476,58 @@ pub fn expireGamesByGs(gsid: u32) void {
         _ = command(&r, &.{ "DEL", gamekey });
     }
     _ = command(&r, &.{ "DEL", gskey });
+}
+
+// ── routes (ephemeral, PX TTL) — keyed by client source IP ───────────────────
+
+fn routeKey(buf: []u8, client_ip: [4]u8) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "route:{d}.{d}.{d}.{d}", .{ client_ip[0], client_ip[1], client_ip[2], client_ip[3] }) catch unreachable;
+}
+
+pub fn recordRoute(client_ip: [4]u8, gs_ip: [4]u8, gs_port: u16, ttl_s: u32) bool {
+    var kb: [64]u8 = undefined;
+    const key = routeKey(&kb, client_ip);
+    var vb: [64]u8 = undefined;
+    const body = std.fmt.bufPrint(&vb, "{d}.{d}.{d}.{d} {d}", .{ gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port }) catch return false;
+
+    conn_lock.lock();
+    defer conn_lock.unlock();
+    var r: Reader = undefined;
+    const rep = if (ttl_s > 0) blk: {
+        var pb: [16]u8 = undefined;
+        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        break :blk command(&r, &.{ "SET", key, body, "PX", px });
+    } else command(&r, &.{ "SET", key, body });
+    return switch (rep orelse return false) {
+        .status, .bulk, .int => true,
+        .array_len, .err => false,
+    };
+}
+
+pub fn lookupRoute(client_ip: [4]u8) ?Route {
+    var kb: [64]u8 = undefined;
+    const key = routeKey(&kb, client_ip);
+
+    conn_lock.lock();
+    defer conn_lock.unlock();
+    var r: Reader = undefined;
+    const rep = command(&r, &.{ "GET", key }) orelse return null;
+    const val = switch (rep) {
+        .bulk => |b| b orelse return null,
+        else => return null,
+    };
+    var it = std.mem.splitScalar(u8, val, ' ');
+    const iptxt = it.next() orelse return null;
+    var ip: [4]u8 = undefined;
+    var ipit = std.mem.splitScalar(u8, iptxt, '.');
+    var i: usize = 0;
+    while (ipit.next()) |o| : (i += 1) {
+        if (i >= 4) return null;
+        ip[i] = std.fmt.parseInt(u8, o, 10) catch return null;
+    }
+    if (i != 4) return null;
+    const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
+    return .{ .gs_ip = ip, .gs_port = gs_port };
 }
 
 // ── housekeeping ─────────────────────────────────────────────────────────────

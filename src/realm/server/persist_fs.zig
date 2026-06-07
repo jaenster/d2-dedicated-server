@@ -18,6 +18,7 @@ const types = @import("store_types.zig");
 const Dir = std.Io.Dir;
 const Name = types.Name;
 const GameRec = types.GameRec;
+const Route = types.Route;
 
 extern "c" fn time(t: ?*c_long) c_long;
 
@@ -392,6 +393,50 @@ pub fn expireGamesByGs(gsid: u32) void {
         deleteSmall(sub, gname);
     }
     Dir.cwd().deleteDir(io, dir) catch {};
+}
+
+// ── routes (ephemeral, TTL) ──────────────────────────────────────────────────
+// Keyed by the client's source IP (hex octets) → "a.b.c.d port". The qqserver
+// looks this up by the connecting socket's peer IP to pick the backend GS.
+
+fn routeKey(buf: []u8, client_ip: [4]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ client_ip[0], client_ip[1], client_ip[2], client_ip[3] }) catch unreachable;
+}
+
+pub fn recordRoute(client_ip: [4]u8, gs_ip: [4]u8, gs_port: u16, ttl_s: u32) bool {
+    var kb: [16]u8 = undefined;
+    const key = routeKey(&kb, client_ip);
+    var vb: [128]u8 = undefined;
+    const hlen = ttlHeader(&vb, ttl_s);
+    const body = std.fmt.bufPrint(vb[hlen..], "{d}.{d}.{d}.{d} {d}", .{ gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port }) catch return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    return writeSmall("routes", key, vb[0 .. hlen + body.len]);
+}
+
+pub fn lookupRoute(client_ip: [4]u8) ?Route {
+    var kb: [16]u8 = undefined;
+    const key = routeKey(&kb, client_ip);
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var vb: [128]u8 = undefined;
+    const raw = readSmall("routes", key, &vb) orelse return null;
+    const val = unexpiredPayload(raw) orelse {
+        deleteSmall("routes", key);
+        return null;
+    };
+    var it = std.mem.splitScalar(u8, val, ' ');
+    const iptxt = it.next() orelse return null;
+    var ip: [4]u8 = undefined;
+    var ipit = std.mem.splitScalar(u8, iptxt, '.');
+    var i: usize = 0;
+    while (ipit.next()) |o| : (i += 1) {
+        if (i >= 4) return null;
+        ip[i] = std.fmt.parseInt(u8, o, 10) catch return null;
+    }
+    if (i != 4) return null;
+    const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
+    return .{ .gs_ip = ip, .gs_port = gs_port };
 }
 
 // ── housekeeping ─────────────────────────────────────────────────────────────

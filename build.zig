@@ -90,6 +90,28 @@ pub fn build(b: *std.Build) void {
     const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
     realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
 
+    // qqserver — the cloud-native game-traffic gateway: a source-IP-routed TCP splice
+    // proxy fronting the GS fleet. Same native target + store deps as realmd (it imports
+    // store.zig → persist_pg → needs the lazy "pg" module), folded into the default install.
+    const qqserver = b.addExecutable(.{
+        .name = "qqserver",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/realm/server/qqserver.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    if (b.lazyDependency("pg", .{ .target = realmd_target, .optimize = optimize })) |pg_dep| {
+        qqserver.root_module.addImport("pg", pg_dep.module("pg"));
+    }
+    qqserver.root_module.addImport("realm_shared", realm_shared);
+    b.installArtifact(qqserver);
+
+    // `zig build qqserver` — build + install ONLY the qqserver binary.
+    const qqserver_step = b.step("qqserver", "Build the qqserver game-traffic gateway");
+    qqserver_step.dependOn(&b.addInstallArtifact(qqserver, .{}).step);
+
     // e2e — clientless wire-protocol test harness (pure Zig, no wine/Game.exe).
     // Builds realmd first, then `zig build e2e` builds AND runs the harness; it
     // auto-starts its own realmd child (REALMD_BIN, health 18080) and runs the
@@ -105,6 +127,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_e2e = b.addRunArtifact(e2e);
     run_e2e.step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
+    run_e2e.step.dependOn(&b.addInstallArtifact(qqserver, .{}).step); // qqserver_routing spawns it
     const e2e_step = b.step("e2e", "Build + run the clientless realmd E2E test harness");
     e2e_step.dependOn(&run_e2e.step);
 
