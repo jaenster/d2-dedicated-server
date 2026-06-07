@@ -24,6 +24,7 @@ const halt_hook = @import("runtime/halt_hook.zig");
 const checkrev_patch = @import("runtime/checkrev_patch.zig");
 const gamecrashfix = @import("runtime/gamecrashfix.zig");
 const multiinstance = @import("runtime/multiinstance.zig");
+const joindiag = @import("runtime/joindiag.zig");
 const autoenter = @import("test/autoenter.zig");
 const autologin = @import("test/autologin.zig");
 const screenshot = @import("test/screenshot.zig");
@@ -194,6 +195,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // otherwise we run open (no D2CS), which the POC already proved listens on :4000.
     if (use_realm) {
         if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
+        joindiag.install(); // log nReason when the engine refuses a join
         realm.init(); // populate the callback table before SetupAsBnetServer
         log.print("d2gs: bootstrap (realm mode, IsBattleNetServer=1)");
         server.bootstrapRealmServer(&realm.table);
@@ -222,6 +224,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
 
     while (true) {
         command.pump(); // run queued engine commands (create game, …) on this thread
+        if (use_realm) realm.pumpDelivery(); // deliver fetched char outside the join stack
         server.tick();
         Sleep(10); // ~100 Hz; D2 logic runs at 25 fps, tune later
     }
