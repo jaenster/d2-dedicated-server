@@ -157,6 +157,11 @@ fn decodeStatstring(ss: []const u8, e: *CharEntry) void {
 pub const RealmClient = struct {
     bnet: ?Socket = null,
     d2cs: ?Socket = null,
+    // Ports default to the single-instance harness layout; the multi-instance
+    // scenario overrides these to point at a specific realmd instance.
+    bnet_port: u16 = HOST_BNET,
+    d2cs_port: u16 = HOST_D2CS,
+    d2dbs_port: u16 = HOST_D2DBS,
     realm_name: []const u8 = "TypeGuru",
     account: []const u8 = "",
     server_token: u32 = 0,
@@ -171,7 +176,7 @@ pub const RealmClient = struct {
     }
 
     pub fn connectBnet(self: *RealmClient) !void {
-        const fd = try net.connectLocal(HOST_BNET);
+        const fd = try net.connectLocal(self.bnet_port);
         try net.writeAll(fd, &[_]u8{0x01}); // protocol selector
         self.bnet = fd;
     }
@@ -333,7 +338,7 @@ pub const RealmClient = struct {
     }
 
     pub fn connectD2cs(self: *RealmClient) !void {
-        const fd = try net.connectLocal(HOST_D2CS);
+        const fd = try net.connectLocal(self.d2cs_port);
         try net.writeAll(fd, &[_]u8{0x01});
         self.d2cs = fd;
     }
