@@ -31,6 +31,10 @@ const Result = struct { name: []const u8, status: Status, msg: []const u8 };
 
 const alloc = std.heap.c_allocator;
 
+// Admin API bearer token the harness starts realmd with (REALMD_ADMIN_TOKEN).
+const ADMIN_TOKEN = "testtoken";
+const HEALTH_PORT: u16 = 18080;
+
 fn msg(comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(alloc, fmt, args) catch "(alloc failed)";
 }
@@ -238,6 +242,56 @@ fn scCreateAccountRealAuth() Result {
     return .{ .name = name, .status = .pass, .msg = msg("create=0 dup={d} good-login=0 bad-login={d}", .{ r2, r4 }) };
 }
 
+// HTTP admin API on the health port: bearer-token auth, GS fleet listing,
+// account creation that a real realm login then accepts.
+//   1. a FakeGS registers (non-empty fleet)
+//   2. GET /admin/gameservers + token -> 200, contains the FakeGS gsid
+//   3. GET /admin/gameservers WITHOUT token -> 401
+//   4. POST /admin/accounts {name,password} -> 200 created
+//   5. realm loginPw(AdminMade, pw) -> success (admin-created account works)
+//   6. GET /admin/status -> 200, gameservers >= 1
+fn scAdminApi() Result {
+    const name = "admin_api";
+    var rxbuf: [8192]u8 = undefined;
+
+    var gs = FakeGS{ .gsid = 0x5151, .ip = .{ 127, 0, 0, 1 }, .maxgame = 50, .gameid = 7 };
+    gs.start(3000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    // 2. listing with the token contains the gsid (formatted lowercase hex "0x5151").
+    const r1 = net.httpRequest(HEALTH_PORT, "GET", "/admin/gameservers", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "gameservers {s}", .{@errorName(e)});
+    if (r1.status != 200) return fail(name, "gameservers status={d} want 200", .{r1.status});
+    if (std.mem.indexOf(u8, r1.body, "0x5151") == null) return fail(name, "gameservers body missing gsid 0x5151: {s}", .{r1.body});
+
+    // 3. same request without the token -> 401.
+    var rx2: [1024]u8 = undefined;
+    const r2 = net.httpRequest(HEALTH_PORT, "GET", "/admin/gameservers", "", "", &rx2) catch |e| return fail(name, "noauth {s}", .{@errorName(e)});
+    if (r2.status != 401) return fail(name, "no-token status={d} want 401", .{r2.status});
+
+    // 4. create an account via the admin API.
+    var rx3: [1024]u8 = undefined;
+    const r3 = net.httpRequest(HEALTH_PORT, "POST", "/admin/accounts", ADMIN_TOKEN, "{\"name\":\"AdminMade\",\"password\":\"pw\"}", &rx3) catch |e| return fail(name, "create {s}", .{@errorName(e)});
+    if (r3.status != 200) return fail(name, "create status={d} body={s}", .{ r3.status, r3.body });
+
+    // 5. that account must log in over the real realm protocol.
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const lr = c.loginPwResult("AdminMade", "pw") catch |e| return fail(name, "login {s}", .{@errorName(e)});
+    if (lr != 0) return fail(name, "admin-created login result={d} want 0", .{lr});
+
+    // 6. status reflects the registered fleet.
+    var rx4: [1024]u8 = undefined;
+    const r4 = net.httpRequest(HEALTH_PORT, "GET", "/admin/status", ADMIN_TOKEN, "", &rx4) catch |e| return fail(name, "status {s}", .{@errorName(e)});
+    if (r4.status != 200) return fail(name, "status status={d} want 200", .{r4.status});
+    if (std.mem.indexOf(u8, r4.body, "\"gameservers\":0") != null) return fail(name, "status reports gameservers=0: {s}", .{r4.body});
+    if (std.mem.indexOf(u8, r4.body, "\"gameservers\"") == null) return fail(name, "status missing gameservers: {s}", .{r4.body});
+
+    return .{ .name = name, .status = .pass, .msg = msg("gameservers listed gsid=0x5151, no-token=401, account created+logged-in, status ok", .{}) };
+}
+
 fn fail(name: []const u8, comptime fmt: []const u8, args: anytype) Result {
     return .{ .name = name, .status = .fail, .msg = msg(fmt, args) };
 }
@@ -277,6 +331,7 @@ fn maybeStartRealmd() !?c_int {
     _ = mkdir(data_dir, 0o755); // ignore EEXIST; realmd creates subdirs itself
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
     _ = setenv("REALMD_HEALTH_PORT", health, 1);
+    _ = setenv("REALMD_ADMIN_TOKEN", ADMIN_TOKEN, 1); // enable the admin API (admin_api scenario)
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
 
     const pid = fork();
@@ -303,6 +358,7 @@ pub fn main() !void {
         scCharListStatstring(),
         scCreateJoinGame(),
         scFleetCapacity(),
+        scAdminApi(),
         scCreateAccountRealAuth(),
         skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
         scLobbyChatAtoB(),

@@ -146,6 +146,30 @@ pub const State = struct {
         }
     }
 
+    /// Mark a game not-in-use by name (admin close). Returns true if one was found.
+    pub fn closeGameByName(st: *State, name: []const u8) bool {
+        st.lock.lock();
+        defer st.lock.unlock();
+        for (&st.games) |*g| {
+            if (g.in_use and std.mem.eql(u8, g.name_slice(), name)) {
+                g.in_use = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Count of in-use sessions (in-memory path; admin status).
+    pub fn sessionCount(st: *State) usize {
+        st.lock.lock();
+        defer st.lock.unlock();
+        var n: usize = 0;
+        for (&st.sessions) |*s| {
+            if (s.in_use) n += 1;
+        }
+        return n;
+    }
+
     /// Expire every game hosted by a GS that just disconnected, so clients stop being
     /// routed to a dead server and creators can reuse the names.
     pub fn expireGamesByGs(st: *State, gsid: u32) void {
@@ -159,3 +183,34 @@ pub const State = struct {
 };
 
 pub var global: State = .{};
+
+/// Read-only view of one active game, for the admin API.
+pub const GameInfo = struct {
+    name: [max_name + 1]u8 = [_]u8{0} ** (max_name + 1),
+    name_len: u8 = 0,
+    gameid: u32 = 0,
+    gsid: u32 = 0,
+    ip: [4]u8 = .{ 0, 0, 0, 0 },
+    port: u16 = 0,
+
+    pub fn name_slice(g: *const GameInfo) []const u8 {
+        return g.name[0..g.name_len];
+    }
+};
+
+/// Snapshot active games into `buf` under the lock; returns the number filled.
+/// In-memory path only — shared-store enumeration is a TODO.
+pub fn snapshotGames(buf: []GameInfo) usize {
+    global.lock.lock();
+    defer global.lock.unlock();
+    var n: usize = 0;
+    for (&global.games) |*g| {
+        if (n >= buf.len) break;
+        if (!g.in_use) continue;
+        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .name_len = g.name_len };
+        @memcpy(gi.name[0..g.name_len], g.name[0..g.name_len]);
+        buf[n] = gi;
+        n += 1;
+    }
+    return n;
+}

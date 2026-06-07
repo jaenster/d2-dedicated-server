@@ -134,6 +134,36 @@ const GsRegistry = struct {
 
 pub var registry: GsRegistry = .{};
 
+/// Read-only view of one registered GS, for the admin API (does not leak the
+/// internal Gs struct — only the fields the API exposes).
+pub const GsInfo = struct { gsid: u32, ip: [4]u8, port: u16, maxgame: u32, live: u32 };
+
+/// Snapshot the registered GSes into `buf` under the registry lock; returns the
+/// number filled (capped at buf.len).
+pub fn snapshot(buf: []GsInfo) usize {
+    registry.lock.lock();
+    defer registry.lock.unlock();
+    var n: usize = 0;
+    for (&registry.entries) |*g| {
+        if (n >= buf.len) break;
+        if (!g.in_use.load(.acquire) or !g.registered.load(.acquire)) continue;
+        buf[n] = .{ .gsid = g.gsid, .ip = g.ip(), .port = g.port, .maxgame = g.maxgame, .live = g.live_games.load(.acquire) };
+        n += 1;
+    }
+    return n;
+}
+
+/// Count of registered GSes (for /admin/status).
+pub fn registeredCount() usize {
+    registry.lock.lock();
+    defer registry.lock.unlock();
+    var n: usize = 0;
+    for (&registry.entries) |*g| {
+        if (g.in_use.load(.acquire) and g.registered.load(.acquire)) n += 1;
+    }
+    return n;
+}
+
 fn isZero4(a: [4]u8) bool {
     return a[0] == 0 and a[1] == 0 and a[2] == 0 and a[3] == 0;
 }

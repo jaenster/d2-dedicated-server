@@ -14,6 +14,7 @@ const net = @import("net.zig");
 const gslink = @import("gslink.zig");
 const store = @import("store.zig");
 const shutdown = @import("shutdown.zig");
+const admin = @import("admin.zig");
 
 /// When set (REALMD_REQUIRE_GS), /readyz only goes green once ≥1 GS is registered —
 /// so the pod isn't routed client traffic before it can actually host games.
@@ -38,6 +39,12 @@ fn parsePath(req: []const u8) []const u8 {
     return rest[0..sp2];
 }
 
+/// The HTTP method (the token before the first space on the request line).
+fn parseMethod(req: []const u8) []const u8 {
+    const sp1 = std.mem.indexOfScalar(u8, req, ' ') orelse return "";
+    return req[0..sp1];
+}
+
 fn respond(fd: net.Socket, status: Status, body: []const u8) void {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status.text, body.len, body }) catch return;
@@ -55,12 +62,16 @@ fn readyReason() ?[]const u8 {
 
 pub fn handle(fd: net.Socket, tag: []const u8) void {
     _ = tag;
-    var buf: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     const n = net.readSome(fd, &buf);
     if (n == 0) return;
-    const path = parsePath(buf[0..n]);
+    const req = buf[0..n];
+    const path = parsePath(req);
 
-    if (std.mem.eql(u8, path, "/healthz")) {
+    if (std.mem.startsWith(u8, path, "/admin/")) {
+        // Admin API: token-gated, JSON. Health probes stay unauthenticated above.
+        admin.handle(fd, parseMethod(req), path, req);
+    } else if (std.mem.eql(u8, path, "/healthz")) {
         // Liveness: alive once we've started; the process answering at all is the
         // signal. We never go un-live on drain (that's readiness' job, not restart's).
         if (started.load(.acquire)) respond(fd, ok, "ok\n") else respond(fd, unavailable, "starting\n");
