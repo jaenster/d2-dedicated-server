@@ -12,7 +12,7 @@ The client verifies the download twice:
    file inside the MPQ against Blizzard's 512-bit "weak" RSA key. That key was
    publicly factored years ago; the private key is in the repo
    (`src/realmd/assets/blizzard-weak-signature.pem`) and StormLib signs with it.
-   `make_vermpq.c` packs the DLL and weak-signs the archive.
+   `make_vermpq.zig` packs the DLL and weak-signs the archive.
 
 2. **DLL Authenticode signature** — `D2FILE_VerifyFileSignature` runs a WinTrust
    Authenticode check and only accepts a signer whose org is
@@ -21,7 +21,7 @@ The client verifies the download twice:
 
 ## What's tracked vs. local
 
-Tracked (in git): `make_vermpq.c`, `build.sh`, `gen-cert.sh`, this README.
+Tracked (in git): `make_vermpq.zig`, `build.sh`, `gen-cert.sh`, this README.
 
 NOT tracked (generate locally): `blizz.key` / `blizz.crt` / `blizz.p12` — a
 **self-signed cert impersonating "Blizzard Entertainment, Inc."** Shipping a
