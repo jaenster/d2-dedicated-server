@@ -3,6 +3,7 @@
 //! tools/e2e/realmclient.py; the Python encodes the exact wire formats.
 const std = @import("std");
 const net = @import("net.zig");
+const xsha1 = @import("xsha1.zig");
 const Socket = net.Socket;
 
 pub const HOST_BNET: u16 = 6112;
@@ -16,7 +17,12 @@ const SID_JOINCHANNEL = 0x0C;
 const SID_CHATEVENT = 0x0F;
 const SID_CHATCOMMAND = 0x0E;
 const SID_LOGONRESPONSE2 = 0x3A;
+const SID_CREATEACCOUNT2 = 0x3D;
 const SID_LOGONREALMEX = 0x3E;
+
+// Fixed client token used for OLS login double-hashing (any non-zero value works;
+// the server combines it with the per-connection server_token it sent us).
+const CLIENT_TOKEN: u32 = 0xCAFEBABE;
 const SID_AUTH_INFO = 0x50;
 const SID_AUTH_CHECK = 0x51;
 
@@ -215,6 +221,41 @@ pub const RealmClient = struct {
         const r = try bncsRecv(fd, &self.rxbuf);
         if (r.id != SID_LOGONRESPONSE2 or net.rdU32(r.body, 0) != 0) return error.LogonFailed;
         self.account = acct;
+    }
+
+    /// SID_CREATEACCOUNT2 — body: u8[20] xsha1(lowercased password) + cstr name.
+    /// Returns the server's result u32 (0 = created, non-zero = name taken/invalid).
+    pub fn createAccount(self: *RealmClient, acct: []const u8, password: []const u8) !u32 {
+        const fd = self.bnet.?;
+        const pwhash = xsha1.passwordHash(password);
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.bytes(&pwhash);
+        w.cstr(acct);
+        try bncsSend(fd, SID_CREATEACCOUNT2, w.slice());
+        const r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_CREATEACCOUNT2) return error.CreateAccountBadId;
+        return net.rdU32(r.body, 0);
+    }
+
+    /// Password-aware OLS login. Sends the double-hash computed from CLIENT_TOKEN,
+    /// the server_token read during auth(), and xsha1(password). Returns the
+    /// server's result u32 (0 = success, 2 = bad password).
+    pub fn loginPwResult(self: *RealmClient, acct: []const u8, password: []const u8) !u32 {
+        const fd = self.bnet.?;
+        const dbl = xsha1.doubleHash(CLIENT_TOKEN, self.server_token, xsha1.passwordHash(password));
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(CLIENT_TOKEN);
+        w.u32v(self.server_token);
+        w.bytes(&dbl);
+        w.cstr(acct);
+        try bncsSend(fd, SID_LOGONRESPONSE2, w.slice());
+        const r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_LOGONRESPONSE2) return error.LogonBadId;
+        const result = net.rdU32(r.body, 0);
+        if (result == 0) self.account = acct;
+        return result;
     }
 
     pub fn enterRealm(self: *RealmClient) !void {

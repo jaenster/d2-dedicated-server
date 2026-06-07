@@ -18,6 +18,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn kill(pid: c_int, sig: c_int) c_int;
 extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
 extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+extern "c" fn system(cmd: [*:0]const u8) c_int;
 extern "c" var environ: [*:null]const ?[*:0]const u8;
 
 fn envOr(name: [*:0]const u8, default: [:0]const u8) [:0]const u8 {
@@ -202,6 +203,41 @@ fn scLobbyChatAtoB() Result {
     return fail(name, "no EID_TALK among first 8 events B received", .{});
 }
 
+// Real Battle.net OLS account creation + password verification (xSHA-1):
+//   1. CREATEACCOUNT2 "AuthUser"/"secret"  -> result 0 (created)
+//   2. CREATEACCOUNT2 "AuthUser" again     -> non-zero (name taken)
+//   3. login "AuthUser"/"secret"           -> 0 (success)
+//   4. login "AuthUser"/"wrongpw"          -> non-zero (rejected)
+fn scCreateAccountRealAuth() Result {
+    const name = "create_account_real_auth";
+    const acct = "AuthUser";
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+
+    const r1 = c.createAccount(acct, "secret") catch |e| return fail(name, "create1 {s}", .{@errorName(e)});
+    if (r1 != 0) return fail(name, "first create result={d}, want 0 (created)", .{r1});
+
+    const r2 = c.createAccount(acct, "secret") catch |e| return fail(name, "create2 {s}", .{@errorName(e)});
+    if (r2 == 0) return fail(name, "dup create result=0, want non-zero (name taken)", .{});
+
+    const r3 = c.loginPwResult(acct, "secret") catch |e| return fail(name, "login-good {s}", .{@errorName(e)});
+    if (r3 != 0) return fail(name, "correct-password login result={d}, want 0", .{r3});
+
+    // Fresh connection: a new per-connection server_token, but the stored hash
+    // means the wrong password must still be rejected.
+    var c2 = rc.RealmClient{};
+    defer c2.close();
+    c2.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c2.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const r4 = c2.loginPwResult(acct, "wrongpw") catch |e| return fail(name, "login-bad {s}", .{@errorName(e)});
+    if (r4 == 0) return fail(name, "wrong-password login result=0, want non-zero (rejected)", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("create=0 dup={d} good-login=0 bad-login={d}", .{ r2, r4 }) };
+}
+
 fn fail(name: []const u8, comptime fmt: []const u8, args: anytype) Result {
     return .{ .name = name, .status = .fail, .msg = msg(fmt, args) };
 }
@@ -232,6 +268,12 @@ fn maybeStartRealmd() !?c_int {
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
     const health = envOr("REALMD_HEALTH_PORT", "18080");
+    // Fresh data dir each run — accounts/chars/games persist otherwise and break
+    // isolation (e.g. a re-created account would already exist on the 2nd run).
+    var rmbuf: [512]u8 = undefined;
+    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+        _ = system(cmd.ptr);
+    } else |_| {}
     _ = mkdir(data_dir, 0o755); // ignore EEXIST; realmd creates subdirs itself
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
     _ = setenv("REALMD_HEALTH_PORT", health, 1);
@@ -261,7 +303,7 @@ pub fn main() !void {
         scCharListStatstring(),
         scCreateJoinGame(),
         scFleetCapacity(),
-        skip("create_account_real_auth", "SKIP: not implemented yet — bnetd accepts any password (no real credential verification)"),
+        scCreateAccountRealAuth(),
         skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
         scLobbyChatAtoB(),
     };
