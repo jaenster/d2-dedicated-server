@@ -222,6 +222,29 @@ pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
     return true;
 }
 
+/// List account names (one file per account under accounts/). Fills `names`,
+/// returns the count (capped at names.len).
+pub fn listAccounts(names: [][32]u8) usize {
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var dbuf: [320]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dbuf, "{s}/accounts", .{data_dir}) catch return 0;
+    var d = Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var it = d.iterate();
+    var count: usize = 0;
+    while (it.next(io) catch null) |entry| {
+        if (count >= names.len) break;
+        if (entry.kind != .file) continue;
+        if (std.mem.indexOf(u8, entry.name, ".tmp.") != null) continue; // skip atomic temps
+        if (entry.name.len == 0 or entry.name.len > 32) continue;
+        @memset(&names[count], 0);
+        @memcpy(names[count][0..entry.name.len], entry.name);
+        count += 1;
+    }
+    return count;
+}
+
 // ── sessions (ephemeral, TTL) ────────────────────────────────────────────────
 
 pub fn saveSession(id: u64, account: []const u8, ttl_s: u32) bool {

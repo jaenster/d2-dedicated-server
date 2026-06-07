@@ -18,6 +18,7 @@ const gslink = @import("gslink.zig");
 const store = @import("store.zig");
 const state = @import("state.zig");
 const health = @import("health.zig");
+const admin = @import("admin.zig");
 const shutdown = @import("shutdown.zig");
 
 fn mapBackend(b: config.Backend) store.Backend {
@@ -57,6 +58,12 @@ pub fn main() !void {
     });
     // Graceful shutdown for k8s rolling updates + readiness gating.
     health.require_gs = cfg.require_gs;
+    // Admin API (served on the health port under /admin/*). Empty token = disabled.
+    admin.token = cfg.admin_token;
+    admin.instance = cfg.instance_id;
+    admin.durable = @tagName(cfg.durable_store);
+    admin.ephemeral = @tagName(cfg.ephemeral_store);
+    if (cfg.admin_token.len > 0) log.line("realmd", "admin API enabled on health port {d}", .{cfg.health_port});
     shutdown.install(cfg.shutdown_grace_ms);
 
     // bnetd advertises the d2cs address to the client. realm_addr must be an

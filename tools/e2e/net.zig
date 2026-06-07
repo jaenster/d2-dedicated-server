@@ -113,3 +113,52 @@ pub fn rdU16(b: []const u8, off: usize) u16 {
 pub fn rdU32(b: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, b[off..][0..4], .little);
 }
+
+// --- tiny HTTP/1.1 client (for the admin API) ---
+pub const HttpResponse = struct { status: u16, body: []const u8 };
+
+/// Send a raw HTTP/1.1 request to 127.0.0.1:port and read the whole response
+/// (Connection: close). `auth_token` (if non-empty) becomes an Authorization:
+/// Bearer header; `body` (if non-empty) is sent with a Content-Length. The parsed
+/// status code and the response body (sliced into `rxbuf`) are returned.
+pub fn httpRequest(port: u16, method: []const u8, path: []const u8, auth_token: []const u8, body: []const u8, rxbuf: []u8) !HttpResponse {
+    const fd = try connectLocal(port);
+    defer _ = close(fd);
+
+    var hbuf: [1024]u8 = undefined;
+    var req = std.fmt.bufPrint(&hbuf, "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n", .{ method, path }) catch return error.RequestTooLong;
+    var w = req.len;
+    if (auth_token.len > 0) {
+        const seg = std.fmt.bufPrint(hbuf[w..], "Authorization: Bearer {s}\r\n", .{auth_token}) catch return error.RequestTooLong;
+        w += seg.len;
+    }
+    if (body.len > 0) {
+        const seg = std.fmt.bufPrint(hbuf[w..], "Content-Type: application/json\r\nContent-Length: {d}\r\n", .{body.len}) catch return error.RequestTooLong;
+        w += seg.len;
+    }
+    if (w + 2 > hbuf.len) return error.RequestTooLong;
+    hbuf[w] = '\r';
+    hbuf[w + 1] = '\n';
+    w += 2;
+    req = hbuf[0..w];
+    try writeAll(fd, req);
+    if (body.len > 0) try writeAll(fd, body);
+
+    // Read the whole response (server closes on completion).
+    var total: usize = 0;
+    while (total < rxbuf.len) {
+        const got = read(fd, rxbuf.ptr + total, rxbuf.len - total);
+        if (got <= 0) break;
+        total += @intCast(got);
+    }
+    const raw = rxbuf[0..total];
+
+    // Status line: "HTTP/1.1 NNN ..."
+    const sp1 = std.mem.indexOfScalar(u8, raw, ' ') orelse return error.BadResponse;
+    const rest = raw[sp1 + 1 ..];
+    const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    const status = std.fmt.parseInt(u16, rest[0..sp2], 10) catch return error.BadResponse;
+
+    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return .{ .status = status, .body = "" };
+    return .{ .status = status, .body = raw[sep + 4 ..] };
+}

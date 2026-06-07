@@ -106,6 +106,12 @@ pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
     };
 }
 
+/// List account names for the admin API. Accounts live on the filesystem for all
+/// backends (redis/pg route createAccount → fs), so this always reads fs.
+pub fn listAccounts(names: [][32]u8) usize {
+    return fs.listAccounts(names);
+}
+
 /// BNFTP assets (version-check MPQ etc.) are static files — always filesystem.
 pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     return fs.getBnftp(filename, out);

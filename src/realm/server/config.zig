@@ -60,6 +60,11 @@ pub const Config = struct {
     redis_addr: []const u8 = "redis:6379",
     /// libpq-style DSN for the Postgres backend.
     pg_dsn: []const u8 = "",
+
+    /// Bearer token for the HTTP admin API (served on the health port under
+    /// /admin/*). EMPTY (default) disables the admin API entirely — it returns
+    /// 403 — so it is off unless explicitly enabled via REALMD_ADMIN_TOKEN.
+    admin_token: []const u8 = "",
 };
 
 pub const Backend = enum { fs, redis, pg };
@@ -108,5 +113,6 @@ pub fn fromEnv() Config {
     if (env("REALMD_EPHEMERAL_STORE")) |v| c.ephemeral_store = parseBackend(v, c.ephemeral_store);
     if (env("REALMD_REDIS_ADDR")) |v| c.redis_addr = v;
     if (env("REALMD_PG_DSN")) |v| c.pg_dsn = v;
+    if (env("REALMD_ADMIN_TOKEN")) |v| c.admin_token = v;
     return c;
 }
