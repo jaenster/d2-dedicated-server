@@ -90,6 +90,24 @@ pub fn build(b: *std.Build) void {
     const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
     realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
 
+    // e2e — clientless wire-protocol test harness (pure Zig, no wine/Game.exe).
+    // Builds realmd first, then `zig build e2e` builds AND runs the harness; it
+    // auto-starts its own realmd child (REALMD_BIN, health 18080) and runs the
+    // named scenarios. Native host target, link_libc (libc TCP sockets).
+    const e2e = b.addExecutable(.{
+        .name = "e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/e2e/main.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_e2e = b.addRunArtifact(e2e);
+    run_e2e.step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
+    const e2e_step = b.step("e2e", "Build + run the clientless realmd E2E test harness");
+    e2e_step.dependOn(&run_e2e.step);
+
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_realmd.addArgs(args);
