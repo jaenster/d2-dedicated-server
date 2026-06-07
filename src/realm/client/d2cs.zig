@@ -6,7 +6,7 @@
 //!
 //! Status: WIP. Framing + handshake + dispatch loop are implemented; the auth
 //! constants (version/checksum) and the create/join engine wiring still need to
-//! be matched against the live PvPGN realm (see PVPGN.md).
+//! be matched against the live realm.
 
 const std = @import("std");
 const p = @import("realm_shared").protocol;
