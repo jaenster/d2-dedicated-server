@@ -9,5 +9,15 @@ testgame-min/
 # Vendored / moved-in tools — live here for convenience, not committed
 tools/ghidra2cpp/
 tools/reconstruct-ts/
-tools/vermpq/
 tools/realmd-test/
+
+# vermpq: the tool source IS tracked, but never the signing key/cert (it
+# impersonates "Blizzard Entertainment, Inc." — generate your own with
+# gen-cert.sh) or the build artifacts.
+tools/vermpq/blizz.key
+tools/vermpq/blizz.crt
+tools/vermpq/blizz.p12
+tools/vermpq/*.signed.dll
+tools/vermpq/ver-IX86-1.dll
+tools/vermpq/*.mpq
+tools/vermpq/make_vermpq
