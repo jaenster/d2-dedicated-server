@@ -167,16 +167,17 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putU16(ret); // number returned in this packet
     var i: usize = 0;
     while (i < ret) : (i += 1) {
-        // Pull class + level from the .d2s (class@0x28, level@0x2b) for the
-        // statstring the client renders the list from.
+        // Pull class@0x28, level@0x2b and the status byte@0x24 from the .d2s for
+        // the statstring the client's CharSel renders the list from.
         var save: [1024]u8 = undefined;
         const n = store.getCharD2s(c.accountName(), names[i].slice(), &save);
         const class: u8 = if (n > 0x2b) save[0x28] else 1;
         const level: u8 = if (n > 0x2b) save[0x2b] else 1;
+        const status: u8 = if (n > 0x24) save[0x24] else 0x20; // default to expansion
 
         w.putU32(0xFFFF_FFFF); // expiration — far future so it's NOT "expired"
         w.putStr(names[i].slice()); // character name
-        writeStatString(&w, class, level); // CharSel.cpp layout (no null bytes)
+        writeStatString(&w, class, level, status, @intCast(total)); // CharSel.cpp layout
         w.putU8(0); // statstring C-string terminator
     }
     finish(c, &w);
@@ -189,20 +190,25 @@ fn enc14(w: *proto.Writer, v: u32) void {
     w.putU8(@intCast(((v >> 7) & 0x7F) | 0x80));
 }
 
-// Character statstring parsed by D2Client CharSel.cpp:
-//   [0..2] realm char count, [2..13] equip slot1 (0xFF=none), [13] class
-//   (parser subtracts CLASS_SORCERESS=1), [14..25] equip slot2, [25] level,
-//   [26..28] flags, [28..30] field9, [30..33] act/fields (0xFF->0), [33..36] guild.
-// All bytes are kept non-zero so it survives as a C-string.
-fn writeStatString(w: *proto.Writer, class: u8, level: u8) void {
-    enc14(w, 1); // realm char count
+// Character statstring parsed by D2Client CharSel.cpp (SAVEFILE_ParseSaveData,
+// verified against the 1.14d client reconstruction):
+//   [0..2] realm char count (14-bit), [2..13] equip slot1 (11 bytes, 0xFF=none),
+//   [13] class (parser subtracts CLASS_SORCERESS=1), [14..25] equip slot2 (11),
+//   [25] level, [26..28] flags (14-bit; &4 = expansion), [28..30] field9 (14-bit),
+//   [30] act, [31..33] fields (0xFF->0), [33..36] guild tag (3 bytes).
+// Every byte is kept non-zero so it survives as a C-string.
+fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, realm_count: u32) void {
+    enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
     var k: usize = 0;
     while (k < 11) : (k += 1) w.putU8(0xFF); // equip slot 1 (none)
     w.putU8(class + 1); // class (CharSel subtracts CLASS_SORCERESS=1)
     k = 0;
     while (k < 11) : (k += 1) w.putU8(0xFF); // equip slot 2 (none)
     w.putU8(if (level == 0) 1 else level); // level (avoid 0)
-    enc14(w, 0x04); // character flags: expansion
+    // flags &4 = expansion — derived from the .d2s status byte (0x20) rather than
+    // hardcoded, so a classic char would render as classic.
+    const flags: u32 = if (status & 0x20 != 0) 0x04 else 0;
+    enc14(w, flags);
     enc14(w, 0); // field9
     w.putU8(0xFF); // act      (0xFF -> 0)
     w.putU8(0xFF); // field_0x32f
