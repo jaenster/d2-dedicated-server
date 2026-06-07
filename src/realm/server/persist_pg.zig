@@ -21,9 +21,22 @@ const std = @import("std");
 const pg = @import("pg");
 const Spinlock = @import("lock.zig").Spinlock;
 const types = @import("store_types.zig");
+const fs = @import("persist_fs.zig");
 
 const Name = types.Name;
 const GameRec = types.GameRec;
+
+// Accounts are durable, low-volume and simple — route them to the always-present
+// filesystem backend rather than carry a parallel SQL schema.
+pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
+    return fs.createAccount(name, pwhash);
+}
+pub fn accountExists(name: []const u8) bool {
+    return fs.accountExists(name);
+}
+pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
+    return fs.accountPwHash(name, out);
+}
 
 // ── lazy global pool ─────────────────────────────────────────────────────────
 

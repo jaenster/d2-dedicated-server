@@ -89,6 +89,12 @@ pub const Reader = struct {
     pub fn skip(r: *Reader, n: usize) void {
         _ = r.take(n);
     }
+    /// Read exactly 20 bytes (a hash); zeros on underflow (sets .bad).
+    pub fn take20(r: *Reader) *const [20]u8 {
+        const zero = &[_]u8{0} ** 20;
+        const s = r.take(20) orelse return zero;
+        return s[0..20];
+    }
     /// Read a null-terminated string (slice excludes the null; advances past it).
     pub fn getStr(r: *Reader) []const u8 {
         const start = r.pos;
