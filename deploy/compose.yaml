@@ -52,19 +52,32 @@ services:
       - "6115:6115"  # gs-link (the wine GS connects here)
       - "18080:8080" # health (8080 is often taken on the host)
 
-  # The headless wine game server needs the proprietary D2 install mounted, so it's not
-  # built/run by default here. Either run it under wine on the host (./run.sh-style,
-  # pointing --realmd at 127.0.0.1) or uncomment + mount your install:
-  #
-  # gs:
-  #   build: { context: .., dockerfile: deploy/Dockerfile, target: gs }
-  #   depends_on: { realmd: { condition: service_started } }
-  #   environment:
-  #     REALMD_HOST: realmd
-  #     D2GS_GS_ADDR: "127.0.0.1:4000"
-  #   volumes:
-  #     - /path/to/your/d2-1.14d-install:/game:ro
-  #   ports: ["4000:4000"]
+  # The headless wine game server. It needs the proprietary D2 1.14d install, so it's
+  # behind the `gs` profile (not started by a plain `up`). Point D2GS_GAME_SRC at your
+  # install (a .env in the repo root works) and run: `docker compose --profile gs up`.
+  gs:
+    profiles: ["gs"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: gs
+    depends_on:
+      realmd: { condition: service_started }
+    environment:
+      REALMD_HOST: realmd                 # dials gslink:6115 + d2dbs:6114 over the network
+      D2GS_GS_ADDR: "127.0.0.1:4000"      # what host clients dial for game traffic
+      D2GS_MAX_GAMES: "50"
+    volumes:
+      # Set D2GS_GAME_SRC to your D2 1.14d install dir (a repo-root .env works). If unset,
+      # an empty dir is mounted and the entrypoint exits with "mount a D2 install at /game".
+      - ${D2GS_GAME_SRC:-./.no-game-src-set}:/game:ro
+      - gs-wine:/wine
+      # Optional: drop server-mod DLLs in ./mods and extra data in ./moddata
+      # - ./mods:/mods:ro
+      # - ./moddata:/moddata:ro
+    ports:
+      - "4000:4000"
 
 volumes:
   realmd-data:
+  gs-wine:

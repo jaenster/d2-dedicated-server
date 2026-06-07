@@ -112,6 +112,46 @@ zig build     # -> zig-out/bin/{dbghelp.dll, d2gs.dll, ver-IX86-1.dll}  (x86-win
 
 ## Run the full stack
 
+### Quick: the cloud stack with Docker Compose
+
+The same `realmd` image and backends you'd run on Kubernetes, on one host — `realmd`
+with **Postgres** (durable char saves) + **Redis** (ephemeral sessions/games). Full
+file at [`deploy/compose.yaml`](deploy/compose.yaml) (it also has a profile-gated `gs`
+game-server service); the core is just:
+
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: realmd, POSTGRES_PASSWORD: realmd, POSTGRES_DB: realmd }
+  realmd:
+    build: { context: ., dockerfile: deploy/Dockerfile, target: realmd }
+    depends_on: [redis, postgres]
+    environment:
+      REALMD_DURABLE_STORE: pg          # character saves
+      REALMD_EPHEMERAL_STORE: redis     # sessions + games (native TTL)
+      REALMD_REDIS_ADDR: redis:6379
+      REALMD_PG_DSN: postgres://realmd:realmd@postgres:5432/realmd
+      REALMD_LOG_JSON: "1"
+    ports: ["6112:6112", "6113:6113", "6114:6114", "6115:6115", "18080:8080"]
+```
+
+```
+docker compose -f deploy/compose.yaml up --build
+curl localhost:18080/readyz        # 200 once Postgres + Redis are reachable
+
+# also run the headless game server in-compose (needs your D2 1.14d install):
+D2GS_GAME_SRC=/path/to/d2-1.14d docker compose -f deploy/compose.yaml --profile gs up --build
+```
+
+The `gs` service is profile-gated because the game files are proprietary (mount them via
+`D2GS_GAME_SRC`). For machine-specific tweaks keep a gitignored
+`deploy/compose.local.yaml` and add `-f deploy/compose.local.yaml`.
+
+### Manual (native realmd + wine GS)
+
 ```
 # 1) realm server (native; data dir holds accounts/chars/games)
 REALMD_DATA_DIR=./realmd-data ./zig-out/bin/realmd
