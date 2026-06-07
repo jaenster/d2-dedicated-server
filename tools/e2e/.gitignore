@@ -1,2 +1,2 @@
-__pycache__/
-*.pyc
+/.zig-cache/
+zig-out/
