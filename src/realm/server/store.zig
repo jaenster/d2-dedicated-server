@@ -77,6 +77,35 @@ pub fn listChars(account: []const u8, names: []Name) usize {
     };
 }
 
+// ── accounts (durable) ───────────────────────────────────────────────────────
+
+/// Create an account. `pwhash` null = password-less. Returns false if it exists.
+pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
+    return switch (durable) {
+        .fs => fs.createAccount(name, pwhash),
+        .redis => redis.createAccount(name, pwhash),
+        .pg => pg.createAccount(name, pwhash),
+    };
+}
+
+pub fn accountExists(name: []const u8) bool {
+    return switch (durable) {
+        .fs => fs.accountExists(name),
+        .redis => redis.accountExists(name),
+        .pg => pg.accountExists(name),
+    };
+}
+
+/// Whether the account has a password (filling `out` when true), null if no such
+/// account.
+pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
+    return switch (durable) {
+        .fs => fs.accountPwHash(name, out),
+        .redis => redis.accountPwHash(name, out),
+        .pg => pg.accountPwHash(name, out),
+    };
+}
+
 /// BNFTP assets (version-check MPQ etc.) are static files — always filesystem.
 pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     return fs.getBnftp(filename, out);

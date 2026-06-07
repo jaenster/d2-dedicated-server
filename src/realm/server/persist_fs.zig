@@ -180,6 +180,48 @@ pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     return out[0..n];
 }
 
+// ── accounts (durable) ───────────────────────────────────────────────────────
+// One file per account at accounts/<name>: 21 bytes = has_password(1) ++ pwhash(20).
+
+pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    // Reject if the account already exists.
+    var eb: [32]u8 = undefined;
+    if (readSmall("accounts", safe, &eb) != null) return false;
+    var rec: [21]u8 = [_]u8{0} ** 21;
+    if (pwhash) |h| {
+        rec[0] = 1;
+        @memcpy(rec[1..21], &h);
+    }
+    return writeSmall("accounts", safe, &rec);
+}
+
+pub fn accountExists(name: []const u8) bool {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var rb: [32]u8 = undefined;
+    return readSmall("accounts", safe, &rb) != null;
+}
+
+/// Returns whether the account has a password (filling `out` when true), or null
+/// if no such account exists.
+pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return null;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var rb: [32]u8 = undefined;
+    const raw = readSmall("accounts", safe, &rb) orelse return null;
+    if (raw.len < 21 or raw[0] == 0) return false;
+    @memcpy(out, raw[1..21]);
+    return true;
+}
+
 // ── sessions (ephemeral, TTL) ────────────────────────────────────────────────
 
 pub fn saveSession(id: u64, account: []const u8, ttl_s: u32) bool {

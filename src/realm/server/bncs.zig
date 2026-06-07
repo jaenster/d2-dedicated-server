@@ -2,10 +2,12 @@
 //! client logs in here, then asks for the realm list and does the realm logon
 //! handoff to d2cs.
 //!
-//! MVP policy: we are the authority and we trust the client — version/checksum
-//! (SID_AUTH_CHECK) and password (SID_LOGONRESPONSE2) are ACCEPTED unconditionally,
-//! accounts auto-create on first logon. Real verification (X-SHA-1, version MPQ)
-//! is a later hardening pass; "just works" first.
+//! Auth policy: version/checksum (SID_AUTH_CHECK) is still ACCEPTED (version MPQ
+//! verification is a later pass), but passwords are now REAL via Battle.net OLS
+//! (xSHA-1, see xsha1.zig). SID_CREATEACCOUNT2 stores xsha1(password); on
+//! SID_LOGONRESPONSE2 an unknown account auto-registers PASSWORD-LESS (back-compat
+//! for the bare-login path) and a password-protected account is verified by the
+//! OLS double-hash and rejected on mismatch.
 //!
 //! Framing: each packet is `FF <id:u8> <len:u16 LE>` where len includes the
 //! 4-byte header. The very first byte on the socket is a protocol selector
@@ -18,6 +20,8 @@ const protocol = @import("bncs_protocol.zig");
 const state = @import("state.zig");
 const bnftp = @import("bnftp.zig");
 const chat = @import("chat.zig");
+const store = @import("store.zig");
+const xsha1 = @import("xsha1.zig");
 
 // Set by main() before serving.
 pub var realm_name: []const u8 = "TypeGuru";
@@ -221,29 +225,57 @@ fn onAuthCheck(c: *Conn, tag: []const u8) void {
     finish(c, &w);
 }
 
+// SID_LOGONRESPONSE2 results.
+const LOGON_OK: u32 = 0;
+const LOGON_BAD_PASSWORD: u32 = 2;
+
 fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     c.client_token = r.getU32();
-    _ = r.getU32(); // server token echo
-    r.skip(20); // double-hashed password (not verified)
-    c.setAccount(r.getStr());
-    log.line(tag, "logon account={s} -> ok", .{c.accountName()});
+    const server_token = r.getU32(); // client echoes the token we sent
+    var got: [20]u8 = undefined;
+    @memcpy(&got, r.take20());
+    const acct = r.getStr();
+    c.setAccount(acct);
+
+    const result = logonResult(c, server_token, got);
+    log.line(tag, "logon account={s} -> result={d}", .{ acct, result });
 
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, SID_LOGONRESPONSE2);
-    w.putU32(0); // success
+    w.putU32(result);
     finish(c, &w);
+}
+
+// Apply the auto-register + verify policy. Unknown account → auto-create
+// password-less and accept; password-less account → accept; password-protected
+// account → verify the OLS double-hash, accept on match else reject.
+fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
+    const acct = c.accountName();
+    var stored: [20]u8 = undefined;
+    const has_pw = store.accountPwHash(acct, &stored) orelse {
+        // No such account → auto-register password-less and accept.
+        _ = store.createAccount(acct, null);
+        return LOGON_OK;
+    };
+    if (!has_pw) return LOGON_OK; // password-less account → accept
+    const expect = xsha1.doubleHash(c.client_token, server_token, stored);
+    return if (std.mem.eql(u8, &expect, &got)) LOGON_OK else LOGON_BAD_PASSWORD;
 }
 
 fn onCreateAccount(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
-    r.skip(20); // password hash
-    c.setAccount(r.getStr());
-    log.line(tag, "create account={s} -> ok", .{c.accountName()});
+    var pwhash: [20]u8 = undefined;
+    @memcpy(&pwhash, r.take20());
+    const acct = r.getStr();
+    c.setAccount(acct);
+
+    const created = store.createAccount(acct, pwhash);
+    log.line(tag, "create account={s} -> {s}", .{ acct, if (created) "ok" else "exists" });
 
     var buf: [64]u8 = undefined;
     var w = startPacket(&buf, SID_CREATEACCOUNT2);
-    w.putU32(0); // success
+    w.putU32(if (created) @as(u32, 0) else 1); // 0 = created, non-zero = name taken
     w.putStr(""); // name suggestion (on failure)
     finish(c, &w);
 }
