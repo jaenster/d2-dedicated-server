@@ -60,12 +60,12 @@ fn b4Intercept() callconv(.naked) void {
 }
 
 pub fn install() void {
-    if (patch.writeCall(B4_CALLSITE, @intFromPtr(&b4Intercept))) {
+    if (patch.MemoryPatch(B4_CALLSITE).call(@intFromPtr(&b4Intercept)).commit()) {
         log.print("joindiag: ConnectionRefused hook installed (logs nReason)");
     } else {
         log.print("joindiag: FAILED to hook ConnectionRefused");
     }
-    if (patch.writeCall(JOINACT_CALLSITE, @intFromPtr(&joinActIntercept))) {
+    if (patch.MemoryPatch(JOINACT_CALLSITE).call(@intFromPtr(&joinActIntercept)).commit()) {
         log.print("joindiag: SrvJoinAct hook installed (logs entry)");
     } else {
         log.print("joindiag: FAILED to hook SrvJoinAct");

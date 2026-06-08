@@ -12,8 +12,8 @@
 //! clients). A stock retail client would still Huffman-decode the verbatim bytes and get
 //! garbage. So it's a closed-ecosystem / debugging switch (readable qqserver traces, no
 //! codec-desync fragility), not something to enable against arbitrary players.
-const patch = @import("patch.zig");
-const log = @import("../log.zig");
+const patch = @import("../patch.zig");
+const log = @import("../../log.zig");
 
 const COMPRESS_ADDR: usize = 0x0040b1b0;
 const DECOMPRESS_ADDR: usize = 0x0040b260;
@@ -37,9 +37,9 @@ fn identityCodec() callconv(.naked) void {
 }
 
 /// Patch both codecs to the identity stub. Call once at process attach (GS or client).
-pub fn apply() void {
-    const ok1 = patch.writeJump(COMPRESS_ADDR, @intFromPtr(&identityCodec));
-    const ok2 = patch.writeJump(DECOMPRESS_ADDR, @intFromPtr(&identityCodec));
+pub fn install() void {
+    const ok1 = patch.MemoryPatch(COMPRESS_ADDR).jump(@intFromPtr(&identityCodec)).commit();
+    const ok2 = patch.MemoryPatch(DECOMPRESS_ADDR).jump(@intFromPtr(&identityCodec)).commit();
     if (ok1 and ok2) {
         log.print("nocompress: D2GS compress + decompress patched to identity (uncompressed wire)");
     } else {

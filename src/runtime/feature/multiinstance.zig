@@ -7,8 +7,8 @@
 //!
 //! FindWindowA is __stdcall(lpClassName, lpWindowName) — 2 args pushed before the
 //! call (8 bytes), so the stub must `ret 8` to keep the stack balanced.
-const patch = @import("patch.zig");
-const log = @import("../log.zig");
+const patch = @import("../patch.zig");
+const log = @import("../../log.zig");
 
 const FINDWINDOW_CALL: usize = 0x004F5623; // call dword [FindWindowA]
 
@@ -19,9 +19,9 @@ fn multiStub() callconv(.naked) void {
     );
 }
 
-pub fn apply() void {
-    if (patch.writeCall(FINDWINDOW_CALL, @intFromPtr(&multiStub))) {
-        _ = patch.writeNops(FINDWINDOW_CALL + 5, 1); // pad the 6-byte call site
+pub fn install() void {
+    // call our stub + 1 NOP to pad the original 6-byte call site.
+    if (patch.MemoryPatch(FINDWINDOW_CALL).call(@intFromPtr(&multiStub)).nops(1).commit()) {
         log.print("multi: single-instance check bypassed (FindWindowA -> 0)");
     } else {
         log.print("multi: FAILED to patch single-instance check");
