@@ -2,7 +2,7 @@
 //!
 //! The engine null-guards every slot before calling it (verified in
 //! NET_D2GS_SERVER_ProcessClientMessage_System @0x0052cc20 and
-//! NET_D2GS_SERVER_SrvJoinGame @0x004665... ), so an all-null table is a SAFE
+//! NET_D2GS_SERVER_SrvJoinGame @0x0052fa50 ), so an all-null table is a SAFE
 //! "realm mode on, no DB yet" state: SetupAsBnetServer sets IsBattleNetServer=1,
 //! games can't be created/joined until we implement the slots — but nothing
 //! crashes. Fill slots in one at a time as each signature is confirmed.
@@ -134,6 +134,58 @@ pub fn pumpDelivery() void {
 
 pub const getDatabaseCharShim = fastcall.Callback2(2, getDatabaseCharImpl).shim;
 
+// ── fpSaveDatabaseCharacter (slot 0x0C) ──────────────────────────────────────
+// The engine persists a player via SaveAllPlayers @0x52ca10 → SaveGameAllGameTypes
+// @0x532400 → SaveToFileBnet @0x531eb0, which calls this callback whenever the save
+// CHANGED (every ~8192 frames / 5.5 min, and on leave/disconnect). __fastcall, same
+// family as fpGetDatabaseCharacter: ECX = account-name string, EDX = &{ u16 size; .d2s
+// bytes } (size = .d2s_len + 2; the .d2s starts at EDX+2), + 2 stack (total size, the
+// client container), ret 0x8. The char name lives INSIDE the .d2s (offset 0x14, 16 bytes);
+// we extract it, validate the 0xaa55aa55 signature, and push the bytes to D2DBS (which
+// realmd persists to <data>/chars/<account>/<char>.d2s). Outbound-only — safe to run
+// synchronously on the tick thread (unlike the load, which re-enters the engine).
+// __fastcall ECX+EDX+4 stack (6 args), ret 0x10 — confirmed by disassembly + a runtime
+// arg dump. ECX=&realmId, EDX/s1=name strings, s2=&{ u16 size; .d2s }, s3=total size,
+// s4=client container. The save buffer is s2 (size = .d2s_len+2, .d2s starts at s2+2);
+// the char name is read from the .d2s (offset 0x14) and the account is resolved from the
+// join context — the same source the load used, so the save lands on the load's path.
+fn saveDatabaseCharImpl(ecx: usize, edx: usize, s1: usize, s2: usize, s3: usize, s4: usize) callconv(.c) usize {
+    _ = .{ ecx, edx, s1, s3, s4 };
+    const buf: [*]const u8 = @ptrFromInt(s2);
+    const total: usize = std.mem.readInt(u16, buf[0..2], .little);
+    if (total < 2 + 0x24) {
+        log.hex("realm: fpSaveDatabaseCharacter — save too small size=0x", total);
+        return 0;
+    }
+    const d2s = buf[2..total]; // the raw .d2s (length = total - 2)
+    const sig = std.mem.readInt(u32, d2s[0..4], .little);
+    if (sig != 0xaa55aa55) {
+        log.hex("realm: fpSaveDatabaseCharacter — bad .d2s signature 0x", sig);
+        return 0;
+    }
+    const char_name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&d2s[0x14])), 0);
+    const account = joinctx.accountForChar(char_name) orelse char_name;
+
+    log.print("realm: fpSaveDatabaseCharacter — persisting char");
+    log.cstr("realm:   char=", @intFromPtr(&d2s[0x14]));
+    log.hex("realm:   bytes=0x", d2s.len);
+
+    if (!dbs_ready) {
+        log.print("realm:   no d2dbs source — save dropped");
+        return 1;
+    }
+    if (d2dbs.connectTo(dbs_host, dbs_port)) {
+        const ok = d2dbs.saveCharSave(account, char_name, d2s);
+        d2dbs.disconnect();
+        log.print(if (ok) "realm:   char saved to d2dbs" else "realm:   d2dbs save FAILED");
+    } else {
+        log.print("realm:   d2dbs connect failed — save dropped");
+    }
+    return 1;
+}
+
+pub const saveDatabaseCharShim = fastcall.Callback2(4, saveDatabaseCharImpl).shim;
+
 // ── fpLeaveGame (slot 0x04) ──────────────────────────────────────────────────
 // Called from CleanUpClient when a client leaves/disconnects. The engine
 // IsBadCodePtr-checks it (a null pointer reads as a bad code pointer and HALTS),
@@ -164,6 +216,7 @@ fn getFileTimeStub() callconv(.naked) void {
 /// bootstrapRealmServer). Wires the char loader + token validation + leave.
 pub fn init() void {
     table.fpGetDatabaseCharacter = @ptrCast(&getDatabaseCharShim);
+    table.fpSaveDatabaseCharacter = @ptrCast(&saveDatabaseCharShim);
     table.fpLeaveGame = @ptrCast(&leaveGameStub);
     table.fpGetDatabaseFileTime = @ptrCast(&getFileTimeStub);
     enableTokenValidation(); // register fpFindPlayerToken (engine IsBadCodePtr-checks it)

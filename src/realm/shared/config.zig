@@ -19,6 +19,9 @@ pub const Config = struct {
     /// Realm advertised to clients (what bnetd hands back as the realm address).
     realm_name: []const u8 = "TypeGuru",
     realm_addr: []const u8 = "127.0.0.1",
+    /// Comma-separated account names granted Battle.net-admin + channel-operator flags
+    /// in chat (the realm's ops). Case-insensitive. Empty = no admins.
+    admins: []const u8 = "",
 
     /// Port the game server (our injected d2gs) connects to for the control
     /// link (its own port so we never confuse it with a client MCP connection).
@@ -110,6 +113,7 @@ pub fn fromEnv() Config {
     if (env("REALMD_ROUTE_TTL_S")) |v| c.route_ttl_s = std.fmt.parseInt(u32, v, 10) catch c.route_ttl_s;
     c.qq_port = envPort("REALMD_QQ_PORT", c.qq_port);
     if (env("REALMD_REALM_NAME")) |v| c.realm_name = v;
+    if (env("REALMD_ADMINS")) |v| c.admins = v;
     if (env("REALMD_REALM_ADDR")) |v| c.realm_addr = v;
     if (env("REALMD_DATA_DIR")) |v| c.data_dir = v;
     if (env("REALMD_SHARED")) |_| c.shared = true;

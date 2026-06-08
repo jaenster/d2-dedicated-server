@@ -36,7 +36,7 @@ deployment {
       description 'The one public :4000 for game traffic'
     }
     workload qqserver_deploy 'qqserver Deployment' {
-      description '1..N stateless gateway pods; route by source IP, splice to the GS'
+      description '1..N STATELESS gateway pods; read the u16 token, look up token -> GS in redis, rewrite to the GS gameid, splice. Any pod behind any LB IP resolves any token (no affinity).'
       instanceOf d2gs.qqserver
     }
 
@@ -70,8 +70,9 @@ deployment {
   lb_player -> realmd_lb 'login/realm (:6112-6115)'
   realmd_lb -> realmd_deploy 'to ready pods'
 
-  // realmd -> backing stores (writes the route map into redis on JOINGAME).
-  realmd_deploy -> redis_svc 'ephemeral (sessions+games+routes)'
+  // realmd -> backing stores. Mints unique tokens via a shared redis counter and
+  // writes the token -> GS map there; the qqservers read it. PG = durable chars.
+  realmd_deploy -> redis_svc 'ephemeral (sessions+games); shared token counter + token->GS map'
   realmd_deploy -> pg_svc 'durable (chars)'
 
   // GS pods register OUT to realmd's gslink (:6115); realmd routes create/join.
@@ -80,11 +81,11 @@ deployment {
 
   // The player talks game traffic to the qqserver LB; the gateway looks up the
   // route by source IP and splices to the owning internal GS pod.
-  lb_player -> qqserver_lb 'game traffic (:4000)'
-  qqserver_lb -> qqserver_deploy 'to gateway pods'
-  qqserver_deploy -> redis_svc 'lookup route by source IP'
-  qqserver_deploy -> gs_pod_a 'splice to owning GS (internal :4000)'
-  qqserver_deploy -> gs_pod_b 'splice to owning GS (internal :4000)'
+  lb_player -> qqserver_lb 'game traffic (:4000) — any LB IP, token is universal'
+  qqserver_lb -> qqserver_deploy 'to any gateway pod (stateless)'
+  qqserver_deploy -> redis_svc 'lookup token -> (GS, real gameid)'
+  qqserver_deploy -> gs_pod_a 'rewrite token; splice (internal :4000)'
+  qqserver_deploy -> gs_pod_b 'rewrite token; splice (internal :4000)'
 }
 
 views {

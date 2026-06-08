@@ -11,7 +11,7 @@
 //!   POST /admin/accounts     {"name","password"} -> create account
 //!   POST /admin/games/close  {"name"} (or ?name=) -> expire a game
 const std = @import("std");
-const net = @import("net.zig");
+const net = @import("realm_infra").net;
 const gslink = @import("gslink.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");

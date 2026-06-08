@@ -134,17 +134,20 @@ fn scCreateJoinGame() Result {
     c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
+    // Tokens are now realm-global minted values (NOT the GS gameid) — the qqserver
+    // translates them back to the gameid. So assert non-zero + uniqueness, not == 42.
     const cg = c.createGame("mygame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
-    if (cg.token != 42) return fail(name, "create token={d} want 42", .{cg.token});
+    if (cg.token == 0) return fail(name, "create token=0 (expected a minted token)", .{});
 
     const jg = c.joinGame("mygame") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
-    if (jg.token != 42) return fail(name, "join token={d} want 42", .{jg.token});
+    if (jg.token == 0) return fail(name, "join token=0 (expected a minted token)", .{});
+    if (jg.token == cg.token) return fail(name, "join token={d} same as create token (tokens must be unique)", .{jg.token});
     if (!(jg.ip[0] == 127 and jg.ip[1] == 0 and jg.ip[2] == 0 and jg.ip[3] == 1))
         return fail(name, "join gs_ip={d}.{d}.{d}.{d} want 127.0.0.1", .{ jg.ip[0], jg.ip[1], jg.ip[2], jg.ip[3] });
     if (gs.creates != 1 or gs.joins != 1) return fail(name, "FakeGS saw creates={d} joins={d}, want 1/1", .{ gs.creates, gs.joins });
-    return .{ .name = name, .status = .pass, .msg = msg("create+join ok token={d} gs_ip=127.0.0.1 (creates={d} joins={d})", .{ cg.token, gs.creates, gs.joins }) };
+    return .{ .name = name, .status = .pass, .msg = msg("create+join ok create-token={d} join-token={d} gs_ip=127.0.0.1 (creates={d} joins={d})", .{ cg.token, jg.token, gs.creates, gs.joins }) };
 }
 
 fn scFleetCapacity() Result {
@@ -348,6 +351,32 @@ fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
 
 /// fork+execve realmd with REALMD_DATA_DIR/REALMD_HEALTH_PORT set in our env
 /// (inherited by the child). Returns the child pid, or null on existing realmd.
+// The realm runs ephemeral state (sessions + games + token routes) in redis, and the
+// qqserver reads token routes from it asynchronously — so the harness brings up a real
+// redis in docker, points realmd + qqserver at it, and flushes it for a clean slate.
+const REDIS_HOST_PORT: u16 = 6399;
+
+fn startRedis() void {
+    _ = system("docker rm -f e2e-redis >/dev/null 2>&1"); // clear any stale container
+    if (system("docker run -d --rm --name e2e-redis -p 6399:6379 redis:7-alpine >/dev/null 2>&1") != 0) {
+        std.debug.print("ERROR: could not start redis container (docker is required for ephemeral=redis).\n", .{});
+        std.process.exit(2);
+    }
+    if (!waitPort(REDIS_HOST_PORT, 10_000)) {
+        std.debug.print("ERROR: redis container did not come up on :{d}\n", .{REDIS_HOST_PORT});
+        _ = system("docker rm -f e2e-redis >/dev/null 2>&1");
+        std.process.exit(2);
+    }
+    _ = system("docker exec e2e-redis redis-cli FLUSHALL >/dev/null 2>&1"); // clean slate
+    _ = setenv("REALMD_EPHEMERAL_STORE", "redis", 1);
+    _ = setenv("REALMD_REDIS_ADDR", "127.0.0.1:6399", 1);
+    std.debug.print("started redis container e2e-redis on :{d} (ephemeral=redis)\n", .{REDIS_HOST_PORT});
+}
+
+fn stopRedis() void {
+    _ = system("docker rm -f e2e-redis >/dev/null 2>&1");
+}
+
 fn maybeStartRealmd() !?c_int {
     if (net.portOpen(rc.HOST_BNET)) {
         std.debug.print("using existing realmd on 127.0.0.1:{d}\n", .{rc.HOST_BNET});
@@ -557,9 +586,14 @@ const EchoServer = struct {
             const n = c_read(cfd, &buf, buf.len);
             if (n <= 0) return;
             const un: usize = @intCast(n);
-            if (@atomicLoad(usize, &self.got_len, .seq_cst) == 0) {
-                @memcpy(self.got[0..un], buf[0..un]);
-                @atomicStore(usize, &self.got_len, un, .seq_cst);
+            // Accumulate the captured payload (across short reads) so a fragmented first
+            // packet still lands fully in `got` for the scenario's byte assertions.
+            const cur = @atomicLoad(usize, &self.got_len, .seq_cst);
+            if (cur < self.got.len) {
+                const room = self.got.len - cur;
+                const take = @min(un, room);
+                @memcpy(self.got[cur..][0..take], buf[0..take]);
+                @atomicStore(usize, &self.got_len, cur + take, .seq_cst);
             }
             _ = c_write(cfd, &buf, un); // echo back
         }
@@ -577,10 +611,10 @@ const EchoServer = struct {
     }
 };
 
-/// fork+execve the qqserver binary (REALMD_QQSERVER_BIN, default ./zig-out/bin/qqserver)
-/// sharing the harness realmd's REALMD_DATA_DIR (so it reads the same fs route store) and
-/// listening on REALMD_QQ_PORT. Waits up to 10s for the port; exits the harness if it
-/// never comes up. Mirrors spawnRealmd.
+/// fork+execve the qqserver binary (REALMD_QQSERVER_BIN, default ./zig-out/bin/qqserver).
+/// It reads token routes from redis (REALMD_REDIS_ADDR, inherited from startRedis) — the
+/// same redis realmd writes them to — and listens on REALMD_QQ_PORT. Waits up to 10s for
+/// the port; exits the harness if it never comes up. Mirrors spawnRealmd.
 fn spawnQqserver(qq_port: u16) !c_int {
     const bin = envOr("REALMD_QQSERVER_BIN", "./zig-out/bin/qqserver");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
@@ -603,22 +637,32 @@ fn spawnQqserver(qq_port: u16) !c_int {
     return pid;
 }
 
-// Prove the full gateway path: realmd records a route on JOINGAME and the qqserver
-// splices the client's game connection to the right backend by source IP.
-//   1. an echo server stands in for the backend GS game port (ephemeral port P)
-//   2. a FakeGS registers with ip=127.0.0.1 / gs_port=P, so the game record points at P
-//   3. a client create+joins from 127.0.0.1 — realmd recordRoute(127.0.0.1 -> 127.0.0.1:P)
-//   4. spawn the qqserver on :14000 sharing the same fs data dir
-//   5. connect to :14000, send "PING-QQ" — assert the echo server got it AND it comes back
-fn scQqserverRouting() Result {
-    const name = "qqserver_routing";
+// Token-offset of the u16 game token in the crafted GAMELOGON (0x68), matching the
+// qqserver's TOKEN_OFFSET: nId(u8) ++ nGameHash(u32) ++ nGameToken(u16) → byte 5.
+const QQ_TOKEN_OFFSET: usize = 5;
+
+// Prove the NAT-proof gateway path: realmd mints a globally-unique token on JOIN and the
+// qqserver translates it — rewriting the in-packet token to the GS's real gameid — then
+// splices the client's game connection to the right backend.
+//   1. an echo server stands in for the backend GS game port (ephemeral port P), and
+//      captures the first packet it receives so we can assert the rewritten token.
+//   2. a FakeGS registers with ip=127.0.0.1 / gs_port=P and a known gameid=3.
+//   3. a client create+joins — realmd records {token T -> 127.0.0.1:P, gameid 3} and
+//      returns T in the join reply.
+//   4. spawn the qqserver on :14000, pointed at the same redis realmd wrote the route to.
+//   5. connect to :14000 and send a crafted GAMELOGON: buf[0]=0x68, token T at offset 5,
+//      tail "PAYLOAD". Assert the echo server received byte[0]==0x68, the u16 at offset 5
+//      == 3 (the GS gameid — proves the rewrite), and the tail matches (proves splice).
+fn scQqserverTokenTranslate() Result {
+    const name = "qqserver_token_translate";
     const QQ_PORT: u16 = 14000;
+    const GS_GAMEID: u32 = 3;
 
     var echo = EchoServer{};
     echo.start() catch |e| return fail(name, "echo start {s}", .{@errorName(e)});
     defer echo.stop();
 
-    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gs_port = echo.port, .maxgame = 10, .gameid = 77 };
+    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gs_port = echo.port, .maxgame = 10, .gameid = GS_GAMEID };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
     if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
@@ -634,9 +678,11 @@ fn scQqserverRouting() Result {
 
     const cg = c.createGame("qqgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
-    // The join records the route {127.0.0.1 -> 127.0.0.1:echo.port}.
+    // The join mints a unique token and records {token -> 127.0.0.1:echo.port, gameid 3}.
     const jg = c.joinGame("qqgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
+    const token = jg.token; // realm-global token the qqserver will translate
+    if (token == 0) return fail(name, "join returned token=0 (expected a minted token)", .{});
 
     const qq_pid = spawnQqserver(QQ_PORT) catch |e| return fail(name, "spawn qqserver {s}", .{@errorName(e)});
     defer {
@@ -644,25 +690,41 @@ fn scQqserverRouting() Result {
         _ = waitpid(qq_pid, null, 0);
     }
 
-    // Connect to the qqserver as the client's game traffic; it routes by our source IP.
+    // Craft a GAMELOGON: id 0x68, gameHash u32, the minted token at offset 5, tail PAYLOAD.
+    const tail = "PAYLOAD";
+    var logon: [QQ_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
+    @memset(&logon, 0);
+    logon[0] = 0x68;
+    std.mem.writeInt(u16, logon[QQ_TOKEN_OFFSET..][0..2], token, .little);
+    @memcpy(logon[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
+
     const fd = net.connectLocal(QQ_PORT) catch |e| return fail(name, "connect qq {s}", .{@errorName(e)});
     defer net.closeSocket(fd);
-    net.writeAll(fd, "PING-QQ") catch |e| return fail(name, "send {s}", .{@errorName(e)});
+    net.writeAll(fd, &logon) catch |e| return fail(name, "send {s}", .{@errorName(e)});
 
-    var back: [16]u8 = undefined;
-    net.readFull(fd, back[0..7]) catch |e| return fail(name, "no echo back through qq ({s})", .{@errorName(e)});
-    if (!std.mem.eql(u8, back[0..7], "PING-QQ")) return fail(name, "echo mismatch '{s}'", .{back[0..7]});
+    // The qqserver replays the (rewritten) packet to the echo backend, which echoes it.
+    var back: [logon.len]u8 = undefined;
+    net.readFull(fd, &back) catch |e| return fail(name, "no echo back through qq ({s})", .{@errorName(e)});
 
-    // Backend must have actually seen the bytes (proves the splice reached the GS port).
+    // Backend must have seen the rewritten packet: id 0x68, token now == GS gameid 3, tail intact.
     var waited: u32 = 0;
-    while (echo.received().len == 0 and waited < 1000) : (waited += 20) _ = net.usleep(20_000);
+    while (echo.received().len < logon.len and waited < 1000) : (waited += 20) _ = net.usleep(20_000);
     const got = echo.received();
-    if (!std.mem.eql(u8, got, "PING-QQ")) return fail(name, "backend GS saw '{s}', want 'PING-QQ'", .{got});
+    if (got.len < logon.len) return fail(name, "backend saw {d} bytes, want {d}", .{ got.len, logon.len });
+    if (got[0] != 0x68) return fail(name, "backend first byte 0x{x:0>2}, want 0x68", .{got[0]});
+    const got_token = std.mem.readInt(u16, got[QQ_TOKEN_OFFSET..][0..2], .little);
+    if (got_token != @as(u16, @truncate(GS_GAMEID)))
+        return fail(name, "rewritten token={d}, want {d} (GS gameid)", .{ got_token, GS_GAMEID });
+    if (!std.mem.eql(u8, got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
+        return fail(name, "tail '{s}', want '{s}'", .{ got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail });
+    if (back[0] != 0x68 or std.mem.readInt(u16, back[QQ_TOKEN_OFFSET..][0..2], .little) != @as(u16, @truncate(GS_GAMEID)))
+        return fail(name, "echoed packet not the rewritten one", .{});
 
-    return .{ .name = name, .status = .pass, .msg = msg("route recorded on join, qqserver spliced 127.0.0.1 -> backend :{d}, echo round-tripped", .{echo.port}) };
+    return .{ .name = name, .status = .pass, .msg = msg("token 0x{x} translated to gameid {d}, packet rewritten + spliced to backend :{d}", .{ token, GS_GAMEID, echo.port }) };
 }
 
 pub fn main() !void {
+    startRedis();
     const child = try maybeStartRealmd();
 
     const results = [_]Result{
@@ -672,7 +734,7 @@ pub fn main() !void {
         scFleetCapacity(),
         scAdminApi(),
         scMultiGameOneGs(),
-        scQqserverRouting(),
+        scQqserverTokenTranslate(),
         scCreateAccountRealAuth(),
         skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
         scLobbyChatAtoB(),
@@ -683,6 +745,7 @@ pub fn main() !void {
         _ = kill(pid, 15); // SIGTERM
         _ = waitpid(pid, null, 0);
     }
+    stopRedis();
 
     var npass: u32 = 0;
     var nfail: u32 = 0;
