@@ -371,13 +371,29 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+// MCP_GAMELIST (0x05). Request body: u16 reqid, u32 difficulty filter, cstr search
+// (NET_MCP_CLIENT_Send_0x05_GameList @0x44a590). Reply: echo reqid, u32 count, then per
+// game a 32-byte header (the client's parser reads a status word at +0xc and the name at
+// +0x20) followed by name\0, description\0, statstring\0. We list every open game from the
+// registry; the level/difficulty filtering is applied client-side from the statstring
+// (empty statstring shows for softcore). The exact 32-byte header fields beyond the status
+// word still need a join-screen pass to refine — TODO.
 fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
-    _ = body;
-    log.line(tag, "game list -> empty", .{});
-    var buf: [16]u8 = undefined;
+    var r = proto.Reader.init(body);
+    const reqid = r.getU16();
+    var games: [64]state.GameInfo = undefined;
+    const n = state.snapshotGames(&games);
+    log.line(tag, "game list (reqid={d}) -> {d} game(s)", .{ reqid, n });
+
+    var buf: [8192]u8 = undefined;
     var w = startPacket(&buf, MCP_GAMELIST);
-    w.putU16(0); // request id
-    w.putU32(0); // index
-    w.putU8(0); // count
+    w.putU16(reqid);
+    w.putU32(@intCast(n)); // number of games that follow
+    for (games[0..n]) |g| {
+        w.zeros(0x20); // per-game header (status word @+0xc; remaining fields TODO)
+        w.putStr(g.name_slice()); // game name
+        w.putStr(""); // description
+        w.putStr(""); // statstring (level/difficulty info; empty = visible to softcore)
+    }
     finish(c, &w);
 }
