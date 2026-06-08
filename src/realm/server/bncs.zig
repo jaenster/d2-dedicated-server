@@ -29,6 +29,22 @@ pub var realm_desc: []const u8 = "D2 Closed Realm";
 pub var d2cs_ip: [4]u8 = .{ 127, 0, 0, 1 };
 pub var d2cs_port: u16 = 6113;
 
+// Comma-separated account names that get Battle.net-admin + operator flags in chat
+// (the "@"/Blizzard-rep style ops). Set from REALMD_ADMINS. Case-insensitive.
+pub var admin_accounts: []const u8 = "";
+
+const FLAG_OPERATOR: u32 = @intFromEnum(protocol.ChatUserFlag.operator);
+const FLAG_ADMIN: u32 = @intFromEnum(protocol.ChatUserFlag.bnet_admin);
+
+fn isAdmin(account: []const u8) bool {
+    if (admin_accounts.len == 0 or account.len == 0) return false;
+    var it = std.mem.tokenizeScalar(u8, admin_accounts, ',');
+    while (it.next()) |a| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, a, " "), account)) return true;
+    }
+    return false;
+}
+
 // BNCS message ids (subset we handle; everything else is logged).
 const SID_NULL = 0x00;
 const SID_ENTERCHAT = 0x0a;
@@ -84,6 +100,7 @@ const Conn = struct {
     in_channel: bool = false,
     channel: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
     channel_len: u8 = 0,
+    user_flags: u32 = 0, // this account's chat flags (admin/operator) in the current channel
 
     fn setChannel(c: *Conn, name: []const u8) void {
         const n: u8 = @intCast(@min(name.len, chat.max_channel));
@@ -169,7 +186,7 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     // If this connection was in a chat channel, leave it and tell the others.
     if (c.in_channel) {
         chat.leave(fd);
-        broadcastEvent(&c, EID_LEAVE, c.accountName(), "");
+        broadcastEvent(&c, EID_LEAVE, c.user_flags, c.accountName(), "");
     }
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }
@@ -296,9 +313,13 @@ fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
 }
 
 fn onGetChannelList(c: *Conn) void {
-    var buf: [32]u8 = undefined;
+    var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_GETCHANNELLIST);
-    w.putStr(""); // empty list terminator
+    // Public channels offered in the channel-select UI. The home channel first.
+    w.putStr(default_channel); // "Diablo II"
+    w.putStr("Trade");
+    w.putStr("Hardcore");
+    w.putStr(""); // empty string terminates the list
     finish(c, &w);
 }
 
@@ -307,10 +328,10 @@ fn onGetChannelList(c: *Conn) void {
 // Build a SID_CHATEVENT into `buf` and return its on-wire slice. Body (S->C):
 // u32 EventID, u32 userFlags, u32 ping, u32 ip(0), u32 acctNumber(0),
 // u32 regAuthority(0), cstr username, cstr text.
-fn buildChatEvent(buf: []u8, eid: u32, username: []const u8, text: []const u8) []u8 {
+fn buildChatEvent(buf: []u8, eid: u32, flags: u32, username: []const u8, text: []const u8) []u8 {
     var w = startPacket(buf, SID_CHATEVENT);
     w.putU32(eid);
-    w.putU32(0); // user flags
+    w.putU32(flags); // user flags (operator/admin/...) or channel flags for EID_CHANNEL
     w.putU32(0); // ping
     w.putU32(0); // ip
     w.putU32(0); // account number
@@ -322,31 +343,32 @@ fn buildChatEvent(buf: []u8, eid: u32, username: []const u8, text: []const u8) [
 }
 
 // Send a CHATEVENT directly to this connection.
-fn sendEvent(c: *Conn, eid: u32, username: []const u8, text: []const u8) void {
+fn sendEvent(c: *Conn, eid: u32, flags: u32, username: []const u8, text: []const u8) void {
     var buf: [512]u8 = undefined;
-    const bytes = buildChatEvent(&buf, eid, username, text);
+    const bytes = buildChatEvent(&buf, eid, flags, username, text);
     _ = net.writeAll(c.fd, bytes);
 }
 
-const BcastCtx = struct { eid: u32, username: []const u8, text: []const u8 };
+const BcastCtx = struct { eid: u32, flags: u32, username: []const u8, text: []const u8 };
 
 fn bcastCb(ctx: *const BcastCtx, m: *chat.Member) void {
     var buf: [512]u8 = undefined;
-    const bytes = buildChatEvent(&buf, ctx.eid, ctx.username, ctx.text);
+    const bytes = buildChatEvent(&buf, ctx.eid, ctx.flags, ctx.username, ctx.text);
     chat.sendTo(m, bytes);
 }
 
 // Broadcast a CHATEVENT to every OTHER member in this connection's channel.
-fn broadcastEvent(c: *Conn, eid: u32, username: []const u8, text: []const u8) void {
-    const ctx = BcastCtx{ .eid = eid, .username = username, .text = text };
+fn broadcastEvent(c: *Conn, eid: u32, flags: u32, username: []const u8, text: []const u8) void {
+    const ctx = BcastCtx{ .eid = eid, .flags = flags, .username = username, .text = text };
     chat.forEachInChannel(c.channelName(), c.fd, &ctx, bcastCb);
 }
 
 const ShowUserCtx = struct { c: *Conn };
 
-// On join, the joiner gets an EID_SHOWUSER for each existing member.
+// On join, the joiner gets an EID_SHOWUSER for each existing member (with that
+// member's own flags, so ops/admins show with the right icon).
 fn showUserCb(ctx: *const ShowUserCtx, m: *chat.Member) void {
-    sendEvent(ctx.c, EID_SHOWUSER, m.nameSlice(), "");
+    sendEvent(ctx.c, EID_SHOWUSER, m.flags, m.nameSlice(), "");
 }
 
 fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -355,18 +377,24 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     var channel = r.getStr();
     if (channel.len == 0) channel = default_channel;
     const acct = c.accountName();
-    log.line(tag, "join channel '{s}' as {s}", .{ channel, acct });
+
+    // Compute this user's chat flags: configured admins always; the FIRST person in
+    // an otherwise-empty channel becomes its operator (typical Battle.net behaviour).
+    var flags: u32 = 0;
+    if (isAdmin(acct)) flags |= FLAG_ADMIN | FLAG_OPERATOR;
+    if (chat.countInChannel(channel, c.fd) == 0) flags |= FLAG_OPERATOR;
+    c.user_flags = flags;
+    log.line(tag, "join channel '{s}' as {s} (flags=0x{x})", .{ channel, acct, flags });
 
     c.setChannel(channel);
-    _ = chat.join(c.fd, acct, channel);
+    _ = chat.join(c.fd, acct, channel, flags);
 
-    // Tell the joiner which channel they're in, then list existing members.
-    sendEvent(c, EID_CHANNEL, channel, "");
+    // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
+    // then list existing members, then announce the join to everyone else.
+    sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), channel, "");
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
-
-    // Tell everyone else this user joined.
-    broadcastEvent(c, EID_JOIN, acct, "");
+    broadcastEvent(c, EID_JOIN, flags, acct, "");
 }
 
 fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -378,21 +406,22 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     if (parseWhisper(text)) |w| {
         log.line(tag, "{s} whispers {s}: {s}", .{ acct, w.target, w.msg });
         var buf: [512]u8 = undefined;
-        const bytes = buildChatEvent(&buf, EID_WHISPER, acct, w.msg);
-        _ = chat.whisper(w.target, bytes);
-        // Confirmation echo back to sender (D2 shows the whisper you sent).
-        sendEvent(c, EID_WHISPER, w.target, w.msg);
+        const bytes = buildChatEvent(&buf, EID_WHISPER, c.user_flags, acct, w.msg);
+        const found = chat.whisper(w.target, bytes);
+        // Echo back to sender: EID_WHISPER (D2 shows "To <target>: msg") on success,
+        // EID_ERROR if the target isn't online.
+        if (found) sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg) else sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
         return;
     }
     if (text.len > 0 and text[0] == '/') {
         // Unknown slash command: acknowledge minimally, don't broadcast.
-        sendEvent(c, EID_INFO, acct, "");
+        sendEvent(c, EID_INFO, 0, acct, "");
         return;
     }
 
     log.line(tag, "{s} talks: {s}", .{ acct, text });
-    broadcastEvent(c, EID_TALK, acct, text); // to the others
-    sendEvent(c, EID_TALK, acct, text); // echo to self (D2 shows own talk)
+    broadcastEvent(c, EID_TALK, c.user_flags, acct, text); // to the others
+    sendEvent(c, EID_TALK, c.user_flags, acct, text); // echo to self (D2 shows own talk)
 }
 
 const Whisper = struct { target: []const u8, msg: []const u8 };
