@@ -232,6 +232,13 @@ const Conn = struct {
     gs_eof: bool = false,
     c2g_bytes: u64 = 0, // total bytes spliced client->GS (diagnostics)
     g2c_bytes: u64 = 0, // total bytes spliced GS->client
+    c2g_skip: u8 = 0, // always 0 (no client->GS skip); kept symmetric with g2c_skip
+    // Swallow the GS's own 0xAF01 connection-established packet: the gateway already sent
+    // one to the client on accept (to mimic the GS's on-accept behaviour), so the GS's
+    // duplicate must NOT reach the client — a second 0xAF after the client switched to
+    // game-packet mode desyncs its decompressor and the game-flags/load-success that
+    // follow are never dispatched. Set to 2 when the GS socket is dialed.
+    g2c_skip: u8 = 0,
 };
 
 const RedisState = enum { disconnected, connecting, ready };
@@ -452,6 +459,7 @@ const Gateway = struct {
             return;
         };
         c.gs = d.fd;
+        c.g2c_skip = 2; // drop the GS's own 0xAF01 — we already sent one to the client
         c.state = if (d.connected) .open else .connecting;
         log.line("qq", "qq: -> GS {d}.{d}.{d}.{d}:{d} (gameid {d}){s}", .{ pr.ip[0], pr.ip[1], pr.ip[2], pr.ip[3], pr.port, pr.gameid, if (d.connected) "" else " [connecting]" });
     }
@@ -610,7 +618,17 @@ const Gateway = struct {
             };
             c.state = .handshake;
             c.cli = cfd;
-            log.line("qq", "accepted game connection (fd={d}) — awaiting GAMELOGON", .{cfd});
+            // The D2 engine's QServer sends 0xAF01 (connection-established) to a client the
+            // INSTANT it accepts the socket (Send_0xAF01 @0x52b720, a constant `af 01`). The
+            // real client's setup depends on receiving it promptly — without it the client
+            // never advances into connecting-mode (GameLoopFuncInitGame/Unused3). The gateway
+            // can't reach the GS yet (it needs the GAMELOGON token to route), so it speaks for
+            // the GS and sends the same 2 bytes now. The GS later sends its own 0xAF01 too; the
+            // client treats 0xAF as idempotent (just sets D2GS_Connected=1), so the duplicate
+            // is harmless.
+            const af01 = [2]u8{ 0xaf, 0x01 };
+            _ = write(cfd, &af01, af01.len);
+            log.line("qq", "accepted game connection (fd={d}) — sent 0xAF01, awaiting GAMELOGON", .{cfd});
         }
     }
 
@@ -680,11 +698,11 @@ const Gateway = struct {
     fn serviceOpen(g: *Gateway, c: *Conn, gs_side: bool, re: i16) void {
         if (gs_side) {
             if (re & posix.POLL.OUT != 0) g.flush(c.gs, &c.c2g, &c.c2g_off, &c.c2g_len, &c.gs_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes);
+            if (re & posix.POLL.IN != 0) g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes, &c.g2c_skip);
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.gs_eof = true;
         } else {
             if (re & posix.POLL.OUT != 0) g.flush(c.cli, &c.g2c, &c.g2c_off, &c.g2c_len, &c.cli_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.cli, &c.c2g, &c.c2g_off, &c.c2g_len, c.gs, &c.cli_eof, &c.gs_eof, "qq C->GS", &c.c2g_bytes);
+            if (re & posix.POLL.IN != 0) g.pump(c.cli, &c.c2g, &c.c2g_off, &c.c2g_len, c.gs, &c.cli_eof, &c.gs_eof, "qq C->GS", &c.c2g_bytes, &c.c2g_skip);
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.cli_eof = true;
         }
         g.propagateEofAndMaybeClose(c);
@@ -693,7 +711,7 @@ const Gateway = struct {
     /// Read from `src` into a pooled buffer, then TRY to write it all to `dst` at once. Full
     /// write → release immediately (no retention, low latency). Partial/EAGAIN → park the
     /// remainder for a later POLLOUT. Gated to only run when idx.* == -1 and the pool has room.
-    fn pump(g: *Gateway, src: c_int, idx: *i32, off: *u32, len: *u32, dst: c_int, src_eof: *bool, dst_eof: *bool, dir: []const u8, total: *u64) void {
+    fn pump(g: *Gateway, src: c_int, idx: *i32, off: *u32, len: *u32, dst: c_int, src_eof: *bool, dst_eof: *bool, dir: []const u8, total: *u64, skip: *u8) void {
         const bi = g.poolAcquire() orelse return;
         const got = read(src, &g.pool[bi], BUF_SZ);
         if (got == 0) {
@@ -707,11 +725,26 @@ const Gateway = struct {
             src_eof.* = true;
             return;
         }
-        const un: u32 = @intCast(got);
+        var base: u32 = 0;
+        var un: u32 = @intCast(got);
+        // Swallow the GS's leading 0xAF01 (see Conn.g2c_skip). Only the first read carries it;
+        // clear the flag after one read regardless so we never eat real payload later.
+        if (skip.* >= 2 and un >= 2 and g.pool[bi][0] == 0xaf and g.pool[bi][1] == 0x01) {
+            base = 2;
+            un -= 2;
+            skip.* = 0;
+            if (trace) log.line("qq", "swallowed GS 0xAF01 duplicate", .{});
+        } else if (skip.* > 0) {
+            skip.* = 0; // first read wasn't the expected af01 — relay verbatim from now on
+        }
+        if (un == 0) {
+            g.poolRelease(bi);
+            return;
+        }
         total.* += un;
-        if (trace) log.hexdump(dir, g.pool[bi][0..un]);
-        const w = write(dst, &g.pool[bi], un);
-        if (w == got) {
+        if (trace) log.hexdump(dir, g.pool[bi][base .. base + un]);
+        const w = write(dst, g.pool[bi][base..].ptr, un);
+        if (w == un) {
             g.poolRelease(bi);
             return;
         }
@@ -720,9 +753,10 @@ const Gateway = struct {
             dst_eof.* = true;
             return;
         }
+        // Park the unsent tail. off/len are absolute indices into pool[bi], so include base.
         idx.* = @intCast(bi);
-        off.* = if (w > 0) @intCast(w) else 0;
-        len.* = un;
+        off.* = if (w > 0) base + @as(u32, @intCast(w)) else base;
+        len.* = base + un;
     }
 
     fn flush(g: *Gateway, dst: c_int, idx: *i32, off: *u32, len: *u32, dst_eof: *bool) void {
