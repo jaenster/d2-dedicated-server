@@ -27,6 +27,7 @@ const multiinstance = @import("runtime/multiinstance.zig");
 const gsport = @import("runtime/gsport.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
+const clientdiag = @import("runtime/clientdiag.zig");
 const autoenter = @import("test/autoenter.zig");
 const autologin = @import("test/autologin.zig");
 const screenshot = @import("test/screenshot.zig");
@@ -378,6 +379,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             if (hasFlag("bypass-checkrev")) checkrev_patch.apply();
             if (hasFlag("screenshot")) screenshot.install();
             if (hasFlag("suppress-halts")) halt_hook.enableSuppress();
+            if (hasFlag("clientdiag")) clientdiag.install(); // client-side join-handshake trace
             // Drive the bnet login form: --auto-login <account>:<password>.
             {
                 var tmp: [160]u8 = undefined;
