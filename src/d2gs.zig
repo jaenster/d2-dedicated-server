@@ -25,6 +25,7 @@ const roominit = @import("runtime/roominit.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
 const realmgw = @import("runtime/realmgw.zig");
+const drawing = @import("runtime/drawing.zig");
 const autoenter = @import("test/autoenter.zig");
 const autologin = @import("test/autologin.zig");
 const screenshot = @import("test/screenshot.zig");
@@ -374,6 +375,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             // are gated by their flags. The single config table is in feature.zig.
             feature.applyFlags(hasFlag);
             feature.installAll();
+            if (hasFlag("mapunits") or hasFlag("mapreveal")) drawing.install();
             if (hasFlag("screenshot")) screenshot.install();
             if (hasFlag("suppress-halts")) halt_hook.enableSuppress(); // sub-mode, not a toggle
             // Install the Battle.net gateway list in-process so the client always has a

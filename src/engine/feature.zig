@@ -78,6 +78,8 @@ const registry = [_]Feature{
     .{ .mod = @import("../runtime/feature/srvdiag.zig"), .name = "srvdiag", .flag = "srvdiag", .default = false },
     // Client-side maphack (the d2gs.dll injects into the real client too).
     .{ .mod = @import("../runtime/feature/omnivision.zig"), .name = "omnivision", .flag = "omnivision", .default = false },
+    .{ .mod = @import("../runtime/feature/mapunits.zig"), .name = "mapunits", .flag = "mapunits", .default = false },
+    .{ .mod = @import("../runtime/feature/mapreveal.zig"), .name = "mapreveal", .flag = "mapreveal", .default = false },
 };
 
 fn initEnabled() [registry.len]bool {
@@ -144,6 +146,25 @@ pub fn fanGameFrame() void {
 pub fn fanOogFrame() void {
     inline for (registry, 0..) |f, i| {
         if (@hasDecl(f.mod, "oogFrame") and enabled[i]) f.mod.oogFrame();
+    }
+}
+
+// ── client draw dispatch (driven by runtime/drawing.zig) ─────────────────────
+// Only the automap hooks have a driver so far; the rest of Charon's draw surface
+// (gameUnitPreDraw/PostDraw, gamePostDraw, oogPostDraw, allPostDraw, allFinalDraw,
+// preDraw) lands with the full Drawing driver when a feature needs it.
+
+/// Just before the engine renders the automap (good place to inject cells).
+pub fn fanGameAutomapPreDraw() void {
+    inline for (registry, 0..) |f, i| {
+        if (@hasDecl(f.mod, "gameAutomapPreDraw") and enabled[i]) f.mod.gameAutomapPreDraw();
+    }
+}
+
+/// Just after the automap is rendered (good place to draw unit dots / labels).
+pub fn fanGameAutomapPostDraw() void {
+    inline for (registry, 0..) |f, i| {
+        if (@hasDecl(f.mod, "gameAutomapPostDraw") and enabled[i]) f.mod.gameAutomapPostDraw();
     }
 }
 
