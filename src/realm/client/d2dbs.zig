@@ -172,3 +172,45 @@ pub fn fetchCharSave(account: []const u8, charname: []const u8, out: []u8) usize
     log.hex("d2dbs: fetched char save, bytes=0x", take);
     return take;
 }
+
+/// Persist a character's .d2s bytes back to D2DBS. Mirrors realmd's onSave wire format:
+/// SAVE_DATA 0x30 req = datatype:u16, account\0, char\0, datalen:u16, <bytes>; reply = result:u32.
+/// Returns true on a result==0 ack.
+pub fn saveCharSave(account: []const u8, charname: []const u8, data: []const u8) bool {
+    if (sock == INVALID_SOCKET) return false;
+    if (data.len > 0xFFFF) return false;
+    seqno +%= 1;
+
+    var req: [9000]u8 = undefined;
+    var n: usize = p.HEADER_LEN;
+    std.mem.writeInt(u16, req[n..][0..2], DATATYPE_CHARSAVE, .little);
+    n += 2;
+    @memcpy(req[n..][0..account.len], account);
+    n += account.len;
+    req[n] = 0;
+    n += 1;
+    @memcpy(req[n..][0..charname.len], charname);
+    n += charname.len;
+    req[n] = 0;
+    n += 1;
+    std.mem.writeInt(u16, req[n..][0..2], @intCast(data.len), .little);
+    n += 2;
+    if (n + data.len > req.len) return false;
+    @memcpy(req[n..][0..data.len], data);
+    n += data.len;
+    const h = p.Header{ .size = @intCast(n), .type = TYPE_SAVE, .seqno = seqno };
+    @memcpy(req[0..p.HEADER_LEN], std.mem.asBytes(&h));
+    if (!sendAll(req[0..n])) return false;
+    log.hex("d2dbs: sent SAVE_DATA_REQUEST bytes=0x", data.len);
+
+    // Reply: header + result:u32
+    var hbuf: [p.HEADER_LEN]u8 = undefined;
+    if (!recvAll(&hbuf)) return false;
+    const rh: *const p.Header = @ptrCast(@alignCast(&hbuf));
+    if (rh.type != TYPE_SAVE or rh.size < p.HEADER_LEN + 4) return false;
+    var rbuf: [4]u8 = undefined;
+    if (!recvAll(&rbuf)) return false;
+    const result = std.mem.readInt(u32, &rbuf, .little);
+    log.hex("d2dbs: SAVE reply result=0x", result);
+    return result == 0;
+}
