@@ -84,6 +84,10 @@ fn lastErrno() c_int {
 const EAGAIN: c_int = @intFromEnum(posix.E.AGAIN);
 const EINPROGRESS: c_int = @intFromEnum(posix.E.INPROGRESS);
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+// REALMD_QQ_TRACE=1 → hexdump every spliced chunk both directions (debug; verbose).
+var trace: bool = false;
+
 // Monotonic milliseconds — used to back off redis reconnect attempts so an unreachable
 // redis makes the loop SLEEP (poll timeout) instead of hammering connect() in a spin.
 const timespec = extern struct { sec: c_long, nsec: c_long };
@@ -226,6 +230,8 @@ const Conn = struct {
     g2c_len: u32 = 0,
     cli_eof: bool = false,
     gs_eof: bool = false,
+    c2g_bytes: u64 = 0, // total bytes spliced client->GS (diagnostics)
+    g2c_bytes: u64 = 0, // total bytes spliced GS->client
 };
 
 const RedisState = enum { disconnected, connecting, ready };
@@ -311,6 +317,8 @@ const Gateway = struct {
     }
 
     fn closeConn(g: *Gateway, c: *Conn) void {
+        if (c.c2g_bytes != 0 or c.g2c_bytes != 0 or c.gs >= 0)
+            log.line("qq", "conn closed: client->GS={d}B GS->client={d}B (cli_eof={} gs_eof={})", .{ c.c2g_bytes, c.g2c_bytes, c.cli_eof, c.gs_eof });
         if (c.cli >= 0) _ = close(c.cli);
         if (c.gs >= 0) _ = close(c.gs);
         if (c.c2g >= 0) g.poolRelease(@intCast(c.c2g));
@@ -635,7 +643,10 @@ const Gateway = struct {
             g.closeConn(c);
             return;
         }
+        const before: u32 = c.c2g_len;
         c.c2g_len += @intCast(got);
+        c.c2g_bytes += @intCast(got);
+        if (trace) log.hexdump("qq C->GS (logon)", g.pool[bi][before..c.c2g_len]);
         if (c.c2g_len < MIN_LOGON_BYTES) return;
 
         if (g.pool[bi][0] != GAMELOGON_ID) {
@@ -669,11 +680,11 @@ const Gateway = struct {
     fn serviceOpen(g: *Gateway, c: *Conn, gs_side: bool, re: i16) void {
         if (gs_side) {
             if (re & posix.POLL.OUT != 0) g.flush(c.gs, &c.c2g, &c.c2g_off, &c.c2g_len, &c.gs_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof);
+            if (re & posix.POLL.IN != 0) g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes);
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.gs_eof = true;
         } else {
             if (re & posix.POLL.OUT != 0) g.flush(c.cli, &c.g2c, &c.g2c_off, &c.g2c_len, &c.cli_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.cli, &c.c2g, &c.c2g_off, &c.c2g_len, c.gs, &c.cli_eof, &c.gs_eof);
+            if (re & posix.POLL.IN != 0) g.pump(c.cli, &c.c2g, &c.c2g_off, &c.c2g_len, c.gs, &c.cli_eof, &c.gs_eof, "qq C->GS", &c.c2g_bytes);
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.cli_eof = true;
         }
         g.propagateEofAndMaybeClose(c);
@@ -682,7 +693,7 @@ const Gateway = struct {
     /// Read from `src` into a pooled buffer, then TRY to write it all to `dst` at once. Full
     /// write → release immediately (no retention, low latency). Partial/EAGAIN → park the
     /// remainder for a later POLLOUT. Gated to only run when idx.* == -1 and the pool has room.
-    fn pump(g: *Gateway, src: c_int, idx: *i32, off: *u32, len: *u32, dst: c_int, src_eof: *bool, dst_eof: *bool) void {
+    fn pump(g: *Gateway, src: c_int, idx: *i32, off: *u32, len: *u32, dst: c_int, src_eof: *bool, dst_eof: *bool, dir: []const u8, total: *u64) void {
         const bi = g.poolAcquire() orelse return;
         const got = read(src, &g.pool[bi], BUF_SZ);
         if (got == 0) {
@@ -697,6 +708,8 @@ const Gateway = struct {
             return;
         }
         const un: u32 = @intCast(got);
+        total.* += un;
+        if (trace) log.hexdump(dir, g.pool[bi][0..un]);
         const w = write(dst, &g.pool[bi], un);
         if (w == got) {
             g.poolRelease(bi);
@@ -774,6 +787,8 @@ fn parseReply(buf: []const u8) ?ParsedReply {
 pub fn main() !void {
     const cfg = config.fromEnv();
     log.json = cfg.log_json;
+    trace = getenv("REALMD_QQ_TRACE") != null;
+    if (trace) log.line("qq", "REALMD_QQ_TRACE on — hexdumping spliced traffic", .{});
 
     // Resolve the redis host once (blocking, startup only). cfg.redis_addr is "host:port".
     var host_buf: [256]u8 = undefined;
