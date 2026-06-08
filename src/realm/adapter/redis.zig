@@ -19,14 +19,15 @@
 //! prefix; the schema mirrors the fs backend's records (chars durable; sessions
 //! and games ephemeral with PX TTL and reverse indexes by gameid and by gs).
 const std = @import("std");
-const net = @import("net.zig");
-const Spinlock = @import("lock.zig").Spinlock;
-const types = @import("store_types.zig");
-const fs = @import("persist_fs.zig");
+const net = @import("realm_infra").net;
+const Spinlock = @import("realm_infra").lock.Spinlock;
+const types = @import("realm_infra").types;
+const fs = @import("fs.zig");
 
 const Name = types.Name;
 const GameRec = types.GameRec;
 const Route = types.Route;
+const TokenRoute = types.TokenRoute;
 
 const prefix = "realmd:";
 
@@ -361,7 +362,61 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
         _ = command(&r, &.{ "SET", idkey, safe });
     // reverse index by gs: SADD name into game:bygs:<gsid>
     _ = command(&r, &.{ "SADD", gskey, safe });
+    // global index of all game names so /admin/games can enumerate (snapshotGames).
+    _ = command(&r, &.{ "SADD", prefix ++ "games", safe });
     return true;
+}
+
+/// Enumerate active games for /admin/games: read the global name set, fetch each record.
+/// Members whose record has TTL-expired are lazily SREM'd from the index.
+pub fn snapshotGames(out: []types.NamedGame) usize {
+    conn_lock.lock();
+    defer conn_lock.unlock();
+    var r: Reader = undefined;
+    const rep = command(&r, &.{ "SMEMBERS", prefix ++ "games" }) orelse return 0;
+    const count = switch (rep) {
+        .array_len => |nn| if (nn <= 0) return 0 else @as(usize, @intCast(nn)),
+        else => return 0,
+    };
+    // Drain the member names first (can't issue GETs mid-reply), then resolve each.
+    var names: [256][48]u8 = undefined;
+    var nlen: [256]u8 = undefined;
+    var got: usize = 0;
+    for (0..count) |_| {
+        const er = readReply(&r) orelse break;
+        const member = switch (er) {
+            .bulk => |b| b orelse continue,
+            else => break,
+        };
+        if (got >= names.len) continue;
+        const ln: u8 = @intCast(@min(member.len, 48));
+        @memcpy(names[got][0..ln], member[0..ln]);
+        nlen[got] = ln;
+        got += 1;
+    }
+    var n: usize = 0;
+    for (0..got) |i| {
+        if (n >= out.len) break;
+        const gname = names[i][0..nlen[i]];
+        var gk: [128]u8 = undefined;
+        const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{gname}) catch continue;
+        const grep = command(&r, &.{ "GET", gamekey }) orelse continue;
+        const val = switch (grep) {
+            .bulk => |b| b orelse {
+                _ = command(&r, &.{ "SREM", prefix ++ "games", gname }); // expired → drop from index
+                continue;
+            },
+            else => continue,
+        };
+        const rec = parseGame(val) orelse continue;
+        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid };
+        const cl: u8 = @intCast(@min(gname.len, ng.name.len));
+        @memcpy(ng.name[0..cl], gname[0..cl]);
+        ng.name_len = cl;
+        out[n] = ng;
+        n += 1;
+    }
+    return n;
 }
 
 pub fn findGame(name: []const u8) ?GameRec {
@@ -422,6 +477,7 @@ pub fn removeGameById(gameid: u32) void {
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{ncopy[0..name.len]}) catch return;
     _ = command(&r, &.{ "DEL", gamekey });
     _ = command(&r, &.{ "DEL", idkey });
+    _ = command(&r, &.{ "SREM", prefix ++ "games", ncopy[0..name.len] });
 }
 
 /// Expire every game hosted by a GS that disconnected, via its bygs set.
@@ -528,6 +584,57 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
     if (i != 4) return null;
     const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
     return .{ .gs_ip = ip, .gs_port = gs_port };
+}
+
+// ── token routes (ephemeral, PX TTL) — keyed by realm-global token ───────────
+
+fn tokenRouteKey(buf: []u8, token: u16) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "troute:{x}", .{token}) catch unreachable;
+}
+
+pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {
+    var kb: [64]u8 = undefined;
+    const key = tokenRouteKey(&kb, token);
+    // Packed binary route: ip[4] ++ port(u16 LE) ++ gameid(u32 LE) = 10 bytes. Redis is
+    // binary-safe, so the qqserver reads these 10 bytes directly — no string parsing.
+    var vb: [10]u8 = undefined;
+    @memcpy(vb[0..4], &gs_ip);
+    std.mem.writeInt(u16, vb[4..6], gs_port, .little);
+    std.mem.writeInt(u32, vb[6..10], real_gameid, .little);
+    const body: []const u8 = &vb;
+
+    conn_lock.lock();
+    defer conn_lock.unlock();
+    var r: Reader = undefined;
+    const rep = if (ttl_s > 0) blk: {
+        var pb: [16]u8 = undefined;
+        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        break :blk command(&r, &.{ "SET", key, body, "PX", px });
+    } else command(&r, &.{ "SET", key, body });
+    return switch (rep orelse return false) {
+        .status, .bulk, .int => true,
+        .array_len, .err => false,
+    };
+}
+
+pub fn lookupTokenRoute(token: u16) ?TokenRoute {
+    var kb: [64]u8 = undefined;
+    const key = tokenRouteKey(&kb, token);
+
+    conn_lock.lock();
+    defer conn_lock.unlock();
+    var r: Reader = undefined;
+    const rep = command(&r, &.{ "GET", key }) orelse return null;
+    const val = switch (rep) {
+        .bulk => |b| b orelse return null,
+        else => return null,
+    };
+    if (val.len < 10) return null; // packed: ip[4] ++ port(u16 LE) ++ gameid(u32 LE)
+    return .{
+        .gs_ip = val[0..4].*,
+        .gs_port = std.mem.readInt(u16, val[4..6], .little),
+        .gameid = std.mem.readInt(u32, val[6..10], .little),
+    };
 }
 
 // ── housekeeping ─────────────────────────────────────────────────────────────

@@ -8,7 +8,7 @@
 //! The signal handler does only an async-signal-safe atomic store; a monitor thread
 //! observes the flag and performs the (sleep + exit) drain off the signal context.
 const std = @import("std");
-const log = @import("log.zig");
+const log = @import("realm_infra").log;
 
 extern "c" fn usleep(usec: c_uint) c_int; // std.Thread.sleep went through Io in 0.16
 

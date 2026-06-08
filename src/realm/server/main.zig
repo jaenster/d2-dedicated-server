@@ -8,9 +8,9 @@
 //! games to our injected d2gs (Game.exe) over the same d2cs<->d2gs protocol the
 //! GS already speaks.
 const std = @import("std");
-const config = @import("config.zig");
-const net = @import("net.zig");
-const log = @import("log.zig");
+const config = @import("realm_infra").config;
+const net = @import("realm_infra").net;
+const log = @import("realm_infra").log;
 const bncs = @import("bncs.zig");
 const d2cs = @import("d2cs.zig");
 const d2dbs = @import("d2dbs.zig");
@@ -84,6 +84,7 @@ pub fn main() !void {
     state.instance_hash = hashStr(cfg.instance_id);
     if (cfg.shared) log.line("realmd", "multi-instance mode: sessions/games in shared store {s} (instance hash 0x{x})", .{ cfg.data_dir, state.instance_hash });
     bncs.realm_name = cfg.realm_name;
+    bncs.admin_accounts = cfg.admins;
     bncs.d2cs_port = cfg.d2cs_port;
     gslink.realm_name = cfg.realm_name;
     if (parseIp4(cfg.realm_addr)) |ip| {

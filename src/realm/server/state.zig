@@ -10,7 +10,7 @@
 //! by d2cs at MCP_STARTUP. Because we own both ends, the realm handoff carries a
 //! plain session id in the MCP chunk — no pvpgn-style shared-secret crypto.
 const std = @import("std");
-const Spinlock = @import("lock.zig").Spinlock;
+const Spinlock = @import("realm_infra").lock.Spinlock;
 const store = @import("store.zig");
 
 pub const max_name = 31;
@@ -201,6 +201,21 @@ pub const GameInfo = struct {
 /// Snapshot active games into `buf` under the lock; returns the number filled.
 /// In-memory path only — shared-store enumeration is a TODO.
 pub fn snapshotGames(buf: []GameInfo) usize {
+    // Shared mode: games live in the store (redis/pg), not the in-memory table — enumerate
+    // them there and convert to GameInfo.
+    if (shared) {
+        var tmp: [256]store.NamedGame = undefined;
+        const cap = @min(buf.len, tmp.len);
+        const m = store.snapshotGames(tmp[0..cap]);
+        for (tmp[0..m], 0..) |ng, i| {
+            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port };
+            const ln: u8 = @intCast(@min(ng.name_len, max_name));
+            @memcpy(gi.name[0..ln], ng.name[0..ln]);
+            gi.name_len = ln;
+            buf[i] = gi;
+        }
+        return m;
+    }
     global.lock.lock();
     defer global.lock.unlock();
     var n: usize = 0;

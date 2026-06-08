@@ -10,8 +10,8 @@
 //! the proof that the front is stateless over shared state — i.e. that a second
 //! realmd instance could resolve it too once the session table is a shared Store.
 const std = @import("std");
-const net = @import("net.zig");
-const log = @import("log.zig");
+const net = @import("realm_infra").net;
+const log = @import("realm_infra").log;
 const proto = @import("proto.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
@@ -35,6 +35,18 @@ const MCP_CHARLIST2 = 0x19;
 // is how long that route stays valid.
 pub var game_ip: ?[4]u8 = null;
 pub var route_ttl_s: u32 = 60;
+
+// Realm-global game-token counter. realmd OWNS the u16 token it hands the client, so a
+// process-global atomic makes it unique per CREATE/JOIN within this instance — two
+// clients behind one public IP get distinct tokens, which is what makes the qqserver's
+// token translation NAT-proof. NOTE: for multi-instance uniqueness this wants a redis
+// INCR / instance-id namespacing (same as session ids); the atomic is fine for now.
+var token_ctr = std.atomic.Value(u16).init(1);
+
+/// Mint the next realm-global game token (wraps at u16; fine for the test/MVP).
+fn mintToken() u16 {
+    return token_ctr.fetchAdd(1, .monotonic);
+}
 
 const DConn = struct {
     fd: net.Socket,
@@ -197,13 +209,30 @@ fn enc14(w: *proto.Writer, v: u32) void {
     w.putU8(@intCast(((v >> 7) & 0x7F) | 0x80));
 }
 
-// Character statstring parsed by D2Client CharSel.cpp (SAVEFILE_ParseSaveData,
-// verified against the 1.14d client reconstruction):
-//   [0..2] realm char count (14-bit), [2..13] equip slot1 (11 bytes, 0xFF=none),
-//   [13] class (parser subtracts CLASS_SORCERESS=1), [14..25] equip slot2 (11),
-//   [25] level, [26..28] flags (14-bit; &4 = expansion), [28..30] field9 (14-bit),
-//   [30] act, [31..33] fields (0xFF->0), [33..36] guild tag (3 bytes).
-// Every byte is kept non-zero so it survives as a C-string.
+// Character statstring — the per-char blob in the MCP_CHARLIST2 (0x19) reply that the
+// client's char-select screen renders each character from. Layout fully reverse-engineered
+// from the 1.14d client (Game.exe), parser CHARSEL_ParseRealmCharList @0x43aab0 →
+// SAVEFILE_ParseSaveData @0x438ad0. Offsets from the statstring start:
+//   [0..2]   realm char count   (14-bit encoded — SAVEFILE_ReadEncodedInt14Bit)
+//   [2..13]  equip slot 1 (11)  → body-component GRAPHIC codes (see below)
+//   [13]     class + 1          (parser subtracts CLASS_SORCERESS=1)
+//   [14..25] equip slot 2 (11)  → component color TRANSFORMS (tints)
+//   [25]     level
+//   [26..28] character flags    (14-bit; bit2=0x04 expansion, bit3=0x08 ladder/hardcore mix)
+//   [28..30] field9             (14-bit)
+//   [30]     act (0xFF->0), [31..33] two fields (0xFF->0), [33..36] guild tag (3 bytes)
+// Every byte must stay NON-ZERO (the statstring is sent as a C-string; a 0 truncates it) —
+// that's why 14-bit ints set the high bit and "none" is 0xFF, not 0x00.
+//
+// Rendering: the client builds the 3D char preview via AllocCharSelectComponent @0x5066c0
+// (class, expansion-mode, slot1 [graphic codes], slot2 [transforms]). The 16-entry equip
+// loop treats a code of 0 / 0xFF / >= max as an EMPTY body slot. Weapons live at slot1[5]
+// (right) and slot1[6] (left); D2COMP_ResolveWeaponClass @0x504af0 returns 1 (unarmed) when
+// both are 0xFF, so an all-0xFF statstring renders a VALID NAKED character of the right
+// class/level — it is not broken, just bare. To show real equipped gear, parse the .d2s
+// item list (JM section) into gaCompCharacterCompositeItems indices and fill slot1/slot2
+// (a future "char portrait" feature; the GS has the items in memory on save and could
+// supply the portrait, like real pvpgn d2cs does).
 fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, realm_count: u32) void {
     enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
     var k: usize = 0;
@@ -283,8 +312,17 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     const rr = routed.?;
     _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid);
-    log.line(tag, "create game '{s}' (account={s}) -> gameid={d} gs=0x{x}@{d}.{d}.{d}.{d}:{d}", .{ name, c.accountName(), rr.gameid, rr.gsid, rr.ip[0], rr.ip[1], rr.ip[2], rr.ip[3], rr.port });
-    w.putU16(@truncate(rr.gameid)); // game token (client passes to the GS)
+    // The creator immediately joins the game they just made, but the GAMELOGON only
+    // carries the char name — the account reaches the GS solely via the join-context
+    // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
+    // the character fetch (fpGetDatabaseCharacter) fails for the game's own creator.
+    if (rr.gsid != 0) _ = gslink.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName());
+    // Mint a realm-global token and record {token -> GS addr + real gameid} so the
+    // qqserver can translate the client's token to the engine's gameid and splice.
+    const token = mintToken();
+    _ = store.recordTokenRoute(token, rr.ip, rr.port, rr.gameid, route_ttl_s);
+    log.line(tag, "create game '{s}' (account={s}) -> gameid={d} token=0x{x} gs=0x{x}@{d}.{d}.{d}.{d}:{d}", .{ name, c.accountName(), rr.gameid, token, rr.gsid, rr.ip[0], rr.ip[1], rr.ip[2], rr.ip[3], rr.port });
+    w.putU16(token); // game token (client presents this to the qqserver)
     w.putU16(0); // unknown
     w.putU32(0); // result: success
     finish(c, &w);
@@ -316,14 +354,16 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
     if (g.gsid != 0) _ = gslink.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName());
-    // Record {this client's source IP → the real GS} so a qqserver fronting game
-    // traffic can splice the connection to the right backend. Additive/harmless when
-    // no qqserver is deployed (nothing reads the route).
-    _ = store.recordRoute(net.peerIp(c.fd), g.gs_ip, g.gs_port, route_ttl_s);
+    // Mint a realm-global token for this joining client and record {token -> the real
+    // GS + engine gameid}. The qqserver reads the token from the client's first packet
+    // and translates it — NAT-proof, since the token is unique even when two clients
+    // share one public IP. (Source-IP recordRoute is no longer used by the gateway.)
+    const token = mintToken();
+    _ = store.recordTokenRoute(token, g.gs_ip, g.gs_port, g.gameid, route_ttl_s);
     // Advertise the qqserver's public IP when configured, else the GS IP (back-compat).
     const advertised_ip = game_ip orelse g.gs_ip;
-    log.line(tag, "join game '{s}' (account={s}) gameid={d} gs={d}.{d}.{d}.{d} -> client dials {d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3], advertised_ip[0], advertised_ip[1], advertised_ip[2], advertised_ip[3] });
-    w.putU16(@truncate(g.gameid)); // game token
+    log.line(tag, "join game '{s}' (account={s}) gameid={d} token=0x{x} gs={d}.{d}.{d}.{d} -> client dials {d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, token, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3], advertised_ip[0], advertised_ip[1], advertised_ip[2], advertised_ip[3] });
+    w.putU16(token); // game token
     w.putU16(0); // unknown
     w.putBytes(&advertised_ip); // d2gs / qqserver IP (in_addr, network order)
     w.putU32(0); // game hash
@@ -331,13 +371,29 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+// MCP_GAMELIST (0x05). Request body: u16 reqid, u32 difficulty filter, cstr search
+// (NET_MCP_CLIENT_Send_0x05_GameList @0x44a590). Reply: echo reqid, u32 count, then per
+// game a 32-byte header (the client's parser reads a status word at +0xc and the name at
+// +0x20) followed by name\0, description\0, statstring\0. We list every open game from the
+// registry; the level/difficulty filtering is applied client-side from the statstring
+// (empty statstring shows for softcore). The exact 32-byte header fields beyond the status
+// word still need a join-screen pass to refine — TODO.
 fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
-    _ = body;
-    log.line(tag, "game list -> empty", .{});
-    var buf: [16]u8 = undefined;
+    var r = proto.Reader.init(body);
+    const reqid = r.getU16();
+    var games: [64]state.GameInfo = undefined;
+    const n = state.snapshotGames(&games);
+    log.line(tag, "game list (reqid={d}) -> {d} game(s)", .{ reqid, n });
+
+    var buf: [8192]u8 = undefined;
     var w = startPacket(&buf, MCP_GAMELIST);
-    w.putU16(0); // request id
-    w.putU32(0); // index
-    w.putU8(0); // count
+    w.putU16(reqid);
+    w.putU32(@intCast(n)); // number of games that follow
+    for (games[0..n]) |g| {
+        w.zeros(0x20); // per-game header (status word @+0xc; remaining fields TODO)
+        w.putStr(g.name_slice()); // game name
+        w.putStr(""); // description
+        w.putStr(""); // statstring (level/difficulty info; empty = visible to softcore)
+    }
     finish(c, &w);
 }

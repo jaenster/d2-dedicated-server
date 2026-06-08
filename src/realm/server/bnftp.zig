@@ -15,8 +15,8 @@
 //!
 //! Files are served from <data_dir>/bnftp/<filename>.
 const std = @import("std");
-const net = @import("net.zig");
-const log = @import("log.zig");
+const net = @import("realm_infra").net;
+const log = @import("realm_infra").log;
 const proto = @import("proto.zig");
 const store = @import("store.zig");
 

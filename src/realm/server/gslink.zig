@@ -15,10 +15,10 @@
 //! are serialised through that GS's `req_lock` (one request in flight per GS), so
 //! replies need no seqno correlation; different GSes run concurrently.
 const std = @import("std");
-const net = @import("net.zig");
-const log = @import("log.zig");
+const net = @import("realm_infra").net;
+const log = @import("realm_infra").log;
 const state = @import("state.zig");
-const Spinlock = @import("lock.zig").Spinlock;
+const Spinlock = @import("realm_infra").lock.Spinlock;
 const p = @import("realm_shared").protocol;
 
 extern "c" fn usleep(usec: c_uint) c_int;
