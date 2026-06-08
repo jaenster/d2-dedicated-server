@@ -295,6 +295,11 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     const rr = routed.?;
     _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid);
+    // The creator immediately joins the game they just made, but the GAMELOGON only
+    // carries the char name — the account reaches the GS solely via the join-context
+    // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
+    // the character fetch (fpGetDatabaseCharacter) fails for the game's own creator.
+    if (rr.gsid != 0) _ = gslink.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName());
     // Mint a realm-global token and record {token -> GS addr + real gameid} so the
     // qqserver can translate the client's token to the engine's gameid and splice.
     const token = mintToken();
