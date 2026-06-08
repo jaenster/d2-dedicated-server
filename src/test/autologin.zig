@@ -12,6 +12,15 @@ const log = @import("../log.zig");
 
 extern "kernel32" fn CreateThread(a: ?*anyopaque, st: usize, f: *const fn (?*anyopaque) callconv(.winapi) u32, p: ?*anyopaque, fl: u32, id: ?*u32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
+
+/// Read an unsigned env var (0 if unset/invalid). Used for opt-in test knobs.
+fn envU32(name: [*:0]const u8) u32 {
+    var buf: [16]u8 = undefined;
+    const n = GetEnvironmentVariableA(name, &buf, buf.len);
+    if (n == 0 or n >= buf.len) return 0;
+    return std.fmt.parseInt(u32, buf[0..n], 10) catch 0;
+}
 
 const Control = extern struct {
     dwType: u32, // 0x00  (1=editbox, 6=button)
@@ -179,6 +188,13 @@ fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
                 clickCtrl(join_tab);
                 log.print("autologin: opened Join Game");
                 Sleep(800);
+                // Opt-in: linger on the JOIN screen so the game list refresh (MCP 0x05)
+                // completes and the screenshot thread captures the populated list.
+                const hold_ms = envU32("D2GS_JOIN_HOLD_MS");
+                if (hold_ms != 0) {
+                    log.hex("autologin: holding on JOIN screen ms=0x", hold_ms);
+                    Sleep(hold_ms);
+                }
                 dumpButtons(); // join form buttons
                 var boxes: [2]*Control = undefined;
                 if (findEditboxes(&boxes) >= 1) {

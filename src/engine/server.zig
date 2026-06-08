@@ -10,6 +10,7 @@
 //! reconstruction or disassembly of the retail binary — see VERIFY.md.
 
 const std = @import("std");
+const feature = @import("feature.zig");
 
 extern "kernel32" fn GetModuleHandleA(name: ?[*:0]const u8) callconv(.winapi) ?*anyopaque;
 
@@ -249,4 +250,8 @@ pub fn tick() void {
     if (QSERVER_TickAllGames(1) != 0) {
         QSERVER_DispatchAndCleanup(0, 0);
     }
+    // Fan out to feature serverTick() hooks. Per-game hooks (gameServerLoop,
+    // gameCreate/Destroy with a GameCtx carrying the game's FOG-pool allocator)
+    // are dispatched once the per-game pool pointer is wired from D2GameStrc.
+    feature.fanServerTick();
 }

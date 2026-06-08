@@ -18,17 +18,13 @@ const command = @import("engine/command.zig");
 const realm = @import("engine/realm.zig");
 const d2cs = @import("realm/client/d2cs.zig");
 const d2dbs = @import("realm/client/d2dbs.zig");
-const headless = @import("runtime/headless.zig");
-const crash = @import("runtime/crash.zig");
-const halt_hook = @import("runtime/halt_hook.zig");
-const checkrev_patch = @import("runtime/checkrev_patch.zig");
-const gamecrashfix = @import("runtime/gamecrashfix.zig");
-const multiinstance = @import("runtime/multiinstance.zig");
+const feature = @import("engine/feature.zig");
+const halt_hook = @import("runtime/feature/halt_hook.zig"); // for enableSuppress (sub-mode, not a toggle)
 const gsport = @import("runtime/gsport.zig");
+const roominit = @import("runtime/roominit.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
-const clientdiag = @import("runtime/clientdiag.zig");
-const nocompress = @import("runtime/nocompress.zig");
+const realmgw = @import("runtime/realmgw.zig");
 const autoenter = @import("test/autoenter.zig");
 const autologin = @import("test/autologin.zig");
 const screenshot = @import("test/screenshot.zig");
@@ -322,6 +318,10 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // qqserver can own the client-facing :4000 and splice through to us. Must precede the
     // QSERVER_CreateAndInit inside bootstrapRealmServer. No-op when gs_public_port == 4000.
     gsport.apply(gs_public_port);
+    // Per-game server hook surface: hook RoomInit to fan out roomInit() with a real
+    // per-game GameCtx (the game's own FOG pool). Opt-in via a consumer flag so the
+    // default server path stays byte-identical.
+    if (hasFlag("srvdiag")) roominit.install();
     if (use_realm) {
         if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         joindiag.install(); // log nReason when the engine refuses a join
@@ -366,23 +366,31 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
         if (hasFlag("d2gs")) {
             log.print("d2gs: DLL_PROCESS_ATTACH (--d2gs)");
             log.hex("d2gs: Game.exe base=0x", @intFromPtr(GetModuleHandleA(null)));
-            // Patch the host to survive with no display so our server can run.
-            // Applied here (process-attach, before client code executes).
-            if (hasFlag("headless")) {
-                headless.apply();
-            }
-            crash.install(); // log faulting addresses of engine access violations
-            halt_hook.install(); // log engine assert sites before exit
-            gamecrashfix.apply(); // d2bs null-deref guard (avoids the crash UI)
-            multiinstance.apply(); // allow GS + client to run at once
-            // Client-side: bypass the Battle.net version check so a real client
-            // can reach our realm without a signed version MPQ.
-            if (hasFlag("bypass-checkrev")) checkrev_patch.apply();
+            // Feature registry (engine/feature.zig): map command-line flags onto
+            // per-feature enable bits, then install every enabled feature. Covers
+            // the attach-time patches that used to be a manual sequence here —
+            // crash/halt_hook/gamecrashfix/multiinstance are default-on; headless,
+            // checkrev (--bypass-checkrev), nocompress (--no-compress) and clientdiag
+            // are gated by their flags. The single config table is in feature.zig.
+            feature.applyFlags(hasFlag);
+            feature.installAll();
             if (hasFlag("screenshot")) screenshot.install();
-            if (hasFlag("suppress-halts")) halt_hook.enableSuppress();
-            if (hasFlag("clientdiag")) clientdiag.install(); // client-side join-handshake trace
-            // Disable the D2GS Huffman codec (both ends must run this DLL). Off by default.
-            if (hasFlag("no-compress")) nocompress.apply();
+            if (hasFlag("suppress-halts")) halt_hook.enableSuppress(); // sub-mode, not a toggle
+            // Install the Battle.net gateway list in-process so the client always has a
+            // valid gateway and never hits the crashing default-ini path (lets clients
+            // share one wineprefix). --realm <ip> sets the realm IP (default 127.0.0.1).
+            {
+                var tmp: [64]u8 = undefined;
+                if (flagToken("realm-gw", &tmp)) |len| {
+                    realmgw.apply(if (len > 0) tmp[0..len] else "127.0.0.1");
+                } else if (flagToken("realm", &tmp)) |len| {
+                    // Bare `--realm` (GS boot, followed by another flag) must NOT be read as
+                    // an IP — only treat the token as the realm IP when it looks numeric.
+                    if (len > 0 and tmp[0] >= '0' and tmp[0] <= '9') realmgw.apply(tmp[0..len]);
+                } else if (hasFlag("realm-gw")) {
+                    realmgw.apply("127.0.0.1");
+                }
+            }
             // Drive the bnet login form: --auto-login <account>:<password>.
             {
                 var tmp: [160]u8 = undefined;

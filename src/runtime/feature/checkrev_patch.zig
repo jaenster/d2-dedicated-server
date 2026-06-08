@@ -11,8 +11,8 @@
 //! __fastcall(uint32_t* version [ECX], uint32_t* checksum [EDX],
 //!            uint8_t* exeInfoOut [stack]) -> int. ret 4 (callee cleans the one
 //! stack arg).
-const patch = @import("patch.zig");
-const log = @import("../log.zig");
+const patch = @import("../patch.zig");
+const log = @import("../../log.zig");
 
 const PERFORM_CHECKREVISION: usize = 0x0051e6d0;
 
@@ -45,13 +45,13 @@ const stub = [_]u8{
     0xC2, 0x04, 0x00, // ret 4
 };
 
-pub fn apply() void {
-    if (patch.writeBytes(PERFORM_CHECKREVISION, &stub)) {
+pub fn install() void {
+    if (patch.MemoryPatch(PERFORM_CHECKREVISION).bytes(&stub).commit()) {
         log.print("checkrev: PerformCheckRevision bypassed (dummy version/checksum)");
     } else {
         log.print("checkrev: FAILED to patch PerformCheckRevision");
     }
-    if (patch.writeBytes(GET_PROGRESS, &ret_0x66)) {
+    if (patch.MemoryPatch(GET_PROGRESS).bytes(&ret_0x66).commit()) {
         log.print("checkrev: GetProgress forced to 0x66 (no patch -> launcher proceeds)");
     } else {
         log.print("checkrev: FAILED to patch GetProgress");
