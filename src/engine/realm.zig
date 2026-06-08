@@ -2,7 +2,7 @@
 //!
 //! The engine null-guards every slot before calling it (verified in
 //! NET_D2GS_SERVER_ProcessClientMessage_System @0x0052cc20 and
-//! NET_D2GS_SERVER_SrvJoinGame @0x004665... ), so an all-null table is a SAFE
+//! NET_D2GS_SERVER_SrvJoinGame @0x0052fa50 ), so an all-null table is a SAFE
 //! "realm mode on, no DB yet" state: SetupAsBnetServer sets IsBattleNetServer=1,
 //! games can't be created/joined until we implement the slots — but nothing
 //! crashes. Fill slots in one at a time as each signature is confirmed.
