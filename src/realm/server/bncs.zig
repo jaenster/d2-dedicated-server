@@ -20,6 +20,7 @@ const protocol = @import("bncs_protocol.zig");
 const state = @import("state.zig");
 const bnftp = @import("bnftp.zig");
 const chat = @import("chat.zig");
+const friends = @import("friends.zig");
 const store = @import("store.zig");
 const xsha1 = @import("xsha1.zig");
 
@@ -82,6 +83,7 @@ const SID_QUERYREALMS2 = 0x40;
 const SID_NETGAMEPORT = 0x45;
 const SID_AUTH_INFO = 0x50;
 const SID_AUTH_CHECK = 0x51;
+const SID_FRIENDSLIST = 0x65;
 
 // Token generator. These tokens aren't security-relevant (we don't verify
 // them), they just need to be distinct per connection. A counter stepped by an
@@ -188,6 +190,7 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
         chat.leave(fd);
         broadcastEvent(&c, EID_LEAVE, c.user_flags, c.accountName(), "");
     }
+    if (c.account_len > 0) friends.setOffline(c.accountName());
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }
 
@@ -205,6 +208,7 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         SID_QUERYREALMS2 => onQueryRealms(c, tag),
         SID_LOGONREALMEX => onLogonRealm(c, tag, body),
         SID_GETFILETIME => onGetFileTime(c, tag, body),
+        SID_FRIENDSLIST => onFriendsList(c, tag),
         SID_PING => onPing(c, body),
         SID_NETGAMEPORT => {},
         else => {
@@ -256,6 +260,7 @@ fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
     c.setAccount(acct);
 
     const result = logonResult(c, server_token, got);
+    if (result == LOGON_OK) friends.setOnline(acct); // presence for friends online-status
     log.line(tag, "logon account={s} -> result={d}", .{ acct, result });
 
     var buf: [16]u8 = undefined;
@@ -413,6 +418,10 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         if (found) sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg) else sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
         return;
     }
+    if (parseFriendCmd(text)) |fc| {
+        handleFriendCmd(c, tag, fc);
+        return;
+    }
     if (text.len > 0 and text[0] == '/') {
         // Unknown slash command: acknowledge minimally, don't broadcast.
         sendEvent(c, EID_INFO, 0, acct, "");
@@ -435,6 +444,52 @@ fn parseWhisper(text: []const u8) ?Whisper {
         return null;
     const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
     return .{ .target = rest[0..sp], .msg = rest[sp + 1 ..] };
+}
+
+const FriendCmd = struct { action: enum { add, remove, list }, name: []const u8 };
+
+// "/f ...", "/friend ...", "/friends ..." — manage the friends list from chat.
+fn parseFriendCmd(text: []const u8) ?FriendCmd {
+    var rest: []const u8 = undefined;
+    if (std.mem.startsWith(u8, text, "/friends")) {
+        rest = std.mem.trim(u8, text[8..], " ");
+    } else if (std.mem.startsWith(u8, text, "/friend")) {
+        rest = std.mem.trim(u8, text[7..], " ");
+    } else if (std.mem.eql(u8, text, "/f") or std.mem.startsWith(u8, text, "/f ")) {
+        rest = std.mem.trim(u8, text[2..], " ");
+    } else return null;
+
+    const sp = std.mem.indexOfScalar(u8, rest, ' ');
+    const verb = if (sp) |s| rest[0..s] else rest;
+    const arg = if (sp) |s| std.mem.trim(u8, rest[s + 1 ..], " ") else "";
+    if (verb.len == 0 or std.mem.startsWith(u8, "list", verb)) return .{ .action = .list, .name = "" };
+    if (std.mem.eql(u8, verb, "add") or std.mem.eql(u8, verb, "a")) return .{ .action = .add, .name = arg };
+    if (std.mem.eql(u8, verb, "remove") or std.mem.eql(u8, verb, "r") or std.mem.eql(u8, verb, "del")) return .{ .action = .remove, .name = arg };
+    return .{ .action = .list, .name = "" };
+}
+
+fn handleFriendCmd(c: *Conn, tag: []const u8, fc: FriendCmd) void {
+    const acct = c.accountName();
+    switch (fc.action) {
+        .add => {
+            if (fc.name.len == 0) return sendEvent(c, EID_INFO, 0, "", "Usage: /f add <account>");
+            const ok = friends.add(acct, fc.name);
+            log.line(tag, "{s} friend-add {s} -> {}", .{ acct, fc.name, ok });
+            sendEvent(c, EID_INFO, 0, "", if (ok) "Added to your friends list." else "Already on your list (or it is full).");
+        },
+        .remove => {
+            const ok = friends.remove(acct, fc.name);
+            log.line(tag, "{s} friend-remove {s} -> {}", .{ acct, fc.name, ok });
+            sendEvent(c, EID_INFO, 0, "", if (ok) "Removed from your friends list." else "That player is not on your list.");
+        },
+        .list => {
+            var infos: [friends.max_friends]friends.FriendInfo = undefined;
+            const n = friends.list(acct, &infos);
+            if (n == 0) sendEvent(c, EID_INFO, 0, "", "Your friends list is empty.");
+            for (infos[0..n]) |f| sendEvent(c, EID_INFO, 0, f.nameSlice(), if (f.online) "online" else "offline");
+            onFriendsList(c, tag); // also push the structured list so the UI panel updates
+        },
+    }
 }
 
 fn onQueryRealms(c: *Conn, tag: []const u8) void {
@@ -493,6 +548,28 @@ fn onGetFileTime(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU32(unknown);
     w.putU64(0); // filetime 0 = not available
     w.putStr(fname);
+    finish(c, &w);
+}
+
+// Product code for an online friend (D2XP), little-endian 4 chars as the client expects.
+const PRODUCT_D2XP: u32 = @bitCast([4]u8{ 'D', '2', 'X', 'P' });
+
+// SID_FRIENDSLIST (0x65): reply with this account's friends. Per entry:
+// cstr name, u8 status flags, u8 location (0=offline,1=online), u32 product, cstr loc-string.
+fn onFriendsList(c: *Conn, tag: []const u8) void {
+    var infos: [friends.max_friends]friends.FriendInfo = undefined;
+    const n = friends.list(c.accountName(), &infos);
+    log.line(tag, "friends list for {s} -> {d} friend(s)", .{ c.accountName(), n });
+    var buf: [2048]u8 = undefined;
+    var w = startPacket(&buf, SID_FRIENDSLIST);
+    w.putU8(@intCast(n));
+    for (infos[0..n]) |f| {
+        w.putStr(f.nameSlice());
+        w.putU8(0); // status flags (mutual/DND/away) — none yet
+        w.putU8(if (f.online) @as(u8, 1) else 0); // location
+        w.putU32(if (f.online) PRODUCT_D2XP else 0);
+        w.putStr(""); // location string (channel/game name)
+    }
     finish(c, &w);
 }
 
