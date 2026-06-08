@@ -24,6 +24,7 @@ const halt_hook = @import("runtime/halt_hook.zig");
 const checkrev_patch = @import("runtime/checkrev_patch.zig");
 const gamecrashfix = @import("runtime/gamecrashfix.zig");
 const multiinstance = @import("runtime/multiinstance.zig");
+const gsport = @import("runtime/gsport.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
 const autoenter = @import("test/autoenter.zig");
@@ -315,6 +316,10 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // minus the host-as-player-1 connect, plus SetupAsBnetServer). With --realm
     // we register the (currently all-null, safe) realm table to enable realm mode;
     // otherwise we run open (no D2CS), which the POC already proved listens on :4000.
+    // Move the engine's QServer off :4000 to the port we advertise (gs_public_port), so the
+    // qqserver can own the client-facing :4000 and splice through to us. Must precede the
+    // QSERVER_CreateAndInit inside bootstrapRealmServer. No-op when gs_public_port == 4000.
+    gsport.apply(gs_public_port);
     if (use_realm) {
         if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         joindiag.install(); // log nReason when the engine refuses a join

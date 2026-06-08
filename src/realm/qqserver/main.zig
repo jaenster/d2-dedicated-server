@@ -602,6 +602,7 @@ const Gateway = struct {
             };
             c.state = .handshake;
             c.cli = cfd;
+            log.line("qq", "accepted game connection (fd={d}) — awaiting GAMELOGON", .{cfd});
         }
     }
 
