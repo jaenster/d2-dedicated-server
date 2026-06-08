@@ -89,7 +89,7 @@ pub const D2UnitStrc = extern struct {
     nAct: u8, // 0x18
     _pad_0x19: [3]u8, // 0x19
     pDrlgAct: u32, // 0x1C
-    sSeed: u64, // 0x20 D2SeedStrc
+    sSeed: [2]u32, // 0x20 D2SeedStrc (lo,hi) — [2]u32 not u64 to keep align 4 (size 244)
     nInitSeed: i32, // 0x28
     pPath: u32, // 0x2C D2PathUnion* — world position lives here
     _pad_0x30: [0xE4 - 0x30]u8, // 0x30 .. 0xE4
