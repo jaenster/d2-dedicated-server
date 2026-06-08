@@ -84,6 +84,7 @@ pub fn main() !void {
     state.instance_hash = hashStr(cfg.instance_id);
     if (cfg.shared) log.line("realmd", "multi-instance mode: sessions/games in shared store {s} (instance hash 0x{x})", .{ cfg.data_dir, state.instance_hash });
     bncs.realm_name = cfg.realm_name;
+    bncs.admin_accounts = cfg.admins;
     bncs.d2cs_port = cfg.d2cs_port;
     gslink.realm_name = cfg.realm_name;
     if (parseIp4(cfg.realm_addr)) |ip| {

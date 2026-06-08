@@ -17,6 +17,7 @@ pub const Member = struct {
     name_len: u8 = 0,
     channel: [max_channel]u8 = [_]u8{0} ** max_channel,
     channel_len: u8 = 0,
+    flags: u32 = 0, // SID_CHATEVENT user flags (operator/admin/...) for this user
     send_lock: Spinlock = .{},
 
     pub fn nameSlice(m: *const Member) []const u8 {
@@ -27,6 +28,18 @@ pub const Member = struct {
     }
 };
 
+/// Count members currently in `channel` (excluding `exclude_fd`). Caller must NOT
+/// hold the registry lock. Used to decide channel-operator on join.
+pub fn countInChannel(channel: []const u8, exclude_fd: net.Socket) usize {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    var n: usize = 0;
+    for (&reg.members) |*m| {
+        if (m.in_use and m.fd != exclude_fd and std.mem.eql(u8, m.channelSlice(), channel)) n += 1;
+    }
+    return n;
+}
+
 const Registry = struct {
     lock: Spinlock = .{},
     members: [1024]Member = [_]Member{.{}} ** 1024,
@@ -36,7 +49,7 @@ var reg: Registry = .{};
 
 /// Claim (or reuse, by fd) a slot for this connection and set its name+channel.
 /// Returns the member, or null if the table is full.
-pub fn join(fd: net.Socket, name: []const u8, channel: []const u8) ?*Member {
+pub fn join(fd: net.Socket, name: []const u8, channel: []const u8, flags: u32) ?*Member {
     reg.lock.lock();
     defer reg.lock.unlock();
     var slot: ?*Member = null;
@@ -55,6 +68,7 @@ pub fn join(fd: net.Socket, name: []const u8, channel: []const u8) ?*Member {
     const cn: u8 = @intCast(@min(channel.len, max_channel));
     @memcpy(m.channel[0..cn], channel[0..cn]);
     m.channel_len = cn;
+    m.flags = flags;
     m.in_use = true;
     return m;
 }
