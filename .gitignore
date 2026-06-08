@@ -24,3 +24,5 @@ tools/vermpq/*.signed.dll
 tools/vermpq/ver-IX86-1.dll
 tools/vermpq/*.mpq
 tools/vermpq/make_vermpq
+114clean
+clientgame/
