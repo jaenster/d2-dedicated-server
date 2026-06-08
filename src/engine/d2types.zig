@@ -54,7 +54,9 @@ pub const D2GameStrc = extern struct {
     _pad_0x6F: u8, // 0x6F
     bExpansion: i32, // 0x70 0=Classic 1=Expansion
     eGameType: u32, // 0x74 eD2GSGameType
-    _tail: [7552]u8, // 0x78.. rest of the 7672-byte struct
+    wItemFormat: u16, // 0x78 item save format (recon)
+    _pad_0x7A: u16, // 0x7A alignment after wItemFormat
+    _tail: [7548]u8, // 0x7C.. rest of the 7672-byte struct
 
     pub inline fn pool(self: *D2GameStrc) ?*D2PoolManagerStrc {
         return self.pMemoryPool;
@@ -73,6 +75,7 @@ pub const D2GameStrc = extern struct {
         std.debug.assert(@offsetOf(D2GameStrc, "pMemoryPool") == 0x1C);
         std.debug.assert(@offsetOf(D2GameStrc, "nDifficulty") == 0x6D);
         std.debug.assert(@offsetOf(D2GameStrc, "bExpansion") == 0x70);
+        std.debug.assert(@offsetOf(D2GameStrc, "wItemFormat") == 0x78);
         std.debug.assert(@sizeOf(D2GameStrc) == 7672);
     }
 };
