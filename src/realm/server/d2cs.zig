@@ -209,13 +209,30 @@ fn enc14(w: *proto.Writer, v: u32) void {
     w.putU8(@intCast(((v >> 7) & 0x7F) | 0x80));
 }
 
-// Character statstring parsed by D2Client CharSel.cpp (SAVEFILE_ParseSaveData,
-// verified against the 1.14d client reconstruction):
-//   [0..2] realm char count (14-bit), [2..13] equip slot1 (11 bytes, 0xFF=none),
-//   [13] class (parser subtracts CLASS_SORCERESS=1), [14..25] equip slot2 (11),
-//   [25] level, [26..28] flags (14-bit; &4 = expansion), [28..30] field9 (14-bit),
-//   [30] act, [31..33] fields (0xFF->0), [33..36] guild tag (3 bytes).
-// Every byte is kept non-zero so it survives as a C-string.
+// Character statstring — the per-char blob in the MCP_CHARLIST2 (0x19) reply that the
+// client's char-select screen renders each character from. Layout fully reverse-engineered
+// from the 1.14d client (Game.exe), parser CHARSEL_ParseRealmCharList @0x43aab0 →
+// SAVEFILE_ParseSaveData @0x438ad0. Offsets from the statstring start:
+//   [0..2]   realm char count   (14-bit encoded — SAVEFILE_ReadEncodedInt14Bit)
+//   [2..13]  equip slot 1 (11)  → body-component GRAPHIC codes (see below)
+//   [13]     class + 1          (parser subtracts CLASS_SORCERESS=1)
+//   [14..25] equip slot 2 (11)  → component color TRANSFORMS (tints)
+//   [25]     level
+//   [26..28] character flags    (14-bit; bit2=0x04 expansion, bit3=0x08 ladder/hardcore mix)
+//   [28..30] field9             (14-bit)
+//   [30]     act (0xFF->0), [31..33] two fields (0xFF->0), [33..36] guild tag (3 bytes)
+// Every byte must stay NON-ZERO (the statstring is sent as a C-string; a 0 truncates it) —
+// that's why 14-bit ints set the high bit and "none" is 0xFF, not 0x00.
+//
+// Rendering: the client builds the 3D char preview via AllocCharSelectComponent @0x5066c0
+// (class, expansion-mode, slot1 [graphic codes], slot2 [transforms]). The 16-entry equip
+// loop treats a code of 0 / 0xFF / >= max as an EMPTY body slot. Weapons live at slot1[5]
+// (right) and slot1[6] (left); D2COMP_ResolveWeaponClass @0x504af0 returns 1 (unarmed) when
+// both are 0xFF, so an all-0xFF statstring renders a VALID NAKED character of the right
+// class/level — it is not broken, just bare. To show real equipped gear, parse the .d2s
+// item list (JM section) into gaCompCharacterCompositeItems indices and fill slot1/slot2
+// (a future "char portrait" feature; the GS has the items in memory on save and could
+// supply the portrait, like real pvpgn d2cs does).
 fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, realm_count: u32) void {
     enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
     var k: usize = 0;
