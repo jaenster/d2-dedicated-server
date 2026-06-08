@@ -84,6 +84,18 @@ fn lastErrno() c_int {
 const EAGAIN: c_int = @intFromEnum(posix.E.AGAIN);
 const EINPROGRESS: c_int = @intFromEnum(posix.E.INPROGRESS);
 
+// Monotonic milliseconds — used to back off redis reconnect attempts so an unreachable
+// redis makes the loop SLEEP (poll timeout) instead of hammering connect() in a spin.
+const timespec = extern struct { sec: c_long, nsec: c_long };
+const CLOCK_MONOTONIC: c_int = if (is_linux) 1 else 6; // linux 1, darwin 6
+extern "c" fn clock_gettime(clk: c_int, tp: *timespec) c_int;
+fn nowMs() i64 {
+    var ts: timespec = undefined;
+    _ = clock_gettime(CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+const REDIS_RECONNECT_MS: i64 = 1000; // min gap between redis connect attempts
+
 // struct addrinfo — ai_addr vs ai_canonname order DIFFERS by OS (Linux: addr first;
 // BSD/darwin: canonname first). One-time use to resolve the redis host at startup.
 const addrinfo = if (is_linux) extern struct {
@@ -245,6 +257,7 @@ const Gateway = struct {
     redis_port: u16 = 6379,
     redis_fd: c_int = -1,
     redis_state: RedisState = .disconnected,
+    redis_retry_at: i64 = 0, // monotonic-ms gate: don't re-dial redis before this (backoff)
     redis_out: [REDIS_OUT_SZ]u8 = undefined,
     redis_out_len: usize = 0,
     redis_in: [REDIS_IN_SZ]u8 = undefined,
@@ -322,6 +335,10 @@ const Gateway = struct {
 
     // ── redis: connection lifecycle ─────────────────────────────────────────────────────
     fn redisConnect(g: *Gateway) void {
+        if (g.redis_fd >= 0) { // never leak a prior (failed/half-open) socket
+            _ = close(g.redis_fd);
+            g.redis_fd = -1;
+        }
         const d = dialNonBlock(g.redis_ip, g.redis_port) orelse {
             g.redis_state = .disconnected;
             return;
@@ -458,7 +475,12 @@ const Gateway = struct {
         var is_gs: [MAX_CONN * 2 + 2]bool = undefined;
 
         while (true) {
-            if (g.redis_state == .disconnected) g.redisConnect();
+            // Reconnect redis at most once per REDIS_RECONNECT_MS — without this gate a
+            // down/unreachable redis spins connect() at ~100% CPU and floods it with SYNs.
+            if (g.redis_state == .disconnected and nowMs() >= g.redis_retry_at) {
+                g.redis_retry_at = nowMs() + REDIS_RECONNECT_MS;
+                g.redisConnect();
+            }
 
             pfds[0] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
             var n: usize = 1;
@@ -524,9 +546,12 @@ const Gateway = struct {
                 }
             }
 
-            // Block until activity. When redis isn't ready yet, wake periodically to retry
-            // the connect; otherwise sleep indefinitely (0% CPU) until an fd is ready.
-            const timeout: c_int = if (g.redis_state == .ready) -1 else 1000;
+            // Block until activity. Redis ready → sleep indefinitely (0% CPU). Otherwise wake
+            // exactly at the next reconnect deadline (so we retry without spinning).
+            const timeout: c_int = if (g.redis_state == .ready) -1 else blk: {
+                const wait = g.redis_retry_at - nowMs();
+                break :blk if (wait <= 0) REDIS_RECONNECT_MS else @intCast(@min(wait, REDIS_RECONNECT_MS));
+            };
             const ready = poll(&pfds, @intCast(n), timeout);
             if (ready <= 0) continue;
 
