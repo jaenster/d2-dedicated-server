@@ -427,6 +427,7 @@ fn onLogonRealm(c: *Conn, tag: []const u8, body: []const u8) void {
     const title = r.getStr();
 
     const acct = c.accountName();
+    log.line(tag, "realm logon: parsed token=0x{x} title='{s}' acct='{s}' (minting session)", .{ c.client_token, title, acct });
     const sid = state.global.mintSession(acct);
     const cookie = nextToken();
     log.line(tag, "realm logon account={s} realm={s} session={d}", .{ acct, title, sid });
