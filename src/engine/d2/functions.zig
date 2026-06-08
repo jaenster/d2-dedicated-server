@@ -825,6 +825,46 @@ pub const TxtNpcGetLine = cdeclTxt(0x00656900);
 /// D2CLIENT_GetMonsterOwner: __fastcall(nMonsterId) -> owner unit ID
 pub const GetMonsterOwner = fastcall(0x479150, fn (u32) u32);
 
+// ============================================================================
+// Ubers (server) — monster/item/portal spawn + boss AI (recon 9df5e900)
+// ============================================================================
+
+/// SERVER_SpawnMonster @0x5A4440 — __fastcall. Full monster spawn with GUID/seed/
+/// flags/mods. ECX=pGame, EDX=pRoom; stack: x, y, classId, guid, seed, isChampion,
+/// isSuperUnique, superUniqueId, mods(char* → &[9]u8).
+pub const SpawnMonster = fastcall(0x5A4440, fn (?*anyopaque, ?*anyopaque, i32, i32, u32, u32, u32, BOOL, BOOL, u32, [*]const u8) ?*UnitAny);
+
+/// SpawnMonster (with-mode variant) @0x5b2f20 — __fastcall. Spawns adds for boss AI.
+/// ECX=pGame, EDX=pRoom; stack: x, y, classId, eMode, nParam, nFlags(i16).
+pub const SpawnMonsterWithMode = fastcall(0x5B2F20, fn (?*anyopaque, ?*anyopaque, i32, i32, u32, u32, u32, i16) ?*UnitAny);
+
+/// FindBestSpotToSpawnItem @0x555DA0 — __fastcall. ECX=pRoom, EDX=pPoint(in);
+/// stack: pNewPosition(out), nCollisionMask(u32), nMaxSearchRadius(byte).
+pub const FindBestSpotToSpawnItem = fastcall(0x555DA0, fn (?*Room1, *POINT, *POINT, u32, u8) ?*Room1);
+
+/// ITEM_CreateItemInstance @0x558D90 (Charon "SpawnItemWithStruct") — __fastcall.
+/// ECX=pGame, EDX=pItemGenCtx (*ItemGenerationData), stack: param (1).
+pub const SpawnItemWithStruct = fastcall(0x558D90, fn (?*anyopaque, *types.ItemGenerationData, i32) ?*UnitAny);
+
+/// TXT_Items_ConvertItemCodeToItemClassId @0x633680 — __stdcall(char[4] code as DWORD).
+pub const GetItemClassIdByCode = struct {
+    const Fn = *const fn (u32) callconv(.winapi) i32;
+    const ptr: Fn = funcPtr(0x633680, Fn);
+    pub inline fn call(code: u32) i32 {
+        return ptr(code);
+    }
+};
+
+/// SetupUpdateEvent (Charon "PlaySoundMaybe") @0x553380 — __fastcall.
+/// ECX=pUnit, EDX=nUpdateType, stack: pUpdateUnit.
+pub const PlaySoundMaybe = fastcall(0x553380, fn (?*UnitAny, u32, ?*UnitAny) void);
+
+/// Boss AI base functions (__fastcall: ECX=pGame, EDX=pUnit, stack: pAiParam).
+/// The Uber* replacements call these after spawning adds.
+pub const MephAI = fastcall(0x5F78B0, fn (?*anyopaque, ?*UnitAny, ?*types.AIParams) void);
+pub const DiabloAI = fastcall(0x5E9170, fn (?*anyopaque, ?*UnitAny, ?*types.AIParams) void);
+pub const BaalAI = fastcall(0x5FCFE0, fn (?*anyopaque, ?*UnitAny, ?*types.AIParams) void);
+
 /// Helper: stdcall txt GetLine wrapper (single u32 param, returns ?[*]u8)
 /// D2Common functions in the monolithic 1.14d exe use __stdcall.
 fn cdeclTxt(comptime addr: usize) type {

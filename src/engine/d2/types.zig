@@ -531,3 +531,67 @@ pub const RoomTile = extern struct {
     _08: [2]DWORD, // 0x08
     nNum: ?*DWORD, // 0x10
 };
+
+// ── Ubers: item generation + AI params (recon 9df5e900) ──────────────────────
+
+/// D2ItemGenContextStrc (recon /D2Game, 132 bytes) — Charon "ItemGenerationData".
+/// Fed to SpawnItemWithStruct (ITEM_CreateItemInstance). Field offsets verified
+/// against the recon; size is 0x84 packed (the recon struct has alignment 1).
+pub const ItemGenerationData = extern struct {
+    pUnit: ?*UnitAny, // 0x00
+    pNext: ?*ItemGenerationData, // 0x04
+    pGame: ?*anyopaque, // 0x08
+    nItemLevel: i32, // 0x0C
+    field_0x10: DWORD, // 0x10
+    nItemClassId: i32, // 0x14
+    dwMode: i32, // 0x18
+    nPosX: i32, // 0x1C
+    nPosY: i32, // 0x20
+    pDrlgRoom: ?*Room1, // 0x24
+    usually_one: i16, // 0x28
+    wItemFormat: WORD, // 0x2A
+    somethingCustom: BOOL, // 0x2C
+    eQuality: ItemQuality, // 0x30
+    nPriceMaybe: i32, // 0x34
+    durability: DWORD, // 0x38
+    maxDurability: DWORD, // 0x3C
+    dwFileIndex: DWORD, // 0x40
+    eItemFlag: DWORD, // 0x44
+    nInitSeed: i32, // 0x48
+    nModSeed: i32, // 0x4C
+    bGrade: u8, // 0x50
+    _51: [7]u8, // 0x51
+    szCustomName: [16]u8, // 0x58
+    _68: [24]u8, // 0x68 .. 0x7F
+    nFlags: DWORD, // 0x80
+
+    comptime {
+        std.debug.assert(@offsetOf(ItemGenerationData, "nItemClassId") == 0x14);
+        std.debug.assert(@offsetOf(ItemGenerationData, "pDrlgRoom") == 0x24);
+        std.debug.assert(@offsetOf(ItemGenerationData, "wItemFormat") == 0x2A);
+        std.debug.assert(@offsetOf(ItemGenerationData, "eQuality") == 0x30);
+        std.debug.assert(@offsetOf(ItemGenerationData, "dwFileIndex") == 0x40);
+        std.debug.assert(@offsetOf(ItemGenerationData, "nInitSeed") == 0x48);
+        std.debug.assert(@offsetOf(ItemGenerationData, "szCustomName") == 0x58);
+        std.debug.assert(@offsetOf(ItemGenerationData, "nFlags") == 0x80);
+        std.debug.assert(@sizeOf(ItemGenerationData) == 0x84);
+    }
+};
+
+/// D2AiParamStrc (recon /Diablo2/AI, 36 bytes) — third arg to boss AI functions.
+pub const AIParams = extern struct {
+    pMonsterAiGeneral: ?*anyopaque, // 0x00
+    fpAiFunction: ?*anyopaque, // 0x04
+    pTarget: ?*UnitAny, // 0x08
+    field_0xC: i32, // 0x0C
+    nVelocity: i32, // 0x10
+    nDistanceToTarget: i32, // 0x14
+    bEngagedInCombat: i32, // 0x18
+    pMonStats: ?*anyopaque, // 0x1C
+    pMonStats2: ?*anyopaque, // 0x20
+
+    comptime {
+        std.debug.assert(@offsetOf(AIParams, "pTarget") == 8);
+        std.debug.assert(@sizeOf(AIParams) == 36);
+    }
+};
