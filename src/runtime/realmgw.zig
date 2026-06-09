@@ -24,6 +24,12 @@ const fastcall = @import("fastcall.zig");
 const log = @import("../log.zig");
 
 const GETGATEWAYLIST_ADDR: usize = 0x00518190;
+// UpdateGatewaysFromIni(this, szText) @0x518850 — __stdcall, 2 stack args. Parses a
+// server-pushed (BNFTP) or default gateway ini and asserts (FindSection -> NULL ->
+// BNetGW.cpp:0x277) when the buffer is bad. Since the detour above always supplies a
+// valid gateway, this is only ever the server/default trying to OVERRIDE our injected
+// list — which we want to ignore — so we no-op it (ret 8) to kill the assert for good.
+const UPDATEGATEWAYS_ADDR: usize = 0x00518850;
 // Fog::SMem::SMemAlloc(size, file, line, flags) -> ptr  (__stdcall: callee cleans 16 bytes)
 const SMemAlloc: *const fn (u32, [*:0]const u8, u32, u32) callconv(.winapi) ?[*]u8 = @ptrFromInt(0x00413020);
 
@@ -83,5 +89,11 @@ pub fn apply(ip: []const u8) void {
         log.print("realmgw: GetGatewayList detoured (gateway list from memory, realm -> injected IP)");
     } else {
         log.print("realmgw: FAILED to detour GetGatewayList");
+    }
+    // No-op the ini parser so a server-pushed/default gateway list can't override ours or assert.
+    if (patch.MemoryPatch(UPDATEGATEWAYS_ADDR).retImm(8).commit()) {
+        log.print("realmgw: UpdateGatewaysFromIni no-op'd (ret 8)");
+    } else {
+        log.print("realmgw: FAILED to no-op UpdateGatewaysFromIni");
     }
 }
