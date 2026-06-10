@@ -703,6 +703,14 @@ fn scQqserverTokenTranslate() Result {
 
     const fd = net.connectLocal(QQ_PORT) catch |e| return fail(name, "connect qq {s}", .{@errorName(e)});
     defer net.closeSocket(fd);
+
+    // On accept the qqserver speaks for the not-yet-dialled GS and sends a 2-byte 0xAF00
+    // connection-established handshake (real D2GS setup; see main.zig accept loop). Consume
+    // it before the echoed game packet, or it shifts every later byte by two.
+    var hs: [2]u8 = undefined;
+    net.readFull(fd, &hs) catch |e| return fail(name, "no 0xAF00 handshake ({s})", .{@errorName(e)});
+    if (hs[0] != 0xaf or hs[1] != 0x00) return fail(name, "handshake={x:0>2}{x:0>2}, want af00", .{ hs[0], hs[1] });
+
     net.writeAll(fd, &logon) catch |e| return fail(name, "send {s}", .{@errorName(e)});
 
     // The qqserver replays the (rewritten) packet to the echo backend, which echoes it.
