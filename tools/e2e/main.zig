@@ -146,7 +146,10 @@ fn scCreateJoinGame() Result {
     if (jg.token == cg.token) return fail(name, "join token={d} same as create token (tokens must be unique)", .{jg.token});
     if (!(jg.ip[0] == 127 and jg.ip[1] == 0 and jg.ip[2] == 0 and jg.ip[3] == 1))
         return fail(name, "join gs_ip={d}.{d}.{d}.{d} want 127.0.0.1", .{ jg.ip[0], jg.ip[1], jg.ip[2], jg.ip[3] });
-    if (gs.creates != 1 or gs.joins != 1) return fail(name, "FakeGS saw creates={d} joins={d}, want 1/1", .{ gs.creates, gs.joins });
+    // The GS sees TWO join-notifies: create auto-seeds the creator's join (the account
+    // reaches the GS only via the join-context notify — see onCreateGame), then the
+    // explicit joinGame seeds it again. So creates=1, joins=2 for a create-then-join.
+    if (gs.creates != 1 or gs.joins != 2) return fail(name, "FakeGS saw creates={d} joins={d}, want 1/2", .{ gs.creates, gs.joins });
     return .{ .name = name, .status = .pass, .msg = msg("create+join ok create-token={d} join-token={d} gs_ip=127.0.0.1 (creates={d} joins={d})", .{ cg.token, jg.token, gs.creates, gs.joins }) };
 }
 
