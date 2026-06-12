@@ -1,0 +1,3 @@
+# generated artifacts (regenerable from the scan workflows + the Ghidra session)
+worklist*.json
+sweep.run.js
