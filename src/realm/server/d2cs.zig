@@ -372,12 +372,20 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
 }
 
 // MCP_GAMELIST (0x05). Request body: u16 reqid, u32 difficulty filter, cstr search
-// (NET_MCP_CLIENT_Send_0x05_GameList @0x44a590). Reply: echo reqid, u32 count, then per
-// game a 32-byte header (the client's parser reads a status word at +0xc and the name at
-// +0x20) followed by name\0, description\0, statstring\0. We list every open game from the
-// registry; the level/difficulty filtering is applied client-side from the statstring
-// (empty statstring shows for softcore). The exact 32-byte header fields beyond the status
-// word still need a join-screen pass to refine — TODO.
+// (NET_MCP_CLIENT_Send_0x05_GameList @0x44a590).
+//
+// The realm game list is delivered ONE GAME PER 0x05 PACKET, not one concatenated reply.
+// Client side: each packet -> NET_MCP_CLIENT_Incoming0x05 @0x44b2d0 stores it in the
+// g_CharSelectBuffer struct; JoinOrCreateGame polls it and calls OOGMENU_AddGameToCache
+// once per game. A final packet whose token field == -2 (0xFFFFFFFE) maps to result 0x33
+// = end-of-list, which triggers OOGMENU_RefreshGameListDisplay() to redraw the list.
+//
+// Per-game 0x05 payload (offsets are from the type byte the client sees as pBytes[0]):
+//   +1   u16 reqid   (must equal the request's seq or the client drops it)
+//   +3   u32 gameid  (low u16 is the AddGameToCache dedup key)
+//   +7   u8  status  (game flags; 0 = open)
+//   +8   u32 token   (must NOT be -1/-2 for a real game)
+//   +0xc cstr name, then cstr description
 fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
@@ -385,15 +393,23 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     const n = state.snapshotGames(&games);
     log.line(tag, "game list (reqid={d}) -> {d} game(s)", .{ reqid, n });
 
-    var buf: [8192]u8 = undefined;
-    var w = startPacket(&buf, MCP_GAMELIST);
-    w.putU16(reqid);
-    w.putU32(@intCast(n)); // number of games that follow
     for (games[0..n]) |g| {
-        w.zeros(0x20); // per-game header (status word @+0xc; remaining fields TODO)
-        w.putStr(g.name_slice()); // game name
+        var buf: [64]u8 = undefined;
+        var w = startPacket(&buf, MCP_GAMELIST);
+        w.putU16(reqid); // +1 echo request id
+        w.putU32(g.gameid); // +3 gameid (low u16 = dedup key)
+        w.putU8(0); // +7 status / flags (0 = open)
+        w.putU32(g.gameid); // +8 token (non -1/-2 -> treated as a real game entry)
+        w.putStr(g.name_slice()); // +0xc game name (shown in the list)
         w.putStr(""); // description
-        w.putStr(""); // statstring (level/difficulty info; empty = visible to softcore)
+        finish(c, &w);
     }
-    finish(c, &w);
+    // End-of-list marker: token == -2 -> SetD2GSJoinResult(0x33) -> RefreshGameListDisplay().
+    var tbuf: [16]u8 = undefined;
+    var tw = startPacket(&tbuf, MCP_GAMELIST);
+    tw.putU16(reqid);
+    tw.putU32(0); // +3 unused
+    tw.putU8(0); // +7 unused
+    tw.putU32(0xFFFF_FFFE); // +8 token = -2 (end of list)
+    finish(c, &tw);
 }

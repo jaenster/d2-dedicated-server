@@ -146,7 +146,10 @@ fn scCreateJoinGame() Result {
     if (jg.token == cg.token) return fail(name, "join token={d} same as create token (tokens must be unique)", .{jg.token});
     if (!(jg.ip[0] == 127 and jg.ip[1] == 0 and jg.ip[2] == 0 and jg.ip[3] == 1))
         return fail(name, "join gs_ip={d}.{d}.{d}.{d} want 127.0.0.1", .{ jg.ip[0], jg.ip[1], jg.ip[2], jg.ip[3] });
-    if (gs.creates != 1 or gs.joins != 1) return fail(name, "FakeGS saw creates={d} joins={d}, want 1/1", .{ gs.creates, gs.joins });
+    // The GS sees TWO join-notifies: create auto-seeds the creator's join (the account
+    // reaches the GS only via the join-context notify — see onCreateGame), then the
+    // explicit joinGame seeds it again. So creates=1, joins=2 for a create-then-join.
+    if (gs.creates != 1 or gs.joins != 2) return fail(name, "FakeGS saw creates={d} joins={d}, want 1/2", .{ gs.creates, gs.joins });
     return .{ .name = name, .status = .pass, .msg = msg("create+join ok create-token={d} join-token={d} gs_ip=127.0.0.1 (creates={d} joins={d})", .{ cg.token, jg.token, gs.creates, gs.joins }) };
 }
 
@@ -700,6 +703,14 @@ fn scQqserverTokenTranslate() Result {
 
     const fd = net.connectLocal(QQ_PORT) catch |e| return fail(name, "connect qq {s}", .{@errorName(e)});
     defer net.closeSocket(fd);
+
+    // On accept the qqserver speaks for the not-yet-dialled GS and sends a 2-byte 0xAF00
+    // connection-established handshake (real D2GS setup; see main.zig accept loop). Consume
+    // it before the echoed game packet, or it shifts every later byte by two.
+    var hs: [2]u8 = undefined;
+    net.readFull(fd, &hs) catch |e| return fail(name, "no 0xAF00 handshake ({s})", .{@errorName(e)});
+    if (hs[0] != 0xaf or hs[1] != 0x00) return fail(name, "handshake={x:0>2}{x:0>2}, want af00", .{ hs[0], hs[1] });
+
     net.writeAll(fd, &logon) catch |e| return fail(name, "send {s}", .{@errorName(e)});
 
     // The qqserver replays the (rewritten) packet to the echo backend, which echoes it.

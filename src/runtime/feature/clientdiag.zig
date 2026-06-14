@@ -13,8 +13,8 @@
 //! jmp at the entry, logs on hit, then resumes the original. `deref_ecx` logs the
 //! byte at [ecx] (a packet id) instead of the raw ecx value.
 const std = @import("std");
-const patch = @import("patch.zig");
-const log = @import("../log.zig");
+const patch = @import("../patch.zig");
+const log = @import("../../log.zig");
 
 extern "kernel32" fn VirtualAlloc(addr: ?*anyopaque, size: usize, typ: u32, protect: u32) callconv(.winapi) ?*anyopaque;
 const MEM_COMMIT_RESERVE: u32 = 0x3000;
@@ -61,8 +61,8 @@ fn EntryHook(comptime addr: usize, comptime prologue_len: usize, comptime deref_
             tr[prologue_len + 4] = rb[3];
             tramp = @intFromPtr(tr);
 
-            if (patch.writeJump(addr, @intFromPtr(&shim))) {
-                if (prologue_len > 5) _ = patch.writeNops(addr + 5, prologue_len - 5);
+            // JMP to our shim, NOP-padding the rest of the relocated prologue.
+            if (patch.MemoryPatch(addr).jump(@intFromPtr(&shim)).nopTo(addr + prologue_len).commit()) {
                 log.print("clientdiag: installed hook @" ++ std.fmt.comptimePrint("0x{x}", .{addr}));
             } else {
                 log.print("clientdiag: hook FAILED " ++ label);

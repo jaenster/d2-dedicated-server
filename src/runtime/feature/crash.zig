@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const win = std.os.windows;
-const log = @import("../log.zig");
+const log = @import("../../log.zig");
 
 const EXCEPTION_RECORD = extern struct {
     ExceptionCode: u32,

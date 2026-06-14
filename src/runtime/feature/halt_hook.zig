@@ -2,8 +2,8 @@
 //! log the asserting caller (return address) + line before the process exits.
 //! Diagnostic only — maps engine asserts back to a function in Ghidra.
 
-const patch = @import("patch.zig");
-const log = @import("../log.zig");
+const patch = @import("../patch.zig");
+const log = @import("../../log.zig");
 
 const HALT_ADDR: usize = 0x00408a60;
 
@@ -52,5 +52,5 @@ fn handler() callconv(.naked) void {
 }
 
 pub fn install() void {
-    _ = patch.writeJump(HALT_ADDR, @intFromPtr(&handler));
+    _ = patch.MemoryPatch(HALT_ADDR).jump(@intFromPtr(&handler)).commit();
 }
