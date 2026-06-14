@@ -6,8 +6,8 @@
 //! intercept that guards the deref:
 //!   CMP ECX,0 / JE skip / MOV [ECX+0x10],EDX / skip: MOV [EAX+0xC],0 / RET
 //! so the game keeps running instead of crashing into the UI.
-const patch = @import("patch.zig");
-const log = @import("../log.zig");
+const patch = @import("../patch.zig");
+const log = @import("../../log.zig");
 
 const PATCH_ADDR: usize = 0x006091E5;
 
@@ -22,9 +22,9 @@ fn intercept() callconv(.naked) void {
     );
 }
 
-pub fn apply() void {
-    if (patch.writeCall(PATCH_ADDR, @intFromPtr(&intercept))) {
-        _ = patch.writeNops(PATCH_ADDR + 5, 5); // d2bs uses a 10-byte patch region
+pub fn install() void {
+    // call intercept + pad to d2bs's 10-byte patch region.
+    if (patch.MemoryPatch(PATCH_ADDR).call(@intFromPtr(&intercept)).nops(5).commit()) {
         log.print("gamecrashfix: D2CMP null-deref guard installed @0x6091E5");
     } else {
         log.print("gamecrashfix: FAILED to patch @0x6091E5");

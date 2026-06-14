@@ -199,9 +199,9 @@ model {
       #ours
       description 'Injected payload: boots Game.exe as a headless dedicated server'
 
-      runtime = component 'runtime (hooks)' {
+      runtime = component 'runtime (plumbing + drivers)' {
         #ours
-        description 'headless, halt_hook, gamecrashfix, checkrev_patch, gameloop, multiinstance, fastcall shims'
+        description 'Low-level in-process machinery: patch.zig (MemoryPatch fluent byte-patcher), fastcall.zig + trampoline.zig (x86 __fastcall shims / detours), plus the fan-out DRIVERS that own an engine byte-hook and dispatch to features: gameloop (frame), drawing (automap draw), roominit (per-game RoomInit), pkttrace (packets). gsport/joindiag/realmgw helpers.'
       }
       engine = component 'engine' {
         #ours
@@ -211,6 +211,37 @@ model {
         #ours
         description 'In-process d2cs/d2dbs client (realm/client/*.zig): session + character DB to the backend'
       }
+
+      // -- the Charon-style feature framework (engine/feature.zig) --
+      framework = component 'feature framework' {
+        #ours
+        description 'engine/feature.zig — Charon-style registry: comptime @hasDecl dispatch over a single central config table, runtime-toggleable per feature (flags now, realm/redis later), per-game GameCtx backed by the game own FOG pool. A feature is a pure module declaring pub fn hooks; drivers in runtime/ fan out to it.'
+      }
+      survival = component 'survival/diag features' {
+        #ours
+        description 'runtime/feature/*: headless (renderer/media stubs), crash, halt_hook, gamecrashfix, multiinstance, checkrev_patch, nocompress, clientdiag, srvdiag.'
+      }
+      maphack = component 'maphack (client features)' {
+        #ours
+        description 'runtime/feature/: omnivision (see through walls + full-bright), mapreveal (auto-reveal automap), mapunits (monster/item/missile dots). Ported from aether. Client-side — d2gs.dll injects into the real client too (--d2gs without --d2gs-boot).'
+      }
+      servermods = component 'server game mods' {
+        #ours
+        description 'runtime/feature/: expmod (exp scaling — wraps CALC_Experience, drives fanExpAward), ubers (Pandemonium / Uber Tristram: roomInit spawns, cube portals, KillMonster torch drop, boss-AI summon adds; no Diablo Clone). Ported from Charon.'
+      }
+      d2layer = component 'engine bindings + structs' {
+        #ours
+        description 'engine/d2types.zig + engine/d2/{types,functions,globals,automap}.zig — D2 1.14d structs mirrored from the Ghidra recon (offsets comptime-asserted) + the fastcall(addr,FnType).call(.{}) engine-call generator (vendored from aether). fog.zig wraps D2 FOG memory pools as a std.mem.Allocator (per-game lifetime + cleanup).'
+      }
+
+      // framework dispatches to features; features use the d2 bindings/structs.
+      framework -> survival 'dispatches install/lifecycle'
+      framework -> maphack 'dispatches draw/frame hooks'
+      framework -> servermods 'dispatches server + roomInit/expAward hooks'
+      runtime -> framework 'drivers fan out to features'
+      maphack -> d2layer 'structs + engine draw calls'
+      servermods -> d2layer 'structs + engine spawn/exp calls'
+      d2layer -> runtime 'byte-patch + fastcall shims'
     }
 
     realmd = process 'realmd' {
@@ -303,6 +334,12 @@ model {
   engine -> d2common 'reads game/character data'
   engine -> realmclient 'GS realm callbacks'
 
+  // feature framework: client maphack hooks the renderer, server mods hook game
+  // logic, and the d2 layer allocates from the engine FOG pools.
+  maphack -> d2client 'hooks automap / line-of-sight rendering (client-side)'
+  servermods -> d2game 'hooks exp / kill / boss-AI / item+monster spawn logic'
+  d2layer -> fog 'allocates from FOG memory pools (per-game lifetime)'
+
   // ---- realm wiring (game server <-> backend) ----
   realmclient -> rd2cs 'realm session'
   realmclient -> rd2dbs 'fetch/store characters'
@@ -346,6 +383,17 @@ views {
     title 'd2gs — injected server driver + realm backend'
     include *
     include diablo2, gameexe, d2game, d2common, checkrevision
+    autoLayout LeftRight
+  }
+
+  // The Charon-style feature framework inside d2gs.dll: the registry dispatches to
+  // pure feature modules (survival, client maphack, server mods); runtime drivers own
+  // the engine byte-hooks and fan out; the d2 layer supplies structs/engine calls and
+  // the per-game FOG allocator. Shows how each set attaches to the native game.
+  view feature_framework {
+    title 'd2gs.dll — feature framework'
+    include dll, framework, runtime, survival, maphack, servermods, d2layer, engine
+    include d2client, d2game, d2common, fog
     autoLayout LeftRight
   }
 

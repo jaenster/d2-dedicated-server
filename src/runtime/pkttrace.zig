@@ -144,8 +144,7 @@ fn installOutbound() void {
     tr[10] = rb[3];
     trampoline = @intFromPtr(tr);
 
-    if (patch.writeJump(SENDPKT, @intFromPtr(&sendShim))) {
-        _ = patch.writeNops(SENDPKT + 5, 1);
+    if (patch.MemoryPatch(SENDPKT).jump(@intFromPtr(&sendShim)).nops(1).commit()) {
         log.print("pkttrace: outbound SendPacket hook installed");
     } else {
         log.print("pkttrace: outbound detour FAILED");
@@ -154,9 +153,9 @@ fn installOutbound() void {
 
 pub fn install() void {
     var ok = true;
-    ok = patch.writeCall(GAMESETUP_CALL, @intFromPtr(&setupShim)) and ok;
-    ok = patch.writeCall(INGAME_CALL, @intFromPtr(&inGameShim)) and ok;
-    ok = patch.writeCall(SYSTEM_CALL, @intFromPtr(&systemShim)) and ok;
+    ok = patch.MemoryPatch(GAMESETUP_CALL).call(@intFromPtr(&setupShim)).commit() and ok;
+    ok = patch.MemoryPatch(INGAME_CALL).call(@intFromPtr(&inGameShim)).commit() and ok;
+    ok = patch.MemoryPatch(SYSTEM_CALL).call(@intFromPtr(&systemShim)).commit() and ok;
     log.print(if (ok) "pkttrace: inbound dispatch hooks installed" else "pkttrace: inbound hook FAILED");
     installOutbound();
 }
