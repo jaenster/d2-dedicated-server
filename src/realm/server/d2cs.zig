@@ -204,6 +204,7 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
         const class: u8 = if (n > 0x2b) save[0x28] else 1;
         const level: u8 = if (n > 0x2b) save[0x2b] else 1;
         const status: u8 = if (n > 0x24) save[0x24] else 0x20; // default to expansion
+        const progression: u8 = if (n > 0x25) save[0x25] else 0; // title (difficulty completed)
         // The .d2s header carries the menu-composite appearance the game wrote on save:
         // pAppearance1@0x88 = body-component graphic codes, pAppearance2@0x98 = color
         // transforms (16 each; the statstring uses the first 11). Empty => naked preview.
@@ -213,7 +214,7 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
 
         w.putU32(0xFFFF_FFFF); // expiration — far future so it's NOT "expired"
         w.putStr(names[i].slice()); // character name
-        writeStatString(&w, class, level, status, @intCast(total), app1, app2); // CharSel.cpp layout
+        writeStatString(&w, class, level, status, progression, @intCast(total), app1, app2); // CharSel.cpp layout
         w.putU8(0); // statstring C-string terminator
     }
     finish(c, &w);
@@ -261,26 +262,26 @@ fn putEquipSlot(w: *proto.Writer, app: []const u8) void {
     }
 }
 
-fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, realm_count: u32, app1: []const u8, app2: []const u8) void {
+fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progression: u8, realm_count: u32, app1: []const u8, app2: []const u8) void {
     enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
     putEquipSlot(w, app1); // equip slot 1: body-component graphic codes (.d2s pAppearance1)
     w.putU8(class + 1); // class (CharSel subtracts CLASS_SORCERESS=1)
     putEquipSlot(w, app2); // equip slot 2: component color transforms (.d2s pAppearance2)
     w.putU8(if (level == 0) 1 else level); // level (avoid 0)
-    // The char-select reads the SAME bit layout from these flags as from the .d2s
-    // status byte: CharSel.cpp tests hardcore via & 4, died & 8, expansion & 0x20,
-    // ladder & 0x40. So pass those bits straight through from the status byte. (The old
-    // code mapped the expansion bit 0x20 ONTO bit 0x04 — which the client reads as
-    // HARDCORE — so every expansion char wrongly showed up as hardcore.)
-    const flags: u32 = status & 0x6C; // hardcore | died | expansion | ladder
+    // The char-select reads nCharacterFlags here: the LOW byte mirrors the .d2s status
+    // byte (CharSel tests hardcore & 4, died & 8, expansion & 0x20, ladder & 0x40), and
+    // the HIGH byte (>> 8 & 0x1f) is the title progression (difficulty completed) that
+    // picks the char's title — without it every char shows the "EXPANSION CHARACTER"
+    // no-title fallback. Both come straight from the .d2s (status@0x24, progression@0x25).
+    const flags: u32 = (@as(u32, progression & 0x1f) << 8) | (status & 0x6C);
     enc14(w, flags);
     enc14(w, 0); // field9
     w.putU8(0xFF); // act      (0xFF -> 0)
     w.putU8(0xFF); // field_0x32f
     w.putU8(0xFF); // field_0x330
-    w.putU8(0xFF); // guild tag [0]
-    w.putU8(0xFF); // guild tag [1]
-    w.putU8(0xFF); // guild tag [2]
+    // No guild tag: the statstring's trailing NUL (added by the caller) lands on the
+    // guild-tag slot, so CharSel's strncpy reads an empty tag. Emitting 0xFF bytes here
+    // instead made it append " {ÿÿÿ}" garbage to the char name (looked like "no name").
 }
 
 fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
@@ -308,7 +309,10 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
 fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
-    _ = r.getU32(); // difficulty bitfield (TODO: map to GS flags via real capture)
+    // MCP create-game flags DWORD: difficulty lives in bits 12-14 (Normal=0x0000,
+    // Nightmare=0x1000, Hell=0x2000), the same GAMEFLAG_DIFFICULTY_BIT=12 the GS uses.
+    const create_flags = r.getU32();
+    const difficulty: u8 = @intCast(@min(@as(u32, 2), (create_flags >> 12) & 0x7));
     _ = r.getU8(); // unknown (1)
     _ = r.getU8(); // player difference
     _ = r.getU8(); // max players
@@ -328,9 +332,10 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         finish(c, &w);
         return;
     }
-    // MVP flags: expansion (LOD), normal difficulty, softcore, non-ladder.
+    // Expansion (LOD), softcore, non-ladder; difficulty from the client's request.
     // The registry picks the least-loaded GS with capacity and gives us its address.
-    const routed = gslink.createGameRouted(name, pass, desc, 0, true, 0, false);
+    log.line(tag, "create game '{s}' diff={d} (flags=0x{x})", .{ name, difficulty, create_flags });
+    const routed = gslink.createGameRouted(name, pass, desc, 0, true, difficulty, false);
     if (routed == null) {
         log.line(tag, "create game '{s}' -> GS refused / all full", .{name});
         w.putU16(0);
