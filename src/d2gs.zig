@@ -21,6 +21,7 @@ const d2dbs = @import("realm/client/d2dbs.zig");
 const feature = @import("engine/feature.zig");
 const halt_hook = @import("runtime/feature/halt_hook.zig"); // for enableSuppress (sub-mode, not a toggle)
 const headless = @import("runtime/feature/headless.zig"); // server_ready flag for the ExitProcess interceptor
+const health = @import("runtime/feature/health.zig"); // hacky in-process HTTP health endpoint
 const gsport = @import("runtime/gsport.zig");
 const gamereap = @import("runtime/gamereap.zig");
 const roominit = @import("runtime/roominit.zig");
@@ -312,6 +313,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // Let the host reach a stable post-init state. TODO: replace this fixed
     // delay with a hook on the engine's init-complete point (VERIFY.md #4).
     log.print("d2gs: server thread up; waiting for engine init...");
+    health.start(); // HTTP health endpoint up now — answers 503 until the tick loop beats
     Sleep(3000);
 
     // Full dedicated-realm bootstrap (mirrors NET_QServer_StartServer's host tail
@@ -360,6 +362,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         command.pump(); // run queued engine commands (create game, …) on this thread
         if (use_realm) realm.pumpDelivery(); // deliver fetched char outside the join stack
         server.tick();
+        health.tick(); // heartbeat for the health endpoint (liveness = this advancing)
         Sleep(10); // ~100 Hz; D2 logic runs at 25 fps, tune later
     }
 }
