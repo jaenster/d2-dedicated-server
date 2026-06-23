@@ -80,6 +80,15 @@ pub fn listChars(account: []const u8, names: []Name) usize {
     };
 }
 
+/// Delete a character's save. Idempotent — true even if it was already gone.
+pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
+    return switch (durable) {
+        .fs => fs.deleteCharD2s(account, charname),
+        .redis => redis.deleteCharD2s(account, charname),
+        .pg => pg.deleteCharD2s(account, charname),
+    };
+}
+
 // ── accounts (durable) ───────────────────────────────────────────────────────
 
 /// Create an account. `pwhash` null = password-less. Returns false if it exists.
@@ -182,8 +191,9 @@ pub fn expireGamesByGs(gsid: u32) void {
 
 pub const NamedGame = types.NamedGame;
 
-/// Enumerate active games from the shared store (for /admin/games when shared). fs/pg are
-/// TODO; redis walks its global game index.
+/// Enumerate active games from the shared store (for /admin/games when shared). Each
+/// backend walks its own game index: fs the games dir, redis the `games` set, pg the
+/// games table — all filtering on TTL/expiry.
 pub fn snapshotGames(out: []types.NamedGame) usize {
     return switch (ephemeral) {
         .fs => fs.snapshotGames(out),

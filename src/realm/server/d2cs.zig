@@ -26,7 +26,11 @@ const MCP_GAMELIST = 0x05;
 const MCP_GAMEINFO = 0x06;
 const MCP_CHARLOGON = 0x07;
 const MCP_CHARDELETE = 0x0a;
+const MCP_LADDERDATA = 0x11;
 const MCP_MOTD = 0x12;
+const MCP_CANCELCREATE = 0x13;
+const MCP_CHARRANK = 0x16;
+const MCP_CHARUPGRADE = 0x18;
 const MCP_CHARLIST2 = 0x19;
 
 // Set from main() (mirrors gslink.gs_ip_override). When `game_ip` is set, JOINGAME
@@ -138,6 +142,13 @@ fn dispatch(c: *DConn, tag: []const u8, id: u8, body: []const u8) void {
         MCP_CREATEGAME => onCreateGame(c, tag, body),
         MCP_JOINGAME => onJoinGame(c, tag, body),
         MCP_GAMELIST => onGameList(c, tag, body),
+        MCP_GAMEINFO => onGameInfo(c, tag, body),
+        MCP_CHARDELETE => onCharDelete(c, tag, body),
+        MCP_CHARUPGRADE => onCharUpgrade(c, tag, body),
+        MCP_MOTD => onMotd(c, tag, body),
+        MCP_LADDERDATA => onLadderData(c, tag, body),
+        MCP_CANCELCREATE => onCancelCreate(c, tag, body),
+        MCP_CHARRANK => onCharRank(c, tag, body),
         else => {
             log.line(tag, "unhandled MCP 0x{x:0>2} ({d} bytes)", .{ id, body.len });
             if (body.len > 0) log.hexdump(tag, body);
@@ -412,4 +423,100 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     tw.putU8(0); // +7 unused
     tw.putU32(0xFFFF_FFFE); // +8 token = -2 (end of list)
     finish(c, &tw);
+}
+
+// Message-of-the-day shown in the chat window after entering the realm. Settable so
+// a deployment can override it; defaults to a neutral welcome.
+pub var motd: []const u8 = "Welcome to the realm.";
+
+// MCP_CHARDELETE (0x0a). Request: u16 reqid, cstr charname. Removes the .d2s from the
+// durable store (fs/redis/pg — works in shared/multi-instance mode). Reply: u16 reqid
+// echo + u32 result (0 = deleted). Client: NET_MCP_CLIENT_Incoming0x0A checks the reqid
+// then SetD2GSJoinResult(result) + marks the delete handled, refreshing CharSel.
+fn onCharDelete(c: *DConn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const reqid = r.getU16();
+    const name = r.getStr();
+    const ok = store.deleteCharD2s(c.accountName(), name);
+    log.line(tag, "char delete '{s}' (account={s}) -> {s}", .{ name, c.accountName(), if (ok) "deleted" else "FAILED" });
+    var buf: [16]u8 = undefined;
+    var w = startPacket(&buf, MCP_CHARDELETE);
+    w.putU16(reqid);
+    w.putU32(if (ok) 0 else 1); // 0 = success
+    finish(c, &w);
+}
+
+// MCP_GAMEINFO (0x06). Request: u16 reqid, cstr gamename. Populates the join-screen
+// detail panel. We mirror the verified 0x05 per-game layout but set the token to -1 so
+// the client cleanly shows "no detail" (Incoming0x06 maps -1 -> result 0x32 and returns
+// before parsing the server-name/player-list area). Join still works without it; the
+// full player-list layout is a live-client follow-up.
+fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const reqid = r.getU16();
+    const name = r.getStr();
+    const exists = state.global.findGame(name) != null;
+    log.line(tag, "game info '{s}' -> {s}", .{ name, if (exists) "exists (no detail)" else "not found" });
+    var buf: [32]u8 = undefined;
+    var w = startPacket(&buf, MCP_GAMEINFO);
+    w.putU16(reqid); // +1 reqid echo
+    w.putU32(0); // +3 unused
+    w.putU8(0); // +7 status
+    w.putU32(0xFFFF_FFFF); // +8 token = -1 -> "no info" (early return, no name parse)
+    finish(c, &w);
+}
+
+// MCP_MOTD (0x12). Request: empty. Reply: 1 pad byte then a C-string the client shows in
+// chat (Incoming0x12 reads the message at pBytes+2).
+fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
+    _ = body;
+    log.line(tag, "motd -> '{s}'", .{motd});
+    var buf: [256]u8 = undefined;
+    var w = startPacket(&buf, MCP_MOTD);
+    w.putU8(0); // body[0] pad; message begins at body[1] (client reads pBytes+2)
+    w.putStr(motd);
+    finish(c, &w);
+}
+
+// MCP_LADDERDATA (0x11). Request: u8 mode, u16 reqid. We have no ladder; reply the
+// "empty ladder" form (all-zero size fields) so Incoming0x11 fires its clear-and-done
+// path instead of waiting for chunks.
+fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
+    _ = body;
+    log.line(tag, "ladder data request -> empty", .{});
+    var buf: [24]u8 = undefined;
+    var w = startPacket(&buf, MCP_LADDERDATA);
+    w.zeros(14); // list flag + zero total/chunk/offset -> client treats as empty ladder
+    finish(c, &w);
+}
+
+// MCP_CHARUPGRADE (0x18). Request: cstr charname (classic -> expansion conversion).
+// We run an expansion-only realm, so we accept it (Incoming0x18 reads result@u32 and
+// marks success). Mutating the .d2s expansion flag needs a checksum rewrite + a live
+// client to verify, so that part is deliberately deferred — the ack keeps the UI happy.
+fn onCharUpgrade(c: *DConn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const name = r.getStr();
+    log.line(tag, "char upgrade '{s}' (account={s}) -> ack (save unchanged)", .{ name, c.accountName() });
+    var buf: [12]u8 = undefined;
+    var w = startPacket(&buf, MCP_CHARUPGRADE);
+    w.putU32(0); // result: success
+    finish(c, &w);
+}
+
+// MCP_CANCELCREATE (0x13). Request: empty. Fire-and-forget — the client gave up on a
+// pending create. CreateGame is synchronous here so there's nothing to unwind; just note
+// it. No reply (the client has no Incoming0x13).
+fn onCancelCreate(c: *DConn, tag: []const u8, body: []const u8) void {
+    _ = c;
+    _ = body;
+    log.line(tag, "cancel game create (no-op)", .{});
+}
+
+// MCP_CHARRANK (0x16). Request: cstr charname, u32, u32. Cosmetic ranking lookup; the
+// client has no Incoming0x16, so there's no reply to send. Acknowledge in the log.
+fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
+    _ = c;
+    _ = body;
+    log.line(tag, "char rank request (no ladder; no-op)", .{});
 }

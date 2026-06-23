@@ -198,8 +198,8 @@ pub const GameInfo = struct {
     }
 };
 
-/// Snapshot active games into `buf` under the lock; returns the number filled.
-/// In-memory path only — shared-store enumeration is a TODO.
+/// Snapshot active games into `buf`; returns the number filled. Shared mode enumerates
+/// the backing store (fs/redis/pg); in-memory mode walks the local table under the lock.
 pub fn snapshotGames(buf: []GameInfo) usize {
     // Shared mode: games live in the store (redis/pg), not the in-memory table — enumerate
     // them there and convert to GameInfo.

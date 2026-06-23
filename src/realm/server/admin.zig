@@ -6,7 +6,7 @@
 //!
 //!   GET  /admin/status       counts + which instance/backends
 //!   GET  /admin/gameservers  the registered GS fleet
-//!   GET  /admin/games        active games (in-memory path)
+//!   GET  /admin/games        active games (in-memory, or shared store when shared)
 //!   GET  /admin/accounts     account names (filesystem)
 //!   POST /admin/accounts     {"name","password"} -> create account
 //!   POST /admin/games/close  {"name"} (or ?name=) -> expire a game
