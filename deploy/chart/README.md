@@ -4,14 +4,33 @@ This chart deploys a complete, fleet-shaped Diablo II 1.14d realm on Kubernetes:
 
 - **realmd** — the stateless protocol front (bnetd + d2cs + d2dbs + gs-link), fronted by
   a `LoadBalancer`. Scales freely because all state lives in backing services.
-- **game-server fleet (d2gs)** — headless `Game.exe` under wine, one per node, that clients
-  dial directly for game traffic.
-- **qqserver** — a token-translating splice gateway (deployed internal-only for now).
+- **game-server fleet (d2gs)** — headless `Game.exe` under wine. In GATEWAY mode it is
+  internal (pod-IP only); in DIRECT mode clients dial it for game traffic. See Topology.
+- **qqserver** — a token-translating splice gateway. In GATEWAY mode it is the single public
+  game entry on the floating IPs; otherwise it is internal-only (ClusterIP).
 - **Postgres** — durable character saves.
 - **Redis** — ephemeral sessions/games (native TTL).
 
 It is a faithful, publishable mirror of a real running cluster, with the cluster-specific
 IPs and passwords replaced by generic, overridable defaults. Treat it as a worked example.
+
+## Topology
+
+Game traffic runs in one of two modes, selected by `gameAddr` / `floatingIPs`:
+
+- **DIRECT** (`gameAddr` empty, default): the GS keeps a client-routable address and clients
+  dial the GS directly for game traffic. realmd advertises the GS's own address.
+- **GATEWAY** (`floatingIPs` + `gameAddr` set): realmd advertises the qqserver entry point
+  (normally the first `floatingIP`). realmd writes `{token -> the real GS pod ip:port}` to
+  redis; the client connects to qqserver with that token and qqserver splices through to the
+  right GS. The GS is internal (pod-IP only, no hostPort), so the fleet can scale past the
+  node count and clients never hit a GS directly.
+
+`floatingIPs` are stable public IPs (e.g. cloud floating IPs that fail over between nodes)
+set as `externalIPs` on the public realmd **and** qqserver Services. The cluster firewall
+only needs the client-facing ports open to those FIPs: **6112-6113** (bnet + d2cs) **and
+4000** (qqserver game traffic). d2dbs (6114) + gs-link (6115) are GS↔realmd internal
+traffic (the `realmd-gslink` ClusterIP Service) and stay unexposed.
 
 ## Quick start
 
@@ -34,6 +53,7 @@ realmd (`templates/realmd-deployment.yaml`):
 | `REALMD_INSTANCE` | fieldRef `metadata.name` (unique per pod — session-id high bits) |
 | `REALMD_REALM_NAME` | `.Values.realmName` |
 | `REALMD_REALM_ADDR` | `.Values.realmAddr` (public IP clients dial; **required**) |
+| `REALMD_GAME_ADDR` | `.Values.gameAddr` (GATEWAY mode only — the qqserver entry advertised for game traffic) |
 | `REALMD_DURABLE_STORE` | `pg` |
 | `REALMD_EPHEMERAL_STORE` | `redis` |
 | `REALMD_REDIS_ADDR` | `realmd-redis:6379` |
@@ -46,9 +66,9 @@ game server (`templates/gameserver-statefulset.yaml`, consumed by `deploy/gs-ent
 
 | env | source |
 |-|-|
-| `REALMD_HOST` | `realmd.<namespace>.svc.cluster.local` |
-| `NODE_IP` | fieldRef `status.hostIP` |
-| `D2GS_GS_ADDR` | `.Values.gameServer.gsAddr` (default `auto:4000`) |
+| `REALMD_HOST` | `realmd-gslink.<namespace>.svc.cluster.local` |
+| `POD_IP` | fieldRef `status.podIP` |
+| `D2GS_GS_ADDR` | `$(POD_IP):4000` (internal pod IP — qqserver splices to it) |
 | `D2GS_MAX_GAMES` | `.Values.gameServer.maxGames` |
 | `D2GS_EXTRA_DLLS` / `D2GS_EXTRA_ARGS` | optional, `.Values.gameServer.extraDlls` / `extraArgs` |
 
@@ -59,14 +79,12 @@ qqserver: `REALMD_BIND`, `REALMD_QQ_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON
 - **Postgres `PGDATA` must be a subdir of the mounted volume.** It is set to
   `/var/lib/postgresql/data/pgdata`, not the volume root — `initdb` refuses the root
   because the mount already contains `lost+found`.
-- **The GS advertises a PUBLIC address.** On cloud nodes the downward-API `status.hostIP`
-  is the node's PRIVATE IP (e.g. Hetzner `10.x`), which clients can't reach. So
-  `D2GS_GS_ADDR=auto:4000` tells the entrypoint to resolve the node's public IPv4 from
-  the cloud metadata service (Hetzner link-local, with an external-echo fallback) and
-  append the game port.
-- **The GS uses `hostPort: 4000` + pod anti-affinity (one GS per node).** Clients dial
-  `<node-ip>:4000` directly, so the GS binds the node port; anti-affinity keeps two pods
-  off the same node so the hostPort never collides and every pod has a distinct node IP.
+- **The GS is internal — it registers its pod IP.** `D2GS_GS_ADDR=$(POD_IP):4000` reports
+  the in-cluster pod IP; qqserver (also in-cluster) dials it to splice client game traffic
+  through. No public exposure, no node-IP resolution needed.
+- **No `hostPort`; anti-affinity is soft.** Without a node-level bind the fleet can exceed
+  the node count, so pod anti-affinity is `preferred` (weight 100) — it still spreads
+  replicas across nodes for fault tolerance but won't block scheduling.
 - **Game files are proprietary — never baked in.** Mount a real D2 1.14d install into the
   RWX `d2-gamefiles` PVC at runtime (read-only into each pod). The entrypoint aborts if
   `/game/Game.exe` is missing.
