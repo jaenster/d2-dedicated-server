@@ -81,21 +81,28 @@ redis:
     requests: { cpu: 50m, memory: 32Mi }
     limits: { cpu: 200m, memory: 128Mi }
 
-# ── gameServer: the d2gs fleet (one GS per node via hostPort + anti-affinity) ───────
+# ── gameServer: the d2gs fleet (internal pod-IP only; qqserver fronts game traffic) ──
 gameServer:
   replicas: 1
   maxGames: 50
-  # Address realmd hands clients for this pod's games. "auto:4000" makes the entrypoint
-  # resolve the node's PUBLIC IPv4 from the cloud metadata service (the downward-API
-  # status.hostIP is the node's PRIVATE IP on cloud nodes, which clients can't reach).
-  gsAddr: "auto:4000"
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: 1000m, memory: 1Gi }
+  # RECOMMENDED: ship the minimal (proprietary) 1.14d data set in a small private image.
+  # When `repository` is set, a load-gamedata initContainer copies /gamedata into an
+  # emptyDir game volume — NO persistent volume, ~16MB rides in the image, nothing for
+  # Longhorn to replicate. Rebuild the image to change the data. When `repository` is
+  # empty, fall back to the gameFiles PVC below (mount your own install).
+  dataImage:
+    repository: ""        # e.g. ghcr.io/you/d2-gamedata — a private image with the minimal proprietary data at /gamedata
+    tag: latest
+    pullPolicy: Always
+    pullSecret: ""        # imagePullSecret name for the private data image (e.g. ghcr)
   gameFiles:
-    # RWX PVC holding a real, proprietary D2 1.14d install. Populate it once before
-    # scaling up; it is mounted read-only into every GS pod.
-    size: 4Gi
+    # FALLBACK (only used when dataImage.repository is empty): RWX PVC holding a real,
+    # proprietary D2 1.14d install. Populate it once before scaling up; it is mounted
+    # read-only into every GS pod. ~16MB is the minimal set, so 256Mi is plenty.
+    size: 256Mi
     # Empty string uses the cluster default StorageClass. Must support ReadWriteMany.
     storageClass: ""
   # Extra server-mod DLLs to --loaddll after d2gs.dll (space-separated; unix paths
@@ -104,7 +111,7 @@ gameServer:
   # Extra Game.exe flags — e.g. "-direct -txt" to load a loose /moddata data/ tree.
   extraArgs: ""
 
-# ── qqserver: token-translating splice gateway (internal-only ClusterIP for now) ────
+# ── qqserver: token-translating game gateway (public on the FIPs when floatingIPs set) ─
 qqserver:
   enabled: true
   logJson: true

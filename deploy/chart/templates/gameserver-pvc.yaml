@@ -1,3 +1,4 @@
+{{- if not .Values.gameServer.dataImage.repository }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -6,8 +7,9 @@ metadata:
     {{- include "realm.labels" . | nindent 4 }}
     app.kubernetes.io/component: gameserver
 spec:
-  # Populated once with a real, proprietary D2 1.14d install; mounted read-only into
-  # every GS pod, so it must support ReadWriteMany.
+  # FALLBACK (only when gameServer.dataImage.repository is empty): populated once with a
+  # real, proprietary D2 1.14d install; mounted read-only into every GS pod, so it must
+  # support ReadWriteMany. The recommended path is dataImage (no persistent volume).
   accessModes: ["ReadWriteMany"]
   resources:
     requests:
@@ -15,3 +17,4 @@ spec:
   {{- if .Values.gameServer.gameFiles.storageClass }}
   storageClassName: {{ .Values.gameServer.gameFiles.storageClass | quote }}
   {{- end }}
+{{- end }}

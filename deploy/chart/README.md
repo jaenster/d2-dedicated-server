@@ -41,8 +41,9 @@ helm install myrealm deploy/chart \
   --set postgres.auth.password=$(openssl rand -hex 16)
 ```
 
-Then populate the `d2-gamefiles` PVC with a real 1.14d install (see gotchas) and watch the
-`realmd` LoadBalancer for its external IP — that IP is what `realmAddr` must be.
+Then supply the proprietary game data — either build a private `dataImage` (recommended;
+see gotchas) or populate the `d2-gamefiles` PVC fallback with a real 1.14d install — and
+watch the `realmd` LoadBalancer for its external IP — that IP is what `realmAddr` must be.
 
 ## Environment contract
 
@@ -85,9 +86,14 @@ qqserver: `REALMD_BIND`, `REALMD_QQ_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON
 - **No `hostPort`; anti-affinity is soft.** Without a node-level bind the fleet can exceed
   the node count, so pod anti-affinity is `preferred` (weight 100) — it still spreads
   replicas across nodes for fault tolerance but won't block scheduling.
-- **Game files are proprietary — never baked in.** Mount a real D2 1.14d install into the
-  RWX `d2-gamefiles` PVC at runtime (read-only into each pod). The entrypoint aborts if
-  `/game/Game.exe` is missing.
+- **Game data ships via a private image (no Longhorn).** Set `gameServer.dataImage.repository`
+  to a small private image carrying the minimal (~16MB) proprietary 1.14d data set at
+  `/gamedata`; a `load-gamedata` initContainer `cp -a`s it into an emptyDir game volume per
+  pod — no persistent volume, nothing for Longhorn to replicate. Pass
+  `gameServer.dataImage.pullSecret` for the registry secret. **Fallback:** leave
+  `dataImage.repository` empty and mount your own real D2 1.14d install into the RWX
+  `d2-gamefiles` PVC (read-only into each pod). The entrypoint aborts if `/game/Game.exe`
+  is missing.
 - **`REALMD_REQUIRE_GS` gates client traffic** until a GS registers over the gs-link, so
   clients never connect to a realm with no games behind it.
 
@@ -98,6 +104,7 @@ qqserver: `REALMD_BIND`, `REALMD_QQ_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON
 | `postgres.enabled=false` | skip in-cluster Postgres; realmd still reads `realmd-pg/DSN` — override `postgres.auth.*` to point at an external DB |
 | `redis.enabled=false` | skip in-cluster Redis (supply an external `realmd-redis:6379`) |
 | `qqserver.enabled=false` | skip the gateway |
+| `gameServer.dataImage.repository=<img>` | ship game data via the load-gamedata initContainer + emptyDir (no PVC); empty = use the `d2-gamefiles` PVC fallback |
 
 The deployment namespace is the Helm release namespace (the hardcoded `realmd`
 namespace from the raw manifests is dropped — Helm sets it).
