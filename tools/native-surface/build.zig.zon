@@ -1,0 +1,11 @@
+.{
+    .name = .native_surface,
+    .fingerprint = 0x9c523cd709357c3,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
