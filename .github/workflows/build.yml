@@ -10,11 +10,29 @@
 # once under github.com/users/jaenster/packages. The PRIVATE d2gs-deploy repo's ArgoCD
 # app rolls them out (imagePullPolicy: Always on :latest).
 name: build
+# Build images only when it matters, not on every commit/branch:
+#  - push to main or a vN.N.N tag (the canonical/published images)
+#  - ONLY when an image input actually changes (source/Dockerfile/entrypoint/webui) —
+#    deploy manifests + the Helm chart don't affect images, so they don't trigger.
+#  - manual (workflow_dispatch) for ad-hoc builds off any branch during dev.
+# concurrency cancels superseded runs so rapid pushes don't pile up.
 on:
   push:
-    branches: [main, feat/realm-server-completeness]
-    paths: [src/**, deploy/**, build.zig, build.zig.zon, .github/workflows/build.yml]
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - src/**
+      - webui/**
+      - deploy/Dockerfile
+      - deploy/gs-entrypoint.sh
+      - build.zig
+      - build.zig.zon
+      - .github/workflows/build.yml
   workflow_dispatch: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
