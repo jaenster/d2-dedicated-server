@@ -118,6 +118,45 @@ fn scCharListStatstring() Result {
     return .{ .name = name, .status = .pass, .msg = msg("listed {s}: class={s} level={d} flags={d} (total={d})", .{ char, cls, ch.level, ch.flags, cl.total }) };
 }
 
+fn scCharDelete() Result {
+    const name = "delete_char";
+    const acct = "DelAcct";
+    const char = "DeleteMe";
+    var d2s: [0x40]u8 = undefined;
+    const blob = minimalD2s(&d2s, char, 1, 10);
+    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const before = c.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var present = false;
+    for (entries[0..before.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) present = true;
+    }
+    if (!present) return fail(name, "char {s} not present before delete", .{char});
+
+    const res = c.charDelete(char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res != 0) return fail(name, "delete result={d}", .{res});
+
+    var entries2: [64]rc.CharEntry = undefined;
+    var dst2: [4096]u8 = undefined;
+    const after = c.charList(&entries2, &dst2) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    for (entries2[0..after.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) return fail(name, "char {s} still listed after delete", .{char});
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("'{s}' deleted: account char count {d} -> {d}", .{ char, before.total, after.total }) };
+}
+
 fn scCreateJoinGame() Result {
     const name = "create_join_game";
     var gs = FakeGS{ .gsid = 0xABCD, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 42 };
@@ -507,6 +546,12 @@ fn scMultiInstance() Result {
         _ = waitpid(b_pid, null, 0);
     }
 
+    // A fake GS registers with instance A's gs-link so A can actually host a game.
+    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gameid = 77, .connect_port = 16115 };
+    gs.start(2000) catch |e| return fail(name, "FakeGS {s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register with instance A", .{});
+
     // Mint a session on instance A (bnetd 16112 -> d2cs handoff lives in shared store).
     var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16113 };
     defer a.close();
@@ -529,7 +574,20 @@ fn scMultiInstance() Result {
     const su = b.startup() catch |e| return fail(name, "B startup {s}", .{@errorName(e)});
     if (su != 0) return fail(name, "B failed to resolve A's session (startup result=0x{x})", .{su});
 
-    return .{ .name = name, .status = .pass, .msg = msg("session id={d} minted on A resolved on B's d2cs (startup=0)", .{a.sessionId()}) };
+    // Cloud-native game visibility: a game created through instance A must be listable
+    // through instance B — both enumerate the same shared ephemeral store. Create on A...
+    a.connectD2cs() catch |e| return fail(name, "A d2cs {s}", .{@errorName(e)});
+    if ((a.startup() catch 1) != 0) return fail(name, "A d2cs startup failed", .{});
+    const cg = a.createGame("fleetgame", "d") catch |e| return fail(name, "A create {s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "A create result={d}", .{cg.result});
+    // ...and confirm B's admin API lists it (shared-store snapshotGames, not A's memory).
+    var rxbuf: [4096]u8 = undefined;
+    const lg = net.httpRequest(17118, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "B admin games {s}", .{@errorName(e)});
+    if (lg.status != 200) return fail(name, "B admin games status={d}", .{lg.status});
+    if (std.mem.indexOf(u8, lg.body, "fleetgame") == null)
+        return fail(name, "game created on A is NOT visible via B's /admin/games (shared enumeration broken)", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("session minted on A resolved on B; game created on A listed via B's /admin/games (fleet-wide)", .{}) };
 }
 
 // A tiny echo TCP server standing in for a real backend GS :4000 game port. Binds an
@@ -747,7 +805,7 @@ pub fn main() !void {
         scMultiGameOneGs(),
         scQqserverTokenTranslate(),
         scCreateAccountRealAuth(),
-        skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
+        scCharDelete(),
         scLobbyChatAtoB(),
         scMultiInstance(),
     };
