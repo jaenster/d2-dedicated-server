@@ -117,14 +117,32 @@ fn clickCtrl(ctrl: *Control) void {
     click(ctrl.dwPosX + ctrl.dwSizeX / 2, ctrl.dwPosY -% ctrl.dwSizeY / 2);
 }
 
-/// Poll up to ~max_500ms*0.5s for a CONTROL_BUTTON at (px,py).
-fn waitForButton(px: u32, py: u32, max_500ms: usize) ?*Control {
-    var i: usize = 0;
-    while (i < max_500ms) : (i += 1) {
-        Sleep(500);
+const POLL_MS: u32 = 20; // poll granularity — tight, so we advance the frame a control appears
+
+/// Poll up to ~max_ms for a CONTROL_BUTTON at (px,py). Checks FIRST (returns
+/// immediately if it's already there), then sleeps one short slice and retries.
+/// This is how we stay "lightning quick": we never wait a fixed amount, we wait
+/// exactly until the next screen's control exists and then act the same frame.
+fn waitForButton(px: u32, py: u32, max_ms: u32) ?*Control {
+    var waited: u32 = 0;
+    while (true) {
         if (findButton(px, py)) |b| return b;
+        if (waited >= max_ms) return null;
+        Sleep(POLL_MS);
+        waited += POLL_MS;
     }
-    return null;
+}
+
+/// Poll up to ~max_ms until at least `min` edit-boxes exist (a freshly-opened
+/// create/join form builds its controls a few frames after the tab click).
+fn waitForEditboxes(boxes: *[2]*Control, min: usize, max_ms: u32) usize {
+    var waited: u32 = 0;
+    while (true) {
+        const n = findEditboxes(boxes);
+        if (n >= min or waited >= max_ms) return n;
+        Sleep(POLL_MS);
+        waited += POLL_MS;
+    }
 }
 
 /// First character slot (a CONTROL_TEXTBOX with text) on the char-select screen.
@@ -144,10 +162,11 @@ fn firstCharSlot() ?*Control {
 /// the version-check flow that runs in it). Reading/writing controls from here is
 /// safe enough: at the login screen the control list is stable.
 fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
-    Sleep(8000); // let the version check + bnet flow settle before touching controls
-
-    // 1) LOGIN — fill account/password, click LOG IN.
-    if (waitForButton(LOGON_X, LOGON_Y, 60)) |_| {
+    // No fixed startup wait: waitForButton polls for the login screen and returns
+    // the frame it appears. Reading the (empty) control list before then is safe.
+    // 1) LOGIN — fill account/password, click LOG IN. Long timeout: the very first
+    // screen can lag behind a real version-check download.
+    if (waitForButton(LOGON_X, LOGON_Y, 30000)) |_| {
         var boxes: [2]*Control = undefined;
         if (findEditboxes(&boxes) >= 2) {
             var acc_box = boxes[0];
@@ -159,17 +178,24 @@ fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
             }
             _ = SetControlText.call(.{ acc_box, @as([*:0]const u16, @ptrCast(&account)) });
             _ = SetControlText.call(.{ pass_box, @as([*:0]const u16, @ptrCast(&password)) });
-            Sleep(300);
+            // SetControlText writes the box buffer synchronously, so click immediately.
             click(LOGON_X + LOGON_W / 2, LOGON_Y - LOGON_H / 2);
             log.print("autologin: logged in");
         }
     }
 
     // 2) CHARACTER SELECT — select the first character, click OK (627,572).
-    if (waitForButton(627, 572, 60)) |ok| {
+    if (waitForButton(627, 572, 30000)) |ok| {
+        // The char slots are filled by the realm's MCP charlist (a round-trip that
+        // lands a few frames after the screen's OK button appears). Selecting before
+        // the char is bound makes OK enter the realm with no character -> the client
+        // drops the d2cs link with no CHARLOGON. Give the list time to populate.
+        Sleep(800);
         if (firstCharSlot()) |slot| {
             clickCtrl(slot);
-            Sleep(500);
+            // The slot-select must process across a few game frames (≥1 frame = ~40ms
+            // at 25fps) before OK, or the realm enters with no character selected.
+            Sleep(150);
             log.print("autologin: selected character");
         }
         clickCtrl(ok);
@@ -177,7 +203,7 @@ fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
     }
 
     // 3) LOBBY — the CREATE tab (533,469) is present once the lobby is up.
-    if (waitForButton(533, 469, 60)) |create_tab| {
+    if (waitForButton(533, 469, 30000)) |create_tab| {
         if (want_join) {
             // JOIN an existing game. Dump the lobby buttons first so we can map the
             // JOIN tab coords, then drive the join form.
@@ -187,7 +213,8 @@ fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
             if (findButton(652, 469)) |join_tab| {
                 clickCtrl(join_tab);
                 log.print("autologin: opened Join Game");
-                Sleep(800);
+                var boxes: [2]*Control = undefined;
+                const have = waitForEditboxes(&boxes, 1, 3000); // act the frame the join form builds
                 // Opt-in: linger on the JOIN screen so the game list refresh (MCP 0x05)
                 // completes and the screenshot thread captures the populated list.
                 const hold_ms = envU32("D2GS_JOIN_HOLD_MS");
@@ -196,10 +223,8 @@ fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
                     Sleep(hold_ms);
                 }
                 dumpButtons(); // join form buttons
-                var boxes: [2]*Control = undefined;
-                if (findEditboxes(&boxes) >= 1) {
+                if (have >= 1) {
                     _ = SetControlText.call(.{ boxes[0], @as([*:0]const u16, @ptrCast(&game_name)) });
-                    Sleep(300);
                     log.print("autologin: typed game name to join");
                 }
                 // JOIN GAME action button: the wide one at (594,433) (same slot the
@@ -212,16 +237,14 @@ fn pollThread(_: ?*anyopaque) callconv(.winapi) u32 {
         } else {
             clickCtrl(create_tab);
             log.print("autologin: opened Create Game");
-            Sleep(800);
             // 4) CREATE FORM — type a game name in the first edit-box, click CREATE.
             var boxes: [2]*Control = undefined;
-            if (findEditboxes(&boxes) >= 1) {
+            if (waitForEditboxes(&boxes, 1, 3000) >= 1) { // act the frame the create form builds
                 _ = SetControlText.call(.{ boxes[0], @as([*:0]const u16, @ptrCast(&game_name)) });
-                Sleep(300);
                 log.print("autologin: typed game name");
             }
             // CREATE button (bottom-right of the create form).
-            if (waitForButton(432, 433, 10)) |btn| {
+            if (waitForButton(432, 433, 3000)) |btn| {
                 clickCtrl(btn);
                 log.print("autologin: clicked CREATE game");
             } else if (findButton(594, 433)) |btn| {
