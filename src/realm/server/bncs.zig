@@ -440,8 +440,10 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     }
 
     log.line(tag, "{s} talks: {s}", .{ acct, text });
-    broadcastEvent(c, EID_TALK, c.user_flags, acct, text); // to the others
-    sendEvent(c, EID_TALK, c.user_flags, acct, text); // echo to self (D2 shows own talk)
+    // Broadcast to the OTHER members only (forEachInChannel excludes c.fd). The 1.14d
+    // client already displays the sender's own line locally, so echoing it back here
+    // makes every message the user types appear twice.
+    broadcastEvent(c, EID_TALK, c.user_flags, acct, text);
 }
 
 const Whisper = struct { target: []const u8, msg: []const u8 };
