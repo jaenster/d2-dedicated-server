@@ -32,9 +32,11 @@ spec:
           ports:
             - { containerPort: 4000, hostPort: 4000, name: game }
           env:
-            # The realm server Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
+            # The gs-link Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
+            # Uses realmd-gslink (publishNotReadyAddresses) so the GS can register even
+            # while realmd is NotReady — otherwise REQUIRE_GS deadlocks registration.
             - name: REALMD_HOST
-              value: realmd.{{ .Release.Namespace }}.svc.cluster.local
+              value: realmd-gslink.{{ .Release.Namespace }}.svc.cluster.local
             # Node IP → reference for the public address clients dial for this pod's games.
             - name: NODE_IP
               valueFrom:
