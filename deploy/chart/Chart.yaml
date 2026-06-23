@@ -1,0 +1,6 @@
+apiVersion: v2
+name: realm
+description: Headless Diablo II 1.14d realm server (realmd + game-server fleet + qqserver gateway)
+type: application
+version: 0.1.0
+appVersion: "1.14d"

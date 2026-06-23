@@ -1,0 +1,15 @@
+{{- if .Values.qqserver.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: qqserver
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: qqserver
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "realm.selectorLabels" (dict "root" . "component" "qqserver") | nindent 4 }}
+  ports:
+    - { port: 4000, targetPort: 4000, name: game }
+{{- end }}

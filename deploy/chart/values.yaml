@@ -1,0 +1,99 @@
+# Default values for the `realm` chart — a headless Diablo II 1.14d realm server:
+# realmd (protocol front) + a d2gs game-server fleet + the qqserver gateway, backed
+# by Postgres (durable character saves) and Redis (ephemeral sessions/games).
+#
+# These defaults are GENERIC and safe to publish: no real cluster IPs or passwords.
+# At minimum you must set `realmAddr` (the public address clients dial) and populate
+# the game-files PVC with a real, proprietary D2 1.14d install.
+
+# Realm display name shown in the client realm list.
+realmName: MyRealm
+
+# Public IPv4 / hostname that clients dial for d2cs (bnetd advertises it). Set this to
+# the realm's external LoadBalancer IP/host. REQUIRED — there is no sane default.
+realmAddr: ""
+
+# Don't take client traffic until a game server has registered over the gs-link.
+requireGS: true
+
+# Per-component container images.
+images:
+  realmd:
+    repository: ghcr.io/jaenster/realmd
+    tag: latest
+    pullPolicy: Always
+  gs:
+    repository: ghcr.io/jaenster/d2gs
+    tag: latest
+    pullPolicy: Always
+  qqserver:
+    repository: ghcr.io/jaenster/qqserver
+    tag: latest
+    pullPolicy: Always
+
+# ── realmd: the stateless protocol front (bnetd + d2cs + d2dbs + gs-link) ───────────
+realmd:
+  replicas: 2
+  # Drain window for the SIGTERM shutdown grace below.
+  terminationGracePeriodSeconds: 30
+  shutdownGraceMs: 10000
+  logJson: true
+  resources:
+    requests: { cpu: 50m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+# ── Postgres: durable character saves ──────────────────────────────────────────────
+postgres:
+  enabled: true
+  image: postgres:16-alpine
+  auth:
+    username: realmd
+    # Override this in production: --set postgres.auth.password=... or a values override.
+    password: change-me
+    database: realmd
+  storage:
+    size: 5Gi
+    # Empty string uses the cluster default StorageClass.
+    storageClass: ""
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+# ── Redis: ephemeral sessions + games (native TTL) ─────────────────────────────────
+redis:
+  enabled: true
+  image: redis:7-alpine
+  resources:
+    requests: { cpu: 50m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+# ── gameServer: the d2gs fleet (one GS per node via hostPort + anti-affinity) ───────
+gameServer:
+  replicas: 1
+  maxGames: 50
+  # Address realmd hands clients for this pod's games. "auto:4000" makes the entrypoint
+  # resolve the node's PUBLIC IPv4 from the cloud metadata service (the downward-API
+  # status.hostIP is the node's PRIVATE IP on cloud nodes, which clients can't reach).
+  gsAddr: "auto:4000"
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 1000m, memory: 1Gi }
+  gameFiles:
+    # RWX PVC holding a real, proprietary D2 1.14d install. Populate it once before
+    # scaling up; it is mounted read-only into every GS pod.
+    size: 4Gi
+    # Empty string uses the cluster default StorageClass. Must support ReadWriteMany.
+    storageClass: ""
+  # Extra server-mod DLLs to --loaddll after d2gs.dll (space-separated; unix paths
+  # under a mounted /mods are converted to Z:\ automatically). Empty by default.
+  extraDlls: ""
+  # Extra Game.exe flags — e.g. "-direct -txt" to load a loose /moddata data/ tree.
+  extraArgs: ""
+
+# ── qqserver: token-translating splice gateway (internal-only ClusterIP for now) ────
+qqserver:
+  enabled: true
+  logJson: true
+  resources:
+    requests: { cpu: 25m, memory: 16Mi }
+    limits: { cpu: 100m, memory: 64Mi }

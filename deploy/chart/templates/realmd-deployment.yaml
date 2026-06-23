@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: realmd
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: realmd
+spec:
+  replicas: {{ .Values.realmd.replicas }}
+  selector:
+    matchLabels:
+      {{- include "realm.selectorLabels" (dict "root" . "component" "realmd") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "realm.selectorLabels" (dict "root" . "component" "realmd") | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.realmd.terminationGracePeriodSeconds }}
+      containers:
+        - name: realmd
+          image: "{{ .Values.images.realmd.repository }}:{{ .Values.images.realmd.tag }}"
+          imagePullPolicy: {{ .Values.images.realmd.pullPolicy }}
+          ports:
+            - { containerPort: 6112, name: bnetd }
+            - { containerPort: 6113, name: d2cs }
+            - { containerPort: 6114, name: d2dbs }
+            - { containerPort: 6115, name: gslink }
+            - { containerPort: 8080, name: health }
+          env:
+            # Unique per pod (session-id high bits).
+            - name: REALMD_INSTANCE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: REALMD_REALM_NAME
+              value: {{ .Values.realmName | quote }}
+            # Public IPv4 clients dial for d2cs (bnetd advertises it).
+            - name: REALMD_REALM_ADDR
+              value: {{ required "realmAddr is required: the public IP/host clients dial" .Values.realmAddr | quote }}
+            - name: REALMD_DURABLE_STORE
+              value: "pg"
+            - name: REALMD_EPHEMERAL_STORE
+              value: "redis"
+            - name: REALMD_REDIS_ADDR
+              value: "realmd-redis:6379"
+            - name: REALMD_PG_DSN
+              valueFrom:
+                secretKeyRef: { name: realmd-pg, key: DSN }
+            - name: REALMD_REQUIRE_GS
+              value: {{ ternary "1" "0" .Values.requireGS | quote }}
+            - name: REALMD_LOG_JSON
+              value: {{ ternary "1" "0" .Values.realmd.logJson | quote }}
+            - name: REALMD_SHUTDOWN_GRACE_MS
+              value: {{ .Values.realmd.shutdownGraceMs | quote }}
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.realmd.resources | nindent 12 }}

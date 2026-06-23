@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: d2-gamefiles
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gameserver
+spec:
+  # Populated once with a real, proprietary D2 1.14d install; mounted read-only into
+  # every GS pod, so it must support ReadWriteMany.
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: {{ .Values.gameServer.gameFiles.size | quote }}
+  {{- if .Values.gameServer.gameFiles.storageClass }}
+  storageClassName: {{ .Values.gameServer.gameFiles.storageClass | quote }}
+  {{- end }}
