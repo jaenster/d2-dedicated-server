@@ -63,7 +63,7 @@ realmd (`templates/realmd-deployment.yaml`):
 | `REALMD_LOG_JSON` | `.Values.realmd.logJson` |
 | `REALMD_SHUTDOWN_GRACE_MS` | `.Values.realmd.shutdownGraceMs` |
 
-game server (`templates/gameserver-statefulset.yaml`, consumed by `deploy/gs-entrypoint.sh`):
+game server (`templates/gameserver-statefulset.yaml` — a stateless `Deployment`, consumed by `deploy/gs-entrypoint.sh`):
 
 | env | source |
 |-|-|
@@ -73,7 +73,14 @@ game server (`templates/gameserver-statefulset.yaml`, consumed by `deploy/gs-ent
 | `D2GS_MAX_GAMES` | `.Values.gameServer.maxGames` |
 | `D2GS_EXTRA_DLLS` / `D2GS_EXTRA_ARGS` | optional, `.Values.gameServer.extraDlls` / `extraArgs` |
 
-qqserver: `REALMD_BIND`, `REALMD_QQ_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON`.
+qqserver: `REALMD_BIND`, `REALMD_QQ_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON`. Its image
+is usually private — set `qqserver.pullSecret` to a dockerconfigjson secret (e.g. `ghcr`).
+
+Version check: the d2gs client bypasses it (`--bypass-checkrev`) and realmd accepts any auth-check, so no version MPQ is served.
+
+`realmd` runs `replicas: 1` with `strategy: Recreate` (`realmd.recreate`): the GS holds its
+gs-link to one realmd pod, so a surging rollout can't go Ready and deadlocks. All Deployments
+set `revisionHistoryLimit: {{ realmd.revisionHistoryLimit }}` (default 0 — GitOps rolls back via git).
 
 ## Gotchas this chart bakes in (the point of the example)
 
@@ -105,6 +112,8 @@ qqserver: `REALMD_BIND`, `REALMD_QQ_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON
 | `redis.enabled=false` | skip in-cluster Redis (supply an external `realmd-redis:6379`) |
 | `qqserver.enabled=false` | skip the gateway |
 | `gameServer.dataImage.repository=<img>` | ship game data via the load-gamedata initContainer + emptyDir (no PVC); empty = use the `d2-gamefiles` PVC fallback |
+| `realmd.recreate=false` | use a normal RollingUpdate instead of Recreate for realmd |
+| `qqserver.pullSecret=<name>` | imagePullSecret for the (usually private) qqserver image |
 
 The deployment namespace is the Helm release namespace (the hardcoded `realmd`
 namespace from the raw manifests is dropped — Helm sets it).

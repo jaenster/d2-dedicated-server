@@ -1,13 +1,16 @@
+# Stateless Deployment (fungible pods): qqserver routes to a pod by the IP recorded in
+# the redis token route, not via a stable name, and in-memory game state dies with the
+# pod anyway — so no StatefulSet / persistent identity is needed.
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: d2gs
   labels:
     {{- include "realm.labels" . | nindent 4 }}
     app.kubernetes.io/component: gameserver
 spec:
-  serviceName: d2gs
   replicas: {{ .Values.gameServer.replicas }}
+  revisionHistoryLimit: {{ .Values.realmd.revisionHistoryLimit }}
   selector:
     matchLabels:
       {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 6 }}
@@ -50,6 +53,7 @@ spec:
           imagePullPolicy: {{ .Values.images.gs.pullPolicy }}
           ports:
             - { containerPort: 4000, name: game }
+            - { containerPort: 8086, name: health }
           env:
             # The gs-link Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
             # Uses realmd-gslink (publishNotReadyAddresses) so the GS can register even
@@ -80,6 +84,19 @@ spec:
             - { name: work, mountPath: /work }
           resources:
             {{- toYaml .Values.gameServer.resources | nindent 12 }}
+          # In-process health endpoint: 200 only while the engine tick loop is beating.
+          # Generous startup budget — wine prefix init + engine boot is slow.
+          startupProbe:
+            httpGet: { path: /, port: 8086 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /, port: 8086 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: 8086 }
+            periodSeconds: 15
+            failureThreshold: 4
       volumes:
         - name: game
           {{- if .Values.gameServer.dataImage.repository }}
