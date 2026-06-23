@@ -133,19 +133,25 @@ env:
   - name: REALMD_TRUSTED_AUTH_HEADER
     value: X-authentik-username
   - name: REALMD_ADMINS
-    value: "alice,bob"            # Authentik usernames == realm account names
+    value: "alice,bob"            # Authentik usernames allowed in (SSO needs no account)
   - name: REALMD_ADMIN_SECRET     # stable HMAC key for account-login sessions
     valueFrom:
       secretKeyRef: { name: realmd-admin, key: secret }
 ```
 
-- `REALMD_ADMINS` is the single allowlist for **both** SSO and password login. An SSO
-  user only gets in if their Authentik username is in this list.
+- Admin-ness is primarily a **DB flag** on the account (set via `realmd create-admin`,
+  `REALMD_ADMIN_BOOTSTRAP`, or the UI's promote/demote). `REALMD_ADMINS` is an additional
+  static allowlist OR'd on top — use it for **SSO users who have no realm account** (the
+  Authentik username just needs to be listed), and as a lockout escape hatch.
 - `REALMD_ADMIN_SECRET` only matters for the password-login session cookie; with pure
   SSO you can omit it (every request is re-authenticated by nginx). Set it (and share it
   across replicas) if you also want account-login sessions to survive restarts.
 - Leave `REALMD_ADMIN_TOKEN` **unset** in prod — it's a bearer bypass for scripts/CI and
   break-glass; if you set it, treat it like a root password.
+
+To seed the first admin declaratively, add a `REALMD_ADMIN_BOOTSTRAP=name:password` env
+from a Secret (idempotent on every boot), or run `kubectl exec deploy/realmd -- realmd
+create-admin <name> <password>` once.
 
 After this, hitting `https://realmd.typeguru.nl` redirects through Authentik; once logged
 in, the UI loads with no second prompt (`/admin/me` returns `via: "sso"`).

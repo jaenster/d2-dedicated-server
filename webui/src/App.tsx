@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   api,
   ApiError,
+  type Account,
   type Game,
   type GameServer,
   type Me,
@@ -145,7 +146,7 @@ function Dashboard(props: { me: Me; onLogout: () => void }) {
         {tab === "overview" && <Overview />}
         {tab === "gameservers" && <GameServers />}
         {tab === "games" && <Games />}
-        {tab === "accounts" && <Accounts />}
+        {tab === "accounts" && <Accounts me={props.me} />}
       </main>
     </div>
   );
@@ -286,8 +287,22 @@ function Games() {
   );
 }
 
-function Accounts() {
-  const { data, err, reload } = usePoll<{ accounts: string[] }>(api.accounts);
+function Accounts(props: { me: Me }) {
+  const { data, err, reload } = usePoll<{ accounts: Account[] }>(api.accounts);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const toggle = async (a: Account) => {
+    setBusy(a.name);
+    try {
+      await api.setAdmin(a.name, !a.admin);
+      await reload();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <section className="cols">
       <div>
@@ -300,9 +315,32 @@ function Accounts() {
           <Empty msg="No accounts." />
         ) : (
           <ul className="list">
-            {data.accounts.map((a) => (
-              <li key={a}>{a}</li>
-            ))}
+            {data.accounts.map((a) => {
+              const isSelf =
+                a.name.toLowerCase() === props.me.name.toLowerCase();
+              return (
+                <li key={a.name} className="acct">
+                  <span>
+                    {a.name}
+                    {a.admin && <span className="via via-sso">admin</span>}
+                  </span>
+                  <button
+                    className={a.admin ? "ghost" : ""}
+                    disabled={busy === a.name || (a.admin && isSelf)}
+                    title={
+                      a.admin && isSelf ? "you can't demote yourself" : undefined
+                    }
+                    onClick={() => toggle(a)}
+                  >
+                    {busy === a.name
+                      ? "…"
+                      : a.admin
+                        ? "Demote"
+                        : "Make admin"}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
@@ -317,17 +355,19 @@ function Accounts() {
 function CreateAccount(props: { onDone: () => void }) {
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
+  const [admin, setAdmin] = useState(false);
   return (
     <ActionForm
       title="Create account"
       submitLabel="Create"
       disabled={!name.trim() || !password}
       onSubmit={async () => {
-        await api.createAccount(name.trim(), password);
+        await api.createAccount(name.trim(), password, admin);
         setName("");
         setPassword("");
+        setAdmin(false);
         props.onDone();
-        return "Account created.";
+        return admin ? "Admin account created." : "Account created.";
       }}
     >
       <input
@@ -341,6 +381,14 @@ function CreateAccount(props: { onDone: () => void }) {
         value={password}
         onChange={(e) => setPassword(e.target.value)}
       />
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={admin}
+          onChange={(e) => setAdmin(e.target.checked)}
+        />
+        web-UI admin
+      </label>
     </ActionForm>
   );
 }

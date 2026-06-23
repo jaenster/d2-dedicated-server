@@ -233,6 +233,37 @@ tbody tr:last-child td {
 .list li:last-child {
   border-bottom: none;
 }
+.acct {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.acct > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.acct button {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.8rem;
+}
+button.ghost {
+  background: transparent;
+  color: var(--muted);
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0.4rem 0;
+}
+.check input {
+  width: auto;
+  margin: 0;
+}
 .forms {
   display: flex;
   flex-direction: column;
