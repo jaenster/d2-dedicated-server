@@ -1,0 +1,28 @@
+{{ .Chart.Name }} {{ .Chart.Version }} — realm "{{ .Values.realmName }}" deployed to namespace {{ .Release.Namespace }}.
+
+Components:
+  realmd        x{{ .Values.realmd.replicas }}   (LoadBalancer: bnetd/d2cs/d2dbs/gslink on 6112-6115)
+  game server   x{{ .Values.gameServer.replicas }}   (hostPort 4000, one per node, advertises {{ .Values.gameServer.gsAddr }})
+  postgres      {{ if .Values.postgres.enabled }}in-cluster{{ else }}DISABLED (point realmd at an external DSN){{ end }}
+  redis         {{ if .Values.redis.enabled }}in-cluster{{ else }}DISABLED{{ end }}
+  qqserver      {{ if .Values.qqserver.enabled }}ClusterIP gateway{{ else }}DISABLED{{ end }}
+
+Next steps:
+  1. Get the realmd LoadBalancer IP:
+       kubectl -n {{ .Release.Namespace }} get svc realmd -w
+{{- if not .Values.realmAddr }}
+     Then set realmAddr to that IP and `helm upgrade` (realmAddr is currently unset).
+{{- else }}
+     realmAddr is set to {{ .Values.realmAddr }} — make sure it matches that IP.
+{{- end }}
+
+  2. Populate the game-files PVC (d2-gamefiles) with a REAL, proprietary D2 1.14d
+     install before the GS will start (the entrypoint exits if /game/Game.exe is missing).
+
+  3. Clients connect to {{ if .Values.realmAddr }}{{ .Values.realmAddr }}{{ else }}<realmd-LB-IP>{{ end }}; realmd won't accept
+     client traffic until a GS registers (REQUIRE_GS is {{ if .Values.requireGS }}on{{ else }}off{{ end }}).
+{{- if not .Values.postgres.enabled }}
+
+  NOTE: postgres is disabled. realmd still reads its DSN from the `realmd-pg` secret —
+  override postgres.auth.* to point at your external database.
+{{- end }}

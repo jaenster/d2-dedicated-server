@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: realmd
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: realmd
+spec:
+  type: LoadBalancer
+  # Preserve the game server's source IP on the gs-link.
+  externalTrafficPolicy: Local
+  selector:
+    {{- include "realm.selectorLabels" (dict "root" . "component" "realmd") | nindent 4 }}
+  ports:
+    - { port: 6112, targetPort: 6112, name: bnetd }
+    - { port: 6113, targetPort: 6113, name: d2cs }
+    - { port: 6114, targetPort: 6114, name: d2dbs }
+    - { port: 6115, targetPort: 6115, name: gslink }

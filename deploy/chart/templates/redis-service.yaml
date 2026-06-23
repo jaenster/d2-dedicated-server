@@ -1,0 +1,14 @@
+{{- if .Values.redis.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: realmd-redis
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  selector:
+    {{- include "realm.selectorLabels" (dict "root" . "component" "redis") | nindent 4 }}
+  ports:
+    - { port: 6379, targetPort: 6379 }
+{{- end }}

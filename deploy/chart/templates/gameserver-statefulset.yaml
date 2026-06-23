@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: d2gs
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gameserver
+spec:
+  serviceName: d2gs
+  replicas: {{ .Values.gameServer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 8 }}
+    spec:
+      # One GS per node: hostPort 4000 is a node-level bind, so two pods on a node
+      # would collide. This also gives each pod a distinct node IP to advertise.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: d2gs
+          image: "{{ .Values.images.gs.repository }}:{{ .Values.images.gs.tag }}"
+          imagePullPolicy: {{ .Values.images.gs.pullPolicy }}
+          ports:
+            - { containerPort: 4000, hostPort: 4000, name: game }
+          env:
+            # The realm server Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
+            - name: REALMD_HOST
+              value: realmd.{{ .Release.Namespace }}.svc.cluster.local
+            # Node IP → reference for the public address clients dial for this pod's games.
+            - name: NODE_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.hostIP }
+            # On cloud nodes status.hostIP is PRIVATE; "auto:4000" makes the entrypoint
+            # resolve the node's PUBLIC IPv4 from the cloud metadata service.
+            - name: D2GS_GS_ADDR
+              value: {{ .Values.gameServer.gsAddr | quote }}
+            - name: D2GS_MAX_GAMES
+              value: {{ .Values.gameServer.maxGames | quote }}
+            {{- if .Values.gameServer.extraDlls }}
+            - name: D2GS_EXTRA_DLLS
+              value: {{ .Values.gameServer.extraDlls | quote }}
+            {{- end }}
+            {{- if .Values.gameServer.extraArgs }}
+            - name: D2GS_EXTRA_ARGS
+              value: {{ .Values.gameServer.extraArgs | quote }}
+            {{- end }}
+          volumeMounts:
+            - { name: game, mountPath: /game, readOnly: true }
+            - { name: wine, mountPath: /wine }
+            - { name: work, mountPath: /work }
+          resources:
+            {{- toYaml .Values.gameServer.resources | nindent 12 }}
+      volumes:
+        - name: game
+          persistentVolumeClaim:
+            claimName: d2-gamefiles
+        - name: wine
+          emptyDir: {}     # wine prefix re-inits per start; make it a PVC to persist
+        - name: work
+          emptyDir: {}
