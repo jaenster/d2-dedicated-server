@@ -1,3 +1,5 @@
-# generated artifacts (regenerable from the scan workflows + the Ghidra session)
-worklist*.json
-sweep.run.js
+# generated/scratch — regenerable from the scan workflows + the Ghidra session
+# (or from the local .cpp.map sidecar parse). The committed harness is *.wf.js.
+*.json
+*.run.js
+*.py

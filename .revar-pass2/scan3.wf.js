@@ -5,7 +5,7 @@ export const meta = {
 }
 
 const TOTAL = 14457
-const BAND = 500
+const BAND = 250  // was 500: dense bands (4500/10000) blew the 64k agent output cap; halve it
 const bands = []
 for (let off = 0; off < TOTAL; off += BAND) bands.push(off)
 
@@ -41,7 +41,7 @@ const prompt = (off) => `Scan a band of Diablo 2 1.14d Game.exe (Ghidra session 
 
 Load tools: ToolSearch query \`select:mcp__claude_ai_ghidra_mcp__list_functions\`.
 
-Page your band: \`list_functions(sessionId:"f4db4b5c", offset:N, limit:100)\` for N = ${off}, ${off+100}, ${off+200}, ${off+300}, ${off+400} (stop if a page returns <100). Do NOT decompile.
+Page your band: \`list_functions(sessionId:"f4db4b5c", offset:N, limit:125)\` for N = ${off}, ${off+125} (2 pages = 250 funcs; stop if a page returns <125). Do NOT decompile.
 
 SKIP entirely (omit from output): namespace \`CRT\`; name starts \`CRT_\`/\`__\`/\`_\`; name starts \`thunk_\`; size < 16.
 

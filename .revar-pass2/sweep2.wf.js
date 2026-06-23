@@ -7,14 +7,14 @@ export const meta = {
 
 // args = { addresses: [...] }  — true fixable worklist from scan3 (bake via sweep2.run.js)
 const addresses = (args && args.addresses) ? args.addresses : []
-const BATCH = 12          // smaller than v1's 25 — v1 agents truncated/rushed long batches
-const WAVE_BATCHES = 8
+const BATCH = 35          // smaller than 50: the v300 run rushed and under-applied at 50; 35 keeps quality up
+const WAVE_BATCHES = 1   // 1-at-a-time per user request (gentle on the single worker; 8-wide OOM-looped it on 2026-06-13). Commit after every batch.
 
 function chunk(arr, n) { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o }
 const batches = chunk(addresses, BATCH)
 const waves = chunk(batches, WAVE_BATCHES)
 
-const processPrompt = (addrs) => `Second-pass type-aware variable cleanup on Diablo 2 1.14d Game.exe in Ghidra (session f4db4b5c). Pass sessionId:"f4db4b5c" on every call. A prior sweep UNDER-DID the retype job — your priority is to apply EVERY resolved type, including scalars.
+const processPrompt = (addrs) => `Second-pass type-aware variable cleanup on Diablo 2 1.14d Game.exe in Ghidra (session 7cb60c00). Pass sessionId:"7cb60c00" on every call. A prior sweep UNDER-DID the retype job — your priority is to apply EVERY resolved type, including scalars.
 
 Load tools: ToolSearch query \`select:mcp__claude_ai_ghidra_mcp__decompile,mcp__claude_ai_ghidra_mcp__set_function_variable_name,mcp__claude_ai_ghidra_mcp__set_function_variable_type\`.
 
@@ -22,7 +22,10 @@ YOUR FUNCTIONS (${addrs.length}): ${JSON.stringify(addrs)}
 
 Process EVERY function — do not stop early, do not skip any. For EACH: \`decompile(address)\`, then:
 
-JOB 1 FIRST, EXHAUSTIVELY — apply resolved types. For EVERY local/param whose declared dataType is \`undefined1/2/4/8\` and whose entry shows \`/* resolvedType: T */\` with T concrete, call \`set_function_variable_type(functionAddress, variableName, dataType:T)\`. This INCLUDES scalars: \`int\`, \`uint\`, \`int32_t\`, \`uint32_t\`, \`BOOL\`, \`byte\`, \`short\`, \`char\`, enums, AND struct pointers. Do NOT skip scalar retypes — they are the bulk of what the last pass missed. Skip a var only if T is itself \`undefined*\`, or the call errors with "Storage can't be resized" (HASH-stored — leave it).
+JOB 1 FIRST, EXHAUSTIVELY — apply resolved types. For EVERY local/param whose declared dataType is \`undefined1/2/4/8\` OR \`undefined1[N]\` and whose entry shows \`/* resolvedType: T */\` with T concrete, call \`set_function_variable_type(functionAddress, variableName, dataType:T)\`. This INCLUDES:
+ - scalars: \`int\`, \`uint\`, \`int32_t\`, \`uint32_t\`, \`BOOL\`, \`byte\`, \`short\`, \`char\`, enums, AND struct pointers. Do NOT skip scalar retypes — they are the bulk of what the last pass missed.
+ - ARRAY / STRUCT-BUFFER stack vars of the form \`undefined1[N] /* resolvedType: T */\` (e.g. \`D2StatStrc[16]\`, \`D2BitBufferStrc\`, \`D2DamageStrc\`, \`int[256]\`). For these set dataType to EXACTLY the resolvedType T and pass \`force:true\` so overlapping stack slots are absorbed. These were NEVER in a prior worklist — apply them.
+Skip a var only if T is itself \`undefined*\`, or the call errors with "Storage can't be resized" (HASH-stored — leave it). If a force:true array retype errors, report it and move on.
 
 JOB 2 — rename residual generics: \`iVarN uVarN cVarN bVarN BVarN eVarN fVarN dVarN lVarN pDVarN ppDVarN puVarN pcVarN piVarN\`, \`local_XX\`, \`uStackN iStackN DStackN sStackN\`, \`param_N\`, \`param_N_NN\`, \`dwParam nParam bParam dwArg nArg pdwParam\` -> meaningful D2-Hungarian names from struct-field accesses + called-function names (p ptr, pp ptr-to-ptr, n int/id, b BOOL, e enum, dw dword, w word, by byte, sz cstring, i/j loop). Leave \`in_*/unaff_*/extraout_*\` and HASH-stored temporaries alone unless trivially clear.
 
@@ -30,7 +33,7 @@ Do NOT save_session or commit.
 
 Return a terse tally: "<N> funcs, <R> retypes, <M> renames, <E> errors" plus one line on anything odd. Keep under 600 chars. The tally is secondary — doing ALL the edits is primary.`
 
-const commitPrompt = (label) => `Persist Ghidra. Load tools: ToolSearch query \`select:mcp__claude_ai_ghidra_mcp__save_session,mcp__claude_ai_ghidra_mcp__commit\`. Call save_session(sessionId:"f4db4b5c") then commit(sessionId:"f4db4b5c", message:"revar pass2 sweep2: ${label}"). Reply with the version number or error.`
+const commitPrompt = (label) => `Persist Ghidra. Load tools: ToolSearch query \`select:mcp__claude_ai_ghidra_mcp__save_session,mcp__claude_ai_ghidra_mcp__commit\`. Call save_session(sessionId:"7cb60c00") then commit(sessionId:"7cb60c00", message:"revar pass2 sweep2: ${label}"). Reply with the version number or error.`
 
 log(`sweep2 start: ${addresses.length} funcs, ${batches.length} batches (x${BATCH}), ${waves.length} waves`)
 
