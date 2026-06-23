@@ -24,6 +24,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false   # one image failing (e.g. a new package's first push) must not cancel the others
       matrix:
         include:
           - target: realmd
