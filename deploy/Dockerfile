@@ -44,8 +44,12 @@ FROM debian:bookworm-slim AS gs
 # engine is byte-patched to never render, and the entrypoint runs with DISPLAY unset
 # and the Mono/Gecko/menu-builder DLLs disabled. (Swap in the WineHQ repo for a newer
 # wine if your D2 build needs it.)
+# wine + a virtual X display (Xvfb). The engine needs a window/graphics context to
+# exist or WinMain bails early (verified: with no display the host exits before the
+# server thread boots). Xvfb provides a headless display; rendering itself stays
+# stubbed by the injected DLL, so nothing actually draws.
 RUN dpkg --add-architecture i386 && apt-get update && \
-    apt-get install -y --no-install-recommends wine wine32 curl ca-certificates && \
+    apt-get install -y --no-install-recommends wine wine32 curl ca-certificates xvfb && \
     rm -rf /var/lib/apt/lists/*
 # The GS needs only these two DLLs (dbghelp proxy + payload) — not realmd's checkrev.
 COPY --from=build-dlls /src/zig-out/bin/dbghelp.dll /src/zig-out/bin/d2gs.dll /opt/d2gs/

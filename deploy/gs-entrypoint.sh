@@ -20,8 +20,19 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 # Truly headless: no X display, and wine's GUI bits disabled so nothing draws or pops a
 # dialog (the engine is byte-patched to never render). mscoree/mshtml are the Mono/Gecko
 # installers; winemenubuilder writes desktop menus. dbghelp=n,b loads our proxy.
-export DISPLAY=
 WINE_HEADLESS_OVERRIDES="mscoree=d;mshtml=d;winemenubuilder.exe=d"
+
+# Headless virtual display. The engine's WinMain needs a window/graphics context to
+# exist or it returns early (the host then ExitProcess()es before the server thread
+# boots). Xvfb gives wine a display; the injected DLL still stubs all rendering, so
+# nothing draws. This mirrors a local run, where wine has a real GPU backend.
+XVFB_DISPLAY="${XVFB_DISPLAY:-:99}"
+Xvfb "$XVFB_DISPLAY" -screen 0 1024x768x16 -nolisten tcp >/dev/null 2>&1 &
+XVFB_PID=$!
+trap 'kill "$XVFB_PID" 2>/dev/null' EXIT
+export DISPLAY="$XVFB_DISPLAY"
+# Give Xvfb a moment to come up before wine connects.
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -e "/tmp/.X11-unix/X${XVFB_DISPLAY#:}" ] && break; sleep 0.3; done
 
 [ -f /game/Game.exe ] || { echo "FATAL: mount a D2 1.14d install at /game (no Game.exe found)"; exit 1; }
 
