@@ -14,6 +14,7 @@ const Alignment = std.mem.Alignment;
 
 const patch = @import("../runtime/patch.zig");
 const trampoline = @import("../runtime/trampoline.zig");
+const fastcall = @import("../runtime/fastcall.zig");
 
 const DWORD = u32;
 const BYTE = u8;
@@ -24,22 +25,33 @@ pub const D2PoolManagerStrc = @import("d2types.zig").D2PoolManagerStrc;
 
 const ThiscallConv = std.builtin.CallingConvention{ .x86_thiscall = .{} };
 const StdcallConv = std.builtin.CallingConvention{ .x86_stdcall = .{} };
-const FastcallConv = std.builtin.CallingConvention{ .x86_fastcall = .{} };
 
 // FOG pool function addresses (D2 1.14d, image base 0x00400000, no ASLR).
 const ADDR_INIT_POOL_SYSTEM: usize = 0x00409DD0; // stdcall (D2PoolManagerStrc**, char*, i32)
-const ADDR_POOL_ALLOC: usize = 0x0040A080; // thiscall (this, size, char*, i32) -> void*
-const ADDR_POOL_FREE: usize = 0x00409AB0; // thiscall (this, void**, char*, i32)
-const ADDR_POOL_REALLOC: usize = 0x0040A1F0; // fastcall (this, void*, size, char*, i32) -> void*
-const ADDR_FREE_MEMORY_POOL: usize = 0x00409C80; // thiscall — the teardown hook target
+const ADDR_POOL_ALLOC: usize = 0x0040A080; // __fastcall (this ECX, size EDX, char*, i32) -> void*
+const ADDR_POOL_FREE: usize = 0x00409AB0; // __fastcall (this ECX, void** EDX, char*, i32)
+const ADDR_POOL_REALLOC: usize = 0x0040A1F0; // __fastcall (this, void*, size, char*, i32) -> void*
+const ADDR_FREE_MEMORY_POOL: usize = 0x00409C80; // single-arg (this ECX) — the teardown hook target
 
-const PoolAllocFn = *const fn (*D2PoolManagerStrc, usize, [*:0]const u8, i32) callconv(ThiscallConv) ?[*]BYTE;
-const PoolFreeFn = *const fn (*D2PoolManagerStrc, *?[*]BYTE, [*:0]const u8, i32) callconv(ThiscallConv) void;
-const PoolReallocFn = *const fn (*D2PoolManagerStrc, ?[*]BYTE, usize, [*:0]const u8, i32) callconv(FastcallConv) ?[*]BYTE;
+// Fog::Memory::Alloc/Free/Realloc are __fastcall (ECX=this, EDX=2nd arg): the size/pointer MUST
+// land in EDX. Zig's own x86 fastcall callconv is broken (ziglang/zig#10363) — declaring the fn
+// pointer `callconv(.x86_fastcall)` mis-places the 2nd arg, so the engine reads a stale register
+// as the size (a ~2GB request -> malloc fails -> POOL_AllocOverflowBlock OOM assert, Fog/Memory
+// line 904 -> headless GS dies on game entry). We build every call in inline asm via
+// fastcall_call instead, which puts arg0->ECX, arg1->EDX, the rest on the stack by hand.
+const AllocCall = fastcall.fastcall_call(ADDR_POOL_ALLOC, fn (*D2PoolManagerStrc, usize, [*:0]const u8, i32) ?[*]BYTE);
+const FreeCall = fastcall.fastcall_call(ADDR_POOL_FREE, fn (*D2PoolManagerStrc, *?[*]BYTE, [*:0]const u8, i32) void);
+const ReallocCall = fastcall.fastcall_call(ADDR_POOL_REALLOC, fn (*D2PoolManagerStrc, ?[*]BYTE, usize, [*:0]const u8, i32) ?[*]BYTE);
 
-pub const pool_alloc: PoolAllocFn = @ptrFromInt(ADDR_POOL_ALLOC);
-pub const pool_free: PoolFreeFn = @ptrFromInt(ADDR_POOL_FREE);
-pub const pool_realloc: PoolReallocFn = @ptrFromInt(ADDR_POOL_REALLOC);
+pub fn pool_alloc(pool: *D2PoolManagerStrc, size: usize, file: [*:0]const u8, line: i32) ?[*]BYTE {
+    return AllocCall.call(.{ pool, size, file, line });
+}
+pub fn pool_free(pool: *D2PoolManagerStrc, pStruct: *?[*]BYTE, file: [*:0]const u8, line: i32) void {
+    FreeCall.call(.{ pool, pStruct, file, line });
+}
+pub fn pool_realloc(pool: *D2PoolManagerStrc, ptr: ?[*]BYTE, size: usize, file: [*:0]const u8, line: i32) ?[*]BYTE {
+    return ReallocCall.call(.{ pool, ptr, size, file, line });
+}
 
 const InitPoolSystemFn = *const fn (**D2PoolManagerStrc, [*:0]const u8, i32) callconv(StdcallConv) void;
 const init_pool_system: InitPoolSystemFn = @ptrFromInt(ADDR_INIT_POOL_SYSTEM);
