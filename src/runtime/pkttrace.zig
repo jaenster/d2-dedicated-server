@@ -8,6 +8,7 @@
 
 const patch = @import("patch.zig");
 const log = @import("../log.zig");
+const evlog = @import("evlog.zig");
 
 extern "kernel32" fn VirtualAlloc(addr: ?*anyopaque, size: usize, typ: u32, protect: u32) callconv(.winapi) ?*anyopaque;
 const MEM_COMMIT_RESERVE: u32 = 0x3000;
@@ -23,14 +24,26 @@ const SYSTEM_FN: usize = 0x0052cc20;
 fn idOf(pbytes: usize) u8 {
     return @as([*]const u8, @ptrFromInt(pbytes))[4];
 }
+fn clientOf(pbytes: usize) u32 {
+    return @as(*align(1) const u32, @ptrFromInt(pbytes)).*; // nClientId @ +0
+}
+// Inbound dequeued buffer = { nClientId:u32, packetId:u8, ... }; emit as JSON so the
+// whole trace shares the [srvtrace] structured stream (no plain-text noise).
+fn pktIn(mode: []const u8, pbytes: usize) void {
+    var e = evlog.Event.begin("pkt_in");
+    e.str("mode", mode);
+    e.int("client", clientOf(pbytes));
+    e.hex("id", idOf(pbytes));
+    e.end();
+}
 fn logSetup(pbytes: usize) callconv(.c) void {
-    log.hex("pkt IN  GameSetup id=0x", idOf(pbytes));
+    pktIn("GameSetup", pbytes);
 }
 fn logInGame(pbytes: usize) callconv(.c) void {
-    log.hex("pkt IN  InGame   id=0x", idOf(pbytes));
+    pktIn("InGame", pbytes);
 }
 fn logSystem(pbytes: usize) callconv(.c) void {
-    log.hex("pkt IN  System   id=0x", idOf(pbytes));
+    pktIn("System", pbytes);
 }
 
 // Intercept template: ECX=pBytes, EDX=iSize must reach the original handler. Save
@@ -97,9 +110,10 @@ const SENDPKT_PROLOGUE = [_]u8{ 0x55, 0x8b, 0xec, 0x53, 0x33, 0xdb };
 var trampoline: usize = 0;
 
 fn logOut(pbytes: usize, nsize: usize) callconv(.c) void {
-    const id = @as([*]const u8, @ptrFromInt(pbytes))[0];
-    log.hex("pkt OUT id=0x", id);
-    _ = nsize;
+    var e = evlog.Event.begin("pkt_out");
+    e.hex("id", @as([*]const u8, @ptrFromInt(pbytes))[0]);
+    e.int("size", @as(i64, @intCast(nsize)));
+    e.end();
 }
 
 fn sendShim() callconv(.naked) void {
