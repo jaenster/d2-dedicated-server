@@ -1,0 +1,60 @@
+# GitOps entry point for the realm on the Hetzner k3s cluster. ArgoCD points at this
+# directory (see deploy/argocd/application.yaml); kustomize uses ONLY the files listed
+# in `resources` (the Dockerfile / compose / entrypoints in this dir are ignored).
+#
+# Base manifests (realmd.yaml, gs.yaml) stay generic — everything cluster-specific is a
+# patch here: ghcr image refs, the public realm address clients dial, the ghcr pull
+# secret, an RWX game-files volume, and a single (but fleet-shaped) GS.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: realmd
+
+resources:
+  - realmd.yaml
+  - gs.yaml
+
+# CI publishes :latest and :<sha>; bump these to a sha to pin a rollout.
+images:
+  - name: realmd
+    newName: ghcr.io/jaenster/realmd
+    newTag: latest
+  - name: d2gs
+    newName: ghcr.io/jaenster/d2gs
+    newTag: latest
+
+patches:
+  # Public address clients dial for the realm (bnetd 6112 + the d2cs IP bnetd
+  # advertises). A node public IP; klipper servicelb binds the realmd ports on every
+  # node, so any node IP works. Swap for a floating IP / DNS later.
+  - target: { kind: Deployment, name: realmd }
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/env/2/value
+        value: "116.202.26.229"
+  # Images are public ghcr packages — no pull secret needed (the realm itself is public,
+  # and the images bake in no proprietary game data).
+  # Single GS for now — but the StatefulSet keeps its anti-affinity + per-node hostPort,
+  # so scaling replicas up later just spreads one GS per node. No single-GS shortcuts.
+  - target: { kind: StatefulSet, name: d2gs }
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  # The GS discovers its node's PUBLIC IP from cloud metadata (see gs-entrypoint.sh), so
+  # let the entrypoint resolve it instead of the private downward-API status.hostIP.
+  - target: { kind: StatefulSet, name: d2gs }
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/env/2/value
+        value: "auto:4000"
+  # Game files: a Longhorn RWX volume so the upload helper can write it and every GS pod
+  # can read it. (ReadOnlyMany can't be populated in-place.)
+  - target: { kind: PersistentVolumeClaim, name: d2-gamefiles }
+    patch: |
+      - op: replace
+        path: /spec/accessModes
+        value: ["ReadWriteMany"]
+      - op: add
+        path: /spec/storageClassName
+        value: longhorn

@@ -75,5 +75,26 @@ set -- "$@" --d2gs --d2gs-boot --realm --create-games
 # Extra engine flags (e.g. -direct -txt for the loose /moddata data/ tree).
 [ -n "$D2GS_EXTRA_ARGS" ] && set -- "$@" $D2GS_EXTRA_ARGS
 
+# Clients dial THIS server directly for game traffic, so D2GS_GS_ADDR must be a
+# PUBLIC, client-routable address. On a cloud node the downward-API status.hostIP is
+# the node's PRIVATE network IP (e.g. Hetzner 10.x), which clients can't reach. When
+# D2GS_GS_ADDR is unset or "auto[:port]", resolve the node's public IPv4 from the
+# cloud metadata service and append the game port.
+case "${D2GS_GS_ADDR:-auto}" in
+  auto|auto:*)
+    port="4000"; case "$D2GS_GS_ADDR" in auto:*) port="${D2GS_GS_ADDR#auto:}";; esac
+    pubip=""
+    # Hetzner Cloud metadata (no auth, link-local). Fall back to an external echo.
+    for url in \
+      "http://169.254.169.254/hetzner/v1/metadata/public-ipv4" \
+      "https://ifconfig.me/ip" "https://api.ipify.org"; do
+      pubip=$(curl -fsS --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]')
+      case "$pubip" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) break;; *) pubip="";; esac
+    done
+    [ -n "$pubip" ] && export D2GS_GS_ADDR="$pubip:$port" \
+      || echo "WARN: could not resolve public IP; leaving D2GS_GS_ADDR unset (realmd will use the gs-link peer IP)"
+    ;;
+esac
+
 echo "starting headless GS: realm=${REALMD_HOST:-<unset>} gs_addr=${D2GS_GS_ADDR:-<peer-ip>} max_games=${D2GS_MAX_GAMES:-100}"
 exec wine "$GAME_DIR/Game.exe" "$@"
