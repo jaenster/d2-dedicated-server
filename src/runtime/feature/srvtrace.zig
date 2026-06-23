@@ -73,6 +73,15 @@ fn rightSkillId(v: usize) i32 {
     return @intCast(si.wSkillId);
 }
 
+/// The left-hand skill id currently selected on a player unit, or -1.
+fn leftSkillId(v: usize) i32 {
+    const u = unit(v) orelse return -1;
+    const info = u.pInfo orelse return -1;
+    const sk = info.pLeftSkill orelse return -1;
+    const si = sk.pSkillInfo orelse return -1;
+    return @intCast(si.wSkillId);
+}
+
 fn gamePtr(v: usize) ?*game.D2GameStrc {
     return if (v == 0) null else @ptrFromInt(v);
 }
@@ -341,6 +350,59 @@ fn onPartyInvite(pinviter: usize, ptarget: usize, _: usize) callconv(.c) void {
     e.end();
 }
 
+// -- decoded player actions (C->S SCMD handlers; ECX=pGame EDX=player, [esp+4]=pkt) --
+
+fn onSkillLeft(pplayer: usize, _: usize, _: usize) callconv(.c) void {
+    var e = evlog.Event.begin("skill_left");
+    putPlayerName(&e, pplayer);
+    e.int("skill", leftSkillId(pplayer));
+    e.end();
+}
+
+fn onSkillRightEntity(pplayer: usize, _: usize, _: usize) callconv(.c) void {
+    var e = evlog.Event.begin("skill_right");
+    putPlayerName(&e, pplayer);
+    e.int("skill", rightSkillId(pplayer));
+    e.end();
+}
+
+/// 0x13 InteractWithEntity — open chest / click shrine / pull lever / pick up gold.
+/// Packet: [op][unitType:u32 @+1][GUID:u32 @+5].
+fn onInteract(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
+    var e = evlog.Event.begin("interact");
+    putPlayerName(&e, pplayer);
+    if (pkt != 0) {
+        e.int("unitType", readU32(pkt, 1));
+        e.int("target", readU32(pkt, 5));
+    }
+    e.end();
+}
+
+/// 0x18 ItemToInventory — move item to inv/stash/trade.
+/// Packet: [op][itemGUID:u32 @+1][x:u32][y:u32][bufferId:u32 @+13] (0=inv 4=stash 2/3=trade).
+fn onItemMove(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
+    var e = evlog.Event.begin("item_move");
+    putPlayerName(&e, pplayer);
+    if (pkt != 0) {
+        e.hex("itemGUID", readU32(pkt, 1));
+        e.int("buffer", readU32(pkt, 13));
+    }
+    e.end();
+}
+
+fn onItemEquip(pplayer: usize, _: usize, _: usize) callconv(.c) void {
+    var e = evlog.Event.begin("item_equip");
+    putPlayerName(&e, pplayer);
+    e.end();
+}
+
+fn onItemUse(pplayer: usize, _: usize, _: usize) callconv(.c) void {
+    var e = evlog.Event.begin("item_use");
+    putPlayerName(&e, pplayer);
+    putPos(&e, pplayer);
+    e.end();
+}
+
 // ── hook framework ───────────────────────────────────────────────────────────
 
 /// Where a captured value comes from at function entry. `.stack` is the original
@@ -462,6 +524,15 @@ const hooks = [_]Hook{
     .{ .addr = 0x54C300, .prologue = 7, .label = "cube_transmute", .handler = &onCube, .a1 = .edx }, // ECX=pGame EDX=pPlayer
     .{ .addr = 0x5A5E50, .prologue = 6, .label = "hostility", .handler = &onHostility, .a1 = .edx, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 8 } }, // ECX=pGame EDX=pUnit, [esp+4]=pTarget, [esp+8]=bHostile
     .{ .addr = 0x5A5BE0, .prologue = 5, .label = "party_invite", .handler = &onPartyInvite, .a1 = .edx, .a2 = .{ .stack = 4 } }, // EDX=inviter, [esp+4]=pTarget
+
+    // -- decoded player actions (SCMD handlers; ECX=pGame EDX=player, [esp+4]=pkt) --
+    .{ .addr = 0x549D80, .prologue = 5, .label = "skill_left", .handler = &onSkillLeft, .a1 = .edx }, // 0x06 LeftSkillOnEntity
+    .{ .addr = 0x54A040, .prologue = 5, .label = "skill_right", .handler = &onSkillRightEntity, .a1 = .edx }, // 0x0D RightSkillOnEntity
+    .{ .addr = 0x54AA90, .prologue = 7, .label = "interact", .handler = &onInteract, .a1 = .edx, .a2 = .{ .stack = 4 } }, // 0x13 InteractWithEntity
+    .{ .addr = 0x54ABB0, .prologue = 8, .label = "item_move", .handler = &onItemMove, .a1 = .edx, .a2 = .{ .stack = 4 } }, // 0x18 ItemToInventory
+    .{ .addr = 0x54AD90, .prologue = 6, .label = "item_equip", .handler = &onItemEquip, .a1 = .edx }, // 0x1A EquipItem
+    .{ .addr = 0x54B1E0, .prologue = 6, .label = "item_use", .handler = &onItemUse, .a1 = .edx }, // 0x20 UseItemAtLocation
+    .{ .addr = 0x54B560, .prologue = 6, .label = "item_use", .handler = &onItemUse, .a1 = .edx }, // 0x26 UseItemAtPlayerCoords
 };
 
 pub fn install() void {
