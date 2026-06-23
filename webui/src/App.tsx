@@ -1,0 +1,399 @@
+import { useCallback, useEffect, useState } from "react";
+import {
+  api,
+  ApiError,
+  getToken,
+  setToken,
+  type Game,
+  type GameServer,
+  type Status,
+} from "./api.ts";
+
+type Tab = "overview" | "gameservers" | "games" | "accounts";
+
+export function App() {
+  const [token, setTok] = useState(getToken());
+  const [authed, setAuthed] = useState(false);
+
+  if (!authed) {
+    return (
+      <Login
+        token={token}
+        onToken={setTok}
+        onConnected={() => setAuthed(true)}
+      />
+    );
+  }
+  return (
+    <Dashboard
+      onLogout={() => {
+        setToken("");
+        setTok("");
+        setAuthed(false);
+      }}
+    />
+  );
+}
+
+function Login(props: {
+  token: string;
+  onToken: (t: string) => void;
+  onConnected: () => void;
+}) {
+  const [value, setValue] = useState(props.token);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const connect = async () => {
+    setBusy(true);
+    setErr(null);
+    setToken(value.trim());
+    try {
+      await api.status();
+      props.onToken(value.trim());
+      props.onConnected();
+    } catch (e) {
+      setToken("");
+      setErr(
+        e instanceof ApiError
+          ? e.status === 403
+            ? "Admin API is disabled (REALMD_ADMIN_TOKEN not set on the server)."
+            : "Invalid token."
+          : String(e),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="login">
+      <div className="card">
+        <h1>realmd admin</h1>
+        <p className="muted">
+          Enter the admin token (<code>REALMD_ADMIN_TOKEN</code>).
+        </p>
+        <input
+          type="password"
+          placeholder="admin token"
+          value={value}
+          autoFocus
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && connect()}
+        />
+        <button disabled={busy || !value.trim()} onClick={connect}>
+          {busy ? "Connecting…" : "Connect"}
+        </button>
+        {err && <p className="error">{err}</p>}
+      </div>
+    </div>
+  );
+}
+
+function Dashboard(props: { onLogout: () => void }) {
+  const [tab, setTab] = useState<Tab>("overview");
+  const tabs: [Tab, string][] = [
+    ["overview", "Overview"],
+    ["gameservers", "Game Servers"],
+    ["games", "Games"],
+    ["accounts", "Accounts"],
+  ];
+  return (
+    <div className="app">
+      <header>
+        <span className="brand">realmd admin</span>
+        <nav>
+          {tabs.map(([t, label]) => (
+            <button
+              key={t}
+              className={t === tab ? "tab active" : "tab"}
+              onClick={() => setTab(t)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+        <button className="logout" onClick={props.onLogout}>
+          Log out
+        </button>
+      </header>
+      <main>
+        {tab === "overview" && <Overview />}
+        {tab === "gameservers" && <GameServers />}
+        {tab === "games" && <Games />}
+        {tab === "accounts" && <Accounts />}
+      </main>
+    </div>
+  );
+}
+
+// Generic polling hook: re-fetches `fn` every `ms` and on demand.
+function usePoll<T>(fn: () => Promise<T>, ms = 5000) {
+  const [data, setData] = useState<T | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try {
+      setData(await fn());
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+    // fn identity is stable enough for this admin tool
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    load();
+    const id = setInterval(load, ms);
+    return () => clearInterval(id);
+  }, [load, ms]);
+  return { data, err, reload: load };
+}
+
+function Overview() {
+  const { data, err } = usePoll<Status>(api.status);
+  if (err) return <Banner msg={err} />;
+  if (!data) return <p className="muted">Loading…</p>;
+  return (
+    <section>
+      <div className="stats">
+        <Stat label="Sessions" value={data.sessions} />
+        <Stat label="Games" value={data.games} />
+        <Stat label="Game Servers" value={data.gameservers} />
+      </div>
+      <dl className="kv">
+        <dt>Instance</dt>
+        <dd>{data.instance}</dd>
+        <dt>Durable store</dt>
+        <dd>{data.durable}</dd>
+        <dt>Ephemeral store</dt>
+        <dd>{data.ephemeral}</dd>
+      </dl>
+    </section>
+  );
+}
+
+function Stat(props: { label: string; value: number }) {
+  return (
+    <div className="stat">
+      <div className="num">{props.value}</div>
+      <div className="lbl">{props.label}</div>
+    </div>
+  );
+}
+
+function GameServers() {
+  const { data, err } = usePoll<GameServer[]>(api.gameservers);
+  if (err) return <Banner msg={err} />;
+  if (!data) return <p className="muted">Loading…</p>;
+  if (data.length === 0) return <Empty msg="No game servers registered." />;
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>GS ID</th>
+          <th>Address</th>
+          <th>Live games</th>
+          <th>Max games</th>
+        </tr>
+      </thead>
+      <tbody>
+        {data.map((g) => (
+          <tr key={g.gsid}>
+            <td className="mono">{g.gsid}</td>
+            <td className="mono">{g.addr}</td>
+            <td>{g.live_games}</td>
+            <td>{g.maxgame}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function Games() {
+  const { data, err, reload } = usePoll<Game[]>(api.games);
+  const [busy, setBusy] = useState<string | null>(null);
+  const close = async (name: string) => {
+    if (!confirm(`Close game "${name}"?`)) return;
+    setBusy(name);
+    try {
+      await api.closeGame(name);
+      await reload();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  if (err) return <Banner msg={err} />;
+  if (!data) return <p className="muted">Loading…</p>;
+  if (data.length === 0) return <Empty msg="No active games." />;
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Game ID</th>
+          <th>GS ID</th>
+          <th>Address</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {data.map((g) => (
+          <tr key={`${g.gsid}:${g.gameid}`}>
+            <td>{g.name}</td>
+            <td>{g.gameid}</td>
+            <td className="mono">{g.gsid}</td>
+            <td className="mono">{g.ip}</td>
+            <td>
+              <button
+                className="danger"
+                disabled={busy === g.name}
+                onClick={() => close(g.name)}
+              >
+                {busy === g.name ? "Closing…" : "Close"}
+              </button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function Accounts() {
+  const { data, err, reload } = usePoll<{ accounts: string[] }>(api.accounts);
+  return (
+    <section className="cols">
+      <div>
+        <h2>Accounts</h2>
+        {err ? (
+          <Banner msg={err} />
+        ) : !data ? (
+          <p className="muted">Loading…</p>
+        ) : data.accounts.length === 0 ? (
+          <Empty msg="No accounts." />
+        ) : (
+          <ul className="list">
+            {data.accounts.map((a) => (
+              <li key={a}>{a}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div className="forms">
+        <CreateAccount onDone={reload} />
+        <CopyChar />
+      </div>
+    </section>
+  );
+}
+
+function CreateAccount(props: { onDone: () => void }) {
+  const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
+  return (
+    <ActionForm
+      title="Create account"
+      submitLabel="Create"
+      disabled={!name.trim() || !password}
+      onSubmit={async () => {
+        await api.createAccount(name.trim(), password);
+        setName("");
+        setPassword("");
+        props.onDone();
+        return "Account created.";
+      }}
+    >
+      <input
+        placeholder="account name"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+      />
+      <input
+        type="password"
+        placeholder="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+      />
+    </ActionForm>
+  );
+}
+
+function CopyChar() {
+  const [f, setF] = useState({
+    src_account: "",
+    src_char: "",
+    dst_char: "",
+    dst_account: "",
+  });
+  const upd = (k: keyof typeof f) => (e: { target: { value: string } }) =>
+    setF({ ...f, [k]: e.target.value });
+  return (
+    <ActionForm
+      title="Copy character"
+      submitLabel="Copy"
+      disabled={!f.src_account.trim() || !f.src_char.trim() || !f.dst_char.trim()}
+      onSubmit={async () => {
+        await api.copyChar({
+          src_account: f.src_account.trim(),
+          src_char: f.src_char.trim(),
+          dst_char: f.dst_char.trim(),
+          dst_account: f.dst_account.trim() || undefined,
+        });
+        setF({ src_account: "", src_char: "", dst_char: "", dst_account: "" });
+        return "Character copied.";
+      }}
+    >
+      <input placeholder="source account" value={f.src_account} onChange={upd("src_account")} />
+      <input placeholder="source character" value={f.src_char} onChange={upd("src_char")} />
+      <input placeholder="new character name" value={f.dst_char} onChange={upd("dst_char")} />
+      <input
+        placeholder="dest account (optional)"
+        value={f.dst_account}
+        onChange={upd("dst_account")}
+      />
+    </ActionForm>
+  );
+}
+
+function ActionForm(props: {
+  title: string;
+  submitLabel: string;
+  disabled?: boolean;
+  onSubmit: () => Promise<string>;
+  children: React.ReactNode;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setMsg(null);
+    try {
+      setMsg({ ok: true, text: await props.onSubmit() });
+    } catch (err) {
+      setMsg({ ok: false, text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form className="card form" onSubmit={submit}>
+      <h3>{props.title}</h3>
+      {props.children}
+      <button disabled={busy || props.disabled}>
+        {busy ? "Working…" : props.submitLabel}
+      </button>
+      {msg && <p className={msg.ok ? "ok" : "error"}>{msg.text}</p>}
+    </form>
+  );
+}
+
+function Banner(props: { msg: string }) {
+  return <div className="error banner">{props.msg}</div>;
+}
+function Empty(props: { msg: string }) {
+  return <p className="muted">{props.msg}</p>;
+}

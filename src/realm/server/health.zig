@@ -15,6 +15,7 @@ const gslink = @import("gslink.zig");
 const store = @import("store.zig");
 const shutdown = @import("shutdown.zig");
 const admin = @import("admin.zig");
+const webui = @import("webui.zig");
 
 /// When set (REALMD_REQUIRE_GS), /readyz only goes green once ≥1 GS is registered —
 /// so the pod isn't routed client traffic before it can actually host games.
@@ -114,6 +115,10 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
         } else {
             respond(fd, ok, "ready\n");
         }
+    } else if (std.mem.eql(u8, parseMethod(req), "GET")) {
+        // Everything else is the admin web UI (a single-page app). Only GET; other
+        // methods on unknown paths stay a 404.
+        webui.handle(fd, path);
     } else {
         respond(fd, not_found, "not found\n");
     }

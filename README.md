@@ -73,6 +73,20 @@ to `nodeIP:4000`:
 
 ![Kubernetes topology](docs/architecture/img/k8s_deploy.png)
 
+## Admin web UI
+
+A small Vite + React UI ([`webui/`](webui/)) over realmd's token-gated `/admin/*` JSON
+API — fleet/games/accounts at a glance, plus create-account, close-game and copy-char.
+It bundles to one self-contained `index.html` and is embedded into the realmd binary
+(`zig build realmd-bin -Dwebui=true`), served on the health/admin port. Auth reuses
+`REALMD_ADMIN_TOKEN`; keep that port behind a port-forward or authed ingress, never public.
+
+![realmd admin — overview](webui/img/overview.png)
+
+![realmd admin — accounts](webui/img/accounts.png)
+
+![realmd admin — login](webui/img/login.png)
+
 ## How injection works
 
 ```
