@@ -334,14 +334,9 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         log.print("d2gs: bootstrap (open mode, no realm)");
         server.bootstrapRealmServer(null);
     }
-    // Load the D2Common data tables (items/monsters/skills/levels/…) that game
-    // creation needs. The client app-mode entry normally does this; our server
-    // boot must do it explicitly. Only when game creation is enabled.
-    if (command.allow_create) {
-        log.print("d2gs: loading data tables (TXT_InitTxtFiles)...");
-        server.TXT_InitTxtFiles(0, 0, 1);
-        log.print("d2gs: data tables loaded");
-    }
+    // Data tables (TXT_InitTxtFiles) are now loaded inside bootstrapRealmServer,
+    // in the correct order: after the memory managers (QSERVER_CreateAndInit) and
+    // before QSERVER_InitializeServerState consumes them.
 
     log.print("d2gs: entering tick loop (listening on :4000)");
 
