@@ -74,6 +74,11 @@ const EID_INFO = 0x12;
 const EID_ERROR = 0x13;
 
 const default_channel = "Diablo II";
+const SID_LEAVECHAT = 0x10;
+const SID_CHECKAD = 0x15;
+const SID_STARTADVEX3 = 0x1c;
+const SID_NOTIFYJOIN = 0x22;
+const SID_NEWS_INFO = 0x46;
 const SID_GETFILETIME = 0x33;
 const SID_PING = 0x25;
 const SID_LOGONRESPONSE2 = 0x3a;
@@ -211,6 +216,12 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         SID_FRIENDSLIST => onFriendsList(c, tag),
         SID_PING => onPing(c, body),
         SID_NETGAMEPORT => {},
+        // Client notifications with no BNCS reply — accept silently so they aren't
+        // logged as "unhandled". LeaveChat (left a channel), NotifyJoin (entered a
+        // game), CheckAd (banner-ad poll; we serve no ads).
+        SID_LEAVECHAT, SID_NOTIFYJOIN, SID_CHECKAD => {},
+        SID_STARTADVEX3 => onStartAdvex(c, tag, body),
+        SID_NEWS_INFO => onNewsInfo(c, tag, body),
         else => {
             log.line(tag, "unhandled SID 0x{x:0>2} ({d} bytes)", .{ id, body.len });
             if (body.len > 0) log.hexdump(tag, body);
@@ -577,5 +588,36 @@ fn onPing(c: *Conn, body: []const u8) void {
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, SID_PING);
     w.putBytes(body); // echo the cookie back
+    finish(c, &w);
+}
+
+// Message-of-the-day shown on the Battle.net chat screen (SID_NEWS_INFO).
+pub var motd: []const u8 = "Welcome to the realm.";
+
+// SID_STARTADVEX3 (0x1c): the client advertises a game it is hosting. Realm games are
+// created over MCP, so there's nothing to advertise here — just ack success (status 0)
+// so the client doesn't stall waiting on the reply.
+fn onStartAdvex(c: *Conn, tag: []const u8, body: []const u8) void {
+    _ = body;
+    log.line(tag, "startadvex3 -> ok", .{});
+    var buf: [16]u8 = undefined;
+    var w = startPacket(&buf, SID_STARTADVEX3);
+    w.putU32(0); // status: 0 = success
+    finish(c, &w);
+}
+
+// SID_NEWS_INFO (0x46): client requests news + MOTD since a timestamp. Reply with a
+// single entry whose timestamp is 0, which the client treats as the MOTD.
+fn onNewsInfo(c: *Conn, tag: []const u8, body: []const u8) void {
+    _ = body; // request: u32 newest-news timestamp the client already has
+    log.line(tag, "news info -> motd '{s}'", .{motd});
+    var buf: [256]u8 = undefined;
+    var w = startPacket(&buf, SID_NEWS_INFO);
+    w.putU8(1); // number of entries
+    w.putU32(0); // last logon timestamp
+    w.putU32(0); // oldest news timestamp
+    w.putU32(0); // newest news timestamp
+    w.putU32(0); // entry timestamp; 0 = this entry is the MOTD
+    w.putStr(motd); // MOTD text (NUL-terminated)
     finish(c, &w);
 }
