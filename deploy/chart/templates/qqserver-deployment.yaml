@@ -8,6 +8,7 @@ metadata:
     app.kubernetes.io/component: qqserver
 spec:
   replicas: 1
+  revisionHistoryLimit: {{ .Values.realmd.revisionHistoryLimit }}
   selector:
     matchLabels:
       {{- include "realm.selectorLabels" (dict "root" . "component" "qqserver") | nindent 6 }}
@@ -16,6 +17,11 @@ spec:
       labels:
         {{- include "realm.selectorLabels" (dict "root" . "component" "qqserver") | nindent 8 }}
     spec:
+      {{- if .Values.qqserver.pullSecret }}
+      # The qqserver image is private; pull it with this dockerconfigjson secret.
+      imagePullSecrets:
+        - name: {{ .Values.qqserver.pullSecret }}
+      {{- end }}
       containers:
         - name: qqserver
           image: "{{ .Values.images.qqserver.repository }}:{{ .Values.images.qqserver.tag }}"

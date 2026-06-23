@@ -47,7 +47,16 @@ images:
 
 # ── realmd: the stateless protocol front (bnetd + d2cs + d2dbs + gs-link) ───────────
 realmd:
-  replicas: 2
+  # replicas 1: the GS holds its gs-link control connection to ONE realmd pod, so only
+  # that pod can route game create/join. Extra replicas sit NotReady (REQUIRE_GS) and
+  # stall the rollout. HA needs the GS connecting to every pod (or redis-shared dispatch).
+  replicas: 1
+  # Recreate (not RollingUpdate): a surged new pod can't go Ready (no GS holds its
+  # gs-link to it) until the old pod is gone, so a rolling update deadlocks. Kill-then-
+  # start has a brief blip but always converges. Set false for a normal RollingUpdate.
+  recreate: true
+  # GitOps rolls back via git, so keep only the active ReplicaSet (0 = no history).
+  revisionHistoryLimit: 0
   # Drain window for the SIGTERM shutdown grace below.
   terminationGracePeriodSeconds: 30
   shutdownGraceMs: 10000
@@ -115,6 +124,9 @@ gameServer:
 qqserver:
   enabled: true
   logJson: true
+  # The qqserver image is typically private (unlike the public realmd/d2gs). Set the
+  # imagePullSecret name (e.g. the cluster-standard `ghcr` dockerconfigjson) to pull it.
+  pullSecret: ""
   resources:
     requests: { cpu: 25m, memory: 16Mi }
     limits: { cpu: 100m, memory: 64Mi }
