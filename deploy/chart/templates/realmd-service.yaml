@@ -16,3 +16,24 @@ spec:
     - { port: 6113, targetPort: 6113, name: d2cs }
     - { port: 6114, targetPort: 6114, name: d2dbs }
     - { port: 6115, targetPort: 6115, name: gslink }
+---
+# Internal gs-link Service. realmd reports NotReady until a GS registers (REQUIRE_GS),
+# but a normal Service only routes to Ready pods — so the GS could never reach the
+# gs-link to register (deadlock). publishNotReadyAddresses lets the GS reach realmd
+# while it's still NotReady; once registered, realmd flips Ready. The GS points
+# REALMD_HOST at this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: realmd-gslink
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: realmd
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "realm.selectorLabels" (dict "root" . "component" "realmd") | nindent 4 }}
+  ports:
+    - { port: 6114, targetPort: 6114, name: d2dbs }
+    - { port: 6115, targetPort: 6115, name: gslink }
