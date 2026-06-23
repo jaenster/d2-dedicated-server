@@ -7,7 +7,19 @@ metadata:
     {{- include "realm.labels" . | nindent 4 }}
     app.kubernetes.io/component: qqserver
 spec:
+  {{- if .Values.floatingIPs }}
+  # The single public game entry point: the floating IPs on :4000. Clients dial here with
+  # a token; qqserver splices through to the right GS pod. The FIP lands on one node, so
+  # Cluster lets any node route the traffic to a qqserver pod anywhere.
+  type: LoadBalancer
+  externalIPs:
+    {{- range .Values.floatingIPs }}
+    - {{ . | quote }}
+    {{- end }}
+  externalTrafficPolicy: Cluster
+  {{- else }}
   type: ClusterIP
+  {{- end }}
   selector:
     {{- include "realm.selectorLabels" (dict "root" . "component" "qqserver") | nindent 4 }}
   ports:

@@ -7,15 +7,27 @@ metadata:
     app.kubernetes.io/component: realmd
 spec:
   type: LoadBalancer
+  {{- if .Values.floatingIPs }}
+  # Front the realm on stable public floating IPs (they fail over between nodes).
+  externalIPs:
+    {{- range .Values.floatingIPs }}
+    - {{ . | quote }}
+    {{- end }}
+  # A floating IP lands on ONE node, which usually won't be co-located with a realmd
+  # replica; Cluster lets any node route the traffic to a realmd pod anywhere.
+  externalTrafficPolicy: Cluster
+  {{- else }}
   # Preserve the game server's source IP on the gs-link.
   externalTrafficPolicy: Local
+  {{- end }}
   selector:
     {{- include "realm.selectorLabels" (dict "root" . "component" "realmd") | nindent 4 }}
+  # Only the client-facing ports are public: bnet login + d2cs realm. d2dbs (6114) and
+  # gs-link (6115) are GS<->realmd internal traffic and live on the realmd-gslink
+  # ClusterIP Service below — not exposed here.
   ports:
     - { port: 6112, targetPort: 6112, name: bnetd }
     - { port: 6113, targetPort: 6113, name: d2cs }
-    - { port: 6114, targetPort: 6114, name: d2dbs }
-    - { port: 6115, targetPort: 6115, name: gslink }
 ---
 # Internal gs-link Service. realmd reports NotReady until a GS registers (REQUIRE_GS),
 # but a normal Service only routes to Ready pods — so the GS could never reach the

@@ -16,35 +16,39 @@ spec:
       labels:
         {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 8 }}
     spec:
-      # One GS per node: hostPort 4000 is a node-level bind, so two pods on a node
-      # would collide. This also gives each pod a distinct node IP to advertise.
+      # The GS is INTERNAL — no public hostPort. qqserver fronts the public :4000 and
+      # splices to each GS by its pod IP (from the redis token route). Without a hostPort
+      # node-level bind the fleet can exceed the node count, so anti-affinity is soft:
+      # preferred (not required) still spreads replicas across nodes for fault tolerance.
       affinity:
         podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 18 }}
-              topologyKey: kubernetes.io/hostname
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: d2gs
           image: "{{ .Values.images.gs.repository }}:{{ .Values.images.gs.tag }}"
           imagePullPolicy: {{ .Values.images.gs.pullPolicy }}
           ports:
-            - { containerPort: 4000, hostPort: 4000, name: game }
+            - { containerPort: 4000, name: game }
           env:
             # The gs-link Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
             # Uses realmd-gslink (publishNotReadyAddresses) so the GS can register even
             # while realmd is NotReady — otherwise REQUIRE_GS deadlocks registration.
             - name: REALMD_HOST
               value: realmd-gslink.{{ .Release.Namespace }}.svc.cluster.local
-            # Node IP → reference for the public address clients dial for this pod's games.
-            - name: NODE_IP
+            # The GS registers its in-cluster POD IP — qqserver (also in-cluster) dials
+            # this to splice client game traffic through. No public exposure. POD_IP must
+            # precede D2GS_GS_ADDR for the $(POD_IP) substitution to resolve.
+            - name: POD_IP
               valueFrom:
-                fieldRef: { fieldPath: status.hostIP }
-            # On cloud nodes status.hostIP is PRIVATE; "auto:4000" makes the entrypoint
-            # resolve the node's PUBLIC IPv4 from the cloud metadata service.
+                fieldRef: { fieldPath: status.podIP }
             - name: D2GS_GS_ADDR
-              value: {{ .Values.gameServer.gsAddr | quote }}
+              value: "$(POD_IP):4000"
             - name: D2GS_MAX_GAMES
               value: {{ .Values.gameServer.maxGames | quote }}
             {{- if .Values.gameServer.extraDlls }}

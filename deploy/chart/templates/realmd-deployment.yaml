@@ -36,6 +36,12 @@ spec:
             # Public IPv4 clients dial for d2cs (bnetd advertises it).
             - name: REALMD_REALM_ADDR
               value: {{ required "realmAddr is required: the public IP/host clients dial" .Values.realmAddr | quote }}
+            {{- if .Values.gameAddr }}
+            # The qqserver gateway address advertised to clients for game traffic. realmd
+            # writes {token -> the real GS pod ip:port} to redis and qqserver splices.
+            - name: REALMD_GAME_ADDR
+              value: {{ .Values.gameAddr | quote }}
+            {{- end }}
             - name: REALMD_DURABLE_STORE
               value: "pg"
             - name: REALMD_EPHEMERAL_STORE

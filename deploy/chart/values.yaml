@@ -13,6 +13,20 @@ realmName: MyRealm
 # the realm's external LoadBalancer IP/host. REQUIRED — there is no sane default.
 realmAddr: ""
 
+# Stable public IPs (e.g. cloud floating IPs) used as Service externalIPs on the public
+# realmd and qqserver Services. A floating IP fails over between nodes and gives the realm
+# a fixed front door instead of an ephemeral LB IP. Empty = don't set externalIPs and fall
+# back to a plain LoadBalancer (the cloud assigns an IP). Example:
+#   floatingIPs: ["5.75.211.1", "78.47.225.57"]
+floatingIPs: []
+
+# Public address realmd advertises to clients for GAME traffic. Two modes:
+#   GATEWAY (set this, normally to the first floatingIP): realmd writes {token -> the real
+#     GS pod ip:port} to redis and hands the client this address + token; the qqserver
+#     gateway looks up the token and splices through to the right GS. The GS is internal.
+#   DIRECT (empty): realmd advertises the GS's own address — clients hit the GS directly.
+gameAddr: ""
+
 # Don't take client traffic until a game server has registered over the gs-link.
 requireGS: true
 
