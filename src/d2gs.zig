@@ -328,7 +328,8 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // Per-game server hook surface: hook RoomInit to fan out roomInit() with a real
     // per-game GameCtx (the game's own FOG pool). Opt-in via a consumer flag so the
     // default server path stays byte-identical.
-    if (hasFlag("srvdiag") or hasFlag("ubers")) roominit.install();
+    // Always install the per-game RoomInit fan-out (cainfix/srvdiag/ubers all consume it).
+    roominit.install();
     if (use_realm) {
         if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         joindiag.install(); // log nReason when the engine refuses a join
