@@ -27,6 +27,12 @@ COPY src ./src
 FROM zig AS build-realmd
 RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 
+# ── build: qqserver (static musl) ────────────────────────────────────────────────
+# The game-traffic gateway: token-translating poll() splice proxy fronting the GS
+# fleet, with its own async redis client. No pg dep — never pulls it.
+FROM zig AS build-qqserver
+RUN zig build qqserver -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+
 # ── build: injected DLLs (x86-windows; dbghelp proxy + d2gs payload only) ─────────
 FROM zig AS build-dlls
 RUN zig build dlls -Doptimize=ReleaseSafe
@@ -59,3 +65,10 @@ COPY --from=build-realmd /src/zig-out/bin/realmd /realmd
 # bnetd / d2cs / d2dbs / gs-link / health
 EXPOSE 6112 6113 6114 6115 8080
 ENTRYPOINT ["/realmd"]
+
+# ── qqserver: static binary in scratch ───────────────────────────────────────────
+FROM scratch AS qqserver
+COPY --from=build-qqserver /src/zig-out/bin/qqserver /qqserver
+# Client-facing game traffic (REALMD_QQ_PORT, default 4000).
+EXPOSE 4000
+ENTRYPOINT ["/qqserver"]

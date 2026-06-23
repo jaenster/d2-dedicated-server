@@ -62,6 +62,14 @@ fn applyHeadlessRendering() void {
 }
 
 // ── ExitProcess interceptor: log where the host tried to die ─────────────────
+// Set true by the d2gs server thread once it reaches its tick loop. Until then a
+// host exit(0) is PREMATURE — the headless engine-init returned before the server
+// came up. We turn that silent success-exit into a loud non-zero failure so an
+// orchestrator (k8s) treats the restart as meaningful instead of a quiet 0-exit loop.
+pub var server_ready: bool = false;
+// Sentinel exit code for a premature pre-server exit (ASCII 'E').
+pub const premature_exit_code: u32 = 0x45;
+
 var exit_process_addr: usize = 0;
 var exit_process_original: [5]u8 = undefined;
 
@@ -75,15 +83,20 @@ fn hookExitProcess() void {
 }
 
 fn exitProcessInterceptor(exit_code: u32) callconv(.winapi) noreturn {
+    var code = exit_code;
+    if (!server_ready and exit_code == 0) {
+        log.print("headless: FATAL — host exited before the d2gs server was ready (premature engine-init exit)");
+        code = premature_exit_code; // fail loud so the orchestrator restarts on a real error
+    }
     log.print("headless: ExitProcess called");
-    log.hex("headless: exit code 0x", exit_code);
+    log.hex("headless: exit code 0x", code);
     // restore original prologue and call through
     var ob: [5]u8 = undefined;
     var i: usize = 0;
     while (i < 5) : (i += 1) ob[i] = exit_process_original[i];
     _ = MemoryPatch(exit_process_addr).bytes(&ob).commit();
     const realExit: *const fn (u32) callconv(.winapi) noreturn = @ptrFromInt(exit_process_addr);
-    realExit(exit_code);
+    realExit(code);
 }
 
 // ── naked handlers (AT&T, absolute targets) ──────────────────────────────────

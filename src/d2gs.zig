@@ -20,6 +20,7 @@ const d2cs = @import("realm/client/d2cs.zig");
 const d2dbs = @import("realm/client/d2dbs.zig");
 const feature = @import("engine/feature.zig");
 const halt_hook = @import("runtime/feature/halt_hook.zig"); // for enableSuppress (sub-mode, not a toggle)
+const headless = @import("runtime/feature/headless.zig"); // server_ready flag for the ExitProcess interceptor
 const gsport = @import("runtime/gsport.zig");
 const gamereap = @import("runtime/gamereap.zig");
 const roominit = @import("runtime/roominit.zig");
@@ -344,6 +345,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // before QSERVER_InitializeServerState consumes them.
 
     log.print("d2gs: entering tick loop (listening on :4000)");
+    headless.server_ready = true; // past init: a later host exit is a real shutdown, not premature
 
     // Connect to PvPGN's D2CS so it can dispatch game create/join to us.
     if (d2cs_enabled) d2cs.start(@ptrCast(&d2cs_host), d2cs_port, gs_public_ip, gs_public_port, gs_max_games, gsid);
