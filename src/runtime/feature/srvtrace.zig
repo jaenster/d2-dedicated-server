@@ -529,11 +529,14 @@ fn TraceHook(comptime h: Hook) type {
 
         fn shim() callconv(.naked) void {
             asm volatile ("pushal\npushfl\n" ++
-                    // Capture the game pointer (or 0) into cur_game first, so ev()
-                    // can stamp the token. Balanced before the handler arg pushes.
-                    pushAsm(h.game, 0) ++ "call %[sg:P]\nadd $4, %%esp\n" ++
-                    // args pushed right-to-left: a3 (0 pushed), a2 (4), a1 (8).
+                    // Push the handler args FIRST, while ECX/EDX still hold the entry
+                    // values (right-to-left: a3 @0 pushed, a2 @4, a1 @8).
                     pushAsm(h.a3, 0) ++ pushAsm(h.a2, 4) ++ pushAsm(h.a1, 8) ++
+                    // THEN capture the game pointer into cur_game. The call may clobber
+                    // ECX/EDX (caller-saved), but the args are already on the stack, so
+                    // that's fine; popal restores them for the engine. game push accounts
+                    // for the 12 bytes of args already pushed.
+                    pushAsm(h.game, 12) ++ "call %[sg:P]\nadd $4, %%esp\n" ++
                     "call %[f:P]\n" ++
                     "add $12, %%esp\n" ++
                     "popfl\npopal\n" ++
