@@ -10,6 +10,7 @@
 //!   GET  /admin/accounts     account names (filesystem)
 //!   POST /admin/accounts     {"name","password"} -> create account
 //!   POST /admin/games/close  {"name"} (or ?name=) -> expire a game
+//!   POST /admin/chars/copy   {"src_account","src_char","dst_char"[,"dst_account"]} -> clone char
 const std = @import("std");
 const net = @import("realm_infra").net;
 const gslink = @import("gslink.zig");
@@ -141,6 +142,9 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
         if (is_get) return accountsList(fd);
         if (is_post) return accountsCreate(fd, req);
         return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+    } else if (std.mem.eql(u8, p, "/admin/chars/copy")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return charsCopy(fd, req);
     }
     return respond(fd, not_found, "{\"error\":\"not found\"}");
 }
@@ -232,6 +236,22 @@ fn accountsList(fd: net.Socket) void {
         w += tail.len;
     }
     respond(fd, ok, buf[0..w]);
+}
+
+// POST /admin/chars/copy {"src_account","src_char","dst_char"[,"dst_account"]} — clone a
+// character to a new name. dst_account defaults to src_account (clone within the account).
+// The .d2s name + checksum are rewritten so the client accepts the copy.
+fn charsCopy(fd: net.Socket, req: []const u8) void {
+    const body = bodyOf(req);
+    const src_account = jsonStr(body, "src_account") orelse return respond(fd, bad_request, "{\"error\":\"missing src_account\"}");
+    const src_char = jsonStr(body, "src_char") orelse return respond(fd, bad_request, "{\"error\":\"missing src_char\"}");
+    const dst_char = jsonStr(body, "dst_char") orelse return respond(fd, bad_request, "{\"error\":\"missing dst_char\"}");
+    const dst_account = jsonStr(body, "dst_account") orelse src_account;
+    if (store.copyChar(src_account, src_char, dst_account, dst_char)) {
+        respond(fd, ok, "{\"copied\":true}");
+    } else {
+        respond(fd, conflict, "{\"error\":\"copy failed (missing source, invalid name, or destination exists)\"}");
+    }
 }
 
 fn accountsCreate(fd: net.Socket, req: []const u8) void {

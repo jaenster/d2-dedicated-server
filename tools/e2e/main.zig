@@ -118,6 +118,50 @@ fn scCharListStatstring() Result {
     return .{ .name = name, .status = .pass, .msg = msg("listed {s}: class={s} level={d} flags={d} (total={d})", .{ char, cls, ch.level, ch.flags, cl.total }) };
 }
 
+fn scCharCopy() Result {
+    const name = "char_copy";
+    const acct = "CopyAcct";
+    const src = "Original";
+    const dst = "CopyCat";
+    var d2sbuf: [0x40]u8 = undefined;
+    const blob = minimalD2s(&d2sbuf, src, 1, 20); // Sorceress, level 20
+    const sr = rc.d2dbsSave(acct, src, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+
+    // Clone Original -> CopyCat within the same account via the admin API.
+    var jb: [160]u8 = undefined;
+    const json = std.fmt.bufPrint(&jb, "{{\"src_account\":\"{s}\",\"src_char\":\"{s}\",\"dst_char\":\"{s}\"}}", .{ acct, src, dst }) catch return fail(name, "json", .{});
+    var rxbuf: [2048]u8 = undefined;
+    const r = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/copy", ADMIN_TOKEN, json, &rxbuf) catch |e| return fail(name, "copy {s}", .{@errorName(e)});
+    if (r.status != 200) return fail(name, "copy status={d} body={s}", .{ r.status, r.body });
+
+    // A second copy must be refused (destination now exists).
+    var rx2: [2048]u8 = undefined;
+    const r2 = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/copy", ADMIN_TOKEN, json, &rx2) catch |e| return fail(name, "copy2 {s}", .{@errorName(e)});
+    if (r2.status == 200) return fail(name, "duplicate copy must be rejected, got 200", .{});
+
+    // Both the original and the clone must now list for the account.
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    var entries: [64]rc.CharEntry = undefined;
+    var dst_buf: [4096]u8 = undefined;
+    const cl = c.charList(&entries, &dst_buf) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var have_src = false;
+    var have_dst = false;
+    for (entries[0..cl.count]) |e| {
+        if (std.mem.eql(u8, e.name, src)) have_src = true;
+        if (std.mem.eql(u8, e.name, dst)) have_dst = true;
+    }
+    if (!have_src or !have_dst) return fail(name, "after copy expected both {s} and {s} (src={}, dst={})", .{ src, dst, have_src, have_dst });
+    return .{ .name = name, .status = .pass, .msg = msg("'{s}' cloned to '{s}'; dup rejected; both list (total={d})", .{ src, dst, cl.total }) };
+}
+
 fn scCharDelete() Result {
     const name = "delete_char";
     const acct = "DelAcct";
@@ -806,6 +850,7 @@ pub fn main() !void {
         scQqserverTokenTranslate(),
         scCreateAccountRealAuth(),
         scCharDelete(),
+        scCharCopy(),
         scLobbyChatAtoB(),
         scMultiInstance(),
     };

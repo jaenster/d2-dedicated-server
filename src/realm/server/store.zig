@@ -10,6 +10,7 @@
 //! The common production split is durable=pg, ephemeral=redis. BNFTP assets are static
 //! files and always come from the filesystem.
 const std = @import("std");
+const d2s = @import("d2s.zig");
 const adapter = @import("realm_adapter");
 const fs = adapter.fs;
 const redis = adapter.redis;
@@ -87,6 +88,27 @@ pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
         .redis => redis.deleteCharD2s(account, charname),
         .pg => pg.deleteCharD2s(account, charname),
     };
+}
+
+/// Largest .d2s we will clone. A real 1.14d save is a few KB (a full char with stash is
+/// well under this); refusing larger avoids a silently-truncated, corrupt copy.
+const max_d2s = 32 * 1024;
+
+/// Clone a character to a new name (and optionally a different account): read the source
+/// save, rewrite its embedded name + checksum, and persist it at the destination. Works on
+/// every backend (it goes through get/saveCharD2s). Returns false if the source is missing,
+/// the name is invalid, the save is implausibly large, or the destination already exists.
+pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []const u8, dst_char: []const u8) bool {
+    if (dst_char.len == 0 or dst_char.len > d2s.name_max) return false;
+    var buf: [max_d2s]u8 = undefined;
+    const n = getCharD2s(src_account, src_char, &buf);
+    if (n == 0 or n == buf.len) return false; // missing, or too large (likely truncated)
+    // Don't clobber an existing destination char.
+    var probe: [16]u8 = undefined;
+    if (getCharD2s(dst_account, dst_char, &probe) != 0) return false;
+    if (!d2s.setName(buf[0..n], dst_char)) return false;
+    d2s.fixChecksum(buf[0..n]);
+    return saveCharD2s(dst_account, dst_char, buf[0..n]);
 }
 
 // ── accounts (durable) ───────────────────────────────────────────────────────
