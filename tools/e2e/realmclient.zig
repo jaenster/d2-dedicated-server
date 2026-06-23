@@ -30,6 +30,7 @@ const SID_AUTH_CHECK = 0x51;
 const MCP_STARTUP = 0x01;
 const MCP_CREATEGAME = 0x03;
 const MCP_JOINGAME = 0x04;
+const MCP_CHARDELETE = 0x0a;
 const MCP_CHARLIST2 = 0x19;
 
 // d2dbs opcodes
@@ -394,6 +395,19 @@ pub const RealmClient = struct {
             count += 1;
         }
         return .{ .total = total, .count = count };
+    }
+
+    /// MCP_CHARDELETE -> result (0 = deleted). Reply: reqid@0, result@2.
+    pub fn charDelete(self: *RealmClient, charname: []const u8) !u32 {
+        const fd = self.d2cs.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u16v(9); // reqid
+        w.cstr(charname);
+        try mcpSend(fd, MCP_CHARDELETE, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_CHARDELETE) return error.CharDeleteBadId;
+        return net.rdU32(r.body, 2);
     }
 
     /// MCP_CREATEGAME -> (token, result).
