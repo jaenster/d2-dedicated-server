@@ -116,6 +116,24 @@ fn ascii(base: usize, max: usize) []const u8 {
     return p[0..i];
 }
 
+/// The game whose handler is in flight, set by every shim before it calls the
+/// handler (0 when no game pointer is available). Lets ev() stamp the game token
+/// on every event without threading pGame through each handler's args.
+var cur_game: usize = 0;
+
+fn setCurGame(pg: usize) callconv(.c) void {
+    cur_game = pg;
+}
+
+/// Begin an event, auto-stamping the game "token" (the per-game trace id) whenever
+/// the in-flight game is known. Use for every per-game event; lifecycle/tick build
+/// their token explicitly so they call evlog.Event.begin directly.
+fn ev(name: []const u8) evlog.Event {
+    var e = evlog.Event.begin(name);
+    if (cur_game != 0) e.int("token", @as(i64, readU32(cur_game, 0)));
+    return e;
+}
+
 /// Emit a packed 4-char item code (D2 stores codes like "hp1"/"ssd " as a u32),
 /// trimming trailing spaces/NULs.
 fn putCode4(e: *evlog.Event, key: []const u8, code: u32) void {
@@ -191,14 +209,14 @@ pub fn serverTick() void {
 // args (see the hooks table for what a1/a2/a3 hold for that hook).
 
 fn onGameCreate(token_map: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("game_create");
+    var e = ev("game_create");
     e.hex("tokenMap", token_map);
     e.end();
 }
 
 fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
     untrackGame(pgame);
-    var e = evlog.Event.begin("game_destroy");
+    var e = ev("game_destroy");
     e.int("token", trunc32(token));
     putGame(&e, pgame);
     e.end();
@@ -206,21 +224,21 @@ fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
 
 fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
     trackGame(pgame);
-    var e = evlog.Event.begin("player_join");
+    var e = ev("player_join");
     putGame(&e, pgame);
     putClient(&e, pclient);
     e.end();
 }
 
 fn onPlayerLeave(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("player_leave");
+    var e = ev("player_leave");
     putGame(&e, pgame);
     putClient(&e, pclient);
     e.end();
 }
 
 fn onDamage(attacker: usize, victim: usize, pdamage: usize) callconv(.c) void {
-    var e = evlog.Event.begin("damage");
+    var e = ev("damage");
     putName(&e, "atk", attacker);
     putName(&e, "vic", victim);
     if (pdamage != 0) {
@@ -232,7 +250,7 @@ fn onDamage(attacker: usize, victim: usize, pdamage: usize) callconv(.c) void {
 }
 
 fn onDeath(victim: usize, killer: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("death");
+    var e = ev("death");
     putName(&e, "vic", victim);
     putName(&e, "killer", killer);
     putPos(&e, victim);
@@ -240,14 +258,14 @@ fn onDeath(victim: usize, killer: usize, _: usize) callconv(.c) void {
 }
 
 fn onItemDrop(pplayer: usize, item_guid: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("item_drop");
+    var e = ev("item_drop");
     putPlayerName(&e, pplayer);
     e.hex("itemGUID", item_guid);
     e.end();
 }
 
 fn onItemSpawn(pctx: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("item_spawn");
+    var e = ev("item_spawn");
     if (pctx != 0) {
         const g: *t.ItemGenerationData = @ptrFromInt(pctx);
         e.int("class", g.nItemClassId);
@@ -264,20 +282,20 @@ fn onItemSpawn(pctx: usize, _: usize, _: usize) callconv(.c) void {
 }
 
 fn onCmdDrop(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("cmd_drop");
+    var e = ev("cmd_drop");
     putPlayerName(&e, pplayer);
     putPos(&e, pplayer);
     e.end();
 }
 
 fn onCmdPickup(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("cmd_pickup");
+    var e = ev("cmd_pickup");
     putPlayerName(&e, pplayer);
     e.end();
 }
 
 fn onSkillCast(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("skill_cast");
+    var e = ev("skill_cast");
     putPlayerName(&e, pplayer);
     e.int("skill", rightSkillId(pplayer));
     if (pkt != 0) {
@@ -288,7 +306,7 @@ fn onSkillCast(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
 }
 
 fn onWaypoint(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("waypoint");
+    var e = ev("waypoint");
     putPlayerName(&e, pplayer);
     if (pkt != 0) e.int("dest", readU16(pkt, 5)); // packet 0x49: dest wp id u16 @+5
     putPos(&e, pplayer);
@@ -296,14 +314,14 @@ fn onWaypoint(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
 }
 
 fn onChat(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("chat");
+    var e = ev("chat");
     putPlayerName(&e, pplayer);
     if (pkt != 0) e.str("msg", ascii(pkt + 3, 256)); // packet 0x14: ASCII NUL-term msg @+3
     e.end();
 }
 
 fn onSpawnMonster(class_id: usize, x: usize, y: usize) callconv(.c) void {
-    var e = evlog.Event.begin("monster_spawn");
+    var e = ev("monster_spawn");
     e.int("class", trunc32(class_id));
     // MonStats record: NameStr key u16 @+6 → localized name; Code char[4] @+0x10.
     if (fns.TxtMonStatsGetLine.call(.{s32(class_id)})) |rec| {
@@ -317,7 +335,7 @@ fn onSpawnMonster(class_id: usize, x: usize, y: usize) callconv(.c) void {
 }
 
 fn onSpawnPortal(dest_level: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("portal_spawn");
+    var e = ev("portal_spawn");
     e.int("destLevel", s32(dest_level));
     e.end();
 }
@@ -325,14 +343,14 @@ fn onSpawnPortal(dest_level: usize, _: usize, _: usize) callconv(.c) void {
 // -- NPC vendor / store path (debugging the blank trade window) --
 
 fn onNpcInteract(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("npc_interact");
+    var e = ev("npc_interact");
     putPlayerName(&e, pplayer);
     if (pkt != 0) e.int("npcGUID", readU32(pkt, 5)); // 0x2F: [op][unk:u32][npcGUID:u32]
     e.end();
 }
 
 fn onNpcMenu(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("npc_menu");
+    var e = ev("npc_menu");
     putPlayerName(&e, pplayer);
     if (pkt != 0) {
         e.int("npcGUID", readU32(pkt, 1)); // 0x38: [op][npcGUID:u32][menuId:u32][params:4B]
@@ -344,7 +362,7 @@ fn onNpcMenu(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
 /// Per vendor item the engine rolls for an NPC store. If this NEVER fires while a
 /// trade window is open, generation was gated out → that's the blank window.
 fn onNpcGenItem(pnpc: usize, code: usize, is_vendor: usize) callconv(.c) void {
-    var e = evlog.Event.begin("npc_genitem");
+    var e = ev("npc_genitem");
     putName(&e, "npc", pnpc); // NPC is a monster → MonStats name
     if (unit(pnpc)) |u| e.int("npcClass", u.dwTxtFileNo);
     putCode4(&e, "code", trunc32(code)); // EDX = packed 4-char item code
@@ -355,21 +373,21 @@ fn onNpcGenItem(pnpc: usize, code: usize, is_vendor: usize) callconv(.c) void {
 // -- expanded discrete events --
 
 fn onWarp(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("warp");
+    var e = ev("warp");
     putPlayerName(&e, pplayer);
     putPos(&e, pplayer);
     e.end();
 }
 
 fn onQuestState(quest: usize, state: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("quest_state");
+    var e = ev("quest_state");
     e.int("quest", trunc32(quest));
     e.int("state", s32(state));
     e.end();
 }
 
 fn onGoldChange(pplayer: usize, stat: usize, delta: usize) callconv(.c) void {
-    var e = evlog.Event.begin("gold_change");
+    var e = ev("gold_change");
     putPlayerName(&e, pplayer);
     e.int("stat", trunc32(stat)); // 0xD = gold, 0xE = stash gold
     e.int("delta", s32(delta));
@@ -377,20 +395,20 @@ fn onGoldChange(pplayer: usize, stat: usize, delta: usize) callconv(.c) void {
 }
 
 fn onTownPortal(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("town_portal");
+    var e = ev("town_portal");
     putPlayerName(&e, pplayer);
     putPos(&e, pplayer);
     e.end();
 }
 
 fn onCube(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("cube_transmute");
+    var e = ev("cube_transmute");
     putPlayerName(&e, pplayer);
     e.end();
 }
 
 fn onHostility(pplayer: usize, ptarget: usize, flag: usize) callconv(.c) void {
-    var e = evlog.Event.begin("hostility");
+    var e = ev("hostility");
     putPlayerName(&e, pplayer);
     putName(&e, "target", ptarget);
     e.int("hostile", s32(flag));
@@ -398,7 +416,7 @@ fn onHostility(pplayer: usize, ptarget: usize, flag: usize) callconv(.c) void {
 }
 
 fn onPartyInvite(pinviter: usize, ptarget: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("party_invite");
+    var e = ev("party_invite");
     putPlayerName(&e, pinviter);
     putName(&e, "target", ptarget);
     e.end();
@@ -407,14 +425,14 @@ fn onPartyInvite(pinviter: usize, ptarget: usize, _: usize) callconv(.c) void {
 // -- decoded player actions (C->S SCMD handlers; ECX=pGame EDX=player, [esp+4]=pkt) --
 
 fn onSkillLeft(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("skill_left");
+    var e = ev("skill_left");
     putPlayerName(&e, pplayer);
     e.int("skill", leftSkillId(pplayer));
     e.end();
 }
 
 fn onSkillRightEntity(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("skill_right");
+    var e = ev("skill_right");
     putPlayerName(&e, pplayer);
     e.int("skill", rightSkillId(pplayer));
     e.end();
@@ -423,7 +441,7 @@ fn onSkillRightEntity(pplayer: usize, _: usize, _: usize) callconv(.c) void {
 /// 0x13 InteractWithEntity — open chest / click shrine / pull lever / pick up gold.
 /// Packet: [op][unitType:u32 @+1][GUID:u32 @+5].
 fn onInteract(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("interact");
+    var e = ev("interact");
     putPlayerName(&e, pplayer);
     if (pkt != 0) {
         e.int("unitType", readU32(pkt, 1));
@@ -435,7 +453,7 @@ fn onInteract(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
 /// 0x18 ItemToInventory — move item to inv/stash/trade.
 /// Packet: [op][itemGUID:u32 @+1][x:u32][y:u32][bufferId:u32 @+13] (0=inv 4=stash 2/3=trade).
 fn onItemMove(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("item_move");
+    var e = ev("item_move");
     putPlayerName(&e, pplayer);
     if (pkt != 0) {
         e.hex("itemGUID", readU32(pkt, 1));
@@ -445,13 +463,13 @@ fn onItemMove(pplayer: usize, pkt: usize, _: usize) callconv(.c) void {
 }
 
 fn onItemEquip(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("item_equip");
+    var e = ev("item_equip");
     putPlayerName(&e, pplayer);
     e.end();
 }
 
 fn onItemUse(pplayer: usize, _: usize, _: usize) callconv(.c) void {
-    var e = evlog.Event.begin("item_use");
+    var e = ev("item_use");
     putPlayerName(&e, pplayer);
     putPos(&e, pplayer);
     e.end();
@@ -500,6 +518,9 @@ const Hook = struct {
     a1: Src = .none,
     a2: Src = .none,
     a3: Src = .none,
+    /// Where the game pointer is at entry (usually .ecx). Captured into cur_game
+    /// before the handler runs so ev() can stamp the game token. .none = no game.
+    game: Src = .none,
 };
 
 fn TraceHook(comptime h: Hook) type {
@@ -508,6 +529,9 @@ fn TraceHook(comptime h: Hook) type {
 
         fn shim() callconv(.naked) void {
             asm volatile ("pushal\npushfl\n" ++
+                    // Capture the game pointer (or 0) into cur_game first, so ev()
+                    // can stamp the token. Balanced before the handler arg pushes.
+                    pushAsm(h.game, 0) ++ "call %[sg:P]\nadd $4, %%esp\n" ++
                     // args pushed right-to-left: a3 (0 pushed), a2 (4), a1 (8).
                     pushAsm(h.a3, 0) ++ pushAsm(h.a2, 4) ++ pushAsm(h.a1, 8) ++
                     "call %[f:P]\n" ++
@@ -516,7 +540,8 @@ fn TraceHook(comptime h: Hook) type {
                     "mov %[tramp], %%eax\n" ++
                     "jmp *(%%eax)\n"
                 :
-                : [f] "X" (h.handler),
+                : [sg] "X" (&setCurGame),
+                  [f] "X" (h.handler),
                   [tramp] "X" (&tramp),
             );
         }
@@ -545,50 +570,50 @@ const hooks = [_]Hook{
     // -- game lifecycle --
     .{ .addr = 0x451000, .prologue = 6, .label = "game_create", .handler = &onGameCreate, .a1 = .{ .stack = 4 } },
     .{ .addr = 0x52C7F0, .prologue = 7, .label = "game_destroy", .handler = &onGameDestroy, .a1 = .ecx, .a2 = .edx },
-    .{ .addr = 0x52C410, .prologue = 6, .label = "player_join", .handler = &onPlayerJoin, .a1 = .ecx, .a2 = .edx },
-    .{ .addr = 0x52C500, .prologue = 5, .label = "player_leave", .handler = &onPlayerLeave, .a1 = .ecx, .a2 = .edx },
+    .{ .addr = 0x52C410, .prologue = 6, .label = "player_join", .handler = &onPlayerJoin, .game = .ecx, .a1 = .ecx, .a2 = .edx },
+    .{ .addr = 0x52C500, .prologue = 5, .label = "player_leave", .handler = &onPlayerLeave, .game = .ecx, .a1 = .ecx, .a2 = .edx },
 
     // -- combat --
-    .{ .addr = 0x57C6C0, .prologue = 6, .label = "damage", .handler = &onDamage, .a1 = .edx, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 0xC } },
-    .{ .addr = 0x535AB0, .prologue = 6, .label = "death", .handler = &onDeath, .a1 = .edx, .a2 = .{ .stack = 4 } },
+    .{ .addr = 0x57C6C0, .prologue = 6, .label = "damage", .handler = &onDamage, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 0xC } },
+    .{ .addr = 0x535AB0, .prologue = 6, .label = "death", .handler = &onDeath, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } },
 
     // -- items --
-    .{ .addr = 0x563C00, .prologue = 6, .label = "item_drop", .handler = &onItemDrop, .a1 = .edx, .a2 = .{ .stack = 4 } },
-    .{ .addr = 0x558D90, .prologue = 6, .label = "item_spawn", .handler = &onItemSpawn, .a1 = .edx },
+    .{ .addr = 0x563C00, .prologue = 6, .label = "item_drop", .handler = &onItemDrop, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } },
+    .{ .addr = 0x558D90, .prologue = 6, .label = "item_spawn", .handler = &onItemSpawn, .game = .ecx, .a1 = .edx },
 
     // -- client command handlers (acting player = EDX=pUnit) --
-    .{ .addr = 0x54AB40, .prologue = 7, .label = "cmd_drop", .handler = &onCmdDrop, .a1 = .edx },
-    .{ .addr = 0x54ACD0, .prologue = 7, .label = "cmd_pickup", .handler = &onCmdPickup, .a1 = .edx },
-    .{ .addr = 0x549FC0, .prologue = 5, .label = "skill_cast", .handler = &onSkillCast, .a1 = .edx, .a2 = .{ .stack = 4 } },
-    .{ .addr = 0x54C5D0, .prologue = 7, .label = "waypoint", .handler = &onWaypoint, .a1 = .edx, .a2 = .{ .stack = 4 } },
-    .{ .addr = 0x54A290, .prologue = 9, .label = "chat", .handler = &onChat, .a1 = .edx, .a2 = .{ .stack = 4 } },
+    .{ .addr = 0x54AB40, .prologue = 7, .label = "cmd_drop", .handler = &onCmdDrop, .game = .ecx, .a1 = .edx },
+    .{ .addr = 0x54ACD0, .prologue = 7, .label = "cmd_pickup", .handler = &onCmdPickup, .game = .ecx, .a1 = .edx },
+    .{ .addr = 0x549FC0, .prologue = 5, .label = "skill_cast", .handler = &onSkillCast, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } },
+    .{ .addr = 0x54C5D0, .prologue = 7, .label = "waypoint", .handler = &onWaypoint, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } },
+    .{ .addr = 0x54A290, .prologue = 9, .label = "chat", .handler = &onChat, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } },
 
     // -- monster / portal spawn --
-    .{ .addr = 0x5A4440, .prologue = 7, .label = "monster_spawn", .handler = &onSpawnMonster, .a1 = .{ .stack = 12 }, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 8 } },
-    .{ .addr = 0x56D130, .prologue = 6, .label = "portal_spawn", .handler = &onSpawnPortal, .a1 = .{ .stack = 16 } },
+    .{ .addr = 0x5A4440, .prologue = 7, .label = "monster_spawn", .handler = &onSpawnMonster, .game = .ecx, .a1 = .{ .stack = 12 }, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 8 } },
+    .{ .addr = 0x56D130, .prologue = 6, .label = "portal_spawn", .handler = &onSpawnPortal, .game = .ecx, .a1 = .{ .stack = 16 } },
 
     // -- NPC vendor / store path (ECX=pGame EDX=player, [esp+4]=pkt; genitem: ECX=pNpc EDX=code) --
-    .{ .addr = 0x54B930, .prologue = 11, .label = "npc_interact", .handler = &onNpcInteract, .a1 = .edx, .a2 = .{ .stack = 4 } },
-    .{ .addr = 0x54BCA0, .prologue = 11, .label = "npc_menu", .handler = &onNpcMenu, .a1 = .edx, .a2 = .{ .stack = 4 } },
-    .{ .addr = 0x576330, .prologue = 12, .label = "npc_genitem", .handler = &onNpcGenItem, .a1 = .ecx, .a2 = .edx, .a3 = .{ .stack = 8 } },
+    .{ .addr = 0x54B930, .prologue = 11, .label = "npc_interact", .handler = &onNpcInteract, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } },
+    .{ .addr = 0x54BCA0, .prologue = 11, .label = "npc_menu", .handler = &onNpcMenu, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } },
+    .{ .addr = 0x576330, .prologue = 12, .label = "npc_genitem", .handler = &onNpcGenItem, .game = .{ .stack = 4 }, .a1 = .ecx, .a2 = .edx, .a3 = .{ .stack = 8 } },
 
     // -- expanded discrete events --
-    .{ .addr = 0x5550B0, .prologue = 8, .label = "warp", .handler = &onWarp, .a1 = .edx }, // TakeStairs: ECX=pGame EDX=pUnit
-    .{ .addr = 0x544720, .prologue = 9, .label = "quest_state", .handler = &onQuestState, .a1 = .edx, .a2 = .{ .stack = 4 } }, // ECX=pGame EDX=eQuest, [esp+4]=eState
+    .{ .addr = 0x5550B0, .prologue = 8, .label = "warp", .handler = &onWarp, .game = .ecx, .a1 = .edx }, // TakeStairs: ECX=pGame EDX=pUnit
+    .{ .addr = 0x544720, .prologue = 9, .label = "quest_state", .handler = &onQuestState, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } }, // ECX=pGame EDX=eQuest, [esp+4]=eState
     .{ .addr = 0x53FF00, .prologue = 5, .label = "gold_change", .handler = &onGoldChange, .a1 = .ecx, .a2 = .edx, .a3 = .{ .stack = 4 } }, // ECX=pUnit EDX=stat, [esp+4]=delta
-    .{ .addr = 0x5BE290, .prologue = 8, .label = "town_portal", .handler = &onTownPortal, .a1 = .edx }, // ECX=pGame EDX=caster
-    .{ .addr = 0x54C300, .prologue = 7, .label = "cube_transmute", .handler = &onCube, .a1 = .edx }, // ECX=pGame EDX=pPlayer
-    .{ .addr = 0x5A5E50, .prologue = 6, .label = "hostility", .handler = &onHostility, .a1 = .edx, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 8 } }, // ECX=pGame EDX=pUnit, [esp+4]=pTarget, [esp+8]=bHostile
+    .{ .addr = 0x5BE290, .prologue = 8, .label = "town_portal", .handler = &onTownPortal, .game = .ecx, .a1 = .edx }, // ECX=pGame EDX=caster
+    .{ .addr = 0x54C300, .prologue = 7, .label = "cube_transmute", .handler = &onCube, .game = .ecx, .a1 = .edx }, // ECX=pGame EDX=pPlayer
+    .{ .addr = 0x5A5E50, .prologue = 6, .label = "hostility", .handler = &onHostility, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 8 } }, // ECX=pGame EDX=pUnit, [esp+4]=pTarget, [esp+8]=bHostile
     .{ .addr = 0x5A5BE0, .prologue = 5, .label = "party_invite", .handler = &onPartyInvite, .a1 = .edx, .a2 = .{ .stack = 4 } }, // EDX=inviter, [esp+4]=pTarget
 
     // -- decoded player actions (SCMD handlers; ECX=pGame EDX=player, [esp+4]=pkt) --
-    .{ .addr = 0x549D80, .prologue = 5, .label = "skill_left", .handler = &onSkillLeft, .a1 = .edx }, // 0x06 LeftSkillOnEntity
-    .{ .addr = 0x54A040, .prologue = 5, .label = "skill_right", .handler = &onSkillRightEntity, .a1 = .edx }, // 0x0D RightSkillOnEntity
-    .{ .addr = 0x54AA90, .prologue = 7, .label = "interact", .handler = &onInteract, .a1 = .edx, .a2 = .{ .stack = 4 } }, // 0x13 InteractWithEntity
-    .{ .addr = 0x54ABB0, .prologue = 8, .label = "item_move", .handler = &onItemMove, .a1 = .edx, .a2 = .{ .stack = 4 } }, // 0x18 ItemToInventory
-    .{ .addr = 0x54AD90, .prologue = 6, .label = "item_equip", .handler = &onItemEquip, .a1 = .edx }, // 0x1A EquipItem
-    .{ .addr = 0x54B1E0, .prologue = 6, .label = "item_use", .handler = &onItemUse, .a1 = .edx }, // 0x20 UseItemAtLocation
-    .{ .addr = 0x54B560, .prologue = 6, .label = "item_use", .handler = &onItemUse, .a1 = .edx }, // 0x26 UseItemAtPlayerCoords
+    .{ .addr = 0x549D80, .prologue = 5, .label = "skill_left", .handler = &onSkillLeft, .game = .ecx, .a1 = .edx }, // 0x06 LeftSkillOnEntity
+    .{ .addr = 0x54A040, .prologue = 5, .label = "skill_right", .handler = &onSkillRightEntity, .game = .ecx, .a1 = .edx }, // 0x0D RightSkillOnEntity
+    .{ .addr = 0x54AA90, .prologue = 7, .label = "interact", .handler = &onInteract, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } }, // 0x13 InteractWithEntity
+    .{ .addr = 0x54ABB0, .prologue = 8, .label = "item_move", .handler = &onItemMove, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 } }, // 0x18 ItemToInventory
+    .{ .addr = 0x54AD90, .prologue = 6, .label = "item_equip", .handler = &onItemEquip, .game = .ecx, .a1 = .edx }, // 0x1A EquipItem
+    .{ .addr = 0x54B1E0, .prologue = 6, .label = "item_use", .handler = &onItemUse, .game = .ecx, .a1 = .edx }, // 0x20 UseItemAtLocation
+    .{ .addr = 0x54B560, .prologue = 6, .label = "item_use", .handler = &onItemUse, .game = .ecx, .a1 = .edx }, // 0x26 UseItemAtPlayerCoords
 };
 
 pub fn install() void {
