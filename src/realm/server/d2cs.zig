@@ -204,10 +204,16 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
         const class: u8 = if (n > 0x2b) save[0x28] else 1;
         const level: u8 = if (n > 0x2b) save[0x2b] else 1;
         const status: u8 = if (n > 0x24) save[0x24] else 0x20; // default to expansion
+        // The .d2s header carries the menu-composite appearance the game wrote on save:
+        // pAppearance1@0x88 = body-component graphic codes, pAppearance2@0x98 = color
+        // transforms (16 each; the statstring uses the first 11). Empty => naked preview.
+        const have_app = n > 0xA2;
+        const app1: []const u8 = if (have_app) save[0x88..0x93] else &.{};
+        const app2: []const u8 = if (have_app) save[0x98..0xA3] else &.{};
 
         w.putU32(0xFFFF_FFFF); // expiration — far future so it's NOT "expired"
         w.putStr(names[i].slice()); // character name
-        writeStatString(&w, class, level, status, @intCast(total)); // CharSel.cpp layout
+        writeStatString(&w, class, level, status, @intCast(total), app1, app2); // CharSel.cpp layout
         w.putU8(0); // statstring C-string terminator
     }
     finish(c, &w);
@@ -244,13 +250,22 @@ fn enc14(w: *proto.Writer, v: u32) void {
 // item list (JM section) into gaCompCharacterCompositeItems indices and fill slot1/slot2
 // (a future "char portrait" feature; the GS has the items in memory on save and could
 // supply the portrait, like real pvpgn d2cs does).
-fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, realm_count: u32) void {
-    enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
+// Emit the 11-byte equip slot from a .d2s appearance block. The statstring is a
+// C-string, so a 0x00 byte would truncate it — map 0x00 (and any missing byte, e.g. a
+// naked char with an empty slice) to 0xFF = "no component in this slot".
+fn putEquipSlot(w: *proto.Writer, app: []const u8) void {
     var k: usize = 0;
-    while (k < 11) : (k += 1) w.putU8(0xFF); // equip slot 1 (none)
+    while (k < 11) : (k += 1) {
+        const b: u8 = if (k < app.len and app[k] != 0) app[k] else 0xFF;
+        w.putU8(b);
+    }
+}
+
+fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, realm_count: u32, app1: []const u8, app2: []const u8) void {
+    enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
+    putEquipSlot(w, app1); // equip slot 1: body-component graphic codes (.d2s pAppearance1)
     w.putU8(class + 1); // class (CharSel subtracts CLASS_SORCERESS=1)
-    k = 0;
-    while (k < 11) : (k += 1) w.putU8(0xFF); // equip slot 2 (none)
+    putEquipSlot(w, app2); // equip slot 2: component color transforms (.d2s pAppearance2)
     w.putU8(if (level == 0) 1 else level); // level (avoid 0)
     // flags &4 = expansion — derived from the .d2s status byte (0x20) rather than
     // hardcoded, so a classic char would render as classic.
