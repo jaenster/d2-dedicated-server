@@ -125,9 +125,16 @@ pub fn GAME_CreateBattleNetGame(
 pub const ARENAFLAG_ClientUpdate: u32 = 0x04;
 pub const ARENAFLAG_Hardcore: u32 = 0x800; // 2048
 pub const ARENAFLAG_Expansion: u32 = 0x10_0000; // 1048576
+// Bit 21 -> pGame->eGameType (GAME_CreateBattleNetGame: eGameType = (flags>>0x15)&1).
+// Non-zero marks the game as NOT single-player: the 0x01 GameFlags packet sends
+// `eGameType != SINGLEPLAYER` to the client (so it renders online NPC positions, e.g.
+// Deckard Cain by the Act 5 waypoint), and ladder updates are enabled. A realm game must
+// set it — leaving it clear makes the client treat the game as single-player.
+pub const ARENAFLAG_Multiplayer: u32 = 0x20_0000; // 2097152 (bit 21)
 pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
     var f: u32 = @as(u32, difficulty) << 12; // difficulty in bits 12-14
     f |= ARENAFLAG_ClientUpdate;
+    f |= ARENAFLAG_Multiplayer; // realm games are multiplayer, not SP
     if (expansion) f |= ARENAFLAG_Expansion;
     if (hardcore) f |= ARENAFLAG_Hardcore;
     return f;
