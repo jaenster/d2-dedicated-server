@@ -61,16 +61,11 @@ pub const Event = struct {
         self.raw("\":");
     }
 
-    /// Greppable line tag kept in front of the JSON payload, so existing
-    /// `grep '[srvtrace]'` / `grep '[srv'` filters still match. A Loki/promtail
-    /// pipeline strips this prefix (regex) before the JSON stage; `jq` users do
-    /// `sed 's/^[^{]*//'` or `grep -o '{.*}'` first.
-    pub const TAG = "[srvtrace] ";
-
-    /// Start an event: `[srvtrace] {"evt":"<name>"`.
+    /// Start an event: a bare JSON object `{"evt":"<name>"` — no prefix, so every
+    /// line is valid JSON straight into `jq` / promtail's json stage. Filter by the
+    /// `evt` field (e.g. `grep '"evt":"tick"'`).
     pub fn begin(name: []const u8) Event {
         var e = Event{};
-        e.raw(TAG);
         e.raw("{\"evt\":\"");
         e.escAscii(name);
         e.rawByte('"');
