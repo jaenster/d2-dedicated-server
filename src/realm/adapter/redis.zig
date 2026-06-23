@@ -346,15 +346,15 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral, PX TTL, reverse indexed by id and by gs) ───────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, password: []const u8, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     const safe = sanitize(name, &nb) orelse return false;
 
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
-    var vb: [96]u8 = undefined;
-    // Trailing " <password>" (empty -> trailing space -> empty 5th token in parseGame).
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, password }) catch return false;
+    var vb: [128]u8 = undefined;
+    // Fields: gameid ip port gsid players <password> (password last, may be empty).
+    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, password }) catch return false;
     var ik: [64]u8 = undefined;
     const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
     var gb: [64]u8 = undefined;
@@ -430,7 +430,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
             else => continue,
         };
         const rec = parseGame(val) orelse continue;
-        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid };
+        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players };
         const cl: u8 = @intCast(@min(gname.len, ng.name.len));
         @memcpy(ng.name[0..cl], gname[0..cl]);
         ng.name_len = cl;
@@ -474,7 +474,8 @@ fn parseGame(val: []const u8) ?GameRec {
     const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
     const gsid: u32 = if (it.next()) |t| (std.fmt.parseInt(u32, t, 10) catch 0) else 0;
     var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
-    if (it.next()) |p| rec.setPw(p); // 5th token = join password (may be empty)
+    rec.players = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 0) else 0; // 5th
+    if (it.next()) |p| rec.setPw(p); // 6th token = join password (may be empty)
     return rec;
 }
 

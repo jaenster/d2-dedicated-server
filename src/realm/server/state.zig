@@ -42,6 +42,7 @@ pub const Game = struct {
     gs_ip: [4]u8 = .{ 0, 0, 0, 0 }, // d2gs address the client connects to
     gs_port: u16 = 4000, // d2gs game port the client connects to
     gsid: u32 = 0, // which GS in the fleet hosts this game
+    players: u16 = 0, // best-effort player count for the join-screen list
     password: [16]u8 = [_]u8{0} ** 16, // join password (empty = open game)
     pw_len: u8 = 0,
     in_use: bool = false,
@@ -99,8 +100,8 @@ pub const State = struct {
     }
 
     /// Register (or replace, by name) a hosted game. Returns false if full.
-    pub fn registerGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, password: []const u8) bool {
-        if (shared) return store.registerGame(name, gameid, gs_ip, gs_port, gsid, password);
+    pub fn registerGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8) bool {
+        if (shared) return store.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password);
         st.lock.lock();
         defer st.lock.unlock();
         var slot: ?*Game = null;
@@ -119,6 +120,7 @@ pub const State = struct {
         g.gs_ip = gs_ip;
         g.gs_port = gs_port;
         g.gsid = gsid;
+        g.players = players;
         const pn: u8 = @intCast(@min(password.len, g.password.len));
         @memcpy(g.password[0..pn], password[0..pn]);
         g.pw_len = pn;
@@ -130,7 +132,7 @@ pub const State = struct {
     pub fn findGame(st: *State, name: []const u8) ?Game {
         if (shared) {
             const rec = store.findGame(name) orelse return null;
-            var g = Game{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .in_use = true };
+            var g = Game{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .in_use = true };
             const n: u8 = @intCast(@min(name.len, max_name));
             @memcpy(g.name[0..n], name[0..n]);
             g.name_len = n;
@@ -203,6 +205,7 @@ pub const GameInfo = struct {
     gsid: u32 = 0,
     ip: [4]u8 = .{ 0, 0, 0, 0 },
     port: u16 = 0,
+    players: u16 = 0,
 
     pub fn name_slice(g: *const GameInfo) []const u8 {
         return g.name[0..g.name_len];
@@ -219,7 +222,7 @@ pub fn snapshotGames(buf: []GameInfo) usize {
         const cap = @min(buf.len, tmp.len);
         const m = store.snapshotGames(tmp[0..cap]);
         for (tmp[0..m], 0..) |ng, i| {
-            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port };
+            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port, .players = ng.players };
             const ln: u8 = @intCast(@min(ng.name_len, max_name));
             @memcpy(gi.name[0..ln], ng.name[0..ln]);
             gi.name_len = ln;
@@ -233,7 +236,7 @@ pub fn snapshotGames(buf: []GameInfo) usize {
     for (&global.games) |*g| {
         if (n >= buf.len) break;
         if (!g.in_use) continue;
-        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .name_len = g.name_len };
+        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .players = g.players, .name_len = g.name_len };
         @memcpy(gi.name[0..g.name_len], g.name[0..g.name_len]);
         buf[n] = gi;
         n += 1;

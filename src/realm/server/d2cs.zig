@@ -340,7 +340,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     }
     const rr = routed.?;
-    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, pass);
+    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, pass); // 1 player: the creator
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -391,6 +391,9 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         finish(c, &w);
         return;
     }
+    // Best-effort bump of the join-screen player count (the GS owns the authoritative
+    // count; leaves aren't tracked here yet, so this can run high until the game closes).
+    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.pw());
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
@@ -424,7 +427,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
 // Per-game 0x05 payload (offsets are from the type byte the client sees as pBytes[0]):
 //   +1   u16 reqid   (must equal the request's seq or the client drops it)
 //   +3   u32 gameid  (low u16 is the AddGameToCache dedup key)
-//   +7   u8  status  (game flags; 0 = open)
+//   +7   u8  player count (the join screen's PLAYERS column; cache+0x14, read as u16)
 //   +8   u32 token   (must NOT be -1/-2 for a real game)
 //   +0xc cstr name, then cstr description
 fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
@@ -439,7 +442,7 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
         var w = startPacket(&buf, MCP_GAMELIST);
         w.putU16(reqid); // +1 echo request id
         w.putU32(g.gameid); // +3 gameid (low u16 = dedup key)
-        w.putU8(0); // +7 status / flags (0 = open)
+        w.putU8(@intCast(@min(g.players, 255))); // +7 player count (PLAYERS column)
         w.putU32(g.gameid); // +8 token (non -1/-2 -> treated as a real game entry)
         w.putStr(g.name_slice()); // +0xc game name (shown in the list)
         w.putStr(""); // description
