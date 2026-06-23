@@ -16,6 +16,9 @@ pub const GameRec = struct {
     gs_ip: [4]u8,
     gs_port: u16 = 4000,
     gsid: u32 = 0,
+    /// Player count shown in the join-screen list. Best-effort: realmd seeds it to 1 on
+    /// create and bumps it per join (the GS owns the authoritative count).
+    players: u16 = 0,
     /// Game join password (empty = open game). Stored with the record so any realmd
     /// instance can validate a join. D2 passwords are short alphanumeric (no spaces).
     password: [16]u8 = [_]u8{0} ** 16,
@@ -59,4 +62,5 @@ pub const NamedGame = struct {
     gs_ip: [4]u8 = .{ 0, 0, 0, 0 },
     gs_port: u16 = 4000,
     gsid: u32 = 0,
+    players: u16 = 0,
 };
