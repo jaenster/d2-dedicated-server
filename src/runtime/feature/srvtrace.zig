@@ -467,17 +467,19 @@ fn TraceHook(comptime h: Hook) type {
             );
         }
 
-        fn install() void {
+        /// Returns true if the hook installed. Logs only on FAILURE — success is
+        /// rolled into a single summary line by install() to keep the log quiet.
+        fn install() bool {
             const tr = trampoline.build(h.addr, h.prologue) orelse {
                 log.print("srvtrace: trampoline FAILED — " ++ h.label);
-                return;
+                return false;
             };
             tramp = @intFromPtr(tr.buffer);
             if (patch.MemoryPatch(h.addr).jump(@intFromPtr(&shim)).nopTo(h.addr + h.prologue).commit()) {
-                log.print("srvtrace: hooked " ++ h.label);
-            } else {
-                log.print("srvtrace: patch FAILED — " ++ h.label);
+                return true;
             }
+            log.print("srvtrace: patch FAILED — " ++ h.label);
+            return false;
         }
     };
 }
@@ -536,8 +538,9 @@ const hooks = [_]Hook{
 };
 
 pub fn install() void {
-    log.print("srvtrace: installing server event hooks");
+    var ok: usize = 0;
     inline for (hooks) |h| {
-        TraceHook(h).install();
+        if (TraceHook(h).install()) ok += 1;
     }
+    log.hex2("srvtrace: event hooks installed", ok, hooks.len);
 }
