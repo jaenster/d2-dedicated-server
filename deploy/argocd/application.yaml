@@ -1,0 +1,23 @@
+# ArgoCD Application for the realm. Kept in THIS (private) repo — nothing realm-related
+# lands in the public hertzner-k8s gitops repo. ArgoCD pulls this private repo via the
+# `repo-d2gs` repository credential (see README.md), renders deploy/ with kustomize, and
+# syncs into the `realmd` namespace.
+#
+#   kubectl apply -f deploy/argocd/application.yaml      # one-time registration
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: d2gs
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/jaenster/d2-dedicated-server.git
+    targetRevision: feat/realm-server-completeness
+    path: deploy
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: realmd
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]

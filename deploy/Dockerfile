@@ -39,7 +39,7 @@ FROM debian:bookworm-slim AS gs
 # and the Mono/Gecko/menu-builder DLLs disabled. (Swap in the WineHQ repo for a newer
 # wine if your D2 build needs it.)
 RUN dpkg --add-architecture i386 && apt-get update && \
-    apt-get install -y --no-install-recommends wine wine32 && \
+    apt-get install -y --no-install-recommends wine wine32 curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 # The GS needs only these two DLLs (dbghelp proxy + payload) — not realmd's checkrev.
 COPY --from=build-dlls /src/zig-out/bin/dbghelp.dll /src/zig-out/bin/d2gs.dll /opt/d2gs/
