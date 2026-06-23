@@ -242,7 +242,7 @@ fn onAuthInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU32(0); // logon type 0 (OLS) — password not verified
     w.putU32(c.server_token);
     w.putU32(0); // UDP value
-    w.putU64(ver_mpq_filetime); // MPQ filetime — NON-ZERO so a fresh client fetches it
+    w.putU64(0); // MPQ filetime
     w.putStr("ver-IX86-1.mpq"); // version-check MPQ name (client BNFTP-fetches it)
     w.putStr("A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B"); // checksum formula (ignored)
     finish(c, &w);
@@ -547,26 +547,19 @@ fn onLogonRealm(c: *Conn, tag: []const u8, body: []const u8) void {
 }
 
 // SID_GETFILETIME (0x33): client asks for a server file's timestamp (e.g.
-// bnserver-D2DV.ini) before deciding to BNFTP-download it. We must report a NON-ZERO
-// filetime for the version-check MPQ (which we serve), or a fresh client without a local
-// copy skips the download and then can't identify its version ("Unable to Identify
-// Version"). A fixed recent FILETIME (100ns ticks since 1601; ~2024) makes any client
-// without an up-to-date copy fetch it; once fetched it caches with this stamp. Other
-// files (e.g. bnserver-D2DV.ini, which we don't serve) still report 0 = not available.
-const ver_mpq_filetime: u64 = 0x01DA_4A8C_0000_0000;
+// bnserver-D2DV.ini) before deciding to BNFTP-download it. Replying filetime 0
+// tells the client we have no such file, so it proceeds without downloading.
 fn onGetFileTime(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU32();
     const unknown = r.getU32();
     const fname = r.getStr();
-    const have = std.mem.eql(u8, fname, "ver-IX86-1.mpq");
-    const filetime: u64 = if (have) ver_mpq_filetime else 0;
-    log.line(tag, "getfiletime '{s}' -> {s}", .{ fname, if (have) "served (download it)" else "none" });
+    log.line(tag, "getfiletime '{s}' -> none", .{fname});
     var buf: [128]u8 = undefined;
     var w = startPacket(&buf, SID_GETFILETIME);
     w.putU32(reqid);
     w.putU32(unknown);
-    w.putU64(filetime);
+    w.putU64(0); // filetime 0 = not available
     w.putStr(fname);
     finish(c, &w);
 }
