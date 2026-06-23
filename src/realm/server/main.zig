@@ -77,6 +77,27 @@ fn ensureAdmin(name: []const u8, password: ?[]const u8) void {
     log.line("realmd", "admin account '{s}' flagged admin", .{name});
 }
 
+/// Seed ordinary (non-admin) accounts with passwords from REALMD_SEED_ACCOUNTS
+/// ("name:pw,name:pw"). Idempotent: only creates a missing account. Lets strict
+/// logon (unknown account rejected) still admit fixture accounts. store.init() must
+/// have run.
+fn seedAccounts(spec: []const u8) void {
+    var it = std.mem.tokenizeScalar(u8, spec, ',');
+    while (it.next()) |pair| {
+        const sep = std.mem.indexOfScalar(u8, pair, ':') orelse pair.len;
+        const name = pair[0..sep];
+        const pw = if (sep < pair.len) pair[sep + 1 ..] else "";
+        if (name.len == 0 or store.accountExists(name)) continue;
+        var pwhash: ?[20]u8 = null;
+        if (pw.len > 0) {
+            var lb: [64]u8 = undefined;
+            pwhash = xsha1.xsha1(lowerStr(pw, &lb));
+        }
+        _ = store.createAccount(name, pwhash);
+        log.line("realmd", "seeded account '{s}' (password={})", .{ name, pw.len > 0 });
+    }
+}
+
 /// Whether any stored account carries the DB admin flag (cheap startup scan).
 fn anyDbAdmin() bool {
     var names: [256][32]u8 = undefined;
@@ -160,6 +181,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const pw: ?[]const u8 = if (sep) |s| cfg.admin_bootstrap[s + 1 ..] else null;
         ensureAdmin(name, pw);
     }
+    // Seed ordinary fixture/test accounts with passwords (REALMD_SEED_ACCOUNTS).
+    if (cfg.seed_accounts.len > 0) seedAccounts(cfg.seed_accounts);
     // Keep the admin API/UI enabled across restarts if any stored account is a DB admin
     // (so it doesn't go dark just because no env auth is configured this boot).
     admin.any_db_admin = anyDbAdmin();
@@ -171,6 +194,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     state.instance_hash = hashStr(cfg.instance_id);
     if (cfg.shared) log.line("realmd", "multi-instance mode: sessions/games in shared store {s} (instance hash 0x{x})", .{ cfg.data_dir, state.instance_hash });
     bncs.realm_name = cfg.realm_name;
+    bncs.permissive_auth = cfg.permissive_auth;
     bncs.admin_accounts = cfg.admins;
     bncs.d2cs_port = cfg.d2cs_port;
     gslink.realm_name = cfg.realm_name;

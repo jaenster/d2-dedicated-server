@@ -94,6 +94,17 @@ pub const Config = struct {
     /// break-glass admin from a k8s Secret. The password part may be empty (SSO-only admin).
     admin_bootstrap: []const u8 = "",
 
+    /// Comma-separated `name:password` pairs to seed as ordinary (non-admin) accounts on
+    /// startup (REALMD_SEED_ACCOUNTS). Idempotent: each is created with that password only
+    /// if missing. With strict logon (unknown account rejected), this is how test/fixture
+    /// accounts get a real password so wrong passwords are refused. e.g. "EpicAma:secret,Sidekick:secret".
+    seed_accounts: []const u8 = "",
+
+    /// Legacy/test auth: unknown accounts auto-register password-less and passwords are
+    /// verified (REALMD_PERMISSIVE_AUTH). Default false = strict (reject unknown accounts,
+    /// no auto-register). The e2e harness sets it; real deployments leave it off.
+    permissive_auth: bool = false,
+
     /// When set (e.g. "X-Forwarded-User"), realmd trusts this request header as an
     /// already-authenticated username — for SSO via a forward-auth proxy (Authentik
     /// outpost / oauth2-proxy). The username must still be in `admins`. ONLY enable
@@ -155,6 +166,8 @@ pub fn fromEnv() Config {
     if (env("REALMD_ADMIN_TOKEN")) |v| c.admin_token = v;
     if (env("REALMD_ADMIN_SECRET")) |v| c.admin_secret = v;
     if (env("REALMD_ADMIN_BOOTSTRAP")) |v| c.admin_bootstrap = v;
+    if (env("REALMD_SEED_ACCOUNTS")) |v| c.seed_accounts = v;
+    if (env("REALMD_PERMISSIVE_AUTH")) |_| c.permissive_auth = true;
     if (env("REALMD_TRUSTED_AUTH_HEADER")) |v| c.trusted_auth_header = v;
     return c;
 }
