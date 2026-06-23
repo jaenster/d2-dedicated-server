@@ -285,6 +285,7 @@ fn parseEndpoints() void {
         }
     }
     gsid = computeGsId();
+    @import("runtime/feature/srvtrace.zig").gsid = gsid; // so the srvtrace tick line carries the GS id
 }
 
 /// One-shot D2DBS character fetch (test/demo for `--fetch-char`).
