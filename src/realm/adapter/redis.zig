@@ -346,14 +346,15 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral, PX TTL, reverse indexed by id and by gs) ───────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, password: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     const safe = sanitize(name, &nb) orelse return false;
 
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
-    var vb: [64]u8 = undefined;
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid }) catch return false;
+    var vb: [96]u8 = undefined;
+    // Trailing " <password>" (empty -> trailing space -> empty 5th token in parseGame).
+    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, password }) catch return false;
     var ik: [64]u8 = undefined;
     const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
     var gb: [64]u8 = undefined;
@@ -472,7 +473,9 @@ fn parseGame(val: []const u8) ?GameRec {
     if (i != 4) return null;
     const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
     const gsid: u32 = if (it.next()) |t| (std.fmt.parseInt(u32, t, 10) catch 0) else 0;
-    return .{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
+    var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
+    if (it.next()) |p| rec.setPw(p); // 5th token = join password (may be empty)
+    return rec;
 }
 
 /// Look up the game name for an engine gameid via the byid index, then delete the

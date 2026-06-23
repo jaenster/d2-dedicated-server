@@ -42,10 +42,15 @@ pub const Game = struct {
     gs_ip: [4]u8 = .{ 0, 0, 0, 0 }, // d2gs address the client connects to
     gs_port: u16 = 4000, // d2gs game port the client connects to
     gsid: u32 = 0, // which GS in the fleet hosts this game
+    password: [16]u8 = [_]u8{0} ** 16, // join password (empty = open game)
+    pw_len: u8 = 0,
     in_use: bool = false,
 
     pub fn name_slice(g: *const Game) []const u8 {
         return g.name[0..g.name_len];
+    }
+    pub fn pw(g: *const Game) []const u8 {
+        return g.password[0..g.pw_len];
     }
 };
 
@@ -94,8 +99,8 @@ pub const State = struct {
     }
 
     /// Register (or replace, by name) a hosted game. Returns false if full.
-    pub fn registerGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32) bool {
-        if (shared) return store.registerGame(name, gameid, gs_ip, gs_port, gsid);
+    pub fn registerGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, password: []const u8) bool {
+        if (shared) return store.registerGame(name, gameid, gs_ip, gs_port, gsid, password);
         st.lock.lock();
         defer st.lock.unlock();
         var slot: ?*Game = null;
@@ -114,6 +119,9 @@ pub const State = struct {
         g.gs_ip = gs_ip;
         g.gs_port = gs_port;
         g.gsid = gsid;
+        const pn: u8 = @intCast(@min(password.len, g.password.len));
+        @memcpy(g.password[0..pn], password[0..pn]);
+        g.pw_len = pn;
         g.in_use = true;
         return true;
     }
@@ -126,6 +134,9 @@ pub const State = struct {
             const n: u8 = @intCast(@min(name.len, max_name));
             @memcpy(g.name[0..n], name[0..n]);
             g.name_len = n;
+            const pn: u8 = @intCast(@min(rec.pw_len, g.password.len));
+            @memcpy(g.password[0..pn], rec.password[0..pn]);
+            g.pw_len = pn;
             return g;
         }
         st.lock.lock();
