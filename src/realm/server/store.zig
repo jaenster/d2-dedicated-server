@@ -146,6 +146,16 @@ pub fn listAccounts(names: [][32]u8) usize {
     return fs.listAccounts(names);
 }
 
+/// Set/clear an account's admin flag (web-UI access). Accounts are always fs-backed.
+pub fn setAdmin(name: []const u8, admin: bool) bool {
+    return fs.setAdmin(name, admin);
+}
+
+/// Whether an account is flagged admin in the store.
+pub fn accountIsAdmin(name: []const u8) bool {
+    return fs.accountIsAdmin(name);
+}
+
 /// BNFTP assets (version-check MPQ etc.) are static files — always filesystem.
 pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     return fs.getBnftp(filename, out);

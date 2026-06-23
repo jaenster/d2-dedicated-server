@@ -29,20 +29,41 @@ The deploy image (`deploy/Dockerfile`, `--target realmd`) builds with `-Dwebui=t
 the same listener as `/healthz`, `/readyz`, and `/admin/*`. Any non-probe, non-`/admin`
 GET returns the SPA. The page is static; every data call hits `/admin/*`, which is gated.
 
-There are three ways in (set any/all; the API is disabled — 403 — if none is set):
+**Who is an admin** is a flag stored on the account in the DB. `REALMD_ADMINS`
+(comma-separated, case-insensitive) is an additional static allowlist — an OR'd-in
+override that's a lockout escape hatch and the way an SSO user with no realm account is
+let in. The API is enabled whenever any auth path can grant access (a DB admin exists,
+or `REALMD_ADMINS` / `REALMD_TRUSTED_AUTH_HEADER` / `REALMD_ADMIN_TOKEN` is set); 403 if
+none.
 
-- **Account login** (`REALMD_ADMINS`) — sign in with a realm account that's in the
-  comma-separated allowlist, by its password. On success realmd sets an HMAC-signed,
-  `HttpOnly` session cookie (`REALMD_ADMIN_SECRET` is the signing key — set a stable one
-  so sessions survive restarts / work across replicas; otherwise a per-process key is used).
+Three ways to authenticate:
+
+- **Account login** — sign in with an admin realm account by its password. On success
+  realmd sets an HMAC-signed, `HttpOnly` session cookie (`REALMD_ADMIN_SECRET` is the
+  signing key — set a stable one so sessions survive restarts / work across replicas;
+  otherwise a per-process key is used).
 - **SSO** (`REALMD_TRUSTED_AUTH_HEADER`) — behind an Authentik/oauth2-proxy forward-auth
   ingress, realmd trusts the injected identity header (e.g. `X-authentik-username`); the
-  user must still be in `REALMD_ADMINS`. The UI shows no login form — `/admin/me` is
-  already authenticated. See [`../deploy/AUTHENTIK-SSO.md`](../deploy/AUTHENTIK-SSO.md).
+  user must be a DB admin or in `REALMD_ADMINS`. The UI shows no login form — `/admin/me`
+  is already authenticated. See [`../deploy/AUTHENTIK-SSO.md`](../deploy/AUTHENTIK-SSO.md).
 - **Bearer token** (`REALMD_ADMIN_TOKEN`) — `Authorization: Bearer <token>`, for
   scripts/CI and break-glass. Not used by the UI. Treat it like a root password.
 
-The header shows who you are and how (`session` / `sso` / `token`).
+The header shows who you are and how (`session` / `sso` / `token`). Admins can
+promote/demote other accounts from the Accounts tab (you can't demote yourself).
+
+### Creating admins
+
+```sh
+# offline, no running server or token (uses the configured store backend):
+realmd create-admin <name> [password]
+
+# or declaratively on boot (idempotent; great for a k8s Secret):
+REALMD_ADMIN_BOOTSTRAP=name:password   # password optional → SSO-only admin
+
+# or, once you have one admin, promote others from the Accounts tab / API:
+curl -b cookie -d '{"name":"bob","admin":true}' .../admin/accounts/admin
+```
 
 > The health/admin port must **not** be public. Reach it via `kubectl port-forward`, or
 > an authenticated ingress (the SSO setup above) — never expose port 8080 directly, since

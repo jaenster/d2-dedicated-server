@@ -78,15 +78,28 @@ pub fn initSigning(secret: []const u8) void {
     }
 }
 
-/// The admin API is enabled if any auth path is configured: bearer token (scripts /
-/// break-glass), account login (admins list), or SSO (trusted header).
+/// Set by main() at startup (and on runtime promote) when ≥1 account carries the DB
+/// admin flag — so account login stays available across restarts without env config.
+pub var any_db_admin: bool = false;
+
+/// The admin API is enabled if any auth path can grant access: bearer token (scripts /
+/// break-glass), env allowlist, SSO (trusted header), or a stored DB admin account.
 fn enabled() bool {
-    return token.len > 0 or admins.len > 0 or trusted_header.len > 0;
+    return token.len > 0 or admins.len > 0 or trusted_header.len > 0 or any_db_admin;
 }
 
-/// Case-insensitive membership of `name` in the comma-separated `admins` allowlist.
+/// Whether `name` may admin: the DB admin flag is the source of truth; the
+/// REALMD_ADMINS env list is an OR'd-in static override (lockout escape hatch, and
+/// the way an SSO user with no realm account is allowed in).
 fn isAdmin(name: []const u8) bool {
-    if (admins.len == 0 or name.len == 0) return false;
+    if (name.len == 0) return false;
+    if (store.accountIsAdmin(name)) return true;
+    return envAdmin(name);
+}
+
+/// Case-insensitive membership of `name` in the comma-separated `admins` env allowlist.
+fn envAdmin(name: []const u8) bool {
+    if (admins.len == 0) return false;
     var it = std.mem.tokenizeScalar(u8, admins, ',');
     while (it.next()) |a| {
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, a, " "), name)) return true;
@@ -332,6 +345,9 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
         if (is_get) return accountsList(fd);
         if (is_post) return accountsCreate(fd, req);
         return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+    } else if (std.mem.eql(u8, p, "/admin/accounts/admin")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return setAdminEndpoint(fd, req, auth.?.name);
     } else if (std.mem.eql(u8, p, "/admin/chars/copy")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return charsCopy(fd, req);
@@ -443,7 +459,7 @@ fn accountsList(fd: net.Socket) void {
     w = head.len;
     for (names[0..n], 0..) |nm, i| {
         const name = std.mem.sliceTo(&nm, 0);
-        const seg = std.fmt.bufPrint(buf[w..], "{s}\"{s}\"", .{ if (i == 0) "" else ",", name }) catch break;
+        const seg = std.fmt.bufPrint(buf[w..], "{s}{{\"name\":\"{s}\",\"admin\":{}}}", .{ if (i == 0) "" else ",", name, store.accountIsAdmin(name) }) catch break;
         w += seg.len;
     }
     const tail = "]}";
@@ -470,6 +486,21 @@ fn charsCopy(fd: net.Socket, req: []const u8) void {
     }
 }
 
+/// True if the flat JSON body has `"key": true`. Crude (no nesting), matches jsonStr.
+fn jsonBool(body: []const u8, key: []const u8) bool {
+    var kbuf: [64]u8 = undefined;
+    if (key.len + 2 > kbuf.len) return false;
+    kbuf[0] = '"';
+    @memcpy(kbuf[1 .. 1 + key.len], key);
+    kbuf[1 + key.len] = '"';
+    const needle = kbuf[0 .. key.len + 2];
+    const ki = std.mem.indexOf(u8, body, needle) orelse return false;
+    const colon = std.mem.indexOfScalarPos(u8, body, ki + needle.len, ':') orelse return false;
+    var i = colon + 1;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t')) i += 1;
+    return std.mem.startsWith(u8, body[i..], "true");
+}
+
 fn accountsCreate(fd: net.Socket, req: []const u8) void {
     const body = bodyOf(req);
     const name = jsonStr(body, "name") orelse return respond(fd, bad_request, "{\"error\":\"missing name\"}");
@@ -477,11 +508,25 @@ fn accountsCreate(fd: net.Socket, req: []const u8) void {
     if (name.len == 0) return respond(fd, bad_request, "{\"error\":\"missing name\"}");
     var lb: [64]u8 = undefined;
     const pwhash = xsha1.xsha1(lower(password, &lb));
-    if (store.createAccount(name, pwhash)) {
-        respond(fd, ok, "{\"created\":true}");
-    } else {
-        respond(fd, conflict, "{\"error\":\"exists\"}");
-    }
+    if (!store.createAccount(name, pwhash)) return respond(fd, conflict, "{\"error\":\"exists\"}");
+    if (jsonBool(body, "admin")) _ = store.setAdmin(name, true);
+    respond(fd, ok, "{\"created\":true}");
+}
+
+// POST /admin/accounts/admin {"name","admin":bool} — promote/demote an account's web-UI
+// admin flag. `caller` is the logged-in identity: you cannot demote yourself (lockout
+// guard; an env-allowlisted admin can always undo via REALMD_ADMINS).
+fn setAdminEndpoint(fd: net.Socket, req: []const u8, caller: []const u8) void {
+    const body = bodyOf(req);
+    const name = jsonStr(body, "name") orelse return respond(fd, bad_request, "{\"error\":\"missing name\"}");
+    const want = jsonBool(body, "admin");
+    if (!want and std.ascii.eqlIgnoreCase(name, caller))
+        return respond(fd, conflict, "{\"error\":\"refusing to demote yourself\"}");
+    if (!store.accountExists(name)) return respond(fd, not_found, "{\"error\":\"no such account\"}");
+    _ = store.setAdmin(name, want);
+    if (want) any_db_admin = true; // keep the API enabled across restarts
+    var b: [64]u8 = undefined;
+    respond(fd, ok, std.fmt.bufPrint(&b, "{{\"name\":\"{s}\",\"admin\":{}}}", .{ name, want }) catch "{}");
 }
 
 fn closeGame(fd: net.Socket, path: []const u8, req: []const u8) void {

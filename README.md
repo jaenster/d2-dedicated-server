@@ -78,10 +78,12 @@ to `nodeIP:4000`:
 A small Vite + React UI ([`webui/`](webui/)) over realmd's `/admin/*` JSON API —
 fleet/games/accounts at a glance, plus create-account, close-game and copy-char. It
 bundles to one self-contained `index.html` and is embedded into the realmd binary
-(`zig build realmd-bin -Dwebui=true`), served on the health/admin port. Sign in with a
-realm admin account (`REALMD_ADMINS` + password → signed session cookie), or front it with
-Authentik/oauth2-proxy SSO ([`deploy/AUTHENTIK-SSO.md`](deploy/AUTHENTIK-SSO.md)); a
-bearer token (`REALMD_ADMIN_TOKEN`) stays for scripts/break-glass. Keep port 8080 behind a
+(`zig build realmd-bin -Dwebui=true`), served on the health/admin port. Admin-ness is a
+DB flag on the account — seed one with `realmd create-admin <name> <password>` or
+`REALMD_ADMIN_BOOTSTRAP`, then sign in (password → signed session cookie) and promote
+others from the UI. Or front it with Authentik/oauth2-proxy SSO
+([`deploy/AUTHENTIK-SSO.md`](deploy/AUTHENTIK-SSO.md)); a bearer token
+(`REALMD_ADMIN_TOKEN`) stays for scripts/break-glass. Keep port 8080 behind a
 port-forward or the authed ingress, never public.
 
 ![realmd admin — overview](webui/img/overview.png)

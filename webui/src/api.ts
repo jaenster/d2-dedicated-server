@@ -32,6 +32,11 @@ export interface Me {
   via: "session" | "sso" | "token";
 }
 
+export interface Account {
+  name: string;
+  admin: boolean;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -72,10 +77,15 @@ export const api = {
   status: () => req<Status>("GET", "/admin/status"),
   gameservers: () => req<GameServer[]>("GET", "/admin/gameservers"),
   games: () => req<Game[]>("GET", "/admin/games"),
-  accounts: () => req<{ accounts: string[] }>("GET", "/admin/accounts"),
+  accounts: () => req<{ accounts: Account[] }>("GET", "/admin/accounts"),
 
-  createAccount: (name: string, password: string) =>
-    req<{ created: boolean }>("POST", "/admin/accounts", { name, password }),
+  createAccount: (name: string, password: string, admin = false) =>
+    req<{ created: boolean }>("POST", "/admin/accounts", { name, password, admin }),
+  setAdmin: (name: string, admin: boolean) =>
+    req<{ name: string; admin: boolean }>("POST", "/admin/accounts/admin", {
+      name,
+      admin,
+    }),
   closeGame: (name: string) =>
     req<{ closed: boolean }>("POST", "/admin/games/close", { name }),
   copyChar: (p: {

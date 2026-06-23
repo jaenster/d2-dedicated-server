@@ -88,6 +88,12 @@ pub const Config = struct {
     /// random key is generated (sessions break on restart / aren't multi-instance).
     admin_secret: []const u8 = "",
 
+    /// `name:password` of an admin account to ensure on startup (REALMD_ADMIN_BOOTSTRAP).
+    /// If the account is missing it is created (with that password) and flagged admin;
+    /// if it exists the admin flag is (re)set. Idempotent — the declarative way to seed a
+    /// break-glass admin from a k8s Secret. The password part may be empty (SSO-only admin).
+    admin_bootstrap: []const u8 = "",
+
     /// When set (e.g. "X-Forwarded-User"), realmd trusts this request header as an
     /// already-authenticated username — for SSO via a forward-auth proxy (Authentik
     /// outpost / oauth2-proxy). The username must still be in `admins`. ONLY enable
@@ -148,6 +154,7 @@ pub fn fromEnv() Config {
     if (env("REALMD_PG_DSN")) |v| c.pg_dsn = v;
     if (env("REALMD_ADMIN_TOKEN")) |v| c.admin_token = v;
     if (env("REALMD_ADMIN_SECRET")) |v| c.admin_secret = v;
+    if (env("REALMD_ADMIN_BOOTSTRAP")) |v| c.admin_bootstrap = v;
     if (env("REALMD_TRUSTED_AUTH_HEADER")) |v| c.trusted_auth_header = v;
     return c;
 }

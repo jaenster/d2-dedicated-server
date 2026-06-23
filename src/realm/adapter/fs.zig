@@ -194,7 +194,9 @@ pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
 }
 
 // ── accounts (durable) ───────────────────────────────────────────────────────
-// One file per account at accounts/<name>: 21 bytes = has_password(1) ++ pwhash(20).
+// One file per account at accounts/<name>: 22 bytes = has_password(1) ++ pwhash(20)
+// ++ admin(1). Older 21-byte records (no admin byte) read back as non-admin.
+const account_rec_len = 22;
 
 pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
     var nb: [64]u8 = undefined;
@@ -204,12 +206,37 @@ pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
     // Reject if the account already exists.
     var eb: [32]u8 = undefined;
     if (readSmall("accounts", safe, &eb) != null) return false;
-    var rec: [21]u8 = [_]u8{0} ** 21;
+    var rec: [account_rec_len]u8 = [_]u8{0} ** account_rec_len;
     if (pwhash) |h| {
         rec[0] = 1;
         @memcpy(rec[1..21], &h);
     }
     return writeSmall("accounts", safe, &rec);
+}
+
+/// Set/clear the account's admin flag (web-UI access). False if no such account.
+pub fn setAdmin(name: []const u8, admin: bool) bool {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var rb: [32]u8 = undefined;
+    const raw = readSmall("accounts", safe, &rb) orelse return false;
+    var rec: [account_rec_len]u8 = [_]u8{0} ** account_rec_len;
+    @memcpy(rec[0..@min(raw.len, account_rec_len)], raw[0..@min(raw.len, account_rec_len)]);
+    rec[21] = if (admin) 1 else 0;
+    return writeSmall("accounts", safe, &rec);
+}
+
+/// Whether the account is flagged admin. False if missing or an old (21-byte) record.
+pub fn accountIsAdmin(name: []const u8) bool {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var rb: [32]u8 = undefined;
+    const raw = readSmall("accounts", safe, &rb) orelse return false;
+    return raw.len >= account_rec_len and raw[21] == 1;
 }
 
 pub fn accountExists(name: []const u8) bool {
