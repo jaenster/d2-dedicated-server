@@ -58,12 +58,19 @@ pub fn main() !void {
     });
     // Graceful shutdown for k8s rolling updates + readiness gating.
     health.require_gs = cfg.require_gs;
-    // Admin API (served on the health port under /admin/*). Empty token = disabled.
+    // Admin API + web UI (served on the health port under /admin/*). Enabled by any of:
+    // bearer token (scripts/break-glass), account login (REALMD_ADMINS), or SSO header.
     admin.token = cfg.admin_token;
     admin.instance = cfg.instance_id;
     admin.durable = @tagName(cfg.durable_store);
     admin.ephemeral = @tagName(cfg.ephemeral_store);
-    if (cfg.admin_token.len > 0) log.line("realmd", "admin API enabled on health port {d}", .{cfg.health_port});
+    admin.admins = cfg.admins;
+    admin.trusted_header = cfg.trusted_auth_header;
+    admin.initSigning(cfg.admin_secret);
+    if (cfg.admin_token.len > 0 or cfg.admins.len > 0 or cfg.trusted_auth_header.len > 0)
+        log.line("realmd", "admin API + web UI enabled on health port {d} (token={} login={} sso={})", .{ cfg.health_port, cfg.admin_token.len > 0, cfg.admins.len > 0, cfg.trusted_auth_header.len > 0 });
+    if (cfg.admins.len > 0 and cfg.admin_secret.len == 0)
+        log.line("realmd", "WARNING REALMD_ADMIN_SECRET unset; web-UI sessions use a per-process key (break on restart, not multi-instance)", .{});
     shutdown.install(cfg.shutdown_grace_ms);
 
     // bnetd advertises the d2cs address to the client. realm_addr must be an

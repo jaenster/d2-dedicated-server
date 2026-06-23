@@ -2,63 +2,77 @@ import { useCallback, useEffect, useState } from "react";
 import {
   api,
   ApiError,
-  getToken,
-  setToken,
   type Game,
   type GameServer,
+  type Me,
   type Status,
 } from "./api.ts";
 
 type Tab = "overview" | "gameservers" | "games" | "accounts";
 
 export function App() {
-  const [token, setTok] = useState(getToken());
-  const [authed, setAuthed] = useState(false);
+  const [me, setMe] = useState<Me | null>(null);
+  const [checking, setChecking] = useState(true);
+  const [disabled, setDisabled] = useState(false);
 
-  if (!authed) {
+  const check = useCallback(async () => {
+    try {
+      setMe(await api.me());
+    } catch (e) {
+      setMe(null);
+      if (e instanceof ApiError && e.status === 403) setDisabled(true);
+    } finally {
+      setChecking(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    check();
+  }, [check]);
+
+  if (checking) return <div className="login" />;
+  if (disabled)
     return (
-      <Login
-        token={token}
-        onToken={setTok}
-        onConnected={() => setAuthed(true)}
-      />
+      <div className="login">
+        <div className="card">
+          <h1>realmd admin</h1>
+          <p className="muted">
+            The admin API is disabled. Set <code>REALMD_ADMINS</code> (account login)
+            or <code>REALMD_TRUSTED_AUTH_HEADER</code> (SSO) on the server.
+          </p>
+        </div>
+      </div>
     );
-  }
+  if (!me) return <Login onLoggedIn={check} />;
   return (
     <Dashboard
-      onLogout={() => {
-        setToken("");
-        setTok("");
-        setAuthed(false);
+      me={me}
+      onLogout={async () => {
+        await api.logout().catch(() => {});
+        setMe(null);
       }}
     />
   );
 }
 
-function Login(props: {
-  token: string;
-  onToken: (t: string) => void;
-  onConnected: () => void;
-}) {
-  const [value, setValue] = useState(props.token);
+function Login(props: { onLoggedIn: () => void }) {
+  const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const connect = async () => {
+  const submit = async () => {
     setBusy(true);
     setErr(null);
-    setToken(value.trim());
     try {
-      await api.status();
-      props.onToken(value.trim());
-      props.onConnected();
+      await api.login(name.trim(), password);
+      props.onLoggedIn();
     } catch (e) {
-      setToken("");
       setErr(
         e instanceof ApiError
-          ? e.status === 403
-            ? "Admin API is disabled (REALMD_ADMIN_TOKEN not set on the server)."
-            : "Invalid token."
+          ? e.status === 401
+            ? "Invalid credentials, or that account isn't an admin."
+            : e.message
           : String(e),
       );
     } finally {
@@ -70,19 +84,23 @@ function Login(props: {
     <div className="login">
       <div className="card">
         <h1>realmd admin</h1>
-        <p className="muted">
-          Enter the admin token (<code>REALMD_ADMIN_TOKEN</code>).
-        </p>
+        <p className="muted">Sign in with your realm admin account.</p>
+        <input
+          placeholder="account"
+          value={name}
+          autoFocus
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+        />
         <input
           type="password"
-          placeholder="admin token"
-          value={value}
-          autoFocus
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && connect()}
+          placeholder="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
         />
-        <button disabled={busy || !value.trim()} onClick={connect}>
-          {busy ? "Connecting…" : "Connect"}
+        <button disabled={busy || !name.trim() || !password} onClick={submit}>
+          {busy ? "Signing in…" : "Sign in"}
         </button>
         {err && <p className="error">{err}</p>}
       </div>
@@ -90,7 +108,7 @@ function Login(props: {
   );
 }
 
-function Dashboard(props: { onLogout: () => void }) {
+function Dashboard(props: { me: Me; onLogout: () => void }) {
   const [tab, setTab] = useState<Tab>("overview");
   const tabs: [Tab, string][] = [
     ["overview", "Overview"],
@@ -113,9 +131,15 @@ function Dashboard(props: { onLogout: () => void }) {
             </button>
           ))}
         </nav>
-        <button className="logout" onClick={props.onLogout}>
-          Log out
-        </button>
+        <span className="who" title={`authenticated via ${props.me.via}`}>
+          {props.me.name}
+          <span className={`via via-${props.me.via}`}>{props.me.via}</span>
+        </span>
+        {props.me.via !== "sso" && (
+          <button className="logout" onClick={props.onLogout}>
+            Log out
+          </button>
+        )}
       </header>
       <main>
         {tab === "overview" && <Overview />}

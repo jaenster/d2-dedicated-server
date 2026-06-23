@@ -18,12 +18,134 @@ const state = @import("state.zig");
 const store = @import("store.zig");
 const xsha1 = @import("xsha1.zig");
 
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const b64 = std.base64.url_safe_no_pad;
+extern "c" fn time(t: ?*c_long) c_long;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
+extern "c" fn close(fd: c_int) c_int;
+
 // Set by main(), mirroring how health.require_gs is wired — admin reflects config
 // without importing config.zig (keeps the listener config-free).
 pub var token: []const u8 = "";
 pub var instance: []const u8 = "realmd-0";
 pub var durable: []const u8 = "fs";
 pub var ephemeral: []const u8 = "fs";
+/// Comma-separated realm-account names allowed into the web UI (REALMD_ADMINS).
+pub var admins: []const u8 = "";
+/// Request header trusted as an authenticated username for SSO (forward-auth proxy).
+/// Empty = SSO off. The value must still be in `admins`.
+pub var trusted_header: []const u8 = "";
+
+/// How long a web-UI session cookie is valid (seconds).
+const session_ttl_s: i64 = 12 * 60 * 60;
+
+// HMAC key signing session cookies. Set by initSigning(): the configured secret
+// (stable across restarts/instances) or a per-process random key.
+var key_buf: [64]u8 = undefined;
+var sign_key: []const u8 = "";
+
+/// Fill `out` with cryptographic randomness from /dev/urandom; on failure fall back
+/// to a time-seeded PRNG (the fallback key is per-process anyway).
+fn fillRandom(out: []u8) void {
+    const fd = open("/dev/urandom", 0, @as(c_int, 0)); // O_RDONLY
+    if (fd >= 0) {
+        defer _ = close(fd);
+        var off: usize = 0;
+        while (off < out.len) {
+            const r = read(fd, out.ptr + off, out.len - off);
+            if (r <= 0) break;
+            off += @intCast(r);
+        }
+        if (off == out.len) return;
+    }
+    var s: u64 = @bitCast(@as(i64, time(null)));
+    for (out) |*b| {
+        s = s *% 6364136223846793005 +% 1442695040888963407;
+        b.* = @truncate(s >> 33);
+    }
+}
+
+/// Wire the cookie-signing key. Call once from main(). Empty secret → random key.
+pub fn initSigning(secret: []const u8) void {
+    if (secret.len > 0) {
+        const n = @min(secret.len, key_buf.len);
+        @memcpy(key_buf[0..n], secret[0..n]);
+        sign_key = key_buf[0..n];
+    } else {
+        fillRandom(key_buf[0..32]);
+        sign_key = key_buf[0..32];
+    }
+}
+
+/// The admin API is enabled if any auth path is configured: bearer token (scripts /
+/// break-glass), account login (admins list), or SSO (trusted header).
+fn enabled() bool {
+    return token.len > 0 or admins.len > 0 or trusted_header.len > 0;
+}
+
+/// Case-insensitive membership of `name` in the comma-separated `admins` allowlist.
+fn isAdmin(name: []const u8) bool {
+    if (admins.len == 0 or name.len == 0) return false;
+    var it = std.mem.tokenizeScalar(u8, admins, ',');
+    while (it.next()) |a| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, a, " "), name)) return true;
+    }
+    return false;
+}
+
+fn ctEq(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var d: u8 = 0;
+    for (a, b) |x, y| d |= x ^ y;
+    return d == 0;
+}
+
+/// Mint a signed session cookie value for `name`: b64(name|exp).b64(hmac). Stateless
+/// (no server-side session table) so it works unchanged across instances given a
+/// shared REALMD_ADMIN_SECRET.
+fn mintSession(name: []const u8, out: []u8) ?[]const u8 {
+    var pbuf: [128]u8 = undefined;
+    const payload = std.fmt.bufPrint(&pbuf, "{s}|{d}", .{ name, time(null) + session_ttl_s }) catch return null;
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, payload, sign_key);
+    var w: usize = 0;
+    const e1 = b64.Encoder.encode(out[w..], payload);
+    w += e1.len;
+    if (w >= out.len) return null;
+    out[w] = '.';
+    w += 1;
+    const e2 = b64.Encoder.encode(out[w..], &mac);
+    w += e2.len;
+    return out[0..w];
+}
+
+/// Verify a session cookie; on success copy the account name into `name_out` and
+/// return it. Rejects bad signatures and expired cookies.
+fn verifySession(tok: []const u8, name_out: []u8) ?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, tok, '.') orelse return null;
+    const p_b64 = tok[0..dot];
+    const s_b64 = tok[dot + 1 ..];
+    var pbuf: [128]u8 = undefined;
+    const plen = b64.Decoder.calcSizeForSlice(p_b64) catch return null;
+    if (plen == 0 or plen > pbuf.len) return null;
+    b64.Decoder.decode(pbuf[0..plen], p_b64) catch return null;
+    const payload = pbuf[0..plen];
+    var sbuf: [32]u8 = undefined;
+    const slen = b64.Decoder.calcSizeForSlice(s_b64) catch return null;
+    if (slen != 32) return null;
+    b64.Decoder.decode(sbuf[0..32], s_b64) catch return null;
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, payload, sign_key);
+    if (!ctEq(&mac, &sbuf)) return null;
+    const bar = std.mem.lastIndexOfScalar(u8, payload, '|') orelse return null;
+    const exp = std.fmt.parseInt(i64, payload[bar + 1 ..], 10) catch return null;
+    if (time(null) >= exp) return null;
+    const nm = payload[0..bar];
+    const n = @min(nm.len, name_out.len);
+    @memcpy(name_out[0..n], nm[0..n]);
+    return name_out[0..n];
+}
 
 const Status = struct { code: u16, text: []const u8 };
 const ok: Status = .{ .code = 200, .text = "200 OK" };
@@ -35,32 +157,78 @@ const method_not_allowed: Status = .{ .code = 405, .text = "405 Method Not Allow
 const conflict: Status = .{ .code = 409, .text = "409 Conflict" };
 
 fn respond(fd: net.Socket, st: Status, body: []const u8) void {
-    var hdr: [256]u8 = undefined;
-    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ st.text, body.len }) catch return;
+    respondCookie(fd, st, body, "");
+}
+
+/// Like respond(), but also emits a Set-Cookie header when `set_cookie` is non-empty.
+fn respondCookie(fd: net.Socket, st: Status, body: []const u8, set_cookie: []const u8) void {
+    var hdr: [512]u8 = undefined;
+    const h = if (set_cookie.len > 0)
+        std.fmt.bufPrint(&hdr, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nSet-Cookie: {s}\r\nConnection: close\r\n\r\n", .{ st.text, body.len, set_cookie }) catch return
+    else
+        std.fmt.bufPrint(&hdr, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ st.text, body.len }) catch return;
     _ = net.writeAll(fd, h);
     if (body.len > 0) _ = net.writeAll(fd, body);
 }
 
-/// Find the value of the case-insensitive "authorization:" header in the raw
-/// request bytes; trims surrounding whitespace. Null if absent.
-fn authHeader(req: []const u8) ?[]const u8 {
+/// Value of the case-insensitive `hname` header in the raw request bytes; trims
+/// surrounding whitespace. Null if absent.
+fn headerValue(req: []const u8, hname: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, req, "\r\n");
     while (it.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (std.ascii.eqlIgnoreCase(line[0..colon], "authorization")) {
+        if (std.ascii.eqlIgnoreCase(line[0..colon], hname)) {
             return std.mem.trim(u8, line[colon + 1 ..], " \t");
         }
     }
     return null;
 }
 
+/// Value of cookie `name` from the request's `Cookie:` header, or null.
+fn cookieValue(req: []const u8, name: []const u8) ?[]const u8 {
+    const cookies = headerValue(req, "cookie") orelse return null;
+    var it = std.mem.splitScalar(u8, cookies, ';');
+    while (it.next()) |pair| {
+        const p = std.mem.trim(u8, pair, " \t");
+        const eq = std.mem.indexOfScalar(u8, p, '=') orelse continue;
+        if (std.mem.eql(u8, p[0..eq], name)) return p[eq + 1 ..];
+    }
+    return null;
+}
+
 /// True if the request carries `Authorization: Bearer <token>` matching `token`.
-fn authorized(req: []const u8) bool {
-    const hv = authHeader(req) orelse return false;
+fn bearerMatches(req: []const u8) bool {
+    if (token.len == 0) return false;
+    const hv = headerValue(req, "authorization") orelse return false;
     const prefix = "Bearer ";
     if (hv.len <= prefix.len) return false;
     if (!std.ascii.eqlIgnoreCase(hv[0..prefix.len], prefix)) return false;
-    return std.mem.eql(u8, hv[prefix.len..], token);
+    return ctEq(hv[prefix.len..], token);
+}
+
+const Auth = struct { name: []const u8, via: []const u8 };
+
+/// Resolve the caller's identity, or null if unauthenticated. Precedence: SSO
+/// (trusted header) → session cookie → bearer token. `name_out` backs the returned
+/// name slice (so the result stays valid after return). SSO/session identities must
+/// be in the `admins` allowlist; the bearer token is the unnamed break-glass path.
+fn identify(req: []const u8, name_out: []u8) ?Auth {
+    if (trusted_header.len > 0) {
+        if (headerValue(req, trusted_header)) |u| {
+            if (isAdmin(u)) {
+                const n = @min(u.len, name_out.len);
+                @memcpy(name_out[0..n], u[0..n]);
+                return .{ .name = name_out[0..n], .via = "sso" };
+            }
+        }
+    }
+    if (cookieValue(req, "realmd_admin")) |tok| {
+        if (verifySession(tok, name_out)) |nm| {
+            if (isAdmin(nm)) return .{ .name = nm, .via = "session" };
+        }
+    }
+    if (bearerMatches(req)) return .{ .name = "token", .via = "token" };
+    return null;
 }
 
 /// The request body is whatever follows the blank line (\r\n\r\n).
@@ -119,12 +287,34 @@ fn lower(s: []const u8, out: []u8) []const u8 {
 /// Entry point from health.zig for any /admin/* request. `req` is the full raw
 /// request buffer (request line + headers + body); `method` and `path` are parsed.
 pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const u8) void {
-    if (token.len == 0) return respond(fd, forbidden, "{\"error\":\"admin disabled\"}");
-    if (!authorized(req)) return respond(fd, unauthorized, "{\"error\":\"unauthorized\"}");
+    if (!enabled()) return respond(fd, forbidden, "{\"error\":\"admin disabled\"}");
 
     const p = pathOnly(path);
     const is_get = std.mem.eql(u8, method, "GET");
     const is_post = std.mem.eql(u8, method, "POST");
+
+    // Pre-auth endpoints: login establishes a session; logout clears it.
+    if (std.mem.eql(u8, p, "/admin/login")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return login(fd, req);
+    }
+    if (std.mem.eql(u8, p, "/admin/logout")) {
+        // Idempotent: always clear the cookie.
+        return respondCookie(fd, ok, "{\"ok\":true}", "realmd_admin=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0");
+    }
+
+    var name_buf: [33]u8 = undefined;
+    const auth = identify(req, &name_buf);
+
+    // /admin/me reports the current identity (the UI uses it to skip the login form,
+    // e.g. when SSO already authenticated upstream). 401 when not logged in.
+    if (std.mem.eql(u8, p, "/admin/me")) {
+        const a = auth orelse return respond(fd, unauthorized, "{\"error\":\"unauthorized\"}");
+        var b: [128]u8 = undefined;
+        return respond(fd, ok, std.fmt.bufPrint(&b, "{{\"name\":\"{s}\",\"via\":\"{s}\"}}", .{ a.name, a.via }) catch "{}");
+    }
+
+    if (auth == null) return respond(fd, unauthorized, "{\"error\":\"unauthorized\"}");
 
     if (std.mem.eql(u8, p, "/admin/status")) {
         if (!is_get) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
@@ -147,6 +337,32 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
         return charsCopy(fd, req);
     }
     return respond(fd, not_found, "{\"error\":\"not found\"}");
+}
+
+const server_error: Status = .{ .code = 500, .text = "500 Internal Server Error" };
+
+// POST /admin/login {"name","password"} — authenticate a realm account that is in the
+// `admins` allowlist, by its stored password hash (xsha1 of the lowercased password,
+// matching account creation). On success sets an HMAC-signed session cookie.
+fn login(fd: net.Socket, req: []const u8) void {
+    const body = bodyOf(req);
+    const name = jsonStr(body, "name") orelse return respond(fd, bad_request, "{\"error\":\"missing name\"}");
+    const password = jsonStr(body, "password") orelse return respond(fd, bad_request, "{\"error\":\"missing password\"}");
+    const invalid = "{\"error\":\"invalid credentials\"}";
+    if (!isAdmin(name)) return respond(fd, unauthorized, invalid);
+    var stored: [20]u8 = undefined;
+    const has = store.accountPwHash(name, &stored) orelse return respond(fd, unauthorized, invalid);
+    if (!has) return respond(fd, unauthorized, invalid); // password-less account can't admin-login
+    var lb: [64]u8 = undefined;
+    const got = xsha1.xsha1(lower(password, &lb));
+    if (!ctEq(&got, &stored)) return respond(fd, unauthorized, invalid);
+
+    var tokbuf: [256]u8 = undefined;
+    const sess = mintSession(name, &tokbuf) orelse return respond(fd, server_error, "{\"error\":\"sign failed\"}");
+    var cbuf: [384]u8 = undefined;
+    const cookie = std.fmt.bufPrint(&cbuf, "realmd_admin={s}; HttpOnly; Path=/; SameSite=Strict; Max-Age={d}", .{ sess, session_ttl_s }) catch return respond(fd, server_error, "{\"error\":\"cookie\"}");
+    var nb: [128]u8 = undefined;
+    respondCookie(fd, ok, std.fmt.bufPrint(&nb, "{{\"name\":\"{s}\",\"via\":\"session\"}}", .{name}) catch "{}", cookie);
 }
 
 fn status(fd: net.Socket) void {

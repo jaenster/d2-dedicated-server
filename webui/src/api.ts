@@ -1,6 +1,8 @@
 // Typed client over realmd's /admin/* JSON API (see src/realm/server/admin.zig).
-// Every call carries the bearer token (REALMD_ADMIN_TOKEN); the API is 403 when
-// admin is disabled and 401 on a wrong token.
+// Auth is cookie-based: POST /admin/login sets an HMAC-signed session cookie; every
+// request rides on it (credentials: same-origin). When realmd is behind an SSO
+// forward-auth proxy, /admin/me is already authenticated upstream and no login form
+// is shown.
 
 export interface Status {
   sessions: number;
@@ -25,6 +27,11 @@ export interface Game {
   ip: string;
 }
 
+export interface Me {
+  name: string;
+  via: "session" | "sso" | "token";
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -34,23 +41,11 @@ export class ApiError extends Error {
   }
 }
 
-const TOKEN_KEY = "realmd.admin.token";
-
-export function getToken(): string {
-  return sessionStorage.getItem(TOKEN_KEY) ?? "";
-}
-export function setToken(t: string): void {
-  if (t) sessionStorage.setItem(TOKEN_KEY, t);
-  else sessionStorage.removeItem(TOKEN_KEY);
-}
-
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
-    headers: {
-      Authorization: `Bearer ${getToken()}`,
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-    },
+    credentials: "same-origin",
+    headers: body !== undefined ? { "Content-Type": "application/json" } : {},
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -69,6 +64,11 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
 }
 
 export const api = {
+  me: () => req<Me>("GET", "/admin/me"),
+  login: (name: string, password: string) =>
+    req<Me>("POST", "/admin/login", { name, password }),
+  logout: () => req<{ ok: boolean }>("POST", "/admin/logout"),
+
   status: () => req<Status>("GET", "/admin/status"),
   gameservers: () => req<GameServer[]>("GET", "/admin/gameservers"),
   games: () => req<Game[]>("GET", "/admin/games"),

@@ -76,9 +76,24 @@ pub const Config = struct {
     pg_dsn: []const u8 = "",
 
     /// Bearer token for the HTTP admin API (served on the health port under
-    /// /admin/*). EMPTY (default) disables the admin API entirely — it returns
-    /// 403 — so it is off unless explicitly enabled via REALMD_ADMIN_TOKEN.
+    /// /admin/*). A non-empty token enables the bearer path (for scripts/CI and as
+    /// break-glass). The admin API is also enabled when `admins` is set (password
+    /// login by realm account) or `trusted_auth_header` is set (SSO). When NONE of
+    /// the three is configured the API is disabled entirely (403).
     admin_token: []const u8 = "",
+
+    /// HMAC key that signs admin session cookies (the web UI's password-login
+    /// sessions). Set REALMD_ADMIN_SECRET to a stable random string so sessions
+    /// survive restarts and are shared across instances; if empty, a per-process
+    /// random key is generated (sessions break on restart / aren't multi-instance).
+    admin_secret: []const u8 = "",
+
+    /// When set (e.g. "X-Forwarded-User"), realmd trusts this request header as an
+    /// already-authenticated username — for SSO via a forward-auth proxy (Authentik
+    /// outpost / oauth2-proxy). The username must still be in `admins`. ONLY enable
+    /// when the admin port is reachable solely through that trusted proxy, since the
+    /// header is trusted verbatim (a direct client could otherwise spoof it).
+    trusted_auth_header: []const u8 = "",
 };
 
 pub const Backend = enum { fs, redis, pg };
@@ -132,5 +147,7 @@ pub fn fromEnv() Config {
     if (env("REALMD_REDIS_ADDR")) |v| c.redis_addr = v;
     if (env("REALMD_PG_DSN")) |v| c.pg_dsn = v;
     if (env("REALMD_ADMIN_TOKEN")) |v| c.admin_token = v;
+    if (env("REALMD_ADMIN_SECRET")) |v| c.admin_secret = v;
+    if (env("REALMD_TRUSTED_AUTH_HEADER")) |v| c.trusted_auth_header = v;
     return c;
 }
