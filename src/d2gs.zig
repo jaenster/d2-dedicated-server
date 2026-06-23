@@ -21,6 +21,7 @@ const d2dbs = @import("realm/client/d2dbs.zig");
 const feature = @import("engine/feature.zig");
 const halt_hook = @import("runtime/feature/halt_hook.zig"); // for enableSuppress (sub-mode, not a toggle)
 const gsport = @import("runtime/gsport.zig");
+const gamereap = @import("runtime/gamereap.zig");
 const roominit = @import("runtime/roominit.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
@@ -319,6 +320,9 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // qqserver can own the client-facing :4000 and splice through to us. Must precede the
     // QSERVER_CreateAndInit inside bootstrapRealmServer. No-op when gs_public_port == 4000.
     gsport.apply(gs_public_port);
+    // Reap empty games after a few seconds (default 5min) so abandoned games don't leak
+    // FOG pool managers (only 8 exist) and crash the GS with 0xe0000001 after ~8 creates.
+    gamereap.applyDefault();
     // Per-game server hook surface: hook RoomInit to fan out roomInit() with a real
     // per-game GameCtx (the game's own FOG pool). Opt-in via a consumer flag so the
     // default server path stays byte-identical.

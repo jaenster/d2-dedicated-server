@@ -145,6 +145,19 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("e2e", "Build + run the clientless realmd E2E test harness");
     e2e_step.dependOn(&run_e2e.step);
 
+    // gamestress — create N games against a RUNNING realm/GS (manual: `zig build gamestress`).
+    // Used to verify the empty-game reaper fix (the GS shouldn't OOM past ~8 games).
+    const gamestress_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gamestress/main.zig"),
+        .target = realmd_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gamestress_mod.addAnonymousImport("realmclient", .{ .root_source_file = b.path("tools/e2e/realmclient.zig") });
+    const gamestress = b.addExecutable(.{ .name = "gamestress", .root_module = gamestress_mod });
+    const run_gamestress = b.addRunArtifact(gamestress);
+    b.step("gamestress", "Create N games against a running realm (reaper stress test)").dependOn(&run_gamestress.step);
+
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_realmd.addArgs(args);
