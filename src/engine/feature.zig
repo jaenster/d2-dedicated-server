@@ -75,8 +75,9 @@ const registry = [_]Feature{
     .{ .mod = @import("../runtime/feature/checkrev_patch.zig"), .name = "checkrev", .flag = "bypass-checkrev", .default = false },
     .{ .mod = @import("../runtime/feature/nocompress.zig"), .name = "nocompress", .flag = "no-compress", .default = false },
     .{ .mod = @import("../runtime/feature/clientdiag.zig"), .name = "clientdiag", .flag = "clientdiag", .default = false },
-    .{ .mod = @import("../runtime/feature/srvdiag.zig"), .name = "srvdiag", .flag = "srvdiag", .default = false },
+    .{ .mod = @import("../runtime/feature/srvdiag.zig"), .name = "srvdiag" },
     .{ .mod = @import("../runtime/feature/srvtrace.zig"), .name = "srvtrace" },
+    .{ .mod = @import("../runtime/feature/cainfix.zig"), .name = "cainfix" },
     .{ .mod = @import("../runtime/feature/expmod.zig"), .name = "expmod", .flag = "expmod", .default = false },
     .{ .mod = @import("../runtime/feature/ubers.zig"), .name = "ubers", .flag = "ubers", .default = false },
     // Client-side maphack (the d2gs.dll injects into the real client too).
