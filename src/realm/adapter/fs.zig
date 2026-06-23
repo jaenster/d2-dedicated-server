@@ -298,12 +298,13 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral, TTL, reverse indexed by id and by gs) ──────────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, password: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     const safe = sanitize(name, &nb) orelse return false;
-    var vb: [128]u8 = undefined;
+    var vb: [160]u8 = undefined;
     const hlen = ttlHeader(&vb, ttl_s);
-    const body = std.fmt.bufPrint(vb[hlen..], "{d} {d}.{d}.{d}.{d} {d} {d}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid }) catch return false;
+    // Trailing " <password>" (empty password -> trailing space -> empty 5th token).
+    const body = std.fmt.bufPrint(vb[hlen..], "{d} {d}.{d}.{d}.{d} {d} {d} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, password }) catch return false;
     fs_lock.lock();
     defer fs_lock.unlock();
     if (!writeSmall("games", safe, vb[0 .. hlen + body.len])) return false;
@@ -346,7 +347,9 @@ fn parseGame(val: []const u8) ?GameRec {
     if (i != 4) return null;
     const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
     const gsid: u32 = if (it.next()) |t| (std.fmt.parseInt(u32, t, 10) catch 0) else 0;
-    return .{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
+    var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
+    if (it.next()) |p| rec.setPw(p); // 5th token = join password (may be empty)
+    return rec;
 }
 
 /// Enumerate live games from the games dir for shared-mode /admin/games. Skips records

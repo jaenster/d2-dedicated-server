@@ -179,11 +179,11 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral) ────────────────────────────────────────────────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, password: []const u8) bool {
     return switch (ephemeral) {
-        .fs => fs.registerGame(name, gameid, gs_ip, gs_port, gsid, game_ttl_s),
-        .redis => redis.registerGame(name, gameid, gs_ip, gs_port, gsid, game_ttl_s),
-        .pg => pg.registerGame(name, gameid, gs_ip, gs_port, gsid, game_ttl_s),
+        .fs => fs.registerGame(name, gameid, gs_ip, gs_port, gsid, password, game_ttl_s),
+        .redis => redis.registerGame(name, gameid, gs_ip, gs_port, gsid, password, game_ttl_s),
+        .pg => pg.registerGame(name, gameid, gs_ip, gs_port, gsid, password, game_ttl_s),
     };
 }
 

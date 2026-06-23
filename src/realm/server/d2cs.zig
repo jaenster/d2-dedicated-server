@@ -322,7 +322,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     }
     const rr = routed.?;
-    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid);
+    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, pass);
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -343,7 +343,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
     const name = r.getStr();
-    _ = r.getStr(); // password
+    const join_pass = r.getStr();
 
     var buf: [32]u8 = undefined;
     var w = startPacket(&buf, MCP_JOINGAME);
@@ -361,6 +361,18 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     }
     const g = game.?;
+    // Reject a wrong password for a passworded game (open games have pw_len == 0).
+    // 0x2a = "incorrect password" (verify the exact client string in a live test).
+    if (g.pw_len > 0 and !std.mem.eql(u8, g.pw(), join_pass)) {
+        log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD", .{ name, c.accountName() });
+        w.putU16(0); // token
+        w.putU16(0); // unknown
+        w.putU32(0); // d2gs IP
+        w.putU32(0); // game hash
+        w.putU32(0x2a); // result: incorrect password
+        finish(c, &w);
+        return;
+    }
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
