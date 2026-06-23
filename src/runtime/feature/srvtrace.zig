@@ -50,9 +50,12 @@ fn putName(e: *evlog.Event, key: []const u8, v: usize) void {
     }
 }
 
-/// Put an acting player's char name as "player" (the unit is known to be a player).
+/// Put an acting player's char name as "player" plus "uid" — the unit GUID, a
+/// stable per-session actor trace id. With the game token (on lifecycle/tick
+/// events) this gives a (game, uid) correlation key for everything a player did.
 fn putPlayerName(e: *evlog.Event, v: usize) void {
     putName(e, "player", v);
+    if (unit(v)) |u| e.int("uid", @as(i64, u.dwUnitId));
 }
 
 /// Emit "x"/"y" for a unit's world position, if it has a path.
