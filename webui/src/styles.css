@@ -55,7 +55,7 @@ code {
 .app header {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: 0.75rem;
   padding: 0.75rem 1.25rem;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
@@ -73,11 +73,36 @@ nav {
   background: transparent;
   border: 1px solid transparent;
   color: var(--muted);
+  white-space: nowrap;
 }
 .tab.active {
   color: var(--text);
   border-color: var(--border);
   background: var(--panel2);
+}
+.who {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+.via {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.via-sso {
+  color: #7bdcb5;
+  border-color: #2e8b57;
+}
+.via-token {
+  color: #ff8a80;
+  border-color: var(--danger);
 }
 .logout {
   background: transparent;

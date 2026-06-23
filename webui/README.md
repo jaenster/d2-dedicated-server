@@ -27,15 +27,26 @@ The deploy image (`deploy/Dockerfile`, `--target realmd`) builds with `-Dwebui=t
 
 `realmd` serves the UI on the **health port** (`REALMD_HEALTH_PORT`, default 8080) —
 the same listener as `/healthz`, `/readyz`, and `/admin/*`. Any non-probe, non-`/admin`
-GET returns the SPA.
+GET returns the SPA. The page is static; every data call hits `/admin/*`, which is gated.
 
-Auth reuses **`REALMD_ADMIN_TOKEN`**: the page itself is static and unauthenticated,
-but every data call hits `/admin/*`, which is bearer-token gated. The UI prompts for the
-token and keeps it in `sessionStorage`. If `REALMD_ADMIN_TOKEN` is empty the admin API
-is disabled (403) and the UI says so.
+There are three ways in (set any/all; the API is disabled — 403 — if none is set):
 
-> The health/admin port must **not** be public. Reach it via `kubectl port-forward` or
-> an authenticated ingress — never expose it directly.
+- **Account login** (`REALMD_ADMINS`) — sign in with a realm account that's in the
+  comma-separated allowlist, by its password. On success realmd sets an HMAC-signed,
+  `HttpOnly` session cookie (`REALMD_ADMIN_SECRET` is the signing key — set a stable one
+  so sessions survive restarts / work across replicas; otherwise a per-process key is used).
+- **SSO** (`REALMD_TRUSTED_AUTH_HEADER`) — behind an Authentik/oauth2-proxy forward-auth
+  ingress, realmd trusts the injected identity header (e.g. `X-authentik-username`); the
+  user must still be in `REALMD_ADMINS`. The UI shows no login form — `/admin/me` is
+  already authenticated. See [`../deploy/AUTHENTIK-SSO.md`](../deploy/AUTHENTIK-SSO.md).
+- **Bearer token** (`REALMD_ADMIN_TOKEN`) — `Authorization: Bearer <token>`, for
+  scripts/CI and break-glass. Not used by the UI. Treat it like a root password.
+
+The header shows who you are and how (`session` / `sso` / `token`).
+
+> The health/admin port must **not** be public. Reach it via `kubectl port-forward`, or
+> an authenticated ingress (the SSO setup above) — never expose port 8080 directly, since
+> with SSO enabled the identity header is trusted verbatim.
 
 ## Develop
 
