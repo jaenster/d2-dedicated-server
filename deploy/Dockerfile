@@ -24,8 +24,12 @@ COPY build.zig build.zig.zon ./
 COPY src ./src
 
 # ── build: realmd (static musl) ──────────────────────────────────────────────────
+# Node builds the admin web UI (webui/ → one self-contained index.html), which the
+# realmd binary embeds via -Dwebui=true. The UI is served on the health/admin port.
 FROM zig AS build-realmd
-RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+RUN apk add --no-cache nodejs npm
+COPY webui ./webui
+RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dwebui=true
 
 # ── build: qqserver (static musl) ────────────────────────────────────────────────
 # The game-traffic gateway: token-translating poll() splice proxy fronting the GS

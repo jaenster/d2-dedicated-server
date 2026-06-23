@@ -99,6 +99,18 @@ pub fn build(b: *std.Build) void {
     realmd.root_module.addImport("realm_shared", realm_shared);
     realmd.root_module.addImport("realm_infra", realm_infra);
     realmd.root_module.addImport("realm_adapter", realm_adapter);
+
+    // Web UI: -Dwebui=true builds webui/ (Vite + React → one self-contained
+    // dist/index.html) and embeds it; otherwise embed a stub page so plain builds
+    // need no Node. webui.zig @embedFile's the "webui_blob" import either way.
+    const webui_enabled = b.option(bool, "webui", "Build and embed the admin web UI (requires Node)") orelse false;
+    const webui_blob: std.Build.LazyPath = if (webui_enabled) blk: {
+        const cmd = b.addSystemCommand(&.{ "sh", "-c", "set -e; npm --prefix \"$1\" ci && npm --prefix \"$1\" run build && cp \"$1/dist/index.html\" \"$2\"", "realmd-webui", b.pathFromRoot("webui") });
+        cmd.has_side_effects = true; // npm/vite do their own incremental builds
+        break :blk cmd.addOutputFileArg("index.html");
+    } else b.path("src/realm/server/webui_stub.html");
+    realmd.root_module.addAnonymousImport("webui_blob", .{ .root_source_file = webui_blob });
+
     b.installArtifact(realmd);
 
     // `zig build realmd-bin` — install ONLY the realmd binary (no windows DLLs).

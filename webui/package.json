@@ -1,0 +1,25 @@
+{
+  "name": "realmd-webui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Admin web UI for the realmd realm server. Built to a single self-contained index.html and embedded into the realmd binary (zig build -Dwebui=true).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vite-plugin-singlefile": "^2.1.0"
+  }
+}
