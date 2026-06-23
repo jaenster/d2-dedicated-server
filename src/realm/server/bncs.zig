@@ -242,7 +242,7 @@ fn onAuthInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU32(0); // logon type 0 (OLS) — password not verified
     w.putU32(c.server_token);
     w.putU32(0); // UDP value
-    w.putU64(0); // MPQ filetime
+    w.putU64(ver_mpq_filetime); // MPQ filetime — NON-ZERO so a fresh client fetches it
     w.putStr("ver-IX86-1.mpq"); // version-check MPQ name (client BNFTP-fetches it)
     w.putStr("A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B"); // checksum formula (ignored)
     finish(c, &w);
