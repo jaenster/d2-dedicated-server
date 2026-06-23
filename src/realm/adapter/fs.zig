@@ -145,6 +145,17 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
     return f.readPositionalAll(io, out, 0) catch 0;
 }
 
+/// Delete a character's .d2s. True if the file existed and is now gone (idempotent:
+/// a missing file is also reported as success so a double-delete doesn't error).
+pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var pbuf: [512]u8 = undefined;
+    const path = charPath(&pbuf, account, charname) orelse return false;
+    Dir.cwd().deleteFile(io, path) catch |e| return e == error.FileNotFound;
+    return true;
+}
+
 pub fn listChars(account: []const u8, names: []Name) usize {
     fs_lock.lock();
     defer fs_lock.unlock();
@@ -338,10 +349,32 @@ fn parseGame(val: []const u8) ?GameRec {
     return .{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
 }
 
-/// Look up the game name for an engine gameid and delete that game + its indexes.
+/// Enumerate live games from the games dir for shared-mode /admin/games. Skips records
+/// whose TTL has lapsed (a sweeper reclaims the files separately).
 pub fn snapshotGames(out: []types.NamedGame) usize {
-    _ = out;
-    return 0; // TODO: enumerate the games dir for fs shared-mode /admin/games
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var dpath: [320]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dpath, "{s}/games", .{data_dir}) catch return 0;
+    var d = Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (it.next(io) catch null) |entry| {
+        if (n >= out.len) break;
+        if (entry.kind != .file) continue;
+        var vb: [128]u8 = undefined;
+        const raw = readSmall("games", entry.name, &vb) orelse continue;
+        const val = unexpiredPayload(raw) orelse continue; // expired → skip
+        const rec = parseGame(val) orelse continue;
+        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid };
+        const ln: u8 = @intCast(@min(entry.name.len, ng.name.len));
+        @memcpy(ng.name[0..ln], entry.name[0..ln]);
+        ng.name_len = ln;
+        out[n] = ng;
+        n += 1;
+    }
+    return n;
 }
 
 pub fn removeGameById(gameid: u32) void {

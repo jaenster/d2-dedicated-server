@@ -247,6 +247,26 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
     return n;
 }
 
+pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    var kb: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return false;
+    var sb: [192]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&sb, prefix ++ "chars:{s}", .{a}) catch return false;
+
+    conn_lock.lock();
+    defer conn_lock.unlock();
+    var r: Reader = undefined;
+    // Drop the save blob and remove the name from the account's char set. Mirror of
+    // saveCharD2s (SET + SADD); idempotent — a missing key is fine.
+    _ = command(&r, &.{ "DEL", key });
+    _ = command(&r, &.{ "SREM", setkey, c });
+    return true;
+}
+
 pub fn listChars(account: []const u8, names: []Name) usize {
     var ab: [64]u8 = undefined;
     const a = sanitize(account, &ab) orelse return 0;

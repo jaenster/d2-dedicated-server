@@ -192,6 +192,16 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
     return n;
 }
 
+pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    const p = ensurePool() orelse return false;
+    _ = p.exec("delete from chars where account = $1 and name = $2", .{ a, c }) catch return false;
+    return true;
+}
+
 pub fn listChars(account: []const u8, names: []Name) usize {
     var ab: [64]u8 = undefined;
     const a = sanitize(account, &ab) orelse return 0;
@@ -306,8 +316,34 @@ pub fn findGame(name: []const u8) ?GameRec {
 }
 
 pub fn snapshotGames(out: []types.NamedGame) usize {
-    _ = out;
-    return 0; // TODO: SELECT active games for pg shared-mode /admin/games
+    const p = ensurePool() orelse return 0;
+    sweepGames(p); // drop lapsed rows first so the listing matches findGame's view
+    var result = p.query(
+        "select name, gameid, ip, port, gsid from games where expires_at is null or expires_at > now()",
+        .{},
+    ) catch return 0;
+    defer result.deinit();
+    var n: usize = 0;
+    while (result.next() catch null) |row| {
+        if (n >= out.len) continue; // drain the rest
+        const nm = row.get([]const u8, 0) catch continue;
+        const gameid = row.get(i64, 1) catch continue;
+        const ip = row.get(i64, 2) catch continue;
+        const port = row.get(i32, 3) catch continue;
+        const gsid = row.get(i64, 4) catch continue;
+        var ng = types.NamedGame{
+            .gameid = @truncate(@as(u64, @bitCast(gameid))),
+            .gs_ip = intToIp(ip),
+            .gs_port = @truncate(@as(u32, @bitCast(port))),
+            .gsid = @truncate(@as(u64, @bitCast(gsid))),
+        };
+        const ln: u8 = @intCast(@min(nm.len, ng.name.len));
+        @memcpy(ng.name[0..ln], nm[0..ln]);
+        ng.name_len = ln;
+        out[n] = ng;
+        n += 1;
+    }
+    return n;
 }
 
 pub fn removeGameById(gameid: u32) void {
