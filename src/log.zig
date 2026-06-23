@@ -81,6 +81,63 @@ pub fn hex(prefix: []const u8, value: usize) void {
     print(line[0..n]);
 }
 
+/// Append the lowercase hex of `value` into `line` at `n`, return new `n`.
+fn appendHex(line: []u8, n_in: usize, value: usize) usize {
+    var buf: [16]u8 = undefined;
+    const hexd = "0123456789abcdef";
+    var v = value;
+    var i: usize = buf.len;
+    if (v == 0) {
+        i -= 1;
+        buf[i] = '0';
+    }
+    while (v != 0) : (v >>= 4) {
+        i -= 1;
+        buf[i] = hexd[v & 0xf];
+    }
+    var n = n_in;
+    for (buf[i..]) |c| {
+        if (n >= line.len) break;
+        line[n] = c;
+        n += 1;
+    }
+    return n;
+}
+
+fn appendStr(line: []u8, n_in: usize, s: []const u8) usize {
+    var n = n_in;
+    for (s) |c| {
+        if (n >= line.len) break;
+        line[n] = c;
+        n += 1;
+    }
+    return n;
+}
+
+/// Append "<prefix> 0x<a> 0x<b>\n" — two hex values on one line.
+pub fn hex2(prefix: []const u8, a: usize, b: usize) void {
+    var line: [96]u8 = undefined;
+    var n: usize = appendStr(&line, 0, prefix);
+    n = appendStr(&line, n, " 0x");
+    n = appendHex(&line, n, a);
+    n = appendStr(&line, n, " 0x");
+    n = appendHex(&line, n, b);
+    print(line[0..n]);
+}
+
+/// Append "<prefix> 0x<a> 0x<b> 0x<c>\n" — three hex values on one line.
+pub fn hex3(prefix: []const u8, a: usize, b: usize, c: usize) void {
+    var line: [128]u8 = undefined;
+    var n: usize = appendStr(&line, 0, prefix);
+    n = appendStr(&line, n, " 0x");
+    n = appendHex(&line, n, a);
+    n = appendStr(&line, n, " 0x");
+    n = appendHex(&line, n, b);
+    n = appendStr(&line, n, " 0x");
+    n = appendHex(&line, n, c);
+    print(line[0..n]);
+}
+
 /// Log "<prefix><null-terminated C string at ptr>". Safe on null/garbage-ish ptr
 /// (bounded scan). ptr may be 0.
 pub fn cstr(prefix: []const u8, ptr: usize) void {
