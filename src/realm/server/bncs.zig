@@ -259,6 +259,7 @@ fn onAuthCheck(c: *Conn, tag: []const u8) void {
 
 // SID_LOGONRESPONSE2 results.
 const LOGON_OK: u32 = 0;
+const LOGON_NO_ACCOUNT: u32 = 1; // SID_LOGONRESPONSE2: account does not exist
 const LOGON_BAD_PASSWORD: u32 = 2;
 
 fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -280,18 +281,28 @@ fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// Apply the auto-register + verify policy. Unknown account → auto-create
-// password-less and accept; password-less account → accept; password-protected
-// account → verify the OLS double-hash, accept on match else reject.
+// Permissive auth (REALMD_PERMISSIVE_AUTH): the legacy/test policy — unknown accounts
+// auto-register password-less, and password-protected accounts get their OLS double-hash
+// verified. Set by the e2e harness, whose synthetic client shares xsha1.zig so the
+// create/verify round-trip is self-consistent. Default OFF (strict) for real deployments:
+// the real 1.14d client's SID_LOGONRESPONSE2 hash is NOT reproduced by xsha1.zig (probing a
+// live login with "secret" gave got=0x403e2744 / ct=0xe56678a5 st=0x1234abcd, and none of the
+// four inner/outer × {broken,standard}-SHA1 combos match), so verifying real logins would
+// reject every one. Until that hash is reversed in Game.exe, strict mode enforces account
+// EXISTENCE only (no silent auto-register) and admits a known account without a password check.
+pub var permissive_auth: bool = false;
+
 fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
     const acct = c.accountName();
     var stored: [20]u8 = undefined;
     const has_pw = store.accountPwHash(acct, &stored) orelse {
-        // No such account → auto-register password-less and accept.
-        _ = store.createAccount(acct, null);
-        return LOGON_OK;
+        if (permissive_auth) {
+            _ = store.createAccount(acct, null); // legacy: auto-register password-less
+            return LOGON_OK;
+        }
+        return LOGON_NO_ACCOUNT; // strict: a brand-new name is rejected, not auto-created
     };
-    if (!has_pw) return LOGON_OK; // password-less account → accept
+    if (!has_pw or !permissive_auth) return LOGON_OK;
     const expect = xsha1.doubleHash(c.client_token, server_token, stored);
     return if (std.mem.eql(u8, &expect, &got)) LOGON_OK else LOGON_BAD_PASSWORD;
 }

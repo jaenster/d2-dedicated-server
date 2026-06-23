@@ -481,6 +481,7 @@ fn maybeStartRealmd() !?c_int {
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
     _ = setenv("REALMD_HEALTH_PORT", health, 1);
     _ = setenv("REALMD_ADMIN_TOKEN", ADMIN_TOKEN, 1); // enable the admin API (admin_api scenario)
+    _ = setenv("REALMD_PERMISSIVE_AUTH", "1", 1); // legacy auth (auto-register + verify) for the synthetic xsha1 client
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
 
     const pid = fork();
