@@ -240,6 +240,11 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     NET_HACK_SetUseQServerHack(0);
     QSERVER_SetGlobalInstance(@ptrFromInt(at(globals.gQServerGameState)), 1); // cookie≠0 → no halt
     gptr(globals.gbQServerRunning, u32).* = 1;
+    // Game-data tables (levels/monstats/skills/NPC item tables/…) must be loaded
+    // BEFORE QSERVER_InitializeServerState — it builds the NPC hireling tables from
+    // this txt data, and game creation's AllocNpcControl/AllocMonsterRegion read it.
+    // Depends on the memory managers brought up by QSERVER_CreateAndInit above.
+    TXT_InitTxtFiles(0, 0, 1);
     QSERVER_InitializeServerState();
 }
 
