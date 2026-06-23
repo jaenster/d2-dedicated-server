@@ -248,12 +248,16 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     NET_HACK_SetUseQServerHack(0);
     QSERVER_SetGlobalInstance(@ptrFromInt(at(globals.gQServerGameState)), 1); // cookie≠0 → no halt
     gptr(globals.gbQServerRunning, u32).* = 1;
-    // Game-data tables (levels/monstats/skills/NPC item tables/…) must be loaded
-    // BEFORE QSERVER_InitializeServerState — it builds the NPC hireling tables from
-    // this txt data, and game creation's AllocNpcControl/AllocMonsterRegion read it.
-    // Depends on the memory managers brought up by QSERVER_CreateAndInit above.
-    TXT_InitTxtFiles(0, 0, 1);
     QSERVER_InitializeServerState();
+    // Game-data tables load AFTER server-state init. Loading them BEFORE (to populate
+    // the NPC store/hireling tables, fixing empty vendors) makes InitializeServerState
+    // build those tables in IsBattleNetServer=1 mode, and that build path CRASHES:
+    // assert @0x6123a3 (line 2279) then a call through a bad pointer — verified on the
+    // cluster with BOTH the minimal and the full 256MB d2data.mpq, so it's the order,
+    // not missing data. The before-init order is right in principle but needs the
+    // 0x6123a3 assert RE'd first; until then keep the proven post-init order so the
+    // realm bootstrap reaches the tick loop. (Trade-off: NPC vendors start empty.)
+    TXT_InitTxtFiles(0, 0, 1);
 }
 
 /// One tick of the server: drain inbound packets, advance all games, then flush
