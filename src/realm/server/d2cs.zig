@@ -267,9 +267,12 @@ fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, realm_cou
     w.putU8(class + 1); // class (CharSel subtracts CLASS_SORCERESS=1)
     putEquipSlot(w, app2); // equip slot 2: component color transforms (.d2s pAppearance2)
     w.putU8(if (level == 0) 1 else level); // level (avoid 0)
-    // flags &4 = expansion — derived from the .d2s status byte (0x20) rather than
-    // hardcoded, so a classic char would render as classic.
-    const flags: u32 = if (status & 0x20 != 0) 0x04 else 0;
+    // The char-select reads the SAME bit layout from these flags as from the .d2s
+    // status byte: CharSel.cpp tests hardcore via & 4, died & 8, expansion & 0x20,
+    // ladder & 0x40. So pass those bits straight through from the status byte. (The old
+    // code mapped the expansion bit 0x20 ONTO bit 0x04 — which the client reads as
+    // HARDCORE — so every expansion char wrongly showed up as hardcore.)
+    const flags: u32 = status & 0x6C; // hardcore | died | expansion | ladder
     enc14(w, flags);
     enc14(w, 0); // field9
     w.putU8(0xFF); // act      (0xFF -> 0)
