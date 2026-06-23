@@ -134,6 +134,55 @@ fn putClient(e: *evlog.Event, pclient: usize) void {
     e.int("slot", readU32(pclient, CL_SLOT));
 }
 
+// ── active-game tracking + per-game tick heartbeat ───────────────────────────
+// We can't cheaply walk the engine's intrusive game list, so we track live games
+// off the join/destroy hooks and read their fields directly each heartbeat.
+// D2GameStrc offsets: nToken@0, szGameName@42, nClientsCount@140, dwSpawnedPlayers@144,
+// dwSpawnedMonsters@148, dwGameFrame@168.
+
+/// Set once by DllMain (computeGsId) so the tick line carries the game-server id.
+pub var gsid: u32 = 0;
+
+/// serverTick() runs at ~100 Hz (d2gs.zig main loop); emit a tick every N so it's
+/// ~1/sec per game rather than a per-frame flood.
+const TICK_EVERY: u64 = 100;
+
+var games: [32]usize = [_]usize{0} ** 32;
+var tick_n: u64 = 0;
+
+fn trackGame(pg: usize) void {
+    if (pg == 0) return;
+    var free: ?usize = null;
+    for (games, 0..) |g, i| {
+        if (g == pg) return; // already tracked
+        if (g == 0 and free == null) free = i;
+    }
+    if (free) |i| games[i] = pg;
+}
+
+fn untrackGame(pg: usize) void {
+    for (&games) |*g| {
+        if (g.* == pg) g.* = 0;
+    }
+}
+
+pub fn serverTick() void {
+    tick_n += 1;
+    if (tick_n % TICK_EVERY != 0) return;
+    for (games) |pg| {
+        if (pg == 0) continue;
+        var e = evlog.Event.begin("tick");
+        e.int("gsid", gsid);
+        e.int("token", readU32(pg, 0));
+        e.str("game", ascii(pg + 42, 16));
+        e.int("frame", @as(i32, @bitCast(readU32(pg, 168))));
+        e.int("clients", @as(i32, @bitCast(readU32(pg, 140))));
+        e.int("players", @as(i32, @bitCast(readU32(pg, 144))));
+        e.int("monsters", @as(i32, @bitCast(readU32(pg, 148))));
+        e.end();
+    }
+}
+
 // ── per-event handlers ───────────────────────────────────────────────────────
 // Signature is always fn(a1, a2, a3) callconv(.c); each interprets the captured
 // args (see the hooks table for what a1/a2/a3 hold for that hook).
@@ -145,6 +194,7 @@ fn onGameCreate(token_map: usize, _: usize, _: usize) callconv(.c) void {
 }
 
 fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
+    untrackGame(pgame);
     var e = evlog.Event.begin("game_destroy");
     e.int("token", trunc32(token));
     putGame(&e, pgame);
@@ -152,6 +202,7 @@ fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
 }
 
 fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
+    trackGame(pgame);
     var e = evlog.Event.begin("player_join");
     putGame(&e, pgame);
     putClient(&e, pclient);
