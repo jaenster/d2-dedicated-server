@@ -8,10 +8,13 @@ const std = @import("std");
 const oog = @import("oog.zig");
 const log = @import("../log.zig");
 
+extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
+
 var account: [64]u16 = undefined;
 var password: [64]u16 = undefined;
 var game_name = [_]u16{ 'r', 'e', 'a', 'l', 'm', 't', 'e', 's', 't', 0 };
 var want_join: bool = false;
+var t_install: u32 = 0; // GetTickCount at install -> measure dll-attach -> in-game
 
 fn toUtf16(out: *[64]u16, s: []const u8) void {
     var i: usize = 0;
@@ -63,11 +66,12 @@ fn loginTask() void {
             oog.findControl(oog.TYPE_BUTTON, -1, 432, 433, -1, -1)) |b| oog.clickControl(b);
         log.print("autologin: clicked CREATE game");
     }
-    log.print("autologin: script done");
+    log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
 }
 
 /// Auto-login + CREATE a game with the default name.
 pub fn install(acct: []const u8, pass: []const u8) void {
+    t_install = GetTickCount();
     toUtf16(&account, acct);
     toUtf16(&password, pass);
     want_join = false;
@@ -77,6 +81,7 @@ pub fn install(acct: []const u8, pass: []const u8) void {
 
 /// Auto-login + JOIN an existing game by name.
 pub fn installJoin(acct: []const u8, pass: []const u8, game: []const u8) void {
+    t_install = GetTickCount();
     toUtf16(&account, acct);
     toUtf16(&password, pass);
     var i: usize = 0;
