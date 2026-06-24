@@ -1,96 +1,146 @@
 // Kubernetes deployment topology for the cloud-native d2gs realm.
 //
-// Maps the logical model (diablo2.c4) onto k8s objects: a stateless realmd
-// front behind a LoadBalancer, Redis (ephemeral) + Postgres (durable), the
-// qqserver game-traffic gateway behind its own LoadBalancer, and a GS
-// StatefulSet of INTERNAL (ClusterIP) pods. The player logs in via the realmd
-// LB, then talks game traffic to the qqserver LB, which splices each connection
-// (routed by source IP) through to the owning GS pod.
+// Verified live: a Hetzner k3s/Cilium cluster (namespace realmd), GitOps-synced by
+// ArgoCD from a PRIVATE d2gs-deploy repo with images on ghcr. Two Hetzner FLOATING
+// IPs (Cilium-routed, fail over between nodes) are set as Service externalIPs — the
+// realm's stable public front door. The firewall opens ONLY the client-facing ports:
+// 6112-6113 (bnet login + d2cs realm) and 4000 (qqserver game traffic).
+//
+// The player logs in via the floating IP on realmd (6112/6113), then talks all game
+// traffic to the same floating IP on :4000 (qqserver), which reads the realm-global
+// token, looks up {token -> GS pod ip:port,gameid} in redis, rewrites it and splices
+// to the owning INTERNAL GS pod. The GS, d2dbs (6114) and gs-link (6115) are never
+// public — gs-link/d2dbs ride a separate realmd-gslink ClusterIP Service.
 //
 // View it with:  npx likec4 start docs/architecture
 
 deployment {
 
-  // External player — its own deployment node (the internet side of the LB).
+  // External player on the internet.
   service lb_player 'Player' {
     description 'Unmodified D2 client on the internet'
   }
 
-  cluster prod 'Kubernetes cluster' {
+  // GitOps + CI live outside the cluster (own deployment nodes).
+  service argocd 'ArgoCD' {
+    description 'GitOps: syncs the PRIVATE d2gs-deploy repo onto the cluster'
+  }
+  service ghcr 'ghcr (CI images)' {
+    description 'CI builds + pushes the realmd / d2gs / qqserver / d2-gamedata images'
+  }
 
-    // realmd front: stateless, /readyz-gated, fronted by a LoadBalancer Service.
-    service realmd_lb 'realmd Service (LoadBalancer)' {
-      description 'Exposes :6112-6115; routes to ready realmd pods only'
+  cluster prod 'Hetzner k3s cluster (Cilium, ns realmd)' {
+
+    // The stable public front door: two Hetzner floating IPs set as Service
+    // externalIPs (Cilium routes them, they fail over between nodes). Shared by the
+    // realmd and qqserver public Services; only 6112-6113 + 4000 are firewalled open.
+    service fip 'Floating IPs (5.75.211.1 / 78.47.225.57)' {
+      description 'Cilium-routed externalIPs; the realm front door. Firewall opens only 6112-6113 + 4000.'
+    }
+
+    // realmd public Service (LoadBalancer, externalIPs=FIP). Only the CLIENT-facing
+    // ports are public: bnet login (6112) + d2cs realm (6113).
+    service realmd_lb 'realmd Service (public)' {
+      description 'externalIPs=FIP; exposes ONLY 6112 (bnet) + 6113 (d2cs); routes to ready realmd pods'
+    }
+    // Internal gs-link/d2dbs Service — publishNotReadyAddresses so the GS can register
+    // while realmd is still NotReady (else REQUIRE_GS deadlocks). Never public.
+    service realmd_gslink_svc 'realmd-gslink Service (ClusterIP)' {
+      description 'Internal only: d2dbs (6114) + gs-link (6115). publishNotReadyAddresses=true so the GS registers while realmd is NotReady.'
     }
     workload realmd_deploy 'realmd Deployment' {
-      description '2 replicas, stateless front, /readyz gated, SIGTERM drain'
+      description 'replicas 1, Recreate strategy (the GS holds gs-link to one pod). Public bnet 6112 + d2cs 6113; internal d2dbs 6114 + gs-link 6115; health/webui 8080. SIGTERM drain.'
       instanceOf d2gs.realmd.bncs
+      instanceOf d2gs.realmd.bnftp
       instanceOf d2gs.realmd.rd2cs
+      instanceOf d2gs.realmd.rd2dbs
       instanceOf d2gs.realmd.gslink
       instanceOf d2gs.realmd.health
     }
+    // initContainer: serves the version-check MPQ over BNFTP. Copies ver-IX86-1.mpq
+    // from the d2-gamedata image into the bnftp emptyDir realmd serves from.
+    workload realmd_vermpq 'load-vermpq init (d2-gamedata)' {
+      description 'initContainer from ghcr d2-gamedata: copies ver-IX86-1.mpq into <data_dir>/bnftp for BNFTP version-check'
+    }
 
-    // qqserver game-traffic gateway: its own LoadBalancer + Deployment. The single
-    // public :4000; splices each connection (routed by source IP) to a GS pod.
-    service qqserver_lb 'qqserver Service (LoadBalancer)' {
-      description 'The one public :4000 for game traffic'
+    // qqserver public Service (LoadBalancer, externalIPs=FIP) — the one public :4000
+    // for game traffic. Its image is private (cluster-standard ghcr pull secret).
+    service qqserver_lb 'qqserver Service (public)' {
+      description 'externalIPs=FIP; the single public :4000 for game traffic'
     }
     workload qqserver_deploy 'qqserver Deployment' {
-      description '1..N STATELESS gateway pods; read the u16 token, look up token -> GS in redis, rewrite to the GS gameid, splice. Any pod behind any LB IP resolves any token (no affinity).'
+      description 'STATELESS gateway: reads the realm-global token from the client GAMELOGON (0x68), looks up token -> GS pod ip:port,gameid in redis, rewrites + splices. Any pod behind any FIP resolves any token (no affinity). Private image via the ghcr pull secret.'
       instanceOf d2gs.qqserver
     }
 
     // Backing stores.
-    service redis_svc 'Redis Service' {
-      description 'Ephemeral sessions + games + route map (native TTL)'
+    service redis_svc 'Redis (Deployment)' {
+      description 'Ephemeral sessions + games + the qqserver token routes (TTL)'
       instanceOf d2gs.realmd.store_redis
     }
-    service pg_svc 'Postgres Service' {
-      description 'Durable character saves'
+    service pg_svc 'Postgres (StatefulSet)' {
+      description 'Durable character saves (PGDATA in a subdir)'
       instanceOf d2gs.realmd.store_pg
     }
 
-    // GS fleet as a StatefulSet — INTERNAL pods (ClusterIP); reached only by the
-    // qqserver. No public/hostPort exposure needed anymore.
-    workload gs_set 'GS StatefulSet' {
-      description 'Stable per-pod identity; internal ClusterIP :4000 (reached via the qqserver)'
+    // GS fleet as a stateless Deployment — INTERNAL pods, no hostPort / public
+    // exposure. Each registers its POD IP (status.podIP:4000) over the gs-link; the
+    // qqserver dials that pod IP to splice. Game data from the d2-gamedata init image
+    // into an emptyDir (no persistent volume); health probe on :8086.
+    workload gs_set 'd2gs Deployment (fleet, stateless)' {
+      description 'soft anti-affinity. INTERNAL only (no hostPort); registers status.podIP:4000 over gs-link; game data via a d2-gamedata initContainer into an emptyDir; health :8086.'
 
-      pod gs_pod_a 'gs-0 pod' {
-        description 'Internal :4000; registers out to realmd over gslink (ADDRINFO = its cluster IP)'
+      pod gs_pod_a 'd2gs pod' {
+        description 'Internal :4000; registers status.podIP:4000 over gs-link (ADDRINFO = pod IP); health :8086'
         instanceOf d2gs.gameserver
       }
-      pod gs_pod_b 'gs-1 pod' {
-        description 'Internal :4000; registers out to realmd over gslink (ADDRINFO = its cluster IP)'
+      pod gs_pod_b 'd2gs pod' {
+        description 'Internal :4000; registers status.podIP:4000 over gs-link (ADDRINFO = pod IP); health :8086'
         instanceOf d2gs.gameserver
       }
     }
   }
 
-  // Player login goes through the LoadBalancer to realmd.
-  lb_player -> realmd_lb 'login/realm (:6112-6115)'
+  // GitOps + CI. ArgoCD reconciles the workloads from the private repo; CI publishes
+  // the images the workloads (and the init image) pull.
+  argocd -> realmd_deploy 'sync (GitOps)'
+  argocd -> qqserver_deploy 'sync (GitOps)'
+  argocd -> gs_set 'sync (GitOps)'
+  ghcr -> realmd_deploy 'realmd image'
+  ghcr -> qqserver_deploy 'qqserver image (private; ghcr pull secret)'
+  ghcr -> gs_set 'd2gs image'
+  ghcr -> realmd_vermpq 'd2-gamedata image (ver-IX86-1.mpq)'
+
+  // Player login goes through the floating IP to the realmd public Service.
+  lb_player -> fip 'login/realm (:6112 bnet, :6113 d2cs) + game (:4000)'
+  fip -> realmd_lb '6112-6113'
   realmd_lb -> realmd_deploy 'to ready pods'
+  realmd_vermpq -> realmd_deploy 'populates bnftp emptyDir (ver-IX86-1.mpq)'
 
   // realmd -> backing stores. Mints unique tokens via a shared redis counter and
-  // writes the token -> GS map there; the qqservers read it. PG = durable chars.
-  realmd_deploy -> redis_svc 'ephemeral (sessions+games); shared token counter + token->GS map'
+  // writes {token -> GS pod ip:port,gameid} there; the qqservers read it. PG = chars.
+  realmd_deploy -> redis_svc 'ephemeral (sessions+games); token counter + token->GS route'
   realmd_deploy -> pg_svc 'durable (chars)'
 
-  // GS pods register OUT to realmd's gslink (:6115); realmd routes create/join.
-  gs_pod_a -> realmd_deploy 'gslink register (:6115) + ADDRINFO (cluster IP)'
-  gs_pod_b -> realmd_deploy 'gslink register (:6115) + ADDRINFO (cluster IP)'
+  // GS pods register OUT to realmd's gs-link via the internal realmd-gslink Service
+  // (:6115, publishNotReadyAddresses); realmd routes create/join, d2dbs serves chars.
+  gs_pod_a -> realmd_gslink_svc 'gs-link register (:6115) + ADDRINFO (pod IP); d2dbs char fetch/save (:6114)'
+  gs_pod_b -> realmd_gslink_svc 'gs-link register (:6115) + ADDRINFO (pod IP); d2dbs char fetch/save (:6114)'
+  realmd_gslink_svc -> realmd_deploy 'incl. NotReady pods'
 
-  // The player talks game traffic to the qqserver LB; the gateway looks up the
-  // route by source IP and splices to the owning internal GS pod.
-  lb_player -> qqserver_lb 'game traffic (:4000) — any LB IP, token is universal'
+  // The player talks game traffic to the floating IP on :4000; the gateway looks up
+  // the token route in redis and splices to the owning internal GS pod.
+  fip -> qqserver_lb ':4000'
   qqserver_lb -> qqserver_deploy 'to any gateway pod (stateless)'
-  qqserver_deploy -> redis_svc 'lookup token -> (GS, real gameid)'
-  qqserver_deploy -> gs_pod_a 'rewrite token; splice (internal :4000)'
-  qqserver_deploy -> gs_pod_b 'rewrite token; splice (internal :4000)'
+  qqserver_deploy -> redis_svc 'lookup token -> GS pod ip:port, real gameid'
+  qqserver_deploy -> gs_pod_a 'rewrite token; splice to the pod IP (internal :4000)'
+  qqserver_deploy -> gs_pod_b 'rewrite token; splice to the pod IP (internal :4000)'
 }
 
 views {
 
-  // The full k8s topology: LB front, stores, GS StatefulSet, direct game path.
+  // The full k8s topology: FIP front door, public/internal split, init images,
+  // GitOps/CI, stores, the internal GS Deployment, and the token-routed game path.
   deployment view k8s_deploy {
     title 'Kubernetes deployment topology'
     include *
