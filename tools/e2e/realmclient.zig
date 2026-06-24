@@ -28,6 +28,7 @@ const SID_AUTH_CHECK = 0x51;
 
 // MCP opcodes
 const MCP_STARTUP = 0x01;
+const MCP_CHARCREATE = 0x02;
 const MCP_CREATEGAME = 0x03;
 const MCP_JOINGAME = 0x04;
 const MCP_CHARDELETE = 0x0a;
@@ -408,6 +409,19 @@ pub const RealmClient = struct {
         const r = try mcpRecv(fd, &self.rxbuf);
         if (r.id != MCP_CHARDELETE) return error.CharDeleteBadId;
         return net.rdU32(r.body, 2);
+    }
+
+    /// MCP_CHARCREATE (0x02) -> result (0 ok, 0x14 name taken, 0x15 invalid). Body: u32 class + cstr name.
+    pub fn charCreate(self: *RealmClient, class: u8, charname: []const u8) !u32 {
+        const fd = self.d2cs.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(class);
+        w.cstr(charname);
+        try mcpSend(fd, MCP_CHARCREATE, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_CHARCREATE) return error.CharCreateBadId;
+        return net.rdU32(r.body, 0);
     }
 
     /// MCP_CREATEGAME -> (token, result).

@@ -15,7 +15,10 @@ const log = @import("realm_infra").log;
 const proto = @import("proto.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
+const d2s = @import("d2s.zig");
 const gslink = @import("gslink.zig");
+
+extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d2s create time
 
 // MCP message ids (subset; everything else is logged).
 const MCP_STARTUP = 0x01;
@@ -295,13 +298,38 @@ fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+// MCP_CHARCREATE (0x02) body: u32 class + cstr name (NET_MCP_CLIENT_Send_0x02_CharCreate
+// writes only the class dword; status isn't on the wire). We generate a fresh level-1 .d2s
+// (the engine fills starting stats/items on first play) and persist it via the store, so the
+// new char shows in CHARLIST2 and is playable. Result: 0 ok, 0x14 name taken, 0x15 invalid.
 fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
-    const class = r.getU32();
+    const class: u8 = @intCast(r.getU32() & 0xff);
     const name = r.getStr();
-    log.line(tag, "char create '{s}' class={d} (account={s}) -> ok (store TODO)", .{ name, class, c.accountName() });
+    const acct = c.accountName();
+
     var buf: [12]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARCREATE);
+
+    if (name.len == 0 or name.len > d2s.name_max or class > 6) {
+        log.line(tag, "char create '{s}' class={d} -> invalid", .{ name, class });
+        w.putU32(0x15);
+        return finish(c, &w);
+    }
+    var probe: [d2s.new_save_size]u8 = undefined;
+    if (store.getCharD2s(acct, name, &probe) > 0) {
+        log.line(tag, "char create '{s}' (account={s}) -> name taken", .{ name, acct });
+        w.putU32(0x14);
+        return finish(c, &w);
+    }
+    var save: [d2s.new_save_size]u8 = undefined;
+    const now: u32 = @truncate(@as(u64, @bitCast(@as(i64, time(null)))));
+    if (!d2s.newSave(&save, name, class, 0x20, now) or !store.saveCharD2s(acct, name, &save)) {
+        log.line(tag, "char create '{s}' (account={s}) -> store FAILED", .{ name, acct });
+        w.putU32(0x06);
+        return finish(c, &w);
+    }
+    log.line(tag, "char create '{s}' class={d} (account={s}) -> created", .{ name, class, acct });
     w.putU32(0); // success
     finish(c, &w);
 }
