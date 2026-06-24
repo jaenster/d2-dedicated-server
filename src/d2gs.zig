@@ -351,7 +351,13 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     headless.server_ready = true; // past init: a later host exit is a real shutdown, not premature
 
     // Connect to PvPGN's D2CS so it can dispatch game create/join to us.
-    if (d2cs_enabled) d2cs.start(@ptrCast(&d2cs_host), d2cs_port, gs_public_ip, gs_public_port, gs_max_games, gsid);
+    if (d2cs_enabled) {
+        // Tell realmd to drop a game from the join list when the engine destroys it
+        // (otherwise dead games linger until their redis TTL → "game name and password
+        // don't match" on join). srvtrace owns the game-destroy hook; d2cs sends CLOSEGAME.
+        @import("runtime/feature/srvtrace.zig").on_game_destroy = &d2cs.onGameDestroyed;
+        d2cs.start(@ptrCast(&d2cs_host), d2cs_port, gs_public_ip, gs_public_port, gs_max_games, gsid);
+    }
 
     // One-shot D2DBS character fetch demo (--d2dbs <ip:port> --fetch-char acct:char).
     if (d2dbs_enabled and fetch_enabled) {
