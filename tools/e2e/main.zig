@@ -162,6 +162,43 @@ fn scCharCopy() Result {
     return .{ .name = name, .status = .pass, .msg = msg("'{s}' cloned to '{s}'; dup rejected; both list (total={d})", .{ src, dst, cl.total }) };
 }
 
+fn scCharCreate() Result {
+    const name = "create_char";
+    const acct = "CreateAcct";
+    const char = "Newbie";
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    // MCP_CHARCREATE a Sorceress (class 1) — realmd must build + persist a level-1 .d2s.
+    const res = c.charCreate(1, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res != 0) return fail(name, "create result={d} want 0", .{res});
+
+    // It must now appear in CHARLIST2 as a level-1 Sorceress.
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const cl = c.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var found: ?rc.CharEntry = null;
+    for (entries[0..cl.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) found = e;
+    }
+    const fe = found orelse return fail(name, "created char '{s}' not listed (total={d})", .{ char, cl.total });
+    if (fe.class_id != 1) return fail(name, "class_id={d} want 1 (Sorceress)", .{fe.class_id});
+    if (fe.level != 1) return fail(name, "level={d} want 1", .{fe.level});
+
+    // A duplicate name must be rejected (non-zero result).
+    const dup = c.charCreate(1, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (dup == 0) return fail(name, "duplicate create succeeded, want rejection", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("created '{s}' (Sorceress lvl 1), listed, dup rejected (result=0x{x})", .{ char, dup }) };
+}
+
 fn scCharDelete() Result {
     const name = "delete_char";
     const acct = "DelAcct";
@@ -850,6 +887,7 @@ pub fn main() !void {
         scMultiGameOneGs(),
         scQqserverTokenTranslate(),
         scCreateAccountRealAuth(),
+        scCharCreate(),
         scCharDelete(),
         scCharCopy(),
         scLobbyChatAtoB(),
