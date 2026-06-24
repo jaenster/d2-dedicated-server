@@ -162,6 +162,33 @@ fn scCharCopy() Result {
     return .{ .name = name, .status = .pass, .msg = msg("'{s}' cloned to '{s}'; dup rejected; both list (total={d})", .{ src, dst, cl.total }) };
 }
 
+fn scClassicChar() Result {
+    const name = "classic_char";
+    const acct = "ClassicAcct";
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    // A classic Barbarian (class 4, no expansion bit) must be allowed.
+    const barb = c.charCreate(4, 0, "ClassicBarb") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (barb != 0) return fail(name, "classic Barbarian rejected (result=0x{x})", .{barb});
+
+    // A classic Druid (class 5) must be REJECTED — Druid/Assassin are expansion-only.
+    const cdruid = c.charCreate(5, 0, "ClassicDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cdruid == 0) return fail(name, "classic Druid was allowed, want rejection", .{});
+
+    // The same Druid WITH the expansion bit must be allowed.
+    const xdruid = c.charCreate(5, 0x20, "ExpacDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (xdruid != 0) return fail(name, "expansion Druid rejected (result=0x{x})", .{xdruid});
+
+    return .{ .name = name, .status = .pass, .msg = msg("classic Barbarian ok, classic Druid rejected (0x{x}), expansion Druid ok", .{cdruid}) };
+}
+
 fn scLadder() Result {
     const name = "ladder_list";
     const acct = "LadderAcct";
@@ -215,7 +242,7 @@ fn scCharCreate() Result {
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
     // MCP_CHARCREATE a Sorceress (class 1) — realmd must build + persist a level-1 .d2s.
-    const res = c.charCreate(1, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const res = c.charCreate(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (res != 0) return fail(name, "create result={d} want 0", .{res});
 
     // It must now appear in CHARLIST2 as a level-1 Sorceress.
@@ -231,7 +258,7 @@ fn scCharCreate() Result {
     if (fe.level != 1) return fail(name, "level={d} want 1", .{fe.level});
 
     // A duplicate name must be rejected (non-zero result).
-    const dup = c.charCreate(1, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const dup = c.charCreate(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (dup == 0) return fail(name, "duplicate create succeeded, want rejection", .{});
 
     return .{ .name = name, .status = .pass, .msg = msg("created '{s}' (Sorceress lvl 1), listed, dup rejected (result=0x{x})", .{ char, dup }) };
@@ -926,6 +953,7 @@ pub fn main() !void {
         scQqserverTokenTranslate(),
         scCreateAccountRealAuth(),
         scCharCreate(),
+        scClassicChar(),
         scLadder(),
         scCharDelete(),
         scCharCopy(),

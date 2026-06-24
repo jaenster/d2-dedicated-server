@@ -303,16 +303,23 @@ fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
 // (the engine fills starting stats/items on first play) and persist it via the store, so the
 // new char shows in CHARLIST2 and is playable. Result: 0 ok, 0x14 name taken, 0x15 invalid.
 fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
+    // MCP_CHARCREATE (0x02) body = [u32 class][u16 status][cstr name] (verified from a live
+    // capture: 01000000 6000 "DiagSorc\0"). status low byte carries the .d2s flags the client's
+    // checkboxes set: expansion 0x20, hardcore 0x04, ladder 0x40.
     var r = proto.Reader.init(body);
     const class: u8 = @intCast(r.getU32() & 0xff);
+    const status_flags: u8 = @intCast(r.getU16() & 0x6C); // hardcore|died|expansion|ladder
     const name = r.getStr();
     const acct = c.accountName();
 
     var buf: [12]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARCREATE);
 
-    if (name.len == 0 or name.len > d2s.name_max or class > 6) {
-        log.line(tag, "char create '{s}' class={d} -> invalid", .{ name, class });
+    const expansion = (status_flags & 0x20) != 0;
+    // Druid (5) and Assassin (6) only exist in the expansion — they cannot be classic chars.
+    const expansion_only_class = (class == 5 or class == 6);
+    if (name.len == 0 or name.len > d2s.name_max or class > 6 or (expansion_only_class and !expansion)) {
+        log.line(tag, "char create '{s}' class={d} exp={} -> invalid", .{ name, class, expansion });
         w.putU32(0x15);
         return finish(c, &w);
     }
@@ -324,7 +331,8 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     var save: [d2s.new_save_size]u8 = undefined;
     const now: u32 = @truncate(@as(u64, @bitCast(@as(i64, time(null)))));
-    if (!d2s.newSave(&save, name, class, 0x20, now) or !store.saveCharD2s(acct, name, &save)) {
+    // Honor the client's flags as-is (classic = no 0x20, expansion = 0x20, +hardcore/ladder).
+    if (!d2s.newSave(&save, name, class, status_flags, now) or !store.saveCharD2s(acct, name, &save)) {
         log.line(tag, "char create '{s}' (account={s}) -> store FAILED", .{ name, acct });
         w.putU32(0x06);
         return finish(c, &w);

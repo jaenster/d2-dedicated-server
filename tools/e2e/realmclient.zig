@@ -451,12 +451,14 @@ pub const RealmClient = struct {
         return n;
     }
 
-    /// MCP_CHARCREATE (0x02) -> result (0 ok, 0x14 name taken, 0x15 invalid). Body: u32 class + cstr name.
-    pub fn charCreate(self: *RealmClient, class: u8, charname: []const u8) !u32 {
+    /// MCP_CHARCREATE (0x02) -> result (0 ok, 0x14 name taken, 0x15 invalid).
+    /// Body: [u32 class][u16 status (expansion 0x20 / hardcore 0x04 / ladder 0x40)][cstr name].
+    pub fn charCreate(self: *RealmClient, class: u8, status: u16, charname: []const u8) !u32 {
         const fd = self.d2cs.?;
         var body: [64]u8 = undefined;
         var w = net.Writer.init(&body);
         w.u32v(class);
+        w.u16v(status);
         w.cstr(charname);
         try mcpSend(fd, MCP_CHARCREATE, w.slice());
         const r = try mcpRecv(fd, &self.rxbuf);
