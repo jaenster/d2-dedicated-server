@@ -71,7 +71,26 @@ pub var gsid: u32 = 0;
 var sock: SOCKET = INVALID_SOCKET;
 var seqno: u32 = 0;
 
+// A tiny atomic spinlock (std.Thread.Mutex isn't built for the GS DLL target). The
+// guarded sections are tiny and contention is near-zero (game create/destroy are rare).
+const SpinLock = struct {
+    held: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    fn lock(self: *SpinLock) void {
+        while (self.held.swap(true, .acquire)) {}
+    }
+    fn unlock(self: *SpinLock) void {
+        self.held.store(false, .release);
+    }
+};
+
+// Replies are sent from the gslink control thread, but CLOSEGAME is sent from the
+// engine tick thread (srvtrace's game-destroy hook). Serialize so two senders can't
+// interleave bytes on the shared socket.
+var send_lock: SpinLock = .{};
+
 fn sendPacket(bytes: []const u8) bool {
+    send_lock.lock();
+    defer send_lock.unlock();
     var off: usize = 0;
     while (off < bytes.len) {
         const n = send(sock, bytes.ptr + off, @intCast(bytes.len - off), 0);
@@ -149,6 +168,62 @@ fn sendJoinGameReply(result: u32, gameid: u32) void {
     _ = sendPacket(std.mem.asBytes(&r));
 }
 
+// ── game name -> gameid tracking (for CLOSEGAME on destroy) ───────────────────
+// We know the gameid createGame returned — the same id realmd indexed the game by.
+// Remember name->gameid on create so that when the engine destroys the game later
+// (srvtrace's game-destroy hook hands us the NAME), we can tell realmd which gameid
+// to drop. Without this, dead games linger in realmd's join list until their redis
+// TTL (~hours) and clients joining one get "game name and password don't match".
+const GameSlot = struct { name: [16]u8 = undefined, len: u8 = 0, gameid: u32 = 0, used: bool = false };
+var games_lock: SpinLock = .{};
+var games_tracked = [_]GameSlot{.{}} ** 256;
+
+fn recordGame(name: []const u8, gameid: u32) void {
+    games_lock.lock();
+    defer games_lock.unlock();
+    var free: ?usize = null;
+    for (&games_tracked, 0..) |*g, i| {
+        if (g.used and g.gameid == gameid) {
+            free = i; // reuse: a recycled gameid replaces its stale entry
+            break;
+        }
+        if (!g.used and free == null) free = i;
+    }
+    const idx = free orelse return; // table full — let the realmd-side TTL reap it
+    const n = @min(name.len, 16);
+    @memcpy(games_tracked[idx].name[0..n], name[0..n]);
+    games_tracked[idx].len = @intCast(n);
+    games_tracked[idx].gameid = gameid;
+    games_tracked[idx].used = true;
+}
+
+/// Look up + forget the gameid for `name`. Null if it was never tracked.
+fn takeGameId(name: []const u8) ?u32 {
+    games_lock.lock();
+    defer games_lock.unlock();
+    for (&games_tracked) |*g| {
+        if (g.used and std.mem.eql(u8, g.name[0..g.len], name)) {
+            g.used = false;
+            return g.gameid;
+        }
+    }
+    return null;
+}
+
+fn sendCloseGame(gameid: u32) void {
+    var r = std.mem.zeroes(p.CloseGame);
+    r.h = p.header(.closegame, @sizeOf(p.CloseGame), nextSeq());
+    r.gameid = gameid;
+    _ = sendPacket(std.mem.asBytes(&r));
+    log.hex("d2cs: sent CLOSEGAME gameid=0x", gameid);
+}
+
+/// srvtrace game-destroy observer: tell realmd to drop the game from the join list.
+/// Registered as `srvtrace.on_game_destroy` by the GS realm bootstrap.
+pub fn onGameDestroyed(name: []const u8) void {
+    if (takeGameId(name)) |gid| sendCloseGame(gid);
+}
+
 /// CREATEGAMEREQ: ladder/expansion/difficulty/hardcore byte flags, then
 /// gamename/gamepass/gamedesc/acct/char/ip cstrs (null-terminated in `body`).
 fn handleCreateGame(body: []const u8) void {
@@ -171,6 +246,7 @@ fn handleCreateGame(body: []const u8) void {
     // The engine writes the server token (= gameid).
     const game_id = command.createGame(name, pass, desc, flags, ladder);
     if (game_id != 0) {
+        recordGame(name, game_id); // remember name->gameid so destroy can CLOSEGAME it
         sendCreateGameReply(0, game_id);
         log.hex("d2cs: CREATEGAME spawned, gameid=0x", game_id);
     } else {
