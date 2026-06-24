@@ -432,6 +432,12 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
                     var acct: [64]u8 = undefined;
                     var pass: [64]u8 = undefined;
                     if (splitNames(tmp[0..len], &acct, &pass)) {
+                        // --bot <name>: after entering the game, run a named in-game bot
+                        // (looked up in bot.registry, e.g. "trade"). Absent = no bot.
+                        var bot_buf: [32]u8 = undefined;
+                        if (flagToken("bot", &bot_buf)) |bl| {
+                            autologin.enableBot(bot_buf[0..bl]);
+                        }
                         autologin.install(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0));
                     }
                 } else if (flagToken("auto-join", &tmp)) |len| {

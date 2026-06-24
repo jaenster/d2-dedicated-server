@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const oog = @import("oog.zig");
+const bot = @import("../bot/bot.zig");
 const log = @import("../log.zig");
 
 extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
@@ -17,7 +18,20 @@ var newchar_name: [64]u16 = undefined;
 var newchar_class: u8 = 1; // default Sorceress
 var newchar_status: u8 = 0x20; // expansion / 0x04 hardcore / 0x40 ladder
 var want_join: bool = false;
+var bot_enabled: bool = false; // after entering the game, run a named bot
+var bot_name_buf: [32]u8 = undefined;
+var bot_name_len: usize = 0;
 var t_install: u32 = 0; // GetTickCount at install -> measure dll-attach -> in-game
+
+/// Enable a named in-game bot as a continuation of the login flow: once the
+/// client is in a game, the bot (looked up in bot.registry) runs inside the same
+/// login fiber. Call before install()/installJoin(). See bot.zig.
+pub fn enableBot(name: []const u8) void {
+    bot_enabled = true;
+    var i: usize = 0;
+    while (i < name.len and i < bot_name_buf.len) : (i += 1) bot_name_buf[i] = name[i];
+    bot_name_len = i;
+}
 
 fn toUtf16(out: *[64]u16, s: []const u8) void {
     var i: usize = 0;
@@ -49,6 +63,8 @@ fn loginTask() void {
 
     enterGame();
     log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
+
+    if (bot_enabled) _ = bot.runInline(bot_name_buf[0..bot_name_len]);
 }
 
 /// From the lobby: open the create- or join-game tab, type the game name, click the action

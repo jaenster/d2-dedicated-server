@@ -674,6 +674,22 @@ pub fn callNpcMenuByMenuId(npc_class_id: u32, menu_id: u16) bool {
     return false;
 }
 
+/// Number of menu options an NPC class has (0 if it has no menu entry — i.e. not
+/// an interactable town NPC). Lets a bot test "is this monster an NPC?".
+pub fn npcMenuOptionCount(npc_class_id: u32) u32 {
+    const entry = findNpcMenuEntry(npc_class_id) orelse return 0;
+    const count: u32 = @as(*align(1) const u32, @ptrCast(entry + 4)).*;
+    return @min(count, 5);
+}
+
+/// The menu string id of an NPC's option at `index` (0 if out of range). Use to
+/// discover the right menu id to pass to callNpcMenuByMenuId for a given NPC.
+pub fn npcMenuOptionId(npc_class_id: u32, index: u32) u16 {
+    const entry = findNpcMenuEntry(npc_class_id) orelse return 0;
+    if (index >= 5) return 0;
+    return @bitCast(@as(*align(1) const i16, @ptrCast(entry + NPC_MENU_STRING_IDS_OFFSET + index * 2)).*);
+}
+
 // ============================================================================
 // ClickMap / Movement
 // ============================================================================
