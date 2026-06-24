@@ -345,7 +345,7 @@ pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, la
 /// Best-effort: tell the GS that owns `gsid` a client is joining `gameid`, so it can
 /// fetch that account's character save. The client routes to the GS via the stored
 /// game record regardless; this just primes the GS. Returns true on ack.
-pub fn notifyJoin(gsid: u32, gameid: u32, token: u32, charname: []const u8, account: []const u8) bool {
+pub fn notifyJoin(gsid: u32, gameid: u32, token: u32, charname: []const u8, account: []const u8, guild_tag: []const u8) bool {
     const g = registry.byId(gsid) orelse return false;
     g.req_lock.lock();
     defer g.req_lock.unlock();
@@ -356,6 +356,7 @@ pub fn notifyJoin(gsid: u32, gameid: u32, token: u32, charname: []const u8, acco
     std.mem.writeInt(u32, buf[12..16], token, .little);
     var pos = putCStr(&buf, 16, charname);
     pos = putCStr(&buf, pos, account);
+    pos = putCStr(&buf, pos, guild_tag); // cut Guild Halls: the player's guild tag (empty = none)
     writeHeader(buf[0..8], @intCast(pos), TYPE_JOINGAME, nextSeq(g));
     if (!sendPacket(g, buf[0..pos])) return false;
 

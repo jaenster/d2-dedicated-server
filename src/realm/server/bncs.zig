@@ -22,6 +22,8 @@ const bnftp = @import("bnftp.zig");
 const chat = @import("chat.zig");
 const friends = @import("friends.zig");
 const store = @import("store.zig");
+const guilds = @import("guilds.zig");
+const guild = @import("realm_shared").guild;
 const xsha1 = @import("xsha1.zig");
 
 // Set by main() before serving.
@@ -79,6 +81,8 @@ const SID_CHECKAD = 0x15;
 const SID_STARTADVEX3 = 0x1c;
 const SID_NOTIFYJOIN = 0x22;
 const SID_NEWS_INFO = 0x46;
+const SID_READUSERDATA = 0x26;
+const SID_WRITEUSERDATA = 0x27;
 const SID_GETFILETIME = 0x33;
 const SID_PING = 0x25;
 const SID_LOGONRESPONSE2 = 0x3a;
@@ -89,6 +93,27 @@ const SID_NETGAMEPORT = 0x45;
 const SID_AUTH_INFO = 0x50;
 const SID_AUTH_CHECK = 0x51;
 const SID_FRIENDSLIST = 0x65;
+// Remaining client SIDs (D2 1.14d's NET_SID_CLIENT_* surface). Reply-bearing ones
+// get handlers; the rest are fire-and-forget notifications or legacy/alt-auth
+// paths D2 1.14d never takes (it uses AUTH_INFO/CHECK + LOGONRESPONSE2).
+const SID_CLIENTID = 0x05; // S->C reply to CLIENTID2
+const SID_STARTVERSIONING = 0x06; // legacy versioning
+const SID_REPORTVERSION = 0x07; // legacy versioning
+const SID_GETADVLISTEX = 0x09; // public game-list search
+const SID_LOCALEINFO = 0x12; // client locale info (notify)
+const SID_CLICKAD = 0x16; // ad clicked (notify)
+const SID_CLIENTID2 = 0x1e; // client registration
+const SID_LEAVEGAME = 0x1f; // left a game (notify)
+const SID_DISPLAYAD = 0x21; // ad displayed (notify)
+const SID_LOGONRESPONSE = 0x29; // legacy logon
+const SID_CHANGEPASSWORD = 0x31; // change account password
+const SID_QUERYADURL = 0x41; // ask for an ad URL
+const SID_CDKEY3 = 0x42; // legacy cd-key auth
+const SID_AUTHACCOUNTLOGON = 0x53; // NLS/SRP logon (D2 uses OLS)
+const SID_SETEMAIL = 0x59; // set account email (notify)
+const SID_RESETPASSWORD = 0x5a; // request password reset (notify)
+const SID_CHANGEEMAIL = 0x5b; // change account email (notify)
+const SID_REPORTCRASH = 0x5d; // crash dump upload (notify)
 
 // Token generator. These tokens aren't security-relevant (we don't verify
 // them), they just need to be distinct per connection. A counter stepped by an
@@ -108,6 +133,10 @@ const Conn = struct {
     channel: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
     channel_len: u8 = 0,
     user_flags: u32 = 0, // this account's chat flags (admin/operator) in the current channel
+    // The client's SID_ENTERCHAT statstring (D2: encodes the char it's on). Captured
+    // on enter, replayed to other members in EID_SHOWUSER/EID_JOIN so chat shows chars.
+    stat: [chat.max_stat]u8 = [_]u8{0} ** chat.max_stat,
+    stat_len: u8 = 0,
 
     fn setChannel(c: *Conn, name: []const u8) void {
         const n: u8 = @intCast(@min(name.len, chat.max_channel));
@@ -126,6 +155,14 @@ const Conn = struct {
     }
     fn accountName(c: *Conn) []const u8 {
         return c.account[0..c.account_len];
+    }
+    fn setStat(c: *Conn, s: []const u8) void {
+        const n: u8 = @intCast(@min(s.len, chat.max_stat));
+        @memcpy(c.stat[0..n], s[0..n]);
+        c.stat_len = n;
+    }
+    fn statSlice(c: *Conn) []const u8 {
+        return c.stat[0..c.stat_len];
     }
 };
 
@@ -213,6 +250,8 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         SID_QUERYREALMS2 => onQueryRealms(c, tag),
         SID_LOGONREALMEX => onLogonRealm(c, tag, body),
         SID_GETFILETIME => onGetFileTime(c, tag, body),
+        SID_READUSERDATA => onReadUserData(c, tag, body),
+        SID_WRITEUSERDATA => onWriteUserData(c, tag, body),
         SID_FRIENDSLIST => onFriendsList(c, tag),
         SID_PING => onPing(c, body),
         SID_NETGAMEPORT => {},
@@ -222,6 +261,20 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         SID_LEAVECHAT, SID_NOTIFYJOIN, SID_CHECKAD => {},
         SID_STARTADVEX3 => onStartAdvex(c, tag, body),
         SID_NEWS_INFO => onNewsInfo(c, tag, body),
+        SID_GETADVLISTEX => onGetAdvListEx(c, tag),
+        SID_CLIENTID2 => onClientId2(c, tag),
+        SID_QUERYADURL => onQueryAdURL(c, tag),
+        SID_CHANGEPASSWORD => onChangePassword(c, tag, body),
+        SID_SETEMAIL => onSetEmail(c, tag, body),
+        SID_CHANGEEMAIL => onChangeEmail(c, tag, body),
+        // NLS/SRP logon — reachable only when the client's g_nBNetClientToken == 1
+        // (non-default; D2 closed-realm uses OLS via LOGONRESPONSE2). realmd is
+        // OLS-only, so fail it cleanly rather than hang an NLS-mode client.
+        SID_AUTHACCOUNTLOGON => onAuthAccountLogon(c, tag),
+        // Fire-and-forget notifications (no reply expected), plus legacy SIDs
+        // RE-verified DEAD in 1.14d — 0x06/0x07/0x29/0x42 have no reachable caller
+        // (connect-flow RE). Accept silently so they aren't logged as "unhandled".
+        SID_LOCALEINFO, SID_CLICKAD, SID_LEAVEGAME, SID_DISPLAYAD, SID_REPORTCRASH, SID_RESETPASSWORD, SID_STARTVERSIONING, SID_REPORTVERSION, SID_LOGONRESPONSE, SID_CDKEY3 => {},
         else => {
             log.line(tag, "unhandled SID 0x{x:0>2} ({d} bytes)", .{ id, body.len });
             if (body.len > 0) log.hexdump(tag, body);
@@ -325,13 +378,18 @@ fn onCreateAccount(c: *Conn, tag: []const u8, body: []const u8) void {
 }
 
 fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
-    _ = body;
+    // SID_ENTERCHAT C->S: (STRING) requested-username (empty; we use the account),
+    // (STRING) statstring (D2: the char the client is on). Capture the statstring so
+    // we can replay it to other members when this user joins a channel.
+    var r = proto.Reader.init(body);
+    _ = r.getStr();
+    c.setStat(r.getStr());
     const acct = c.accountName();
-    log.line(tag, "enter chat as {s}", .{acct});
-    var buf: [128]u8 = undefined;
+    log.line(tag, "enter chat as {s} (stat {d}B)", .{ acct, c.stat_len });
+    var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_ENTERCHAT);
     w.putStr(acct); // unique name
-    w.putStr(""); // statstring
+    w.putStr(c.statSlice()); // statstring (echo the client's own)
     w.putStr(acct); // account name
     finish(c, &w);
     // NOTE: do not push a SID_CHATEVENT here. The D2 realm lobby is not a chat
@@ -395,7 +453,7 @@ const ShowUserCtx = struct { c: *Conn };
 // On join, the joiner gets an EID_SHOWUSER for each existing member (with that
 // member's own flags, so ops/admins show with the right icon).
 fn showUserCb(ctx: *const ShowUserCtx, m: *chat.Member) void {
-    sendEvent(ctx.c, EID_SHOWUSER, m.flags, m.nameSlice(), "");
+    sendEvent(ctx.c, EID_SHOWUSER, m.flags, m.nameSlice(), m.statSlice());
 }
 
 fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -414,14 +472,138 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     log.line(tag, "join channel '{s}' as {s} (flags=0x{x})", .{ channel, acct, flags });
 
     c.setChannel(channel);
-    _ = chat.join(c.fd, acct, channel, flags);
+    _ = chat.join(c.fd, acct, channel, flags, c.statSlice());
 
     // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
     // then list existing members, then announce the join to everyone else.
     sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), channel, "");
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
-    broadcastEvent(c, EID_JOIN, flags, acct, "");
+    broadcastEvent(c, EID_JOIN, flags, acct, c.statSlice());
+}
+
+fn guildErr(e: guilds.Error) []const u8 {
+    return switch (e) {
+        error.NotFound => "No such guild.",
+        error.Exists => "That name is already taken.",
+        error.Denied => "You don't have permission to do that.",
+        error.Full => "The guild roster is full.",
+        error.BadName => "Invalid name.",
+        error.BadTag => "Invalid tag (1-3 letters).",
+        error.AtMaxLevel => "The Guild Hall is already at the maximum level.",
+        error.Insufficient => "The treasury can't fund the next upgrade yet.",
+        error.NotMember => "You are not a member of that guild.",
+        error.IoError => "Storage error — try again.",
+    };
+}
+
+// "/guild ..." — the cut Guild Halls feature, driven from chat. Replies to the
+// sender via EID_INFO / EID_ERROR. Returns true if it consumed the command.
+fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
+    if (!std.mem.eql(u8, text, "/guild") and !std.mem.startsWith(u8, text, "/guild ")) return false;
+    const acct = c.accountName();
+    const rest = std.mem.trim(u8, text[@min(text.len, 6)..], " ");
+    const sp = std.mem.indexOfScalar(u8, rest, ' ');
+    const sub = if (sp) |i| rest[0..i] else rest;
+    const args = if (sp) |i| std.mem.trim(u8, rest[i + 1 ..], " ") else "";
+    var rb: [256]u8 = undefined;
+
+    if (sub.len == 0 or std.mem.eql(u8, sub, "help")) {
+        sendEvent(c, EID_INFO, 0, "", "Guild: /guild create <TAG> <name> | info | deposit <gold> | upgrade | invite <name> | kick <name> | promote <name> | disband");
+        return true;
+    }
+
+    if (std.mem.eql(u8, sub, "create")) {
+        const asp = std.mem.indexOfScalar(u8, args, ' ') orelse {
+            sendEvent(c, EID_ERROR, 0, "", "Usage: /guild create <TAG> <name>");
+            return true;
+        };
+        const tagv = std.mem.trim(u8, args[0..asp], "[]");
+        const namev = std.mem.trim(u8, args[asp + 1 ..], " ");
+        guilds.create(acct, tagv, namev) catch |e| {
+            sendEvent(c, EID_ERROR, 0, "", guildErr(e));
+            return true;
+        };
+        const msg = std.fmt.bufPrint(&rb, "Guild '{s}' [{s}] founded — you are the Guildmaster.", .{ namev, tagv }) catch "Guild founded.";
+        sendEvent(c, EID_INFO, 0, "", msg);
+        log.line(tag, "{s} founded guild '{s}' [{s}]", .{ acct, namev, tagv });
+        return true;
+    }
+
+    // The remaining ops act on the actor's own guild.
+    var gnb: [guild.name_max]u8 = undefined;
+    const gname = guilds.guildNameOf(acct, &gnb) orelse {
+        sendEvent(c, EID_ERROR, 0, "", "You are not in a guild. Found one with: /guild create <TAG> <name>");
+        return true;
+    };
+
+    if (std.mem.eql(u8, sub, "info")) {
+        var g = guilds.load(gname) orelse return true;
+        const msg = if (g.nextUpgradeCost()) |cost|
+            std.fmt.bufPrint(&rb, "{s} [{s}] | Hall lvl {d} | Treasury {d} (next {d}) | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, cost, g.member_count }) catch "guild"
+        else
+            std.fmt.bufPrint(&rb, "{s} [{s}] | Hall lvl {d} (MAX) | Treasury {d} | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, g.member_count }) catch "guild";
+        sendEvent(c, EID_INFO, 0, "", msg);
+        return true;
+    }
+    if (std.mem.eql(u8, sub, "deposit")) {
+        const gold = std.fmt.parseInt(u64, args, 10) catch {
+            sendEvent(c, EID_ERROR, 0, "", "Usage: /guild deposit <gold>");
+            return true;
+        };
+        const total = guilds.deposit(acct, gname, gold) catch |e| {
+            sendEvent(c, EID_ERROR, 0, "", guildErr(e));
+            return true;
+        };
+        const msg = std.fmt.bufPrint(&rb, "Deposited {d} into the Steeg Stone. Treasury: {d}.", .{ gold, total }) catch "Deposited.";
+        sendEvent(c, EID_INFO, 0, "", msg);
+        return true;
+    }
+    if (std.mem.eql(u8, sub, "upgrade")) {
+        const lvl = guilds.upgrade(acct, gname) catch |e| {
+            sendEvent(c, EID_ERROR, 0, "", guildErr(e));
+            return true;
+        };
+        const msg = std.fmt.bufPrint(&rb, "Guild Hall upgraded to level {d}!", .{lvl}) catch "Upgraded.";
+        sendEvent(c, EID_INFO, 0, "", msg);
+        return true;
+    }
+    if (std.mem.eql(u8, sub, "invite")) {
+        guilds.invite(acct, gname, args) catch |e| {
+            sendEvent(c, EID_ERROR, 0, "", guildErr(e));
+            return true;
+        };
+        const msg = std.fmt.bufPrint(&rb, "{s} added to the guild.", .{args}) catch "Invited.";
+        sendEvent(c, EID_INFO, 0, "", msg);
+        return true;
+    }
+    if (std.mem.eql(u8, sub, "kick")) {
+        guilds.kick(acct, gname, args) catch |e| {
+            sendEvent(c, EID_ERROR, 0, "", guildErr(e));
+            return true;
+        };
+        sendEvent(c, EID_INFO, 0, "", "Member removed from the guild.");
+        return true;
+    }
+    if (std.mem.eql(u8, sub, "promote")) {
+        guilds.promote(acct, gname, args, .lieutenant) catch |e| {
+            sendEvent(c, EID_ERROR, 0, "", guildErr(e));
+            return true;
+        };
+        sendEvent(c, EID_INFO, 0, "", "Member promoted to Lieutenant.");
+        return true;
+    }
+    if (std.mem.eql(u8, sub, "disband")) {
+        guilds.disband(acct, gname) catch |e| {
+            sendEvent(c, EID_ERROR, 0, "", guildErr(e));
+            return true;
+        };
+        sendEvent(c, EID_INFO, 0, "", "The guild has been disbanded.");
+        return true;
+    }
+
+    sendEvent(c, EID_ERROR, 0, "", "Unknown /guild subcommand. Try /guild help.");
+    return true;
 }
 
 fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -440,6 +622,7 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         if (found) sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg) else sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
         return;
     }
+    if (handleGuildCmd(c, tag, text)) return;
     if (parseFriendCmd(text)) |fc| {
         handleFriendCmd(c, tag, fc);
         return;
@@ -573,6 +756,191 @@ fn onGetFileTime(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU64(0); // filetime 0 = not available
     w.putStr(fname);
     finish(c, &w);
+}
+
+// SID_READUSERDATA (0x26): C->S { u32 numAccounts, u32 numKeys, u32 reqId,
+// STRING[numAccounts] accounts, STRING[numKeys] keys }. Reply mirrors the
+// header then STRING[numAccounts*numKeys] values (account-major). Profile reads
+// are public (you can view anyone's profile), so we serve whatever is named; an
+// unset key is returned as an empty string (what the client expects).
+fn onReadUserData(c: *Conn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const num_accounts = r.getU32();
+    const num_keys = r.getU32();
+    const reqid = r.getU32();
+
+    var accts: [4][]const u8 = undefined;
+    const na = @min(num_accounts, accts.len);
+    var i: u32 = 0;
+    while (i < num_accounts) : (i += 1) {
+        const s = r.getStr();
+        if (i < na) accts[i] = s;
+    }
+    var keys: [16][]const u8 = undefined;
+    const nk = @min(num_keys, keys.len);
+    i = 0;
+    while (i < num_keys) : (i += 1) {
+        const s = r.getStr();
+        if (i < nk) keys[i] = s;
+    }
+
+    var buf: [2048]u8 = undefined;
+    var w = startPacket(&buf, SID_READUSERDATA);
+    w.putU32(num_accounts);
+    w.putU32(num_keys);
+    w.putU32(reqid);
+    var ai: usize = 0;
+    while (ai < na) : (ai += 1) {
+        var ki: usize = 0;
+        while (ki < nk) : (ki += 1) {
+            var vbuf: [256]u8 = undefined;
+            const n = store.getUserData(accts[ai], keys[ki], &vbuf);
+            w.putStr(vbuf[0..n]);
+        }
+    }
+    finish(c, &w);
+    log.line(tag, "readuserdata accts={d} keys={d}", .{ num_accounts, num_keys });
+}
+
+// SID_WRITEUSERDATA (0x27): C->S { u32 numAccounts, u32 numKeys,
+// STRING[numAccounts] accounts, STRING[numKeys] keys,
+// STRING[numAccounts*numKeys] values }. No reply. A client may only write its
+// OWN account's profile (others are silently ignored).
+fn onWriteUserData(c: *Conn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const num_accounts = r.getU32();
+    const num_keys = r.getU32();
+
+    var accts: [4][]const u8 = undefined;
+    const na = @min(num_accounts, accts.len);
+    var i: u32 = 0;
+    while (i < num_accounts) : (i += 1) {
+        const s = r.getStr();
+        if (i < na) accts[i] = s;
+    }
+    var keys: [16][]const u8 = undefined;
+    const nk = @min(num_keys, keys.len);
+    i = 0;
+    while (i < num_keys) : (i += 1) {
+        const s = r.getStr();
+        if (i < nk) keys[i] = s;
+    }
+
+    var stored: usize = 0;
+    var ai: usize = 0;
+    while (ai < num_accounts) : (ai += 1) {
+        var ki: usize = 0;
+        while (ki < num_keys) : (ki += 1) {
+            const val = r.getStr();
+            if (ai < na and ki < nk and std.ascii.eqlIgnoreCase(accts[ai], c.accountName())) {
+                if (store.setUserData(accts[ai], keys[ki], val)) stored += 1;
+            }
+        }
+    }
+    log.line(tag, "writeuserdata keys={d} stored={d}", .{ num_keys, stored });
+}
+
+// SID_GETADVLISTEX (0x09): public game-list search { STRING name, pass, stat }.
+// D2 closed games live on the realm (MCP/d2cs), not BNCS, so this list is always
+// empty: reply u32 0 (zero games), the minimal valid reply the client accepts.
+fn onGetAdvListEx(c: *Conn, tag: []const u8) void {
+    var buf: [16]u8 = undefined;
+    var w = startPacket(&buf, SID_GETADVLISTEX);
+    w.putU32(0);
+    finish(c, &w);
+    log.line(tag, "getadvlistex -> 0 games", .{});
+}
+
+// SID_CLIENTID2 (0x1E): client registration. Reply SID_CLIENTID (0x05) with the
+// four registration dwords (version/authority/id/token); zeros are valid.
+fn onClientId2(c: *Conn, tag: []const u8) void {
+    var buf: [24]u8 = undefined;
+    var w = startPacket(&buf, SID_CLIENTID);
+    w.putU32(0);
+    w.putU32(0);
+    w.putU32(0);
+    w.putU32(0);
+    finish(c, &w);
+    log.line(tag, "clientid2 -> clientid", .{});
+}
+
+// SID_QUERYADURL (0x41): the client asks for an ad URL { u32 adType }. We serve no
+// ads: reply ad-id 0 + an empty URL string.
+fn onQueryAdURL(c: *Conn, tag: []const u8) void {
+    var buf: [16]u8 = undefined;
+    var w = startPacket(&buf, SID_QUERYADURL);
+    w.putU32(0);
+    w.putStr("");
+    finish(c, &w);
+    log.line(tag, "queryadurl -> none", .{});
+}
+
+// SID_CHANGEPASSWORD (0x31): { u32 clientToken, u32 serverToken, u8[20] oldProof
+// (OLS double-hash of the OLD password, exactly as LOGONRESPONSE2), u8[20] newHash
+// (single xSHA-1 of the NEW password), STRING username }. Verify the old proof
+// against the stored hash, then store the new hash. Reply u32 status (0=success).
+fn onChangePassword(c: *Conn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const client_token = r.getU32();
+    const server_token = r.getU32();
+    const old_proof = r.take20().*;
+    const new_hash = r.take20().*;
+    const user = r.getStr();
+
+    var ok = false;
+    var stored: [20]u8 = undefined;
+    if (store.accountPwHash(user, &stored)) |has_pw| {
+        var verified = !has_pw; // password-less account: nothing to prove
+        if (!verified) {
+            const expect = xsha1.doubleHash(client_token, server_token, stored);
+            verified = std.mem.eql(u8, &expect, &old_proof);
+        }
+        if (verified) ok = store.setAccountPassword(user, new_hash);
+    } // null = no such account -> ok stays false
+
+    var buf: [16]u8 = undefined;
+    var w = startPacket(&buf, SID_CHANGEPASSWORD);
+    w.putU32(if (ok) 0 else 1); // 0 = success
+    finish(c, &w);
+    log.line(tag, "changepassword '{s}' -> {s}", .{ user, if (ok) "ok" else "denied" });
+}
+
+// SID_SETEMAIL (0x59): { STRING email }. The client registers an email for its
+// account (often answering a server prompt). Persist it in the account's userdata
+// hive. No reply expected.
+fn onSetEmail(c: *Conn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const email = r.getStr();
+    if (c.account_len > 0 and email.len > 0) _ = store.setUserData(c.accountName(), "email", email);
+    log.line(tag, "setemail '{s}' ({d}B)", .{ c.accountName(), email.len });
+}
+
+// SID_CHANGEEMAIL (0x5B): { STRING account, STRING oldEmail, STRING newEmail }.
+// Update the stored email — only for the client's own account. No reply.
+fn onChangeEmail(c: *Conn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const acct = r.getStr();
+    _ = r.getStr(); // old email (we hold no email auth, so nothing to verify against)
+    const new_email = r.getStr();
+    if (std.ascii.eqlIgnoreCase(acct, c.accountName()) and new_email.len > 0)
+        _ = store.setUserData(acct, "email", new_email);
+    log.line(tag, "changeemail '{s}'", .{acct});
+}
+
+// SID_AUTHACCOUNTLOGON (0x53): the NLS/SRP secure-logon path. The 1.14d client
+// only sends this when its g_nBNetClientToken == 1 (a client-side config, not the
+// default) — RE-confirmed reachable via BNCLIENT_SendLogonRequest. Standard D2
+// closed-realm uses OLS (LOGONRESPONSE2 0x3a), which we implement; realmd does NOT
+// implement NLS/SRP. So instead of leaving an NLS-mode client hanging on its logon
+// reply, fail it cleanly: SID_AUTHACCOUNTLOGON reply = u32 status, 1 = "account
+// does not exist" (on failure no salt/serverKey follows). The user gets a defined
+// error, not a hang. (Full NLS/SRP would be a separate feature.)
+fn onAuthAccountLogon(c: *Conn, tag: []const u8) void {
+    var buf: [16]u8 = undefined;
+    var w = startPacket(&buf, SID_AUTHACCOUNTLOGON);
+    w.putU32(1); // 1 = account does not exist — clean NLS failure (realmd is OLS-only)
+    finish(c, &w);
+    log.line(tag, "authaccountlogon (NLS) -> rejected; realmd is OLS-only", .{});
 }
 
 // Product code for an online friend (D2XP), little-endian 4 chars as the client expects.

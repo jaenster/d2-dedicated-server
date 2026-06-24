@@ -268,14 +268,17 @@ fn handleJoinGame(body: []const u8) void {
     var off: usize = 8;
     const charname = p.readCStr(body, &off);
     const account = p.readCStr(body, &off);
+    // Optional 3rd cstr: the joining player's guild tag (cut Guild Halls feature),
+    // resolved by realmd. Absent from older realmd builds → empty.
+    const guild_tag = if (off < body.len) p.readCStr(body, &off) else "";
     // The game's own token was registered by GAME_CreateBattleNetGame; this join
     // token authorizes a client to enter `gameid`, validated when the client
     // connects to :4000 (engine calls fpFindPlayerToken). We don't touch the
     // engine token table here — just remember who is joining so we can resolve
-    // the account when the engine asks us for the character save.
+    // the account (and guild) when the engine asks us for the character save.
     if (charname.len > 0 and account.len > 0) {
-        joinctx.remember(token, charname, account);
-        log.print("d2cs: JOINGAME cached char/account for fetch");
+        joinctx.remember(token, charname, account, guild_tag);
+        if (guild_tag.len > 0) log.print("d2cs: JOINGAME cached char/account/guild for fetch") else log.print("d2cs: JOINGAME cached char/account for fetch");
     }
     sendJoinGameReply(if (command.allow_create) 0 else 1, gameid);
     log.hex("d2cs: JOINGAME ack for gameid=0x", gameid);
