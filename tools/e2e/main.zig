@@ -162,6 +162,44 @@ fn scCharCopy() Result {
     return .{ .name = name, .status = .pass, .msg = msg("'{s}' cloned to '{s}'; dup rejected; both list (total={d})", .{ src, dst, cl.total }) };
 }
 
+fn scLadder() Result {
+    const name = "ladder_list";
+    const acct = "LadderAcct";
+    var d2s: [0x40]u8 = undefined;
+    const king = rc.d2dbsSave(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (king != 0) return fail(name, "save LadderKing result={d}", .{king});
+    const pawn = rc.d2dbsSave(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (pawn != 0) return fail(name, "save LadderPawn result={d}", .{pawn});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var entries: [256]rc.LadderEntry = undefined;
+    var dst: [8192]u8 = undefined;
+    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var king_rank: ?usize = null;
+    var pawn_rank: ?usize = null;
+    var king_level: u32 = 0;
+    for (entries[0..cnt], 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, "LadderKing")) {
+            king_rank = i;
+            king_level = e.level;
+        }
+        if (std.mem.eql(u8, e.name, "LadderPawn")) pawn_rank = i;
+    }
+    const kr = king_rank orelse return fail(name, "LadderKing not on ladder (cnt={d})", .{cnt});
+    const pr = pawn_rank orelse return fail(name, "LadderPawn not on ladder (cnt={d})", .{cnt});
+    if (king_level != 99) return fail(name, "LadderKing level={d} want 99", .{king_level});
+    if (kr >= pr) return fail(name, "not ranked by level: King@{d} not before Pawn@{d}", .{ kr, pr });
+    return .{ .name = name, .status = .pass, .msg = msg("ladder lists {d}; LadderKing(99)@{d} ranked above LadderPawn(1)@{d}", .{ cnt, kr, pr }) };
+}
+
 fn scCharCreate() Result {
     const name = "create_char";
     const acct = "CreateAcct";
@@ -888,6 +926,7 @@ pub fn main() !void {
         scQqserverTokenTranslate(),
         scCreateAccountRealAuth(),
         scCharCreate(),
+        scLadder(),
         scCharDelete(),
         scCharCopy(),
         scLobbyChatAtoB(),

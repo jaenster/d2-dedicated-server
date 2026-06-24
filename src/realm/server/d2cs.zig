@@ -544,15 +544,81 @@ fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// MCP_LADDERDATA (0x11). Request: u8 mode, u16 reqid. We have no ladder; reply the
-// "empty ladder" form (all-zero size fields) so Incoming0x11 fires its clear-and-done
-// path instead of waiting for chunks.
+// MCP_LADDERDATA (0x11). Request: u8 mode, u16 reqid. Reply with the realm's characters
+// ranked by level. Wire format reversed from NET_MCP_CLIENT_Incoming0x11 @0x44afc0 +
+// CHATDLG_HandleChatListClick @0x4403f0: after the id, [u8 flag][u16 total][u16 chunk]
+// [u16 offset][data]; `data` (sent as one chunk) = [u32 rankBase=0][u32 count][u32 entrySize]
+// then count entries of [u32 expLo][u32 expHi][u32 charStats][entrySize-byte name]. charStats
+// = class(&0xf) | died<<4 | expansion<<5 | hardcore<<6 | progression<<8 | level<<16. Empty
+// realm -> the all-zero "empty ladder" form. count/entrySize are capped (<=256 / <=16) by the
+// client parser. Experience lives in the .d2s stat section (not the header) so we rank by level.
+const ladder_max = 200;
+const ladder_entry_size: u32 = 16; // name field width
+
+const LadderEntry = struct { name: [16]u8 = .{0} ** 16, stats: u32 = 0 };
+
+fn ladderLevelDesc(_: void, a: LadderEntry, b: LadderEntry) bool {
+    return (a.stats >> 16) > (b.stats >> 16);
+}
+
+fn collectLadder(out: *[ladder_max]LadderEntry) usize {
+    var n: usize = 0;
+    var accts: [256][32]u8 = undefined;
+    const na = store.listAccounts(&accts);
+    for (accts[0..na]) |acct_buf| {
+        const acct = std.mem.sliceTo(&acct_buf, 0);
+        if (acct.len == 0) continue;
+        var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
+        const nc = store.listChars(acct, &names);
+        for (names[0..nc]) |nm| {
+            if (n >= ladder_max) return n;
+            var save: [256]u8 = undefined;
+            const sz = store.getCharD2s(acct, nm.slice(), &save);
+            if (sz <= 0x2b) continue;
+            const status = save[0x24];
+            const progression: u32 = if (sz > 0x25) save[0x25] else 0;
+            var stats: u32 = save[0x28] & 0xf; // class
+            if (status & 0x08 != 0) stats |= 0x10; // died
+            if (status & 0x20 != 0) stats |= 0x20; // expansion
+            if (status & 0x04 != 0) stats |= 0x40; // hardcore
+            stats |= (progression & 0x1f) << 8;
+            stats |= @as(u32, save[0x2b]) << 16; // level
+            const cn = nm.slice();
+            out[n] = .{ .stats = stats };
+            @memcpy(out[n].name[0..@min(cn.len, 16)], cn[0..@min(cn.len, 16)]);
+            n += 1;
+        }
+    }
+    return n;
+}
+
 fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
-    _ = body;
-    log.line(tag, "ladder data request -> empty", .{});
-    var buf: [24]u8 = undefined;
+    const mode: u8 = if (body.len > 0) body[0] else 0;
+    var entries: [ladder_max]LadderEntry = undefined;
+    const n = collectLadder(&entries);
+    std.sort.pdq(LadderEntry, entries[0..n], {}, ladderLevelDesc);
+    log.line(tag, "ladder data request mode=0x{x} -> {d} entries", .{ mode, n });
+
+    var buf: [8192]u8 = undefined;
     var w = startPacket(&buf, MCP_LADDERDATA);
-    w.zeros(14); // list flag + zero total/chunk/offset -> client treats as empty ladder
+    if (n == 0) {
+        w.zeros(14); // empty-ladder form (Incoming0x11 clear-and-done path)
+        return finish(c, &w);
+    }
+    const total: u16 = @intCast(12 + n * (12 + ladder_entry_size));
+    w.putU8(mode); // flag — echo the requested mode so the client renders this tab
+    w.putU16(total); // whole-buffer size
+    w.putU16(total); // this chunk's length (single chunk)
+    w.putU16(0); // write offset
+    w.putU32(0); // rankBase
+    w.putU32(@intCast(n)); // count
+    w.putU32(ladder_entry_size); // per-entry name width
+    for (entries[0..n]) |e| {
+        w.putU32(0); // experience low (not in the .d2s header)
+        w.putU32(0); // experience high
+        w.putU32(e.stats);
+        w.putBytes(&e.name);
+    }
     finish(c, &w);
 }
 

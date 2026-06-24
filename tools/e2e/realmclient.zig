@@ -30,6 +30,7 @@ const SID_AUTH_CHECK = 0x51;
 const MCP_STARTUP = 0x01;
 const MCP_CHARCREATE = 0x02;
 const MCP_CREATEGAME = 0x03;
+const MCP_LADDERDATA = 0x11;
 const MCP_JOINGAME = 0x04;
 const MCP_CHARDELETE = 0x0a;
 const MCP_CHARLIST2 = 0x19;
@@ -136,6 +137,12 @@ pub const EID_LEAVE = 0x03;
 pub const EID_WHISPER = 0x04;
 pub const EID_TALK = 0x05;
 pub const EID_CHANNEL = 0x07;
+
+pub const LadderEntry = struct {
+    name: []const u8, // slice into the caller's dst buffer
+    level: u32 = 0,
+    class_id: u8 = 0,
+};
 
 pub const CharEntry = struct {
     name: []const u8, // slice into the caller's recv buffer
@@ -409,6 +416,39 @@ pub const RealmClient = struct {
         const r = try mcpRecv(fd, &self.rxbuf);
         if (r.id != MCP_CHARDELETE) return error.CharDeleteBadId;
         return net.rdU32(r.body, 2);
+    }
+
+    /// MCP_LADDERDATA (0x11): request the ladder, parse the entry buffer into `out`
+    /// (names copied into `dst`), return the entry count. Mirrors NET_MCP_CLIENT_Incoming0x11:
+    /// body = [u8 flag][u16 total][u16 chunk][u16 offset][u32 rankBase][u32 count][u32 entrySize]
+    /// then count × [u32 expLo][u32 expHi][u32 stats][entrySize-byte name].
+    pub fn ladderData(self: *RealmClient, mode: u8, out: []LadderEntry, dst: []u8) !usize {
+        const fd = self.d2cs.?;
+        var body: [4]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u8v(mode);
+        w.u16v(0); // reqid
+        try mcpSend(fd, MCP_LADDERDATA, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_LADDERDATA) return error.LadderBadId;
+        if (r.body.len < 7 or net.rdU16(r.body, 1) < 12) return 0; // empty ladder
+        const data = r.body[7..];
+        if (data.len < 12) return 0;
+        const count = net.rdU32(data, 4);
+        const entry_size = net.rdU32(data, 8);
+        var off: usize = 12;
+        var di: usize = 0;
+        var n: usize = 0;
+        while (n < count and n < out.len) : (n += 1) {
+            if (off + 12 + entry_size > data.len) break;
+            const stats = net.rdU32(data, off + 8);
+            const nm = std.mem.sliceTo(data[off + 12 .. off + 12 + entry_size], 0);
+            @memcpy(dst[di .. di + nm.len], nm);
+            out[n] = .{ .name = dst[di .. di + nm.len], .level = stats >> 16, .class_id = @intCast(stats & 0xf) };
+            di += nm.len;
+            off += 12 + entry_size;
+        }
+        return n;
     }
 
     /// MCP_CHARCREATE (0x02) -> result (0 ok, 0x14 name taken, 0x15 invalid). Body: u32 class + cstr name.
