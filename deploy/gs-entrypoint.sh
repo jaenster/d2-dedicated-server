@@ -20,8 +20,19 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 # Truly headless: no X display, and wine's GUI bits disabled so nothing draws or pops a
 # dialog (the engine is byte-patched to never render). mscoree/mshtml are the Mono/Gecko
 # installers; winemenubuilder writes desktop menus. dbghelp=n,b loads our proxy.
-export DISPLAY=
 WINE_HEADLESS_OVERRIDES="mscoree=d;mshtml=d;winemenubuilder.exe=d"
+
+# Headless virtual display. The engine's WinMain needs a window/graphics context to
+# exist or it returns early (the host then ExitProcess()es before the server thread
+# boots). Xvfb gives wine a display; the injected DLL still stubs all rendering, so
+# nothing draws. This mirrors a local run, where wine has a real GPU backend.
+XVFB_DISPLAY="${XVFB_DISPLAY:-:99}"
+Xvfb "$XVFB_DISPLAY" -screen 0 1024x768x16 -nolisten tcp >/dev/null 2>&1 &
+XVFB_PID=$!
+trap 'kill "$XVFB_PID" 2>/dev/null' EXIT
+export DISPLAY="$XVFB_DISPLAY"
+# Give Xvfb a moment to come up before wine connects.
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -e "/tmp/.X11-unix/X${XVFB_DISPLAY#:}" ] && break; sleep 0.3; done
 
 [ -f /game/Game.exe ] || { echo "FATAL: mount a D2 1.14d install at /game (no Game.exe found)"; exit 1; }
 
@@ -74,6 +85,27 @@ done
 set -- "$@" --d2gs --d2gs-boot --realm --create-games
 # Extra engine flags (e.g. -direct -txt for the loose /moddata data/ tree).
 [ -n "$D2GS_EXTRA_ARGS" ] && set -- "$@" $D2GS_EXTRA_ARGS
+
+# Clients dial THIS server directly for game traffic, so D2GS_GS_ADDR must be a
+# PUBLIC, client-routable address. On a cloud node the downward-API status.hostIP is
+# the node's PRIVATE network IP (e.g. Hetzner 10.x), which clients can't reach. When
+# D2GS_GS_ADDR is unset or "auto[:port]", resolve the node's public IPv4 from the
+# cloud metadata service and append the game port.
+case "${D2GS_GS_ADDR:-auto}" in
+  auto|auto:*)
+    port="4000"; case "$D2GS_GS_ADDR" in auto:*) port="${D2GS_GS_ADDR#auto:}";; esac
+    pubip=""
+    # Hetzner Cloud metadata (no auth, link-local). Fall back to an external echo.
+    for url in \
+      "http://169.254.169.254/hetzner/v1/metadata/public-ipv4" \
+      "https://ifconfig.me/ip" "https://api.ipify.org"; do
+      pubip=$(curl -fsS --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]')
+      case "$pubip" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) break;; *) pubip="";; esac
+    done
+    [ -n "$pubip" ] && export D2GS_GS_ADDR="$pubip:$port" \
+      || echo "WARN: could not resolve public IP; leaving D2GS_GS_ADDR unset (realmd will use the gs-link peer IP)"
+    ;;
+esac
 
 echo "starting headless GS: realm=${REALMD_HOST:-<unset>} gs_addr=${D2GS_GS_ADDR:-<peer-ip>} max_games=${D2GS_MAX_GAMES:-100}"
 exec wine "$GAME_DIR/Game.exe" "$@"

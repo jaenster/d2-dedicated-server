@@ -24,8 +24,18 @@ COPY build.zig build.zig.zon ./
 COPY src ./src
 
 # ── build: realmd (static musl) ──────────────────────────────────────────────────
+# Node builds the admin web UI (webui/ → one self-contained index.html), which the
+# realmd binary embeds via -Dwebui=true. The UI is served on the health/admin port.
 FROM zig AS build-realmd
-RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+RUN apk add --no-cache nodejs npm
+COPY webui ./webui
+RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dwebui=true
+
+# ── build: qqserver (static musl) ────────────────────────────────────────────────
+# The game-traffic gateway: token-translating poll() splice proxy fronting the GS
+# fleet, with its own async redis client. No pg dep — never pulls it.
+FROM zig AS build-qqserver
+RUN zig build qqserver -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 
 # ── build: injected DLLs (x86-windows; dbghelp proxy + d2gs payload only) ─────────
 FROM zig AS build-dlls
@@ -38,8 +48,12 @@ FROM debian:bookworm-slim AS gs
 # engine is byte-patched to never render, and the entrypoint runs with DISPLAY unset
 # and the Mono/Gecko/menu-builder DLLs disabled. (Swap in the WineHQ repo for a newer
 # wine if your D2 build needs it.)
+# wine + a virtual X display (Xvfb). The engine needs a window/graphics context to
+# exist or WinMain bails early (verified: with no display the host exits before the
+# server thread boots). Xvfb provides a headless display; rendering itself stays
+# stubbed by the injected DLL, so nothing actually draws.
 RUN dpkg --add-architecture i386 && apt-get update && \
-    apt-get install -y --no-install-recommends wine wine32 && \
+    apt-get install -y --no-install-recommends wine wine32 curl ca-certificates xvfb && \
     rm -rf /var/lib/apt/lists/*
 # The GS needs only these two DLLs (dbghelp proxy + payload) — not realmd's checkrev.
 COPY --from=build-dlls /src/zig-out/bin/dbghelp.dll /src/zig-out/bin/d2gs.dll /opt/d2gs/
@@ -59,3 +73,10 @@ COPY --from=build-realmd /src/zig-out/bin/realmd /realmd
 # bnetd / d2cs / d2dbs / gs-link / health
 EXPOSE 6112 6113 6114 6115 8080
 ENTRYPOINT ["/realmd"]
+
+# ── qqserver: static binary in scratch ───────────────────────────────────────────
+FROM scratch AS qqserver
+COPY --from=build-qqserver /src/zig-out/bin/qqserver /qqserver
+# Client-facing game traffic (REALMD_QQ_PORT, default 4000).
+EXPOSE 4000
+ENTRYPOINT ["/qqserver"]

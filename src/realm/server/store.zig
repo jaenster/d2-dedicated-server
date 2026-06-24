@@ -10,6 +10,7 @@
 //! The common production split is durable=pg, ephemeral=redis. BNFTP assets are static
 //! files and always come from the filesystem.
 const std = @import("std");
+const d2s = @import("d2s.zig");
 const adapter = @import("realm_adapter");
 const fs = adapter.fs;
 const redis = adapter.redis;
@@ -80,6 +81,36 @@ pub fn listChars(account: []const u8, names: []Name) usize {
     };
 }
 
+/// Delete a character's save. Idempotent — true even if it was already gone.
+pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
+    return switch (durable) {
+        .fs => fs.deleteCharD2s(account, charname),
+        .redis => redis.deleteCharD2s(account, charname),
+        .pg => pg.deleteCharD2s(account, charname),
+    };
+}
+
+/// Largest .d2s we will clone. A real 1.14d save is a few KB (a full char with stash is
+/// well under this); refusing larger avoids a silently-truncated, corrupt copy.
+const max_d2s = 32 * 1024;
+
+/// Clone a character to a new name (and optionally a different account): read the source
+/// save, rewrite its embedded name + checksum, and persist it at the destination. Works on
+/// every backend (it goes through get/saveCharD2s). Returns false if the source is missing,
+/// the name is invalid, the save is implausibly large, or the destination already exists.
+pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []const u8, dst_char: []const u8) bool {
+    if (dst_char.len == 0 or dst_char.len > d2s.name_max) return false;
+    var buf: [max_d2s]u8 = undefined;
+    const n = getCharD2s(src_account, src_char, &buf);
+    if (n == 0 or n == buf.len) return false; // missing, or too large (likely truncated)
+    // Don't clobber an existing destination char.
+    var probe: [16]u8 = undefined;
+    if (getCharD2s(dst_account, dst_char, &probe) != 0) return false;
+    if (!d2s.setName(buf[0..n], dst_char)) return false;
+    d2s.fixChecksum(buf[0..n]);
+    return saveCharD2s(dst_account, dst_char, buf[0..n]);
+}
+
 // ── accounts (durable) ───────────────────────────────────────────────────────
 
 /// Create an account. `pwhash` null = password-less. Returns false if it exists.
@@ -115,6 +146,16 @@ pub fn listAccounts(names: [][32]u8) usize {
     return fs.listAccounts(names);
 }
 
+/// Set/clear an account's admin flag (web-UI access). Accounts are always fs-backed.
+pub fn setAdmin(name: []const u8, admin: bool) bool {
+    return fs.setAdmin(name, admin);
+}
+
+/// Whether an account is flagged admin in the store.
+pub fn accountIsAdmin(name: []const u8) bool {
+    return fs.accountIsAdmin(name);
+}
+
 /// BNFTP assets (version-check MPQ etc.) are static files — always filesystem.
 pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     return fs.getBnftp(filename, out);
@@ -148,11 +189,11 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral) ────────────────────────────────────────────────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8) bool {
     return switch (ephemeral) {
-        .fs => fs.registerGame(name, gameid, gs_ip, gs_port, gsid, game_ttl_s),
-        .redis => redis.registerGame(name, gameid, gs_ip, gs_port, gsid, game_ttl_s),
-        .pg => pg.registerGame(name, gameid, gs_ip, gs_port, gsid, game_ttl_s),
+        .fs => fs.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, game_ttl_s),
+        .redis => redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, game_ttl_s),
+        .pg => pg.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, game_ttl_s),
     };
 }
 
@@ -182,8 +223,9 @@ pub fn expireGamesByGs(gsid: u32) void {
 
 pub const NamedGame = types.NamedGame;
 
-/// Enumerate active games from the shared store (for /admin/games when shared). fs/pg are
-/// TODO; redis walks its global game index.
+/// Enumerate active games from the shared store (for /admin/games when shared). Each
+/// backend walks its own game index: fs the games dir, redis the `games` set, pg the
+/// games table — all filtering on TTL/expiry.
 pub fn snapshotGames(out: []types.NamedGame) usize {
     return switch (ephemeral) {
         .fs => fs.snapshotGames(out),

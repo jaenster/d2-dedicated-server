@@ -20,6 +20,7 @@ const state = @import("state.zig");
 const health = @import("health.zig");
 const admin = @import("admin.zig");
 const shutdown = @import("shutdown.zig");
+const xsha1 = @import("xsha1.zig");
 
 fn mapBackend(b: config.Backend) store.Backend {
     return switch (b) {
@@ -49,21 +50,116 @@ fn parseIp4(text: []const u8) ?[4]u8 {
     return if (i == 4) octets else null;
 }
 
-pub fn main() !void {
+fn lowerStr(s: []const u8, out: []u8) []const u8 {
+    const n = @min(s.len, out.len);
+    for (s[0..n], 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out[0..n];
+}
+
+/// Ensure `name` exists as an admin account: create it (with `password` if given,
+/// lowercased+xsha1 to match the login path) when missing, then set the admin flag.
+/// Idempotent — used by both `create-admin` and REALMD_ADMIN_BOOTSTRAP. Assumes
+/// store.init() has run.
+fn ensureAdmin(name: []const u8, password: ?[]const u8) void {
+    if (name.len == 0) return;
+    if (!store.accountExists(name)) {
+        var pwhash: ?[20]u8 = null;
+        if (password) |p| {
+            if (p.len > 0) {
+                var lb: [64]u8 = undefined;
+                pwhash = xsha1.xsha1(lowerStr(p, &lb));
+            }
+        }
+        _ = store.createAccount(name, pwhash);
+        log.line("realmd", "admin account '{s}' created (password={})", .{ name, password != null and password.?.len > 0 });
+    }
+    _ = store.setAdmin(name, true);
+    log.line("realmd", "admin account '{s}' flagged admin", .{name});
+}
+
+/// Seed ordinary (non-admin) accounts with passwords from REALMD_SEED_ACCOUNTS
+/// ("name:pw,name:pw"). Idempotent: only creates a missing account. Lets strict
+/// logon (unknown account rejected) still admit fixture accounts. store.init() must
+/// have run.
+fn seedAccounts(spec: []const u8) void {
+    var it = std.mem.tokenizeScalar(u8, spec, ',');
+    while (it.next()) |pair| {
+        const sep = std.mem.indexOfScalar(u8, pair, ':') orelse pair.len;
+        const name = pair[0..sep];
+        const pw = if (sep < pair.len) pair[sep + 1 ..] else "";
+        if (name.len == 0 or store.accountExists(name)) continue;
+        var pwhash: ?[20]u8 = null;
+        if (pw.len > 0) {
+            var lb: [64]u8 = undefined;
+            pwhash = xsha1.xsha1(lowerStr(pw, &lb));
+        }
+        _ = store.createAccount(name, pwhash);
+        log.line("realmd", "seeded account '{s}' (password={})", .{ name, pw.len > 0 });
+    }
+}
+
+/// Whether any stored account carries the DB admin flag (cheap startup scan).
+fn anyDbAdmin() bool {
+    var names: [256][32]u8 = undefined;
+    const n = store.listAccounts(&names);
+    for (names[0..n]) |nm| {
+        const name = std.mem.sliceTo(&nm, 0);
+        if (store.accountIsAdmin(name)) return true;
+    }
+    return false;
+}
+
+fn initStore(cfg: config.Config, io: anytype) void {
+    store.init(.{
+        .io = io,
+        .data_dir = cfg.data_dir,
+        .durable = mapBackend(cfg.durable_store),
+        .ephemeral = mapBackend(cfg.ephemeral_store),
+        .redis_addr = cfg.redis_addr,
+        .pg_dsn = cfg.pg_dsn,
+    });
+}
+
+/// `realmd create-admin <name> [password]` — create/flag an admin account offline
+/// (no server, no token) against the configured store, then exit. Returns true if a
+/// subcommand was handled.
+fn runSubcommand(cfg: config.Config, args: std.process.Args) bool {
+    var it = args.iterate();
+    _ = it.next(); // argv[0] — program name
+    const sub = it.next() orelse return false;
+    if (!std.mem.eql(u8, sub, "create-admin")) return false;
+    const name = it.next() orelse {
+        log.line("realmd", "usage: realmd create-admin <name> [password]", .{});
+        std.process.exit(2);
+    };
+    const password: ?[]const u8 = if (it.next()) |p| p else null;
+    var threaded = std.Io.Threaded.init_single_threaded;
+    initStore(cfg, threaded.io());
+    ensureAdmin(name, password);
+    return true;
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
     const cfg = config.fromEnv();
     log.json = cfg.log_json;
+    if (runSubcommand(cfg, init.args)) return;
     log.line("realmd", "starting instance={s} bind={s} bnet={d} d2cs={d} d2dbs={d} realm={s}@{s} capture={}", .{
         cfg.instance_id, cfg.bind,       cfg.bnet_port,  cfg.d2cs_port,
         cfg.d2dbs_port,  cfg.realm_name, cfg.realm_addr, cfg.capture,
     });
     // Graceful shutdown for k8s rolling updates + readiness gating.
     health.require_gs = cfg.require_gs;
-    // Admin API (served on the health port under /admin/*). Empty token = disabled.
+    // Admin API + web UI (served on the health port under /admin/*). Enabled by any of:
+    // bearer token (scripts/break-glass), account login (REALMD_ADMINS), or SSO header.
     admin.token = cfg.admin_token;
     admin.instance = cfg.instance_id;
     admin.durable = @tagName(cfg.durable_store);
     admin.ephemeral = @tagName(cfg.ephemeral_store);
-    if (cfg.admin_token.len > 0) log.line("realmd", "admin API enabled on health port {d}", .{cfg.health_port});
+    admin.admins = cfg.admins;
+    admin.trusted_header = cfg.trusted_auth_header;
+    admin.initSigning(cfg.admin_secret);
+    if ((cfg.admins.len > 0 or cfg.admin_bootstrap.len > 0) and cfg.admin_secret.len == 0)
+        log.line("realmd", "WARNING REALMD_ADMIN_SECRET unset; web-UI sessions use a per-process key (break on restart, not multi-instance)", .{});
     shutdown.install(cfg.shutdown_grace_ms);
 
     // bnetd advertises the d2cs address to the client. realm_addr must be an
@@ -78,12 +174,27 @@ pub fn main() !void {
         .pg_dsn = cfg.pg_dsn,
     });
     log.line("realmd", "store: durable={s} ephemeral={s}", .{ @tagName(cfg.durable_store), @tagName(cfg.ephemeral_store) });
+    // Seed a break-glass admin from REALMD_ADMIN_BOOTSTRAP=name[:password] (idempotent).
+    if (cfg.admin_bootstrap.len > 0) {
+        const sep = std.mem.indexOfScalar(u8, cfg.admin_bootstrap, ':');
+        const name = if (sep) |s| cfg.admin_bootstrap[0..s] else cfg.admin_bootstrap;
+        const pw: ?[]const u8 = if (sep) |s| cfg.admin_bootstrap[s + 1 ..] else null;
+        ensureAdmin(name, pw);
+    }
+    // Seed ordinary fixture/test accounts with passwords (REALMD_SEED_ACCOUNTS).
+    if (cfg.seed_accounts.len > 0) seedAccounts(cfg.seed_accounts);
+    // Keep the admin API/UI enabled across restarts if any stored account is a DB admin
+    // (so it doesn't go dark just because no env auth is configured this boot).
+    admin.any_db_admin = anyDbAdmin();
+    if (admin.token.len > 0 or admin.admins.len > 0 or admin.trusted_header.len > 0 or admin.any_db_admin)
+        log.line("realmd", "admin API + web UI enabled on health port {d} (token={} env-admins={} sso={} db-admins={})", .{ cfg.health_port, admin.token.len > 0, admin.admins.len > 0, admin.trusted_header.len > 0, admin.any_db_admin });
     // A redis/pg ephemeral backend IS an external shared store — route sessions/games
     // through it even without REALMD_SHARED (the in-memory table is fs-only).
     state.shared = cfg.shared or cfg.ephemeral_store != .fs;
     state.instance_hash = hashStr(cfg.instance_id);
     if (cfg.shared) log.line("realmd", "multi-instance mode: sessions/games in shared store {s} (instance hash 0x{x})", .{ cfg.data_dir, state.instance_hash });
     bncs.realm_name = cfg.realm_name;
+    bncs.permissive_auth = cfg.permissive_auth;
     bncs.admin_accounts = cfg.admins;
     bncs.d2cs_port = cfg.d2cs_port;
     gslink.realm_name = cfg.realm_name;

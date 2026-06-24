@@ -7,8 +7,18 @@ const patch = @import("patch.zig");
 const async_ = @import("async.zig");
 const feature = @import("../engine/feature.zig");
 
+extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+
 const ADDR_GAME_LOOP: usize = 0x00451C2A; // sleep call in game loop, CALL + 2 NOP
 const ADDR_OOG_LOOP: usize = 0x004FA663; // sleep call in OOG loop, CALL + 18 NOP
+
+// The two patches above overwrite the engine's own Sleep() calls that paced
+// these loops (the game loop's `Sleep(10)` gate, the OOG loop's `Sleep(<=20)`),
+// so without yielding here the loop spins flat-out and pegs a core. Restore the
+// per-frame yield ourselves. The game's logic advances on an internal wall-clock
+// timer, not on this sleep, so frame rate is unaffected.
+const GAME_FRAME_SLEEP_MS: u32 = 10;
+const OOG_FRAME_SLEEP_MS: u32 = 10;
 
 /// Called every out-of-game (menu) frame.
 pub var on_oog: ?*const fn () void = null;
@@ -19,12 +29,14 @@ fn hookGameLoop() callconv(.c) void {
     async_.init(); // idempotent; runs on the game thread
     if (on_game) |cb| cb();
     feature.fanGameFrame(); // fan out to every enabled feature's gameFrame()
+    Sleep(GAME_FRAME_SLEEP_MS); // yield: we clobbered the engine's own loop sleep
 }
 
 fn hookOogLoop() callconv(.c) void {
     async_.init();
     if (on_oog) |cb| cb();
     feature.fanOogFrame();
+    Sleep(OOG_FRAME_SLEEP_MS); // yield: we clobbered the engine's own loop sleep
 }
 
 pub fn install() void {

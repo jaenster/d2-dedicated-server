@@ -99,6 +99,18 @@ pub fn build(b: *std.Build) void {
     realmd.root_module.addImport("realm_shared", realm_shared);
     realmd.root_module.addImport("realm_infra", realm_infra);
     realmd.root_module.addImport("realm_adapter", realm_adapter);
+
+    // Web UI: -Dwebui=true builds webui/ (Vite + React → one self-contained
+    // dist/index.html) and embeds it; otherwise embed a stub page so plain builds
+    // need no Node. webui.zig @embedFile's the "webui_blob" import either way.
+    const webui_enabled = b.option(bool, "webui", "Build and embed the admin web UI (requires Node)") orelse false;
+    const webui_blob: std.Build.LazyPath = if (webui_enabled) blk: {
+        const cmd = b.addSystemCommand(&.{ "sh", "-c", "set -e; npm --prefix \"$1\" ci && npm --prefix \"$1\" run build && cp \"$1/dist/index.html\" \"$2\"", "realmd-webui", b.pathFromRoot("webui") });
+        cmd.has_side_effects = true; // npm/vite do their own incremental builds
+        break :blk cmd.addOutputFileArg("index.html");
+    } else b.path("src/realm/server/webui_stub.html");
+    realmd.root_module.addAnonymousImport("webui_blob", .{ .root_source_file = webui_blob });
+
     b.installArtifact(realmd);
 
     // `zig build realmd-bin` — install ONLY the realmd binary (no windows DLLs).
@@ -144,6 +156,35 @@ pub fn build(b: *std.Build) void {
     run_e2e.step.dependOn(&b.addInstallArtifact(qqserver, .{}).step); // qqserver_routing spawns it
     const e2e_step = b.step("e2e", "Build + run the clientless realmd E2E test harness");
     e2e_step.dependOn(&run_e2e.step);
+
+    // gamestress — create N games against a RUNNING realm/GS (manual: `zig build gamestress`).
+    // Used to verify the empty-game reaper fix (the GS shouldn't OOM past ~8 games).
+    const gamestress_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gamestress/main.zig"),
+        .target = realmd_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gamestress_mod.addAnonymousImport("realmclient", .{ .root_source_file = b.path("tools/e2e/realmclient.zig") });
+    const gamestress = b.addExecutable(.{ .name = "gamestress", .root_module = gamestress_mod });
+    const run_gamestress = b.addRunArtifact(gamestress);
+    b.step("gamestress", "Create N games against a running realm (reaper stress test)").dependOn(&run_gamestress.step);
+
+    // bnftp-probe — clientless BNFTP discovery client (point it at a real bnet,
+    // optionally via SOCKS5). Manual: `zig build bnftp-probe -- [opts] <host> ...`
+    const probe = b.addExecutable(.{
+        .name = "bnftp-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bnftp-probe/main.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(probe);
+    const run_probe = b.addRunArtifact(probe);
+    if (b.args) |args| run_probe.addArgs(args);
+    b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
 
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());

@@ -445,6 +445,10 @@ const Gateway = struct {
         }
         // c2g still holds the original first packet; rewrite its token to the GS gameid.
         const bi: u16 = @intCast(c.c2g);
+        // The realm-minted token the client presented (before we rewrite it) — log it
+        // next to the GS gameid so a trace links client token -> GS game. The gameid we
+        // write here IS the GS game's nToken, i.e. the `token` field in the GS event log.
+        const client_token = std.mem.readInt(u16, g.pool[bi][TOKEN_OFFSET..][0..2], .little);
         std.mem.writeInt(u16, g.pool[bi][TOKEN_OFFSET..][0..2], @truncate(pr.gameid), .little);
         const d = dialNonBlock(pr.ip, pr.port) orelse {
             log.line("qq", "GS {d}.{d}.{d}.{d}:{d} dial failed", .{ pr.ip[0], pr.ip[1], pr.ip[2], pr.ip[3], pr.port });
@@ -453,7 +457,7 @@ const Gateway = struct {
         };
         c.gs = d.fd;
         c.state = if (d.connected) .open else .connecting;
-        log.line("qq", "qq: -> GS {d}.{d}.{d}.{d}:{d} (gameid {d}){s}", .{ pr.ip[0], pr.ip[1], pr.ip[2], pr.ip[3], pr.port, pr.gameid, if (d.connected) "" else " [connecting]" });
+        log.line("qq", "route client_token={d} -> GS {d}.{d}.{d}.{d}:{d} token={d}{s}", .{ client_token, pr.ip[0], pr.ip[1], pr.ip[2], pr.ip[3], pr.port, pr.gameid, if (d.connected) "" else " [connecting]" });
     }
 
     /// Service the redis fd this turn (connect-complete, flush sends, read replies).

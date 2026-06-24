@@ -125,6 +125,14 @@ pub fn GAME_CreateBattleNetGame(
 pub const ARENAFLAG_ClientUpdate: u32 = 0x04;
 pub const ARENAFLAG_Hardcore: u32 = 0x800; // 2048
 pub const ARENAFLAG_Expansion: u32 = 0x10_0000; // 1048576
+// Bit 21 -> pGame->eGameType (GAME_CreateBattleNetGame: eGameType = (flags>>0x15)&1).
+// Setting it marks the game NOT single-player, which would make the 0x01 GameFlags packet
+// tell the client to render online NPC positions (e.g. Deckard Cain by the Act 5 waypoint).
+// BUT it also routes CLIENT_LoadCharacterAndSendGameData down a different validation branch
+// that refuses the join with nReason 0x19 (verified live: flag on -> every join refused;
+// flag off -> joins succeed). So leave it CLEAR until that char-load path is understood —
+// a working join beats Cain's cosmetic position.
+pub const ARENAFLAG_Multiplayer: u32 = 0x20_0000; // 2097152 (bit 21) — intentionally NOT set
 pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
     var f: u32 = @as(u32, difficulty) << 12; // difficulty in bits 12-14
     f |= ARENAFLAG_ClientUpdate;
@@ -206,6 +214,15 @@ pub fn TXT_InitTxtFiles(p_mem: usize, n_zero2: u32, b_obnet_host: u32) void {
     stdcall(0x00619300, fn (usize, u32, u32) callconv(StdcallConv) void)(p_mem, n_zero2, b_obnet_host); // VERIFIED 0061 9300
 }
 
+/// Build the per-NPC vendor item tables (driven off sgptDataTable->pTxtMonStats). Reads
+/// MonStats, so it MUST run AFTER TXT_InitTxtFiles — otherwise nTxtMonStatsSize==0 and it
+/// bails at the top, leaving every vendor empty. QSERVER_InitializeServerState already
+/// calls it once, but that runs before the data load, so we re-run it here post-load.
+///   void SUNITPROXY_InitAllNpcItemTables()
+pub fn SUNITPROXY_InitAllNpcItemTables() void {
+    stdcall(0x00536f80, fn () callconv(StdcallConv) void)(); // VERIFIED 0053 6f80
+}
+
 // ── engine globals (static, retail addresses; base 0x400000, no ASLR) ────────
 // From zig-output/data/data_symbols.json.
 pub const globals = struct {
@@ -241,6 +258,14 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     QSERVER_SetGlobalInstance(@ptrFromInt(at(globals.gQServerGameState)), 1); // cookie≠0 → no halt
     gptr(globals.gbQServerRunning, u32).* = 1;
     QSERVER_InitializeServerState();
+    // Game-data tables load AFTER server-state init. Loading them BEFORE the whole server
+    // bootstrap (the retail app-mode order) corrupts pool state and breaks the network join
+    // path (tables load into a NULL pool because the 52-entry LoadDataForGame init never ran).
+    // So keep the proven post-init order — but QSERVER_InitializeServerState's NPC-vendor table
+    // build (SUNITPROXY_InitAllNpcItemTables) ran with MonStats unloaded and bailed, leaving
+    // vendors empty. Re-run it here, now that the data is loaded, to populate the vendor tables.
+    TXT_InitTxtFiles(0, 0, 1);
+    SUNITPROXY_InitAllNpcItemTables();
 }
 
 /// One tick of the server: drain inbound packets, advance all games, then flush

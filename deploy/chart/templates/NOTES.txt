@@ -1,0 +1,35 @@
+{{ .Chart.Name }} {{ .Chart.Version }} — realm "{{ .Values.realmName }}" deployed to namespace {{ .Release.Namespace }}.
+
+Components:
+  realmd        x{{ .Values.realmd.replicas }}   (public: bnet 6112 + d2cs 6113; d2dbs/gslink internal on realmd-gslink)
+  game server   x{{ .Values.gameServer.replicas }}   (internal pod-IP only, no hostPort; reached via qqserver)
+  postgres      {{ if .Values.postgres.enabled }}in-cluster{{ else }}DISABLED (point realmd at an external DSN){{ end }}
+  redis         {{ if .Values.redis.enabled }}in-cluster{{ else }}DISABLED{{ end }}
+  qqserver      {{ if .Values.qqserver.enabled }}{{ if .Values.floatingIPs }}PUBLIC gateway on {{ join "," .Values.floatingIPs }}:4000{{ else }}ClusterIP gateway{{ end }}{{ else }}DISABLED{{ end }}
+
+Next steps:
+  1. Get the realmd LoadBalancer IP:
+       kubectl -n {{ .Release.Namespace }} get svc realmd -w
+{{- if not .Values.realmAddr }}
+     Then set realmAddr to that IP and `helm upgrade` (realmAddr is currently unset).
+{{- else }}
+     realmAddr is set to {{ .Values.realmAddr }} — make sure it matches that IP.
+{{- end }}
+
+  2. Supply the proprietary D2 1.14d game data before the GS will start (the entrypoint
+     exits if /game/Game.exe is missing):
+{{- if .Values.gameServer.dataImage.repository }}
+     dataImage {{ .Values.gameServer.dataImage.repository }}:{{ .Values.gameServer.dataImage.tag }} — the load-gamedata initContainer
+     copies /gamedata into an emptyDir per pod (no persistent volume).
+{{- else }}
+     no dataImage set — populate the d2-gamefiles PVC fallback with a real install, or set
+     gameServer.dataImage.repository to a private image carrying the minimal data set.
+{{- end }}
+
+  3. Clients connect to {{ if .Values.realmAddr }}{{ .Values.realmAddr }}{{ else }}<realmd-LB-IP>{{ end }}; realmd won't accept
+     client traffic until a GS registers (REQUIRE_GS is {{ if .Values.requireGS }}on{{ else }}off{{ end }}).
+{{- if not .Values.postgres.enabled }}
+
+  NOTE: postgres is disabled. realmd still reads its DSN from the `realmd-pg` secret —
+  override postgres.auth.* to point at your external database.
+{{- end }}

@@ -76,9 +76,41 @@ pub const Config = struct {
     pg_dsn: []const u8 = "",
 
     /// Bearer token for the HTTP admin API (served on the health port under
-    /// /admin/*). EMPTY (default) disables the admin API entirely — it returns
-    /// 403 — so it is off unless explicitly enabled via REALMD_ADMIN_TOKEN.
+    /// /admin/*). A non-empty token enables the bearer path (for scripts/CI and as
+    /// break-glass). The admin API is also enabled when `admins` is set (password
+    /// login by realm account) or `trusted_auth_header` is set (SSO). When NONE of
+    /// the three is configured the API is disabled entirely (403).
     admin_token: []const u8 = "",
+
+    /// HMAC key that signs admin session cookies (the web UI's password-login
+    /// sessions). Set REALMD_ADMIN_SECRET to a stable random string so sessions
+    /// survive restarts and are shared across instances; if empty, a per-process
+    /// random key is generated (sessions break on restart / aren't multi-instance).
+    admin_secret: []const u8 = "",
+
+    /// `name:password` of an admin account to ensure on startup (REALMD_ADMIN_BOOTSTRAP).
+    /// If the account is missing it is created (with that password) and flagged admin;
+    /// if it exists the admin flag is (re)set. Idempotent — the declarative way to seed a
+    /// break-glass admin from a k8s Secret. The password part may be empty (SSO-only admin).
+    admin_bootstrap: []const u8 = "",
+
+    /// Comma-separated `name:password` pairs to seed as ordinary (non-admin) accounts on
+    /// startup (REALMD_SEED_ACCOUNTS). Idempotent: each is created with that password only
+    /// if missing. With strict logon (unknown account rejected), this is how test/fixture
+    /// accounts get a real password so wrong passwords are refused. e.g. "EpicAma:secret,Sidekick:secret".
+    seed_accounts: []const u8 = "",
+
+    /// Legacy/test auth: unknown accounts auto-register password-less and passwords are
+    /// verified (REALMD_PERMISSIVE_AUTH). Default false = strict (reject unknown accounts,
+    /// no auto-register). The e2e harness sets it; real deployments leave it off.
+    permissive_auth: bool = false,
+
+    /// When set (e.g. "X-Forwarded-User"), realmd trusts this request header as an
+    /// already-authenticated username — for SSO via a forward-auth proxy (Authentik
+    /// outpost / oauth2-proxy). The username must still be in `admins`. ONLY enable
+    /// when the admin port is reachable solely through that trusted proxy, since the
+    /// header is trusted verbatim (a direct client could otherwise spoof it).
+    trusted_auth_header: []const u8 = "",
 };
 
 pub const Backend = enum { fs, redis, pg };
@@ -132,5 +164,10 @@ pub fn fromEnv() Config {
     if (env("REALMD_REDIS_ADDR")) |v| c.redis_addr = v;
     if (env("REALMD_PG_DSN")) |v| c.pg_dsn = v;
     if (env("REALMD_ADMIN_TOKEN")) |v| c.admin_token = v;
+    if (env("REALMD_ADMIN_SECRET")) |v| c.admin_secret = v;
+    if (env("REALMD_ADMIN_BOOTSTRAP")) |v| c.admin_bootstrap = v;
+    if (env("REALMD_SEED_ACCOUNTS")) |v| c.seed_accounts = v;
+    if (env("REALMD_PERMISSIVE_AUTH")) |_| c.permissive_auth = true;
+    if (env("REALMD_TRUSTED_AUTH_HEADER")) |v| c.trusted_auth_header = v;
     return c;
 }

@@ -20,7 +20,10 @@ const d2cs = @import("realm/client/d2cs.zig");
 const d2dbs = @import("realm/client/d2dbs.zig");
 const feature = @import("engine/feature.zig");
 const halt_hook = @import("runtime/feature/halt_hook.zig"); // for enableSuppress (sub-mode, not a toggle)
+const headless = @import("runtime/feature/headless.zig"); // server_ready flag for the ExitProcess interceptor
+const health = @import("runtime/feature/health.zig"); // hacky in-process HTTP health endpoint
 const gsport = @import("runtime/gsport.zig");
+const gamereap = @import("runtime/gamereap.zig");
 const roominit = @import("runtime/roominit.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
@@ -284,6 +287,7 @@ fn parseEndpoints() void {
         }
     }
     gsid = computeGsId();
+    @import("runtime/feature/srvtrace.zig").gsid = gsid; // so the srvtrace tick line carries the GS id
 }
 
 /// One-shot D2DBS character fetch (test/demo for `--fetch-char`).
@@ -309,6 +313,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // Let the host reach a stable post-init state. TODO: replace this fixed
     // delay with a hook on the engine's init-complete point (VERIFY.md #4).
     log.print("d2gs: server thread up; waiting for engine init...");
+    health.start(); // HTTP health endpoint up now — answers 503 until the tick loop beats
     Sleep(3000);
 
     // Full dedicated-realm bootstrap (mirrors NET_QServer_StartServer's host tail
@@ -319,10 +324,14 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // qqserver can own the client-facing :4000 and splice through to us. Must precede the
     // QSERVER_CreateAndInit inside bootstrapRealmServer. No-op when gs_public_port == 4000.
     gsport.apply(gs_public_port);
+    // Reap empty games after a few seconds (default 5min) so abandoned games don't leak
+    // FOG pool managers (only 8 exist) and crash the GS with 0xe0000001 after ~8 creates.
+    gamereap.applyDefault();
     // Per-game server hook surface: hook RoomInit to fan out roomInit() with a real
     // per-game GameCtx (the game's own FOG pool). Opt-in via a consumer flag so the
     // default server path stays byte-identical.
-    if (hasFlag("srvdiag") or hasFlag("ubers")) roominit.install();
+    // Always install the per-game RoomInit fan-out (cainfix/srvdiag/ubers all consume it).
+    roominit.install();
     if (use_realm) {
         if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         joindiag.install(); // log nReason when the engine refuses a join
@@ -334,16 +343,12 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         log.print("d2gs: bootstrap (open mode, no realm)");
         server.bootstrapRealmServer(null);
     }
-    // Load the D2Common data tables (items/monsters/skills/levels/…) that game
-    // creation needs. The client app-mode entry normally does this; our server
-    // boot must do it explicitly. Only when game creation is enabled.
-    if (command.allow_create) {
-        log.print("d2gs: loading data tables (TXT_InitTxtFiles)...");
-        server.TXT_InitTxtFiles(0, 0, 1);
-        log.print("d2gs: data tables loaded");
-    }
+    // Data tables (TXT_InitTxtFiles) are now loaded inside bootstrapRealmServer,
+    // in the correct order: after the memory managers (QSERVER_CreateAndInit) and
+    // before QSERVER_InitializeServerState consumes them.
 
     log.print("d2gs: entering tick loop (listening on :4000)");
+    headless.server_ready = true; // past init: a later host exit is a real shutdown, not premature
 
     // Connect to PvPGN's D2CS so it can dispatch game create/join to us.
     if (d2cs_enabled) d2cs.start(@ptrCast(&d2cs_host), d2cs_port, gs_public_ip, gs_public_port, gs_max_games, gsid);
@@ -357,6 +362,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         command.pump(); // run queued engine commands (create game, …) on this thread
         if (use_realm) realm.pumpDelivery(); // deliver fetched char outside the join stack
         server.tick();
+        health.tick(); // heartbeat for the health endpoint (liveness = this advancing)
         Sleep(10); // ~100 Hz; D2 logic runs at 25 fps, tune later
     }
 }
@@ -396,10 +402,42 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             // Drive the bnet login form: --auto-login <account>:<password>.
             {
                 var tmp: [160]u8 = undefined;
-                if (flagToken("auto-login", &tmp)) |len| {
+                if (flagToken("create-char", &tmp)) |len| {
+                    // acct:pass:name:class — log in and drive the create-character UI.
+                    var acct: [64]u8 = undefined;
+                    var rest: [96]u8 = undefined;
+                    if (splitNames(tmp[0..len], &acct, &rest)) {
+                        var pass: [64]u8 = undefined;
+                        var rest2: [96]u8 = undefined;
+                        if (splitNames(std.mem.sliceTo(&rest, 0), &pass, &rest2)) {
+                            var name: [64]u8 = undefined;
+                            var cls: [32]u8 = undefined;
+                            if (splitNames(std.mem.sliceTo(&rest2, 0), &name, &cls)) {
+                                // cls = "class[:status]" — status is hex/dec (default 0x20 expansion).
+                                var classstr: [16]u8 = undefined;
+                                var statusstr: [16]u8 = undefined;
+                                var class: u8 = 1;
+                                var status: u8 = 0x20;
+                                if (splitNames(std.mem.sliceTo(&cls, 0), &classstr, &statusstr)) {
+                                    class = std.fmt.parseInt(u8, std.mem.sliceTo(&classstr, 0), 10) catch 1;
+                                    status = std.fmt.parseInt(u8, std.mem.sliceTo(&statusstr, 0), 0) catch 0x20;
+                                } else {
+                                    class = std.fmt.parseInt(u8, std.mem.sliceTo(&cls, 0), 10) catch 1;
+                                }
+                                autologin.installCreateChar(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0), std.mem.sliceTo(&name, 0), class, status);
+                            }
+                        }
+                    }
+                } else if (flagToken("auto-login", &tmp)) |len| {
                     var acct: [64]u8 = undefined;
                     var pass: [64]u8 = undefined;
                     if (splitNames(tmp[0..len], &acct, &pass)) {
+                        // --bot <name>: after entering the game, run a named in-game bot
+                        // (looked up in bot.registry, e.g. "trade"). Absent = no bot.
+                        var bot_buf: [32]u8 = undefined;
+                        if (flagToken("bot", &bot_buf)) |bl| {
+                            autologin.enableBot(bot_buf[0..bl]);
+                        }
                         autologin.install(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0));
                     }
                 } else if (flagToken("auto-join", &tmp)) |len| {

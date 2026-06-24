@@ -145,6 +145,17 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
     return f.readPositionalAll(io, out, 0) catch 0;
 }
 
+/// Delete a character's .d2s. True if the file existed and is now gone (idempotent:
+/// a missing file is also reported as success so a double-delete doesn't error).
+pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var pbuf: [512]u8 = undefined;
+    const path = charPath(&pbuf, account, charname) orelse return false;
+    Dir.cwd().deleteFile(io, path) catch |e| return e == error.FileNotFound;
+    return true;
+}
+
 pub fn listChars(account: []const u8, names: []Name) usize {
     fs_lock.lock();
     defer fs_lock.unlock();
@@ -183,7 +194,9 @@ pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
 }
 
 // ── accounts (durable) ───────────────────────────────────────────────────────
-// One file per account at accounts/<name>: 21 bytes = has_password(1) ++ pwhash(20).
+// One file per account at accounts/<name>: 22 bytes = has_password(1) ++ pwhash(20)
+// ++ admin(1). Older 21-byte records (no admin byte) read back as non-admin.
+const account_rec_len = 22;
 
 pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
     var nb: [64]u8 = undefined;
@@ -193,12 +206,37 @@ pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
     // Reject if the account already exists.
     var eb: [32]u8 = undefined;
     if (readSmall("accounts", safe, &eb) != null) return false;
-    var rec: [21]u8 = [_]u8{0} ** 21;
+    var rec: [account_rec_len]u8 = [_]u8{0} ** account_rec_len;
     if (pwhash) |h| {
         rec[0] = 1;
         @memcpy(rec[1..21], &h);
     }
     return writeSmall("accounts", safe, &rec);
+}
+
+/// Set/clear the account's admin flag (web-UI access). False if no such account.
+pub fn setAdmin(name: []const u8, admin: bool) bool {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var rb: [32]u8 = undefined;
+    const raw = readSmall("accounts", safe, &rb) orelse return false;
+    var rec: [account_rec_len]u8 = [_]u8{0} ** account_rec_len;
+    @memcpy(rec[0..@min(raw.len, account_rec_len)], raw[0..@min(raw.len, account_rec_len)]);
+    rec[21] = if (admin) 1 else 0;
+    return writeSmall("accounts", safe, &rec);
+}
+
+/// Whether the account is flagged admin. False if missing or an old (21-byte) record.
+pub fn accountIsAdmin(name: []const u8) bool {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var rb: [32]u8 = undefined;
+    const raw = readSmall("accounts", safe, &rb) orelse return false;
+    return raw.len >= account_rec_len and raw[21] == 1;
 }
 
 pub fn accountExists(name: []const u8) bool {
@@ -287,12 +325,14 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral, TTL, reverse indexed by id and by gs) ──────────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     const safe = sanitize(name, &nb) orelse return false;
-    var vb: [128]u8 = undefined;
+    var vb: [160]u8 = undefined;
     const hlen = ttlHeader(&vb, ttl_s);
-    const body = std.fmt.bufPrint(vb[hlen..], "{d} {d}.{d}.{d}.{d} {d} {d}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid }) catch return false;
+    // Fields: gameid ip port gsid players <password>. password is last (empty -> trailing
+    // space -> empty token); players is always a number so the field count stays stable.
+    const body = std.fmt.bufPrint(vb[hlen..], "{d} {d}.{d}.{d}.{d} {d} {d} {d} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, password }) catch return false;
     fs_lock.lock();
     defer fs_lock.unlock();
     if (!writeSmall("games", safe, vb[0 .. hlen + body.len])) return false;
@@ -335,13 +375,38 @@ fn parseGame(val: []const u8) ?GameRec {
     if (i != 4) return null;
     const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
     const gsid: u32 = if (it.next()) |t| (std.fmt.parseInt(u32, t, 10) catch 0) else 0;
-    return .{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
+    var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
+    rec.players = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 0) else 0; // 5th
+    if (it.next()) |p| rec.setPw(p); // 6th token = join password (may be empty)
+    return rec;
 }
 
-/// Look up the game name for an engine gameid and delete that game + its indexes.
+/// Enumerate live games from the games dir for shared-mode /admin/games. Skips records
+/// whose TTL has lapsed (a sweeper reclaims the files separately).
 pub fn snapshotGames(out: []types.NamedGame) usize {
-    _ = out;
-    return 0; // TODO: enumerate the games dir for fs shared-mode /admin/games
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var dpath: [320]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dpath, "{s}/games", .{data_dir}) catch return 0;
+    var d = Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (it.next(io) catch null) |entry| {
+        if (n >= out.len) break;
+        if (entry.kind != .file) continue;
+        var vb: [128]u8 = undefined;
+        const raw = readSmall("games", entry.name, &vb) orelse continue;
+        const val = unexpiredPayload(raw) orelse continue; // expired → skip
+        const rec = parseGame(val) orelse continue;
+        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players };
+        const ln: u8 = @intCast(@min(entry.name.len, ng.name.len));
+        @memcpy(ng.name[0..ln], entry.name[0..ln]);
+        ng.name_len = ln;
+        out[n] = ng;
+        n += 1;
+    }
+    return n;
 }
 
 pub fn removeGameById(gameid: u32) void {

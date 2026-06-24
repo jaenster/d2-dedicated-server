@@ -1,0 +1,111 @@
+# Stateless Deployment (fungible pods): qqserver routes to a pod by the IP recorded in
+# the redis token route, not via a stable name, and in-memory game state dies with the
+# pod anyway — so no StatefulSet / persistent identity is needed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d2gs
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gameserver
+spec:
+  replicas: {{ .Values.gameServer.replicas }}
+  revisionHistoryLimit: {{ .Values.realmd.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 8 }}
+    spec:
+      # The GS is INTERNAL — no public hostPort. qqserver fronts the public :4000 and
+      # splices to each GS by its pod IP (from the redis token route). Without a hostPort
+      # node-level bind the fleet can exceed the node count, so anti-affinity is soft:
+      # preferred (not required) still spreads replicas across nodes for fault tolerance.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- if .Values.gameServer.dataImage.repository }}
+      {{- if .Values.gameServer.dataImage.pullSecret }}
+      # Pull the private game-data init image.
+      imagePullSecrets:
+        - name: {{ .Values.gameServer.dataImage.pullSecret }}
+      {{- end }}
+      # Copy the minimal game data into the game emptyDir — no persistent volume.
+      initContainers:
+        - name: load-gamedata
+          image: "{{ .Values.gameServer.dataImage.repository }}:{{ .Values.gameServer.dataImage.tag }}"
+          imagePullPolicy: {{ .Values.gameServer.dataImage.pullPolicy }}
+          command: ["sh", "-c", "cp -a /gamedata/. /game/"]
+          volumeMounts:
+            - { name: game, mountPath: /game }
+      {{- end }}
+      containers:
+        - name: d2gs
+          image: "{{ .Values.images.gs.repository }}:{{ .Values.images.gs.tag }}"
+          imagePullPolicy: {{ .Values.images.gs.pullPolicy }}
+          ports:
+            - { containerPort: 4000, name: game }
+            - { containerPort: 8086, name: health }
+          env:
+            # The gs-link Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
+            # Uses realmd-gslink (publishNotReadyAddresses) so the GS can register even
+            # while realmd is NotReady — otherwise REQUIRE_GS deadlocks registration.
+            - name: REALMD_HOST
+              value: realmd-gslink.{{ .Release.Namespace }}.svc.cluster.local
+            # The GS registers its in-cluster POD IP — qqserver (also in-cluster) dials
+            # this to splice client game traffic through. No public exposure. POD_IP must
+            # precede D2GS_GS_ADDR for the $(POD_IP) substitution to resolve.
+            - name: POD_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+            - name: D2GS_GS_ADDR
+              value: "$(POD_IP):4000"
+            - name: D2GS_MAX_GAMES
+              value: {{ .Values.gameServer.maxGames | quote }}
+            {{- if .Values.gameServer.extraDlls }}
+            - name: D2GS_EXTRA_DLLS
+              value: {{ .Values.gameServer.extraDlls | quote }}
+            {{- end }}
+            {{- if .Values.gameServer.extraArgs }}
+            - name: D2GS_EXTRA_ARGS
+              value: {{ .Values.gameServer.extraArgs | quote }}
+            {{- end }}
+          volumeMounts:
+            - { name: game, mountPath: /game, readOnly: true }
+            - { name: wine, mountPath: /wine }
+            - { name: work, mountPath: /work }
+          resources:
+            {{- toYaml .Values.gameServer.resources | nindent 12 }}
+          # In-process health endpoint: 200 only while the engine tick loop is beating.
+          # Generous startup budget — wine prefix init + engine boot is slow.
+          startupProbe:
+            httpGet: { path: /, port: 8086 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /, port: 8086 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: 8086 }
+            periodSeconds: 15
+            failureThreshold: 4
+      volumes:
+        - name: game
+          {{- if .Values.gameServer.dataImage.repository }}
+          emptyDir: {}     # minimal game data copied in by the load-gamedata initContainer
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: d2-gamefiles
+          {{- end }}
+        - name: wine
+          emptyDir: {}     # wine prefix re-inits per start; make it a PVC to persist
+        - name: work
+          emptyDir: {}
