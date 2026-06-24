@@ -47,6 +47,13 @@ fn loginTask() void {
     oog.enterFirstChar();
     log.print("autologin: entered realm with first char");
 
+    enterGame();
+    log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
+}
+
+/// From the lobby: open the create- or join-game tab, type the game name, click the action
+/// button. (Shared by the auto-login and create-char-then-play scripts.)
+fn enterGame() void {
     oog.awaitLocation(.lobby);
     if (want_join) {
         if (oog.findControl(oog.TYPE_BUTTON, -1, 652, 469, -1, -1)) |tab| oog.clickControl(tab); // JOIN tab
@@ -54,7 +61,6 @@ fn loginTask() void {
         var boxes: [2]*oog.Control = undefined;
         if (oog.editboxes(&boxes) >= 1) oog.setControlText(boxes[0], gameZ());
         oog.waitFrames(1);
-        // JOIN action button: the wide one at (594,433), fall back to (433,433).
         if (oog.findControl(oog.TYPE_BUTTON, -1, 594, 433, -1, -1) orelse
             oog.findControl(oog.TYPE_BUTTON, -1, 433, 433, -1, -1)) |b| oog.clickControl(b);
         log.print("autologin: clicked JOIN game");
@@ -64,12 +70,10 @@ fn loginTask() void {
         var boxes: [2]*oog.Control = undefined;
         if (oog.editboxes(&boxes) >= 1) oog.setControlText(boxes[0], gameZ());
         oog.waitFrames(1);
-        // CREATE button: bottom-right of the form, with a fallback slot.
         if (oog.findControl(oog.TYPE_BUTTON, -1, 594, 433, -1, -1) orelse
             oog.findControl(oog.TYPE_BUTTON, -1, 432, 433, -1, -1)) |b| oog.clickControl(b);
         log.print("autologin: clicked CREATE game");
     }
-    log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
 }
 
 /// The create-character script: log in, reach char-select, then drive the create-char UI
