@@ -411,10 +411,20 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
                         var rest2: [96]u8 = undefined;
                         if (splitNames(std.mem.sliceTo(&rest, 0), &pass, &rest2)) {
                             var name: [64]u8 = undefined;
-                            var cls: [16]u8 = undefined;
+                            var cls: [32]u8 = undefined;
                             if (splitNames(std.mem.sliceTo(&rest2, 0), &name, &cls)) {
-                                const class = std.fmt.parseInt(u8, std.mem.sliceTo(&cls, 0), 10) catch 1;
-                                autologin.installCreateChar(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0), std.mem.sliceTo(&name, 0), class);
+                                // cls = "class[:status]" — status is hex/dec (default 0x20 expansion).
+                                var classstr: [16]u8 = undefined;
+                                var statusstr: [16]u8 = undefined;
+                                var class: u8 = 1;
+                                var status: u8 = 0x20;
+                                if (splitNames(std.mem.sliceTo(&cls, 0), &classstr, &statusstr)) {
+                                    class = std.fmt.parseInt(u8, std.mem.sliceTo(&classstr, 0), 10) catch 1;
+                                    status = std.fmt.parseInt(u8, std.mem.sliceTo(&statusstr, 0), 0) catch 0x20;
+                                } else {
+                                    class = std.fmt.parseInt(u8, std.mem.sliceTo(&cls, 0), 10) catch 1;
+                                }
+                                autologin.installCreateChar(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0), std.mem.sliceTo(&name, 0), class, status);
                             }
                         }
                     }
