@@ -13,6 +13,8 @@ extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
 var account: [64]u16 = undefined;
 var password: [64]u16 = undefined;
 var game_name = [_]u16{ 'r', 'e', 'a', 'l', 'm', 't', 'e', 's', 't', 0 };
+var newchar_name: [64]u16 = undefined;
+var newchar_class: u8 = 1; // default Sorceress
 var want_join: bool = false;
 var t_install: u32 = 0; // GetTickCount at install -> measure dll-attach -> in-game
 
@@ -67,6 +69,34 @@ fn loginTask() void {
         log.print("autologin: clicked CREATE game");
     }
     log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
+}
+
+/// The create-character script: log in, reach char-select, then drive the create-char UI
+/// (click "create new" -> pick the class art -> type the name -> OK). The client sends
+/// MCP_CHARCREATE and the realm persists a fresh level-1 .d2s.
+fn createCharTask() void {
+    oog.awaitLocation(.login);
+    oog.doLogin(acctZ(), passZ());
+    log.print("autologin: logged in");
+
+    _ = oog.awaitAny(&.{ .char_select, .char_select_empty });
+    log.print("autologin: at char-select — creating character");
+    if (oog.createCharacter(@ptrCast(&newchar_name), newchar_class))
+        log.print("autologin: create-character submitted")
+    else
+        log.print("autologin: create-character FAILED to drive the UI");
+    log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
+}
+
+/// Auto-login + CREATE a new character (then stop at char-select). class: 0..6.
+pub fn installCreateChar(acct: []const u8, pass: []const u8, name: []const u8, class: u8) void {
+    t_install = GetTickCount();
+    toUtf16(&account, acct);
+    toUtf16(&password, pass);
+    toUtf16(&newchar_name, name);
+    newchar_class = class;
+    oog.run(&createCharTask);
+    log.print("autologin: script installed (create-char)");
 }
 
 /// Auto-login + CREATE a game with the default name.

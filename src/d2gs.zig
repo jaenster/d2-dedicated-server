@@ -402,7 +402,23 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             // Drive the bnet login form: --auto-login <account>:<password>.
             {
                 var tmp: [160]u8 = undefined;
-                if (flagToken("auto-login", &tmp)) |len| {
+                if (flagToken("create-char", &tmp)) |len| {
+                    // acct:pass:name:class — log in and drive the create-character UI.
+                    var acct: [64]u8 = undefined;
+                    var rest: [96]u8 = undefined;
+                    if (splitNames(tmp[0..len], &acct, &rest)) {
+                        var pass: [64]u8 = undefined;
+                        var rest2: [96]u8 = undefined;
+                        if (splitNames(std.mem.sliceTo(&rest, 0), &pass, &rest2)) {
+                            var name: [64]u8 = undefined;
+                            var cls: [16]u8 = undefined;
+                            if (splitNames(std.mem.sliceTo(&rest2, 0), &name, &cls)) {
+                                const class = std.fmt.parseInt(u8, std.mem.sliceTo(&cls, 0), 10) catch 1;
+                                autologin.installCreateChar(std.mem.sliceTo(&acct, 0), std.mem.sliceTo(&pass, 0), std.mem.sliceTo(&name, 0), class);
+                            }
+                        }
+                    }
+                } else if (flagToken("auto-login", &tmp)) |len| {
                     var acct: [64]u8 = undefined;
                     var pass: [64]u8 = undefined;
                     if (splitNames(tmp[0..len], &acct, &pass)) {

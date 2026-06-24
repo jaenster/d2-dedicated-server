@@ -218,6 +218,16 @@ pub fn waitFrames(n: u32) void {
     async_.waitFrames(n);
 }
 
+/// Yield frames (up to ~`max` of them) until a control matching the fields exists; null on timeout.
+pub fn awaitControl(ctype: u32, x: i32, y: i32, w: i32, h: i32, max: u32) ?*Control {
+    var i: u32 = 0;
+    while (i < max) : (i += 1) {
+        if (findControl(ctype, -1, x, y, w, h)) |c| return c;
+        async_.yield();
+    }
+    return null;
+}
+
 // ── high-level menu ops (call when getLocation() is the matching screen) ──
 
 /// Fill the account/password edit-boxes (ordered by Y: account above password) and click LOGON.
@@ -249,4 +259,37 @@ pub fn fillNameAndClick(name: [*:0]const u16, px: u32, py: u32, pw: u32, ph: u32
     var boxes: [2]*Control = undefined;
     if (editboxes(&boxes) >= 1) setControlText(boxes[0], name);
     click(px + pw / 2, py -% ph / 2);
+}
+
+// Per-class character-create art: the class IMAGE rect {x,y} (88x184) and the point to click
+// on it {clickX,clickY}, indexed by class id (0=Ama,1=Sorc,2=Necro,3=Pal,4=Barb,5=Druid,6=Asn).
+// From d2bs OOG_CreateCharacter (1.14d).
+const class_art = [7][4]i32{
+    .{ 100, 337, 80, 330 }, // amazon
+    .{ 626, 353, 600, 300 }, // sorceress
+    .{ 301, 333, 300, 330 }, // necromancer
+    .{ 521, 339, 500, 330 }, // paladin
+    .{ 400, 330, 390, 330 }, // barbarian
+    .{ 720, 370, 700, 370 }, // druid
+    .{ 232, 364, 200, 300 }, // assassin
+};
+
+/// From char-select: click "create new", pick the class art, type the name, click OK. The
+/// client then sends MCP_CHARCREATE and the realm persists the new .d2s. Returns false if the
+/// class is invalid or the create screen / class art never appears. Frame-driven (no sleeps).
+pub fn createCharacter(name: [*:0]const u16, class: u8) bool {
+    if (class > 6) return false;
+    const a = findControl(TYPE_BUTTON, -1, 33, 528, 168, 60) orelse return false; // "CREATE NEW"
+    clickControl(a);
+    const art = class_art[class];
+    if (awaitControl(TYPE_IMAGE, art[0], art[1], 88, 184, 300) == null) return false; // on create screen
+    click(@intCast(art[2]), @intCast(art[3])); // select the class (d2bs double-clicks it)
+    async_.waitFrames(3);
+    click(@intCast(art[2]), @intCast(art[3]));
+    async_.waitFrames(8); // class animates in + the name edit-box appears
+    var boxes: [2]*Control = undefined;
+    if (editboxes(&boxes) >= 1) setControlText(boxes[0], name);
+    async_.waitFrames(3);
+    if (findControl(TYPE_BUTTON, -1, 627, 572, 128, 35)) |ok| clickControl(ok); // OK -> MCP_CHARCREATE
+    return true;
 }
