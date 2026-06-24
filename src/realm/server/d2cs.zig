@@ -15,7 +15,10 @@ const log = @import("realm_infra").log;
 const proto = @import("proto.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
+const d2s = @import("d2s.zig");
 const gslink = @import("gslink.zig");
+
+extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d2s create time
 
 // MCP message ids (subset; everything else is logged).
 const MCP_STARTUP = 0x01;
@@ -26,7 +29,11 @@ const MCP_GAMELIST = 0x05;
 const MCP_GAMEINFO = 0x06;
 const MCP_CHARLOGON = 0x07;
 const MCP_CHARDELETE = 0x0a;
+const MCP_LADDERDATA = 0x11;
 const MCP_MOTD = 0x12;
+const MCP_CANCELCREATE = 0x13;
+const MCP_CHARRANK = 0x16;
+const MCP_CHARUPGRADE = 0x18;
 const MCP_CHARLIST2 = 0x19;
 
 // Set from main() (mirrors gslink.gs_ip_override). When `game_ip` is set, JOINGAME
@@ -138,6 +145,13 @@ fn dispatch(c: *DConn, tag: []const u8, id: u8, body: []const u8) void {
         MCP_CREATEGAME => onCreateGame(c, tag, body),
         MCP_JOINGAME => onJoinGame(c, tag, body),
         MCP_GAMELIST => onGameList(c, tag, body),
+        MCP_GAMEINFO => onGameInfo(c, tag, body),
+        MCP_CHARDELETE => onCharDelete(c, tag, body),
+        MCP_CHARUPGRADE => onCharUpgrade(c, tag, body),
+        MCP_MOTD => onMotd(c, tag, body),
+        MCP_LADDERDATA => onLadderData(c, tag, body),
+        MCP_CANCELCREATE => onCancelCreate(c, tag, body),
+        MCP_CHARRANK => onCharRank(c, tag, body),
         else => {
             log.line(tag, "unhandled MCP 0x{x:0>2} ({d} bytes)", .{ id, body.len });
             if (body.len > 0) log.hexdump(tag, body);
@@ -193,10 +207,17 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
         const class: u8 = if (n > 0x2b) save[0x28] else 1;
         const level: u8 = if (n > 0x2b) save[0x2b] else 1;
         const status: u8 = if (n > 0x24) save[0x24] else 0x20; // default to expansion
+        const progression: u8 = if (n > 0x25) save[0x25] else 0; // title (difficulty completed)
+        // The .d2s header carries the menu-composite appearance the game wrote on save:
+        // pAppearance1@0x88 = body-component graphic codes, pAppearance2@0x98 = color
+        // transforms (16 each; the statstring uses the first 11). Empty => naked preview.
+        const have_app = n > 0xA2;
+        const app1: []const u8 = if (have_app) save[0x88..0x93] else &.{};
+        const app2: []const u8 = if (have_app) save[0x98..0xA3] else &.{};
 
         w.putU32(0xFFFF_FFFF); // expiration — far future so it's NOT "expired"
         w.putStr(names[i].slice()); // character name
-        writeStatString(&w, class, level, status, @intCast(total)); // CharSel.cpp layout
+        writeStatString(&w, class, level, status, progression, @intCast(total), app1, app2); // CharSel.cpp layout
         w.putU8(0); // statstring C-string terminator
     }
     finish(c, &w);
@@ -233,25 +254,37 @@ fn enc14(w: *proto.Writer, v: u32) void {
 // item list (JM section) into gaCompCharacterCompositeItems indices and fill slot1/slot2
 // (a future "char portrait" feature; the GS has the items in memory on save and could
 // supply the portrait, like real pvpgn d2cs does).
-fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, realm_count: u32) void {
-    enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
+// Emit the 11-byte equip slot from a .d2s appearance block. The statstring is a
+// C-string, so a 0x00 byte would truncate it — map 0x00 (and any missing byte, e.g. a
+// naked char with an empty slice) to 0xFF = "no component in this slot".
+fn putEquipSlot(w: *proto.Writer, app: []const u8) void {
     var k: usize = 0;
-    while (k < 11) : (k += 1) w.putU8(0xFF); // equip slot 1 (none)
+    while (k < 11) : (k += 1) {
+        const b: u8 = if (k < app.len and app[k] != 0) app[k] else 0xFF;
+        w.putU8(b);
+    }
+}
+
+fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progression: u8, realm_count: u32, app1: []const u8, app2: []const u8) void {
+    enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
+    putEquipSlot(w, app1); // equip slot 1: body-component graphic codes (.d2s pAppearance1)
     w.putU8(class + 1); // class (CharSel subtracts CLASS_SORCERESS=1)
-    k = 0;
-    while (k < 11) : (k += 1) w.putU8(0xFF); // equip slot 2 (none)
+    putEquipSlot(w, app2); // equip slot 2: component color transforms (.d2s pAppearance2)
     w.putU8(if (level == 0) 1 else level); // level (avoid 0)
-    // flags &4 = expansion — derived from the .d2s status byte (0x20) rather than
-    // hardcoded, so a classic char would render as classic.
-    const flags: u32 = if (status & 0x20 != 0) 0x04 else 0;
+    // The char-select reads nCharacterFlags here: the LOW byte mirrors the .d2s status
+    // byte (CharSel tests hardcore & 4, died & 8, expansion & 0x20, ladder & 0x40), and
+    // the HIGH byte (>> 8 & 0x1f) is the title progression (difficulty completed) that
+    // picks the char's title — without it every char shows the "EXPANSION CHARACTER"
+    // no-title fallback. Both come straight from the .d2s (status@0x24, progression@0x25).
+    const flags: u32 = (@as(u32, progression & 0x1f) << 8) | (status & 0x6C);
     enc14(w, flags);
     enc14(w, 0); // field9
     w.putU8(0xFF); // act      (0xFF -> 0)
     w.putU8(0xFF); // field_0x32f
     w.putU8(0xFF); // field_0x330
-    w.putU8(0xFF); // guild tag [0]
-    w.putU8(0xFF); // guild tag [1]
-    w.putU8(0xFF); // guild tag [2]
+    // No guild tag: the statstring's trailing NUL (added by the caller) lands on the
+    // guild-tag slot, so CharSel's strncpy reads an empty tag. Emitting 0xFF bytes here
+    // instead made it append " {ÿÿÿ}" garbage to the char name (looked like "no name").
 }
 
 fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
@@ -265,13 +298,46 @@ fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+// MCP_CHARCREATE (0x02) body: u32 class + cstr name (NET_MCP_CLIENT_Send_0x02_CharCreate
+// writes only the class dword; status isn't on the wire). We generate a fresh level-1 .d2s
+// (the engine fills starting stats/items on first play) and persist it via the store, so the
+// new char shows in CHARLIST2 and is playable. Result: 0 ok, 0x14 name taken, 0x15 invalid.
 fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
+    // MCP_CHARCREATE (0x02) body = [u32 class][u16 status][cstr name] (verified from a live
+    // capture: 01000000 6000 "DiagSorc\0"). status low byte carries the .d2s flags the client's
+    // checkboxes set: expansion 0x20, hardcore 0x04, ladder 0x40.
     var r = proto.Reader.init(body);
-    const class = r.getU32();
+    const class: u8 = @intCast(r.getU32() & 0xff);
+    const status_flags: u8 = @intCast(r.getU16() & 0x6C); // hardcore|died|expansion|ladder
     const name = r.getStr();
-    log.line(tag, "char create '{s}' class={d} (account={s}) -> ok (store TODO)", .{ name, class, c.accountName() });
+    const acct = c.accountName();
+
     var buf: [12]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARCREATE);
+
+    const expansion = (status_flags & 0x20) != 0;
+    // Druid (5) and Assassin (6) only exist in the expansion — they cannot be classic chars.
+    const expansion_only_class = (class == 5 or class == 6);
+    if (name.len == 0 or name.len > d2s.name_max or class > 6 or (expansion_only_class and !expansion)) {
+        log.line(tag, "char create '{s}' class={d} exp={} -> invalid", .{ name, class, expansion });
+        w.putU32(0x15);
+        return finish(c, &w);
+    }
+    var probe: [d2s.new_save_size]u8 = undefined;
+    if (store.getCharD2s(acct, name, &probe) > 0) {
+        log.line(tag, "char create '{s}' (account={s}) -> name taken", .{ name, acct });
+        w.putU32(0x14);
+        return finish(c, &w);
+    }
+    var save: [d2s.new_save_size]u8 = undefined;
+    const now: u32 = @truncate(@as(u64, @bitCast(@as(i64, time(null)))));
+    // Honor the client's flags as-is (classic = no 0x20, expansion = 0x20, +hardcore/ladder).
+    if (!d2s.newSave(&save, name, class, status_flags, now) or !store.saveCharD2s(acct, name, &save)) {
+        log.line(tag, "char create '{s}' (account={s}) -> store FAILED", .{ name, acct });
+        w.putU32(0x06);
+        return finish(c, &w);
+    }
+    log.line(tag, "char create '{s}' class={d} (account={s}) -> created", .{ name, class, acct });
     w.putU32(0); // success
     finish(c, &w);
 }
@@ -279,7 +345,10 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
 fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
-    _ = r.getU32(); // difficulty bitfield (TODO: map to GS flags via real capture)
+    // MCP create-game flags DWORD: difficulty lives in bits 12-14 (Normal=0x0000,
+    // Nightmare=0x1000, Hell=0x2000), the same GAMEFLAG_DIFFICULTY_BIT=12 the GS uses.
+    const create_flags = r.getU32();
+    const difficulty: u8 = @intCast(@min(@as(u32, 2), (create_flags >> 12) & 0x7));
     _ = r.getU8(); // unknown (1)
     _ = r.getU8(); // player difference
     _ = r.getU8(); // max players
@@ -299,9 +368,10 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         finish(c, &w);
         return;
     }
-    // MVP flags: expansion (LOD), normal difficulty, softcore, non-ladder.
+    // Expansion (LOD), softcore, non-ladder; difficulty from the client's request.
     // The registry picks the least-loaded GS with capacity and gives us its address.
-    const routed = gslink.createGameRouted(name, pass, desc, 0, true, 0, false);
+    log.line(tag, "create game '{s}' diff={d} (flags=0x{x})", .{ name, difficulty, create_flags });
+    const routed = gslink.createGameRouted(name, pass, desc, 0, true, difficulty, false);
     if (routed == null) {
         log.line(tag, "create game '{s}' -> GS refused / all full", .{name});
         w.putU16(0);
@@ -311,7 +381,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     }
     const rr = routed.?;
-    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid);
+    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, pass); // 1 player: the creator
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -332,7 +402,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
     const name = r.getStr();
-    _ = r.getStr(); // password
+    const join_pass = r.getStr();
 
     var buf: [32]u8 = undefined;
     var w = startPacket(&buf, MCP_JOINGAME);
@@ -350,6 +420,21 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     }
     const g = game.?;
+    // Reject a wrong password for a passworded game (open games have pw_len == 0).
+    // 0x2a = "incorrect password" (verify the exact client string in a live test).
+    if (g.pw_len > 0 and !std.mem.eql(u8, g.pw(), join_pass)) {
+        log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD", .{ name, c.accountName() });
+        w.putU16(0); // token
+        w.putU16(0); // unknown
+        w.putU32(0); // d2gs IP
+        w.putU32(0); // game hash
+        w.putU32(0x2a); // result: incorrect password
+        finish(c, &w);
+        return;
+    }
+    // Best-effort bump of the join-screen player count (the GS owns the authoritative
+    // count; leaves aren't tracked here yet, so this can run high until the game closes).
+    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.pw());
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
@@ -383,7 +468,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
 // Per-game 0x05 payload (offsets are from the type byte the client sees as pBytes[0]):
 //   +1   u16 reqid   (must equal the request's seq or the client drops it)
 //   +3   u32 gameid  (low u16 is the AddGameToCache dedup key)
-//   +7   u8  status  (game flags; 0 = open)
+//   +7   u8  player count (the join screen's PLAYERS column; cache+0x14, read as u16)
 //   +8   u32 token   (must NOT be -1/-2 for a real game)
 //   +0xc cstr name, then cstr description
 fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
@@ -398,7 +483,7 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
         var w = startPacket(&buf, MCP_GAMELIST);
         w.putU16(reqid); // +1 echo request id
         w.putU32(g.gameid); // +3 gameid (low u16 = dedup key)
-        w.putU8(0); // +7 status / flags (0 = open)
+        w.putU8(@intCast(@min(g.players, 255))); // +7 player count (PLAYERS column)
         w.putU32(g.gameid); // +8 token (non -1/-2 -> treated as a real game entry)
         w.putStr(g.name_slice()); // +0xc game name (shown in the list)
         w.putStr(""); // description
@@ -412,4 +497,166 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     tw.putU8(0); // +7 unused
     tw.putU32(0xFFFF_FFFE); // +8 token = -2 (end of list)
     finish(c, &tw);
+}
+
+// Message-of-the-day shown in the chat window after entering the realm. Settable so
+// a deployment can override it; defaults to a neutral welcome.
+pub var motd: []const u8 = "Welcome to the realm.";
+
+// MCP_CHARDELETE (0x0a). Request: u16 reqid, cstr charname. Removes the .d2s from the
+// durable store (fs/redis/pg — works in shared/multi-instance mode). Reply: u16 reqid
+// echo + u32 result (0 = deleted). Client: NET_MCP_CLIENT_Incoming0x0A checks the reqid
+// then SetD2GSJoinResult(result) + marks the delete handled, refreshing CharSel.
+fn onCharDelete(c: *DConn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const reqid = r.getU16();
+    const name = r.getStr();
+    const ok = store.deleteCharD2s(c.accountName(), name);
+    log.line(tag, "char delete '{s}' (account={s}) -> {s}", .{ name, c.accountName(), if (ok) "deleted" else "FAILED" });
+    var buf: [16]u8 = undefined;
+    var w = startPacket(&buf, MCP_CHARDELETE);
+    w.putU16(reqid);
+    w.putU32(if (ok) 0 else 1); // 0 = success
+    finish(c, &w);
+}
+
+// MCP_GAMEINFO (0x06). Request: u16 reqid, cstr gamename. Populates the join-screen
+// detail panel. We mirror the verified 0x05 per-game layout but set the token to -1 so
+// the client cleanly shows "no detail" (Incoming0x06 maps -1 -> result 0x32 and returns
+// before parsing the server-name/player-list area). Join still works without it; the
+// full player-list layout is a live-client follow-up.
+fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const reqid = r.getU16();
+    const name = r.getStr();
+    const exists = state.global.findGame(name) != null;
+    log.line(tag, "game info '{s}' -> {s}", .{ name, if (exists) "exists (no detail)" else "not found" });
+    var buf: [32]u8 = undefined;
+    var w = startPacket(&buf, MCP_GAMEINFO);
+    w.putU16(reqid); // +1 reqid echo
+    w.putU32(0); // +3 unused
+    w.putU8(0); // +7 status
+    w.putU32(0xFFFF_FFFF); // +8 token = -1 -> "no info" (early return, no name parse)
+    finish(c, &w);
+}
+
+// MCP_MOTD (0x12). Request: empty. Reply: 1 pad byte then a C-string the client shows in
+// chat (Incoming0x12 reads the message at pBytes+2).
+fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
+    _ = body;
+    log.line(tag, "motd -> '{s}'", .{motd});
+    var buf: [256]u8 = undefined;
+    var w = startPacket(&buf, MCP_MOTD);
+    w.putU8(0); // body[0] pad; message begins at body[1] (client reads pBytes+2)
+    w.putStr(motd);
+    finish(c, &w);
+}
+
+// MCP_LADDERDATA (0x11). Request: u8 mode, u16 reqid. Reply with the realm's characters
+// ranked by level. Wire format reversed from NET_MCP_CLIENT_Incoming0x11 @0x44afc0 +
+// CHATDLG_HandleChatListClick @0x4403f0: after the id, [u8 flag][u16 total][u16 chunk]
+// [u16 offset][data]; `data` (sent as one chunk) = [u32 rankBase=0][u32 count][u32 entrySize]
+// then count entries of [u32 expLo][u32 expHi][u32 charStats][entrySize-byte name]. charStats
+// = class(&0xf) | died<<4 | expansion<<5 | hardcore<<6 | progression<<8 | level<<16. Empty
+// realm -> the all-zero "empty ladder" form. count/entrySize are capped (<=256 / <=16) by the
+// client parser. Experience lives in the .d2s stat section (not the header) so we rank by level.
+const ladder_max = 200;
+const ladder_entry_size: u32 = 16; // name field width
+
+const LadderEntry = struct { name: [16]u8 = .{0} ** 16, stats: u32 = 0 };
+
+fn ladderLevelDesc(_: void, a: LadderEntry, b: LadderEntry) bool {
+    return (a.stats >> 16) > (b.stats >> 16);
+}
+
+fn collectLadder(out: *[ladder_max]LadderEntry) usize {
+    var n: usize = 0;
+    var accts: [256][32]u8 = undefined;
+    const na = store.listAccounts(&accts);
+    for (accts[0..na]) |acct_buf| {
+        const acct = std.mem.sliceTo(&acct_buf, 0);
+        if (acct.len == 0) continue;
+        var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
+        const nc = store.listChars(acct, &names);
+        for (names[0..nc]) |nm| {
+            if (n >= ladder_max) return n;
+            var save: [256]u8 = undefined;
+            const sz = store.getCharD2s(acct, nm.slice(), &save);
+            if (sz <= 0x2b) continue;
+            const status = save[0x24];
+            const progression: u32 = if (sz > 0x25) save[0x25] else 0;
+            var stats: u32 = save[0x28] & 0xf; // class
+            if (status & 0x08 != 0) stats |= 0x10; // died
+            if (status & 0x20 != 0) stats |= 0x20; // expansion
+            if (status & 0x04 != 0) stats |= 0x40; // hardcore
+            stats |= (progression & 0x1f) << 8;
+            stats |= @as(u32, save[0x2b]) << 16; // level
+            const cn = nm.slice();
+            out[n] = .{ .stats = stats };
+            @memcpy(out[n].name[0..@min(cn.len, 16)], cn[0..@min(cn.len, 16)]);
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
+    const mode: u8 = if (body.len > 0) body[0] else 0;
+    var entries: [ladder_max]LadderEntry = undefined;
+    const n = collectLadder(&entries);
+    std.sort.pdq(LadderEntry, entries[0..n], {}, ladderLevelDesc);
+    log.line(tag, "ladder data request mode=0x{x} -> {d} entries", .{ mode, n });
+
+    var buf: [8192]u8 = undefined;
+    var w = startPacket(&buf, MCP_LADDERDATA);
+    if (n == 0) {
+        w.zeros(14); // empty-ladder form (Incoming0x11 clear-and-done path)
+        return finish(c, &w);
+    }
+    const total: u16 = @intCast(12 + n * (12 + ladder_entry_size));
+    w.putU8(mode); // flag — echo the requested mode so the client renders this tab
+    w.putU16(total); // whole-buffer size
+    w.putU16(total); // this chunk's length (single chunk)
+    w.putU16(0); // write offset
+    w.putU32(0); // rankBase
+    w.putU32(@intCast(n)); // count
+    w.putU32(ladder_entry_size); // per-entry name width
+    for (entries[0..n]) |e| {
+        w.putU32(0); // experience low (not in the .d2s header)
+        w.putU32(0); // experience high
+        w.putU32(e.stats);
+        w.putBytes(&e.name);
+    }
+    finish(c, &w);
+}
+
+// MCP_CHARUPGRADE (0x18). Request: cstr charname (classic -> expansion conversion).
+// We run an expansion-only realm, so we accept it (Incoming0x18 reads result@u32 and
+// marks success). Mutating the .d2s expansion flag needs a checksum rewrite + a live
+// client to verify, so that part is deliberately deferred — the ack keeps the UI happy.
+fn onCharUpgrade(c: *DConn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    const name = r.getStr();
+    log.line(tag, "char upgrade '{s}' (account={s}) -> ack (save unchanged)", .{ name, c.accountName() });
+    var buf: [12]u8 = undefined;
+    var w = startPacket(&buf, MCP_CHARUPGRADE);
+    w.putU32(0); // result: success
+    finish(c, &w);
+}
+
+// MCP_CANCELCREATE (0x13). Request: empty. Fire-and-forget — the client gave up on a
+// pending create. CreateGame is synchronous here so there's nothing to unwind; just note
+// it. No reply (the client has no Incoming0x13).
+fn onCancelCreate(c: *DConn, tag: []const u8, body: []const u8) void {
+    _ = c;
+    _ = body;
+    log.line(tag, "cancel game create (no-op)", .{});
+}
+
+// MCP_CHARRANK (0x16). Request: cstr charname, u32, u32. Cosmetic ranking lookup; the
+// client has no Incoming0x16, so there's no reply to send. Acknowledge in the log.
+fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
+    _ = c;
+    _ = body;
+    log.line(tag, "char rank request (no ladder; no-op)", .{});
 }

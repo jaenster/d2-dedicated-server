@@ -118,6 +118,191 @@ fn scCharListStatstring() Result {
     return .{ .name = name, .status = .pass, .msg = msg("listed {s}: class={s} level={d} flags={d} (total={d})", .{ char, cls, ch.level, ch.flags, cl.total }) };
 }
 
+fn scCharCopy() Result {
+    const name = "char_copy";
+    const acct = "CopyAcct";
+    const src = "Original";
+    const dst = "CopyCat";
+    var d2sbuf: [0x40]u8 = undefined;
+    const blob = minimalD2s(&d2sbuf, src, 1, 20); // Sorceress, level 20
+    const sr = rc.d2dbsSave(acct, src, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+
+    // Clone Original -> CopyCat within the same account via the admin API.
+    var jb: [160]u8 = undefined;
+    const json = std.fmt.bufPrint(&jb, "{{\"src_account\":\"{s}\",\"src_char\":\"{s}\",\"dst_char\":\"{s}\"}}", .{ acct, src, dst }) catch return fail(name, "json", .{});
+    var rxbuf: [2048]u8 = undefined;
+    const r = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/copy", ADMIN_TOKEN, json, &rxbuf) catch |e| return fail(name, "copy {s}", .{@errorName(e)});
+    if (r.status != 200) return fail(name, "copy status={d} body={s}", .{ r.status, r.body });
+
+    // A second copy must be refused (destination now exists).
+    var rx2: [2048]u8 = undefined;
+    const r2 = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/copy", ADMIN_TOKEN, json, &rx2) catch |e| return fail(name, "copy2 {s}", .{@errorName(e)});
+    if (r2.status == 200) return fail(name, "duplicate copy must be rejected, got 200", .{});
+
+    // Both the original and the clone must now list for the account.
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    var entries: [64]rc.CharEntry = undefined;
+    var dst_buf: [4096]u8 = undefined;
+    const cl = c.charList(&entries, &dst_buf) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var have_src = false;
+    var have_dst = false;
+    for (entries[0..cl.count]) |e| {
+        if (std.mem.eql(u8, e.name, src)) have_src = true;
+        if (std.mem.eql(u8, e.name, dst)) have_dst = true;
+    }
+    if (!have_src or !have_dst) return fail(name, "after copy expected both {s} and {s} (src={}, dst={})", .{ src, dst, have_src, have_dst });
+    return .{ .name = name, .status = .pass, .msg = msg("'{s}' cloned to '{s}'; dup rejected; both list (total={d})", .{ src, dst, cl.total }) };
+}
+
+fn scClassicChar() Result {
+    const name = "classic_char";
+    const acct = "ClassicAcct";
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    // A classic Barbarian (class 4, no expansion bit) must be allowed.
+    const barb = c.charCreate(4, 0, "ClassicBarb") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (barb != 0) return fail(name, "classic Barbarian rejected (result=0x{x})", .{barb});
+
+    // A classic Druid (class 5) must be REJECTED — Druid/Assassin are expansion-only.
+    const cdruid = c.charCreate(5, 0, "ClassicDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cdruid == 0) return fail(name, "classic Druid was allowed, want rejection", .{});
+
+    // The same Druid WITH the expansion bit must be allowed.
+    const xdruid = c.charCreate(5, 0x20, "ExpacDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (xdruid != 0) return fail(name, "expansion Druid rejected (result=0x{x})", .{xdruid});
+
+    return .{ .name = name, .status = .pass, .msg = msg("classic Barbarian ok, classic Druid rejected (0x{x}), expansion Druid ok", .{cdruid}) };
+}
+
+fn scLadder() Result {
+    const name = "ladder_list";
+    const acct = "LadderAcct";
+    var d2s: [0x40]u8 = undefined;
+    const king = rc.d2dbsSave(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (king != 0) return fail(name, "save LadderKing result={d}", .{king});
+    const pawn = rc.d2dbsSave(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (pawn != 0) return fail(name, "save LadderPawn result={d}", .{pawn});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var entries: [256]rc.LadderEntry = undefined;
+    var dst: [8192]u8 = undefined;
+    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var king_rank: ?usize = null;
+    var pawn_rank: ?usize = null;
+    var king_level: u32 = 0;
+    for (entries[0..cnt], 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, "LadderKing")) {
+            king_rank = i;
+            king_level = e.level;
+        }
+        if (std.mem.eql(u8, e.name, "LadderPawn")) pawn_rank = i;
+    }
+    const kr = king_rank orelse return fail(name, "LadderKing not on ladder (cnt={d})", .{cnt});
+    const pr = pawn_rank orelse return fail(name, "LadderPawn not on ladder (cnt={d})", .{cnt});
+    if (king_level != 99) return fail(name, "LadderKing level={d} want 99", .{king_level});
+    if (kr >= pr) return fail(name, "not ranked by level: King@{d} not before Pawn@{d}", .{ kr, pr });
+    return .{ .name = name, .status = .pass, .msg = msg("ladder lists {d}; LadderKing(99)@{d} ranked above LadderPawn(1)@{d}", .{ cnt, kr, pr }) };
+}
+
+fn scCharCreate() Result {
+    const name = "create_char";
+    const acct = "CreateAcct";
+    const char = "Newbie";
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    // MCP_CHARCREATE a Sorceress (class 1) — realmd must build + persist a level-1 .d2s.
+    const res = c.charCreate(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res != 0) return fail(name, "create result={d} want 0", .{res});
+
+    // It must now appear in CHARLIST2 as a level-1 Sorceress.
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const cl = c.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var found: ?rc.CharEntry = null;
+    for (entries[0..cl.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) found = e;
+    }
+    const fe = found orelse return fail(name, "created char '{s}' not listed (total={d})", .{ char, cl.total });
+    if (fe.class_id != 1) return fail(name, "class_id={d} want 1 (Sorceress)", .{fe.class_id});
+    if (fe.level != 1) return fail(name, "level={d} want 1", .{fe.level});
+
+    // A duplicate name must be rejected (non-zero result).
+    const dup = c.charCreate(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (dup == 0) return fail(name, "duplicate create succeeded, want rejection", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("created '{s}' (Sorceress lvl 1), listed, dup rejected (result=0x{x})", .{ char, dup }) };
+}
+
+fn scCharDelete() Result {
+    const name = "delete_char";
+    const acct = "DelAcct";
+    const char = "DeleteMe";
+    var d2s: [0x40]u8 = undefined;
+    const blob = minimalD2s(&d2s, char, 1, 10);
+    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const before = c.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var present = false;
+    for (entries[0..before.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) present = true;
+    }
+    if (!present) return fail(name, "char {s} not present before delete", .{char});
+
+    const res = c.charDelete(char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res != 0) return fail(name, "delete result={d}", .{res});
+
+    var entries2: [64]rc.CharEntry = undefined;
+    var dst2: [4096]u8 = undefined;
+    const after = c.charList(&entries2, &dst2) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    for (entries2[0..after.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) return fail(name, "char {s} still listed after delete", .{char});
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("'{s}' deleted: account char count {d} -> {d}", .{ char, before.total, after.total }) };
+}
+
 fn scCreateJoinGame() Result {
     const name = "create_join_game";
     var gs = FakeGS{ .gsid = 0xABCD, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 42 };
@@ -398,6 +583,7 @@ fn maybeStartRealmd() !?c_int {
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
     _ = setenv("REALMD_HEALTH_PORT", health, 1);
     _ = setenv("REALMD_ADMIN_TOKEN", ADMIN_TOKEN, 1); // enable the admin API (admin_api scenario)
+    _ = setenv("REALMD_PERMISSIVE_AUTH", "1", 1); // legacy auth (auto-register + verify) for the synthetic xsha1 client
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
 
     const pid = fork();
@@ -507,6 +693,12 @@ fn scMultiInstance() Result {
         _ = waitpid(b_pid, null, 0);
     }
 
+    // A fake GS registers with instance A's gs-link so A can actually host a game.
+    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gameid = 77, .connect_port = 16115 };
+    gs.start(2000) catch |e| return fail(name, "FakeGS {s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register with instance A", .{});
+
     // Mint a session on instance A (bnetd 16112 -> d2cs handoff lives in shared store).
     var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16113 };
     defer a.close();
@@ -529,7 +721,20 @@ fn scMultiInstance() Result {
     const su = b.startup() catch |e| return fail(name, "B startup {s}", .{@errorName(e)});
     if (su != 0) return fail(name, "B failed to resolve A's session (startup result=0x{x})", .{su});
 
-    return .{ .name = name, .status = .pass, .msg = msg("session id={d} minted on A resolved on B's d2cs (startup=0)", .{a.sessionId()}) };
+    // Cloud-native game visibility: a game created through instance A must be listable
+    // through instance B — both enumerate the same shared ephemeral store. Create on A...
+    a.connectD2cs() catch |e| return fail(name, "A d2cs {s}", .{@errorName(e)});
+    if ((a.startup() catch 1) != 0) return fail(name, "A d2cs startup failed", .{});
+    const cg = a.createGame("fleetgame", "d") catch |e| return fail(name, "A create {s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "A create result={d}", .{cg.result});
+    // ...and confirm B's admin API lists it (shared-store snapshotGames, not A's memory).
+    var rxbuf: [4096]u8 = undefined;
+    const lg = net.httpRequest(17118, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "B admin games {s}", .{@errorName(e)});
+    if (lg.status != 200) return fail(name, "B admin games status={d}", .{lg.status});
+    if (std.mem.indexOf(u8, lg.body, "fleetgame") == null)
+        return fail(name, "game created on A is NOT visible via B's /admin/games (shared enumeration broken)", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("session minted on A resolved on B; game created on A listed via B's /admin/games (fleet-wide)", .{}) };
 }
 
 // A tiny echo TCP server standing in for a real backend GS :4000 game port. Binds an
@@ -747,7 +952,11 @@ pub fn main() !void {
         scMultiGameOneGs(),
         scQqserverTokenTranslate(),
         scCreateAccountRealAuth(),
-        skip("delete_char", "SKIP: not implemented yet — MCP_DELETECHARACTER (0x0a) has no handler in d2cs.zig"),
+        scCharCreate(),
+        scClassicChar(),
+        scLadder(),
+        scCharDelete(),
+        scCharCopy(),
         scLobbyChatAtoB(),
         scMultiInstance(),
     };

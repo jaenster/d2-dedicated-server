@@ -20,6 +20,7 @@ extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
 extern "c" fn getpeername(fd: c_int, addr: *anyopaque, len: *c_uint) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn inet_addr(cp: [*:0]const u8) c_uint;
+extern "c" fn usleep(usec: c_uint) c_int;
 
 /// The connected peer's IPv4 address (network-order octets), or zeros on error.
 pub fn peerIp(fd: Socket) [4]u8 {
@@ -144,8 +145,21 @@ pub fn serve(tag: []const u8, listen_fd: Socket, handler: Handler) void {
     while (true) {
         const cfd = accept(listen_fd, null, null);
         if (cfd < 0) {
-            log.line(tag, "accept failed", .{});
-            continue;
+            switch (@as(posix.E, @enumFromInt(std.c._errno().*))) {
+                // A signal interrupted accept (SIGTERM during drain) or the peer
+                // aborted before we got to it — neither is an error, retry silently.
+                .INTR, .CONNABORTED => continue,
+                // The listener fd was closed under us — we're shutting down. Stop
+                // cleanly instead of busy-spinning forever on a dead socket.
+                .BADF, .INVAL, .NOTSOCK => return,
+                // fd exhaustion or anything else: log and back off so a persistent
+                // failure doesn't peg a core.
+                else => |e| {
+                    log.line(tag, "accept failed (errno {d})", .{@intFromEnum(e)});
+                    _ = usleep(50_000); // 50ms back-off
+                    continue;
+                },
+            }
         }
         const t = std.Thread.spawn(.{}, connThread, .{ cfd, tag, handler }) catch {
             _ = close(cfd);

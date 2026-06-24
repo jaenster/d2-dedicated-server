@@ -10,6 +10,7 @@ pub const FakeGS = struct {
     gsid: u32 = 0xABCD,
     ip: [4]u8 = .{ 127, 0, 0, 1 },
     gs_port: u16 = 4000,
+    connect_port: u16 = rc.HOST_GS, // realmd gs-link port to register with
     maxgame: u32 = 100,
     gameid: u32 = 42,
     next_gameid: ?u32 = null, // if set, hand out incrementing ids
@@ -23,7 +24,7 @@ pub const FakeGS = struct {
     _next: u32 = 0,
 
     fn run(self: *FakeGS) void {
-        const fd = net.connectLocal(rc.HOST_GS) catch return;
+        const fd = net.connectLocal(self.connect_port) catch return;
         self.sock = fd;
         if (self.next_gameid) |n| self._next = n;
         var rx: [1024]u8 = undefined;

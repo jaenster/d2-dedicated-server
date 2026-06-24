@@ -61,6 +61,14 @@ DLL_WIN="Z:$(echo "$D2GS_CLIENTDIR/d2gs.dll" | tr '/' '\\')"
 # (this is a pure client, not the dedicated server).
 MAPHACK="--omnivision --mapreveal --mapunits"
 
+# Connecting to a realm (--realm-gw)? The Battle.net version check is pointless against
+# our realmd (it accepts any SID_AUTH_CHECK), so bypass it client-side by default —
+# otherwise the stock CheckRevision flow fails ("Unable to Identify Version").
+case " $* " in
+    *" --realm-gw "*|*" --realm-gw="*)
+        case " $* " in *" --bypass-checkrev "*) ;; *) MAPHACK="$MAPHACK --bypass-checkrev" ;; esac ;;
+esac
+
 pkill -9 -f '\\Game.exe' 2>/dev/null || true
 wineserver --kill 2>/dev/null || true
 sleep 1

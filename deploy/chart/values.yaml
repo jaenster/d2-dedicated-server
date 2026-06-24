@@ -1,0 +1,132 @@
+# Default values for the `realm` chart — a headless Diablo II 1.14d realm server:
+# realmd (protocol front) + a d2gs game-server fleet + the qqserver gateway, backed
+# by Postgres (durable character saves) and Redis (ephemeral sessions/games).
+#
+# These defaults are GENERIC and safe to publish: no real cluster IPs or passwords.
+# At minimum you must set `realmAddr` (the public address clients dial) and populate
+# the game-files PVC with a real, proprietary D2 1.14d install.
+
+# Realm display name shown in the client realm list.
+realmName: MyRealm
+
+# Public IPv4 / hostname that clients dial for d2cs (bnetd advertises it). Set this to
+# the realm's external LoadBalancer IP/host. REQUIRED — there is no sane default.
+realmAddr: ""
+
+# Stable public IPs (e.g. cloud floating IPs) used as Service externalIPs on the public
+# realmd and qqserver Services. A floating IP fails over between nodes and gives the realm
+# a fixed front door instead of an ephemeral LB IP. Empty = don't set externalIPs and fall
+# back to a plain LoadBalancer (the cloud assigns an IP). Example:
+#   floatingIPs: ["5.75.211.1", "78.47.225.57"]
+floatingIPs: []
+
+# Public address realmd advertises to clients for GAME traffic. Two modes:
+#   GATEWAY (set this, normally to the first floatingIP): realmd writes {token -> the real
+#     GS pod ip:port} to redis and hands the client this address + token; the qqserver
+#     gateway looks up the token and splices through to the right GS. The GS is internal.
+#   DIRECT (empty): realmd advertises the GS's own address — clients hit the GS directly.
+gameAddr: ""
+
+# Don't take client traffic until a game server has registered over the gs-link.
+requireGS: true
+
+# Per-component container images.
+images:
+  realmd:
+    repository: ghcr.io/jaenster/realmd
+    tag: latest
+    pullPolicy: Always
+  gs:
+    repository: ghcr.io/jaenster/d2gs
+    tag: latest
+    pullPolicy: Always
+  qqserver:
+    repository: ghcr.io/jaenster/qqserver
+    tag: latest
+    pullPolicy: Always
+
+# ── realmd: the stateless protocol front (bnetd + d2cs + d2dbs + gs-link) ───────────
+realmd:
+  # replicas 1: the GS holds its gs-link control connection to ONE realmd pod, so only
+  # that pod can route game create/join. Extra replicas sit NotReady (REQUIRE_GS) and
+  # stall the rollout. HA needs the GS connecting to every pod (or redis-shared dispatch).
+  replicas: 1
+  # Recreate (not RollingUpdate): a surged new pod can't go Ready (no GS holds its
+  # gs-link to it) until the old pod is gone, so a rolling update deadlocks. Kill-then-
+  # start has a brief blip but always converges. Set false for a normal RollingUpdate.
+  recreate: true
+  # GitOps rolls back via git, so keep only the active ReplicaSet (0 = no history).
+  revisionHistoryLimit: 0
+  # Drain window for the SIGTERM shutdown grace below.
+  terminationGracePeriodSeconds: 30
+  shutdownGraceMs: 10000
+  logJson: true
+  resources:
+    requests: { cpu: 50m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+# ── Postgres: durable character saves ──────────────────────────────────────────────
+postgres:
+  enabled: true
+  image: postgres:16-alpine
+  auth:
+    username: realmd
+    # Override this in production: --set postgres.auth.password=... or a values override.
+    password: change-me
+    database: realmd
+  storage:
+    size: 5Gi
+    # Empty string uses the cluster default StorageClass.
+    storageClass: ""
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+# ── Redis: ephemeral sessions + games (native TTL) ─────────────────────────────────
+redis:
+  enabled: true
+  image: redis:7-alpine
+  resources:
+    requests: { cpu: 50m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+# ── gameServer: the d2gs fleet (internal pod-IP only; qqserver fronts game traffic) ──
+gameServer:
+  replicas: 1
+  maxGames: 50
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 1000m, memory: 1Gi }
+  # RECOMMENDED: ship the minimal (proprietary) 1.14d data set in a small private image.
+  # When `repository` is set, a load-gamedata initContainer copies /gamedata into an
+  # emptyDir game volume — NO persistent volume, ~16MB rides in the image, nothing for
+  # Longhorn to replicate. Rebuild the image to change the data. When `repository` is
+  # empty, fall back to the gameFiles PVC below (mount your own install).
+  dataImage:
+    repository: ""        # e.g. ghcr.io/you/d2-gamedata — a private image with the minimal proprietary data at /gamedata
+    tag: latest
+    pullPolicy: Always
+    pullSecret: ""        # imagePullSecret name for the private data image (e.g. ghcr)
+  gameFiles:
+    # FALLBACK (only used when dataImage.repository is empty): RWX PVC holding a real,
+    # proprietary D2 1.14d install. Populate it once before scaling up; it is mounted
+    # read-only into every GS pod. ~16MB is the minimal set, so 256Mi is plenty.
+    size: 256Mi
+    # Empty string uses the cluster default StorageClass. Must support ReadWriteMany.
+    storageClass: ""
+  # Extra server-mod DLLs to --loaddll after d2gs.dll (space-separated; unix paths
+  # under a mounted /mods are converted to Z:\ automatically). Empty by default.
+  extraDlls: ""
+  # Extra Game.exe flags — e.g. "-direct -txt" to load a loose /moddata data/ tree.
+  extraArgs: ""
+
+# ── qqserver: token-translating game gateway (public on the FIPs when floatingIPs set) ─
+qqserver:
+  enabled: true
+  logJson: true
+  # The qqserver image is typically private (unlike the public realmd/d2gs). Set the
+  # imagePullSecret name (e.g. the cluster-standard `ghcr` dockerconfigjson) to pull it.
+  pullSecret: ""
+  resources:
+    requests: { cpu: 25m, memory: 16Mi }
+    limits: { cpu: 100m, memory: 64Mi }

@@ -1,0 +1,14 @@
+{{- if .Values.postgres.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: realmd-pg
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  selector:
+    {{- include "realm.selectorLabels" (dict "root" . "component" "postgres") | nindent 4 }}
+  ports:
+    - { port: 5432, targetPort: 5432 }
+{{- end }}

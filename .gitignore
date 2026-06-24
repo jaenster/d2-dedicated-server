@@ -26,3 +26,22 @@ tools/vermpq/*.mpq
 tools/vermpq/make_vermpq
 114clean
 clientgame/
+
+# macOS
+.DS_Store
+
+# bnftp-probe captured files (Blizzard MPQs etc — do not commit)
+bnftp-*.mpq
+bnftp-*.bin
+
+# realmd runtime data (may contain Blizzard MPQs — do not commit)
+/realmd-data/
+
+# revar variable-naming campaign scratch (per-session worklists, not source)
+.revar-pass2/
+
+# compiled standalone tools (built manually, not via build.zig)
+tools/mpqcat/mpqcat
+
+# arena-mode design/worklist — local planning doc, not in VCS
+ARENA.md

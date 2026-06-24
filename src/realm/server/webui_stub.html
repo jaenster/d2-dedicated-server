@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>realmd admin</title>
+    <style>
+      body { font-family: system-ui, sans-serif; background: #0f1115; color: #e6e9ef; display: grid; place-items: center; min-height: 100vh; margin: 0; }
+      .card { border: 1px solid #2a2f3a; border-radius: 10px; padding: 2rem; max-width: 560px; }
+      code { color: #d4a017; }
+      a { color: #d4a017; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Web UI not built</h1>
+      <p>
+        This <code>realmd</code> binary was built without the web UI. Rebuild with
+        <code>zig build -Dwebui=true</code> (requires Node) to embed it.
+      </p>
+      <p>The <code>/admin/*</code> JSON API is still available on this port.</p>
+    </div>
+  </body>
+</html>

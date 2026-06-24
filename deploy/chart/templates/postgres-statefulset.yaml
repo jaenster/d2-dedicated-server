@@ -1,0 +1,46 @@
+{{- if .Values.postgres.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: realmd-pg
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: realmd-pg
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "realm.selectorLabels" (dict "root" . "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "realm.selectorLabels" (dict "root" . "component" "postgres") | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image | quote }}
+          envFrom:
+            - secretRef: { name: realmd-pg }
+          env:
+            # initdb refuses the volume root (lost+found); use a subdir as PGDATA.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - { containerPort: 5432, name: pg }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", {{ .Values.postgres.auth.username | quote }}] }
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.postgres.storage.storageClass }}
+        storageClassName: {{ .Values.postgres.storage.storageClass | quote }}
+        {{- end }}
+        resources: { requests: { storage: {{ .Values.postgres.storage.size | quote }} } }
+{{- end }}
