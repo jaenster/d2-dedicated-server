@@ -332,6 +332,37 @@ pub const FindBetterNearbyRoom = fastcall(0x463740, fn (?*Room1, i32, i32) ?*Roo
 /// collision mask 0x1C09 = PLAYER_COLLISION_DEFAULT (what teleport uses).
 pub const CheckCollisionWidth = fastcall(0x64D9B0, fn (?*Room1, i32, i32, u32, u16) u16);
 
+/// D2Game::Game::Level::InitLevel @0x53AEC0 — __fastcall(pGame ECX, pUnit EDX,
+/// eLevel, nMasks). Relocates a player unit into a different level: resolves the
+/// destination act, lazily allocates that act's DRLG if absent, lazy-loads the
+/// level's rooms, finds a collision-free spawn, and re-links the unit. This is
+/// the same routine waypoints, resurrects, and town portals use.
+///
+/// Named `WarpUnitToLevel` here to avoid colliding with the unrelated
+/// D2Common::Drlg `InitLevel` (0x6424A0) bound above. nMasks: 0 = random spawn
+/// point, 0xD = waypoint spawn anchor (if the level has one).
+pub const WarpUnitToLevel = fastcall(0x53AEC0, fn (?*anyopaque, ?*UnitAny, u32, u32) void);
+
+/// D2Game::Game::Clients::GetPlayerFromClient @0x537860 — __stdcall(pClient,
+/// alwaysZero). Returns the client's player unit (D2ClientStrc.pPlayer @+372,
+/// validated against the game's unit hash). Pass 0 for the second arg. This is
+/// exactly what BroadcastPlayerJoin uses to resolve a client's unit.
+pub const GetPlayerFromClient = struct {
+    const Fn = *const fn (?*anyopaque, i32) callconv(.winapi) ?*UnitAny;
+    const ptr: Fn = funcPtr(0x537860, Fn);
+    pub inline fn call(client: ?*anyopaque) ?*UnitAny {
+        return ptr(client, 0);
+    }
+};
+
+/// PARTYSCREEN_SetHostileRelation @0x5A60E0 — __fastcall(pGame ECX, pUnit EDX,
+/// pTarget). Declares pUnit hostile toward pTarget: allocates the player-list
+/// entry if needed, sets the hostile bit (0x8), and sends the 0x8C relationship
+/// packet so pTarget's client allows attacks. Bypasses the level>=9 UI gate.
+/// For mutual PvP call BOTH directions: (a,b) and (b,a). The damage gate
+/// UNITS_CheckIfCanAttackTarget (0x554200) checks the attacker's list entry.
+pub const SetHostileRelation = fastcall(0x5A60E0, fn (?*anyopaque, ?*UnitAny, ?*UnitAny) void);
+
 // ============================================================================
 // Game entry
 // ============================================================================
