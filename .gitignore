@@ -26,3 +26,6 @@ tools/vermpq/*.mpq
 tools/vermpq/make_vermpq
 114clean
 clientgame/
+
+# macOS
+.DS_Store
