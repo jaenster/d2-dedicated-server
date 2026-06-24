@@ -17,6 +17,7 @@ const state = @import("state.zig");
 const store = @import("store.zig");
 const d2s = @import("d2s.zig");
 const gslink = @import("gslink.zig");
+const guilds = @import("guilds.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d2s create time
 
@@ -386,7 +387,9 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
     // the character fetch (fpGetDatabaseCharacter) fails for the game's own creator.
-    if (rr.gsid != 0) _ = gslink.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName());
+    var gtagbuf1: [8]u8 = undefined;
+    const gtag1 = guilds.tagOf(c.accountName(), &gtagbuf1); // cut Guild Halls: tell the GS the creator's guild
+    if (rr.gsid != 0) _ = gslink.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName(), gtag1);
     // Mint a realm-global token and record {token -> GS addr + real gameid} so the
     // qqserver can translate the client's token to the engine's gameid and splice.
     const token = mintToken();
@@ -432,13 +435,33 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         finish(c, &w);
         return;
     }
+    // Guild Hall game type (cut feature): a game named exactly after a guild IS that
+    // guild's private hall. Only members on the approved list may enter — the wiki's
+    // "the Battle.net server will check if your character is on the approved list".
+    // Non-members get 0x29 (game does not exist) so the hall stays hidden from outsiders.
+    if (guilds.load(name)) |gh| {
+        var ghc = gh;
+        if (ghc.findMember(c.accountName()) == null) {
+            log.line(tag, "join guild hall '{s}' (account={s}) -> NOT A MEMBER, hidden", .{ name, c.accountName() });
+            w.putU16(0); // token
+            w.putU16(0); // unknown
+            w.putU32(0); // d2gs IP
+            w.putU32(0); // game hash
+            w.putU32(0x29); // result: game does not exist
+            finish(c, &w);
+            return;
+        }
+        log.line(tag, "join guild hall '{s}' as member {s}", .{ name, c.accountName() });
+    }
     // Best-effort bump of the join-screen player count (the GS owns the authoritative
     // count; leaves aren't tracked here yet, so this can run high until the game closes).
     _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.pw());
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
-    if (g.gsid != 0) _ = gslink.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName());
+    var gtagbuf2: [8]u8 = undefined;
+    const gtag2 = guilds.tagOf(c.accountName(), &gtagbuf2); // cut Guild Halls: tell the GS the joiner's guild
+    if (g.gsid != 0) _ = gslink.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName(), gtag2);
     // Mint a realm-global token for this joining client and record {token -> the real
     // GS + engine gameid}. The qqserver reads the token from the client's first packet
     // and translates it — NAT-proof, since the token is unique even when two clients

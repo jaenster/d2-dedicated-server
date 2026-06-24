@@ -9,6 +9,7 @@ const Spinlock = @import("realm_infra").lock.Spinlock;
 
 pub const max_name = 16;
 pub const max_channel = 32;
+pub const max_stat = 128; // SID_CHATEVENT statstring (the per-user char info D2 draws)
 
 pub const Member = struct {
     fd: net.Socket = -1,
@@ -18,6 +19,11 @@ pub const Member = struct {
     channel: [max_channel]u8 = [_]u8{0} ** max_channel,
     channel_len: u8 = 0,
     flags: u32 = 0, // SID_CHATEVENT user flags (operator/admin/...) for this user
+    // The client's SID_ENTERCHAT statstring — for D2 it encodes the character
+    // (name/class/level/gear) the channel user-list draws via
+    // COMCALLBACK_FormatChannelUserData. Replayed in EID_SHOWUSER/EID_JOIN.
+    stat: [max_stat]u8 = [_]u8{0} ** max_stat,
+    stat_len: u8 = 0,
     send_lock: Spinlock = .{},
 
     pub fn nameSlice(m: *const Member) []const u8 {
@@ -25,6 +31,9 @@ pub const Member = struct {
     }
     pub fn channelSlice(m: *const Member) []const u8 {
         return m.channel[0..m.channel_len];
+    }
+    pub fn statSlice(m: *const Member) []const u8 {
+        return m.stat[0..m.stat_len];
     }
 };
 
@@ -49,7 +58,7 @@ var reg: Registry = .{};
 
 /// Claim (or reuse, by fd) a slot for this connection and set its name+channel.
 /// Returns the member, or null if the table is full.
-pub fn join(fd: net.Socket, name: []const u8, channel: []const u8, flags: u32) ?*Member {
+pub fn join(fd: net.Socket, name: []const u8, channel: []const u8, flags: u32, stat: []const u8) ?*Member {
     reg.lock.lock();
     defer reg.lock.unlock();
     var slot: ?*Member = null;
@@ -69,6 +78,9 @@ pub fn join(fd: net.Socket, name: []const u8, channel: []const u8, flags: u32) ?
     @memcpy(m.channel[0..cn], channel[0..cn]);
     m.channel_len = cn;
     m.flags = flags;
+    const sn: u8 = @intCast(@min(stat.len, max_stat));
+    @memcpy(m.stat[0..sn], stat[0..sn]);
+    m.stat_len = sn;
     m.in_use = true;
     return m;
 }

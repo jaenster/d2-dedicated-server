@@ -90,6 +90,16 @@ pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
     };
 }
 
+// ── per-account userdata (BNCS profile: SID_READ/WRITEUSERDATA 0x26/0x27) ─────
+// Key-path addressed ("profile\\sex"), durable and low-volume → always fs (same
+// policy as accounts; redis/pg don't carry a parallel schema for it).
+pub fn getUserData(account: []const u8, key: []const u8, out: []u8) usize {
+    return fs.getUserData(account, key, out);
+}
+pub fn setUserData(account: []const u8, key: []const u8, value: []const u8) bool {
+    return fs.setUserData(account, key, value);
+}
+
 /// Largest .d2s we will clone. A real 1.14d save is a few KB (a full char with stash is
 /// well under this); refusing larger avoids a silently-truncated, corrupt copy.
 const max_d2s = 32 * 1024;
@@ -140,6 +150,12 @@ pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
     };
 }
 
+/// Set an account's password hash (single xSHA-1 of the new password). Durable,
+/// low-volume → always fs (same policy as account creation). False if no account.
+pub fn setAccountPassword(name: []const u8, hash: [20]u8) bool {
+    return fs.setAccountPassword(name, hash);
+}
+
 /// List account names for the admin API. Accounts live on the filesystem for all
 /// backends (redis/pg route createAccount → fs), so this always reads fs.
 pub fn listAccounts(names: [][32]u8) usize {
@@ -159,6 +175,26 @@ pub fn accountIsAdmin(name: []const u8) bool {
 /// BNFTP assets (version-check MPQ etc.) are static files — always filesystem.
 pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     return fs.getBnftp(filename, out);
+}
+
+// ── guilds (durable) ─────────────────────────────────────────────────────────
+// The cut Guild Halls feature. Like accounts, guilds are always fs-backed (low
+// volume, durable); the service layer (server/guilds.zig) owns the blob format.
+
+pub fn saveGuild(name: []const u8, bytes: []const u8) bool {
+    return fs.saveGuild(name, bytes);
+}
+
+pub fn getGuild(name: []const u8, out: []u8) usize {
+    return fs.getGuild(name, out);
+}
+
+pub fn deleteGuild(name: []const u8) bool {
+    return fs.deleteGuild(name);
+}
+
+pub fn listGuilds(names: []Name) usize {
+    return fs.listGuilds(names);
 }
 
 // ── sessions (ephemeral) ─────────────────────────────────────────────────────
