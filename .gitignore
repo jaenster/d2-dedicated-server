@@ -42,3 +42,6 @@ bnftp-*.bin
 
 # compiled standalone tools (built manually, not via build.zig)
 tools/mpqcat/mpqcat
+
+# arena-mode design/worklist — local planning doc, not in VCS
+ARENA.md
