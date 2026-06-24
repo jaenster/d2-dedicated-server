@@ -170,6 +170,22 @@ pub fn build(b: *std.Build) void {
     const run_gamestress = b.addRunArtifact(gamestress);
     b.step("gamestress", "Create N games against a running realm (reaper stress test)").dependOn(&run_gamestress.step);
 
+    // bnftp-probe — clientless BNFTP discovery client (point it at a real bnet,
+    // optionally via SOCKS5). Manual: `zig build bnftp-probe -- [opts] <host> ...`
+    const probe = b.addExecutable(.{
+        .name = "bnftp-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bnftp-probe/main.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(probe);
+    const run_probe = b.addRunArtifact(probe);
+    if (b.args) |args| run_probe.addArgs(args);
+    b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
+
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_realmd.addArgs(args);
