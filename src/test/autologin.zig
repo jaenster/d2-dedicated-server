@@ -15,6 +15,7 @@ var password: [64]u16 = undefined;
 var game_name = [_]u16{ 'r', 'e', 'a', 'l', 'm', 't', 'e', 's', 't', 0 };
 var newchar_name: [64]u16 = undefined;
 var newchar_class: u8 = 1; // default Sorceress
+var newchar_status: u8 = 0x20; // expansion / 0x04 hardcore / 0x40 ladder
 var want_join: bool = false;
 var t_install: u32 = 0; // GetTickCount at install -> measure dll-attach -> in-game
 
@@ -81,20 +82,22 @@ fn createCharTask() void {
 
     _ = oog.awaitAny(&.{ .char_select, .char_select_empty });
     log.print("autologin: at char-select — creating character");
-    if (oog.createCharacter(@ptrCast(&newchar_name), newchar_class))
+    if (oog.createCharacter(@ptrCast(&newchar_name), newchar_class, newchar_status))
         log.print("autologin: create-character submitted")
     else
         log.print("autologin: create-character FAILED to drive the UI");
     log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
 }
 
-/// Auto-login + CREATE a new character (then stop at char-select). class: 0..6.
-pub fn installCreateChar(acct: []const u8, pass: []const u8, name: []const u8, class: u8) void {
+/// Auto-login + CREATE a new character (then stop at char-select). class 0..6,
+/// status bits 0x20 expansion / 0x04 hardcore / 0x40 ladder.
+pub fn installCreateChar(acct: []const u8, pass: []const u8, name: []const u8, class: u8, status: u8) void {
     t_install = GetTickCount();
     toUtf16(&account, acct);
     toUtf16(&password, pass);
     toUtf16(&newchar_name, name);
     newchar_class = class;
+    newchar_status = status;
     oog.run(&createCharTask);
     log.print("autologin: script installed (create-char)");
 }

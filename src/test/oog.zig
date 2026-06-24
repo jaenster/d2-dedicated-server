@@ -123,6 +123,23 @@ pub fn clickControl(ctrl: *Control) void {
     click(ctrl.dwPosX + ctrl.dwSizeX / 2, ctrl.dwPosY -% ctrl.dwSizeY / 2);
 }
 
+const dlog = @import("../log.zig");
+
+/// Log every control (type / pos / size / disabled) — used to discover screen coords
+/// (e.g. the char-create expansion/hardcore/ladder checkboxes) we haven't mapped yet.
+pub fn dumpControls() void {
+    var c = FirstControl.*;
+    var n: usize = 0;
+    while (c) |ctrl| : (c = ctrl.pNext) {
+        if (n >= max_walk) break;
+        n += 1;
+        dlog.hex("oog: ctl type=0x", ctrl.dwType);
+        dlog.hex("oog:   posXY=0x", ctrl.dwPosX | (ctrl.dwPosY << 16));
+        dlog.hex("oog:   sizeXY=0x", ctrl.dwSizeX | (ctrl.dwSizeY << 16));
+        dlog.hex("oog:   disabled=0x", ctrl.dwDisabled);
+    }
+}
+
 pub fn setControlText(ctrl: *Control, text: [*:0]const u16) void {
     _ = SetControlTextFn.call(.{ ctrl, text });
 }
@@ -274,11 +291,28 @@ const class_art = [7][4]i32{
     .{ 232, 364, 200, 300 }, // assassin
 };
 
-/// From char-select: click "create new", pick the class art, type the name, click OK. The
-/// client then sends MCP_CHARCREATE and the realm persists the new .d2s. Returns false if the
-/// class is invalid or the create screen / class art never appears. Frame-driven (no sleeps).
-pub fn createCharacter(name: [*:0]const u16, class: u8) bool {
+// Char-create checkboxes (type-6 buttons, found via dumpControls). Default state on the
+// screen is Expansion ON, Hardcore OFF, Ladder ON.
+const cb_expansion = [2]i32{ 319, 540 };
+const cb_hardcore = [2]i32{ 319, 560 };
+const cb_ladder = [2]i32{ 319, 580 };
+
+fn toggleCheckbox(p: [2]i32) void {
+    if (findControl(TYPE_BUTTON, -1, p[0], p[1], -1, -1)) |cb| clickControl(cb);
+}
+
+/// From char-select: click "create new", pick the class art, set the expansion/hardcore/ladder
+/// checkboxes to match `status` (0x20 expansion / 0x04 hardcore / 0x40 ladder), type the name,
+/// click OK, and confirm the hardcore "are you sure?" popup. The client then sends
+/// MCP_CHARCREATE and the realm persists the new .d2s. Frame-driven (no sleeps). Returns false
+/// for an invalid class or a classic Druid/Assassin (expansion-only), or if the screen never shows.
+pub fn createCharacter(name: [*:0]const u16, class: u8, status: u8) bool {
     if (class > 6) return false;
+    const want_expansion = (status & 0x20) != 0;
+    const want_hardcore = (status & 0x04) != 0;
+    const want_ladder = (status & 0x40) != 0;
+    if ((class == 5 or class == 6) and !want_expansion) return false; // Druid/Assassin need expansion
+
     const a = findControl(TYPE_BUTTON, -1, 33, 528, 168, 60) orelse return false; // "CREATE NEW"
     clickControl(a);
     const art = class_art[class];
@@ -287,9 +321,24 @@ pub fn createCharacter(name: [*:0]const u16, class: u8) bool {
     async_.waitFrames(3);
     click(@intCast(art[2]), @intCast(art[3]));
     async_.waitFrames(8); // class animates in + the name edit-box appears
+
+    // Drive the checkboxes from the default (expansion ON, hardcore OFF, ladder ON).
+    if (!want_expansion) toggleCheckbox(cb_expansion);
+    if (want_hardcore) toggleCheckbox(cb_hardcore);
+    if (!want_ladder) toggleCheckbox(cb_ladder);
+    async_.waitFrames(3);
+
     var boxes: [2]*Control = undefined;
     if (editboxes(&boxes) >= 1) setControlText(boxes[0], name);
     async_.waitFrames(3);
     if (findControl(TYPE_BUTTON, -1, 627, 572, 128, 35)) |ok| clickControl(ok); // OK -> MCP_CHARCREATE
+
+    // Hardcore creation pops an "are you sure?" confirm with OK (281,337) / Cancel (421,337).
+    // WAIT for the popup button to actually exist before clicking it — clicking the screen at
+    // that point before the popup appears just deselects the class.
+    if (want_hardcore) {
+        _ = awaitControl(TYPE_BUTTON, 281, 337, -1, -1, 90); // wait for the popup to exist
+        if (findControl(TYPE_BUTTON, -1, 421, 337, -1, -1)) |hc| clickControl(hc); // OK (right button)
+    }
     return true;
 }
