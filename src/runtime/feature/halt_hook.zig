@@ -7,6 +7,12 @@ const log = @import("../../log.zig");
 
 const HALT_ADDR: usize = 0x00408a60;
 
+// FOG top-level unhandled-exception filter (the SetUnhandledExceptionFilter target) —
+// the function that shows the "application encountered an unexpected error" Blizzard
+// dialog on a hard crash (access violation etc.). We replace its entry so an unhandled
+// crash exits SILENTLY instead of popping the dialog. Always on, no flag.
+const EXC_FILTER_ADDR: usize = 0x00403e90;
+
 extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
 
 /// When true, asserts are SWALLOWED (Halt returns to its caller) instead of
@@ -25,6 +31,14 @@ fn logHalt(retaddr: usize, nLine: usize) callconv(.c) void {
 
 fn finish() callconv(.c) noreturn {
     ExitProcess(0xFFFF_FFFF);
+}
+
+/// Replaces the engine's crash-dialog filter: log the crash and exit silently, so the
+/// Blizzard "unexpected error" popup never appears (vectored crash.zig already logged
+/// the faulting address). Runs for every unhandled crash; no flag.
+fn noCrashDialog() callconv(.c) noreturn {
+    log.print("crash: Blizzard error dialog suppressed — exiting silently");
+    ExitProcess(0xC0000005);
 }
 
 // On entry to Halt: [esp]=caller return addr, [esp+4]=msg, [esp+8]=addr, [esp+0xc]=nLine.
@@ -53,4 +67,8 @@ fn handler() callconv(.naked) void {
 
 pub fn install() void {
     _ = patch.MemoryPatch(HALT_ADDR).jump(@intFromPtr(&handler)).commit();
+    // Override the engine's crash-dialog filter so the Blizzard "unexpected error"
+    // popup never appears — an unhandled crash exits silently after we've logged it.
+    _ = patch.MemoryPatch(EXC_FILTER_ADDR).jump(@intFromPtr(&noCrashDialog)).commit();
+    log.print("halt: crash dialog suppressed (no Blizzard error popup)");
 }

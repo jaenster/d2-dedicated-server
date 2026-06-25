@@ -249,7 +249,23 @@ fn findPlayerTokenImpl(
     log.hex("realm:   s5=0x", s5);
     log.hex("realm:   s6=0x", s6);
     log.hex("realm:   s7=0x", s7);
-    return 1; // accept (token valid) — join proceeds to char load
+
+    // Token validation ported from D2Server.dll 1.00 PlayerToken_ValidateAndConsume:
+    // the realm (realmd/d2cs) issued this join token via joinctx.remember; the GS
+    // validates it here — known + unconsumed + within the 120s TTL — and consumes it
+    // once so it can't be replayed. Default is OBSERVE-ONLY: the legacy path accepted
+    // every join, and s1==issued-token isn't yet confirmed in a live join, so we only
+    // log the verdict. Flip `enforce_token` true once a live join shows "token VALID"
+    // to close the accept-all gap (then unknown/stale/replayed tokens are rejected).
+    const enforce_token = false;
+    const token = @as(u32, @truncate(s1));
+    const token_valid = joinctx.validate(token);
+    log.print(if (token_valid) "realm:   token VALID (known, fresh)" else "realm:   token UNKNOWN/STALE/USED");
+    if (enforce_token) {
+        if (!token_valid) return 0; // reject: unknown, replayed, or expired token
+        joinctx.consume(token);
+    }
+    return 1; // accept — join proceeds to char load
 }
 
 pub const findPlayerTokenShim = fastcall.Callback2(7, findPlayerTokenImpl).shim;
