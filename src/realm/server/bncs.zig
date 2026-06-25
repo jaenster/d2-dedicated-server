@@ -296,8 +296,15 @@ fn onAuthInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU32(c.server_token);
     w.putU32(0); // UDP value
     w.putU64(0); // MPQ filetime
-    w.putStr("ver-IX86-1.mpq"); // version-check MPQ name (client BNFTP-fetches it)
-    w.putStr("A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B"); // checksum formula (ignored)
+    w.putStr("CheckRevision.mpq"); // modern version-check MPQ (matches real bnet)
+    // Modern base64 challenge (6 bytes: 4 from the server token + 2 zero), like real bnet's
+    // "value string". The client's CheckRevision base64-decodes it and hashes the first 4 bytes;
+    // realmd accepts any AUTH_CHECK result, but this lets a clientless tool compute a real response.
+    var chal_raw: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, chal_raw[0..4], c.server_token, .little);
+    var chal_b64: [8]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&chal_b64, &chal_raw);
+    w.putStr(&chal_b64);
     finish(c, &w);
 }
 
