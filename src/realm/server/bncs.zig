@@ -236,7 +236,21 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }
 
+// REALMD_TRACE=1 -> hexdump every inbound BNCS packet (the full client stream) while
+// realmd still responds normally. Used to capture exactly what the real client sends
+// (e.g. the account-create + set-email sequence). Set in main from the env.
+pub var trace_packets: bool = false;
+
+// Serve the modern CheckRevision.mpq + base64 challenge (mirrors real bnet) only when
+// REALMD_MODERN_CHALLENGE is set — for the clientless probe. Default is the legacy A/B/C
+// formula, which the real bypassed 1.14d client is stable with (modern crashes its UI path).
+pub var modern_challenge: bool = false;
+
 fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
+    if (trace_packets) {
+        log.line(tag, "rx SID 0x{x:0>2} ({d} bytes)", .{ id, body.len });
+        if (body.len > 0) log.hexdump(tag, body);
+    }
     switch (id) {
         SID_NULL => {}, // keepalive
         SID_AUTH_INFO => onAuthInfo(c, tag, body),
@@ -296,15 +310,21 @@ fn onAuthInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU32(c.server_token);
     w.putU32(0); // UDP value
     w.putU64(0); // MPQ filetime
-    w.putStr("CheckRevision.mpq"); // modern version-check MPQ (matches real bnet)
-    // Modern base64 challenge (6 bytes: 4 from the server token + 2 zero), like real bnet's
-    // "value string". The client's CheckRevision base64-decodes it and hashes the first 4 bytes;
-    // realmd accepts any AUTH_CHECK result, but this lets a clientless tool compute a real response.
-    var chal_raw: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
-    std.mem.writeInt(u32, chal_raw[0..4], c.server_token, .little);
-    var chal_b64: [8]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&chal_b64, &chal_raw);
-    w.putStr(&chal_b64);
+    // Default: legacy A/B/C formula + ver-IX86-1.mpq — what the real bypassed 1.14d client
+    // is stable with. (The modern CheckRevision.mpq + base64 challenge that mirrors real bnet
+    // is served only when REALMD_MODERN_CHALLENGE is set, for the clientless probe — it makes
+    // the real client crash, so it's opt-in.)
+    if (modern_challenge) {
+        w.putStr("CheckRevision.mpq");
+        var chal_raw: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
+        std.mem.writeInt(u32, chal_raw[0..4], c.server_token, .little);
+        var chal_b64: [8]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&chal_b64, &chal_raw);
+        w.putStr(&chal_b64);
+    } else {
+        w.putStr("ver-IX86-1.mpq");
+        w.putStr("A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B");
+    }
     finish(c, &w);
 }
 
