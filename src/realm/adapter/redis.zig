@@ -499,9 +499,29 @@ pub fn removeGameById(gameid: u32) void {
     @memcpy(ncopy[0..name.len], name);
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{ncopy[0..name.len]}) catch return;
+    // Recover the gsid (record fields: "gameid ip port gsid players <pw>") so we can
+    // also drop the name from the per-GS reverse index — otherwise dead names pile up
+    // in bygs until the GS disconnects. Parse it to a value BEFORE the next command
+    // reuses the reader buffer (val aliases it).
+    var gsid: ?u32 = null;
+    if (command(&r, &.{ "GET", gamekey })) |grep| switch (grep) {
+        .bulk => |b| if (b) |val| {
+            var it = std.mem.splitScalar(u8, val, ' ');
+            _ = it.next(); // gameid
+            _ = it.next(); // ip
+            _ = it.next(); // port
+            if (it.next()) |t| gsid = std.fmt.parseInt(u32, t, 10) catch null;
+        },
+        else => {},
+    };
     _ = command(&r, &.{ "DEL", gamekey });
     _ = command(&r, &.{ "DEL", idkey });
     _ = command(&r, &.{ "SREM", prefix ++ "games", ncopy[0..name.len] });
+    if (gsid) |gid| {
+        var gb: [64]u8 = undefined;
+        const gskey = std.fmt.bufPrint(&gb, prefix ++ "game:bygs:{x}", .{gid}) catch return;
+        _ = command(&r, &.{ "SREM", gskey, ncopy[0..name.len] });
+    }
 }
 
 /// Expire every game hosted by a GS that disconnected, via its bygs set.

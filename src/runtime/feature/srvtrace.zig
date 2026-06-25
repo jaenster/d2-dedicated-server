@@ -214,12 +214,19 @@ fn onGameCreate(token_map: usize, _: usize, _: usize) callconv(.c) void {
     e.end();
 }
 
+/// Optional observer fired when a game is destroyed, with the game's name (read
+/// from the engine game struct). The realm GS client subscribes to tell realmd to
+/// drop the game from the join list — without it, dead games linger until their
+/// redis TTL and clients get "game name and password don't match" on join.
+pub var on_game_destroy: ?*const fn (name: []const u8) void = null;
+
 fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
     untrackGame(pgame);
     var e = ev("game_destroy");
     e.int("token", trunc32(token));
     putGame(&e, pgame);
     e.end();
+    if (on_game_destroy) |cb| cb(ascii(pgame + 42, 16));
 }
 
 fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
