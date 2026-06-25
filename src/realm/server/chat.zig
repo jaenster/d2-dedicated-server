@@ -10,6 +10,8 @@ const Spinlock = @import("realm_infra").lock.Spinlock;
 pub const max_name = 16;
 pub const max_channel = 32;
 pub const max_stat = 128; // SID_CHATEVENT statstring (the per-user char info D2 draws)
+pub const max_status = 96; // /away and /dnd message length
+pub const max_ignores = 32; // per-user squelch (/ignore) list size
 
 pub const Member = struct {
     fd: net.Socket = -1,
@@ -24,6 +26,14 @@ pub const Member = struct {
     // COMCALLBACK_FormatChannelUserData. Replayed in EID_SHOWUSER/EID_JOIN.
     stat: [max_stat]u8 = [_]u8{0} ** max_stat,
     stat_len: u8 = 0,
+    // Social state, visible cross-connection (whisper auto-reply + message filtering).
+    away: [max_status]u8 = [_]u8{0} ** max_status,
+    away_len: u8 = 0, // 0 = not away
+    dnd: [max_status]u8 = [_]u8{0} ** max_status,
+    dnd_len: u8 = 0, // 0 = not in Do-Not-Disturb
+    ignores: [max_ignores][max_name]u8 = [_][max_name]u8{[_]u8{0} ** max_name} ** max_ignores,
+    ignore_lens: [max_ignores]u8 = [_]u8{0} ** max_ignores,
+    ignore_count: u8 = 0,
     send_lock: Spinlock = .{},
 
     pub fn nameSlice(m: *const Member) []const u8 {
@@ -34,6 +44,20 @@ pub const Member = struct {
     }
     pub fn statSlice(m: *const Member) []const u8 {
         return m.stat[0..m.stat_len];
+    }
+    pub fn awaySlice(m: *const Member) []const u8 {
+        return m.away[0..m.away_len];
+    }
+    pub fn dndSlice(m: *const Member) []const u8 {
+        return m.dnd[0..m.dnd_len];
+    }
+    /// Does this member squelch `name` (case-insensitive)?
+    pub fn ignoresName(m: *const Member, name: []const u8) bool {
+        var i: usize = 0;
+        while (i < m.ignore_count) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(m.ignores[i][0..m.ignore_lens[i]], name)) return true;
+        }
+        return false;
     }
 };
 
@@ -126,16 +150,123 @@ pub fn forEachInChannel(
     }
 }
 
-/// Deliver `bytes` to the member with this exact name (first match), if any.
-/// Returns true if a recipient was found. Used for whispers.
-pub fn whisper(name: []const u8, bytes: []const u8) bool {
+// ── social helpers (caller must NOT hold reg.lock) ───────────────────────────
+
+fn findByNameLocked(name: []const u8) ?*Member {
+    for (&reg.members) |*m| {
+        if (m.in_use and std.ascii.eqlIgnoreCase(m.nameSlice(), name)) return m;
+    }
+    return null;
+}
+fn findByFdLocked(fd: net.Socket) ?*Member {
+    for (&reg.members) |*m| {
+        if (m.in_use and m.fd == fd) return m;
+    }
+    return null;
+}
+
+/// Set (msg non-empty) or clear (msg empty) this connection's /away message.
+pub fn setAway(fd: net.Socket, msg: []const u8) void {
     reg.lock.lock();
     defer reg.lock.unlock();
-    for (&reg.members) |*m| {
-        if (m.in_use and std.mem.eql(u8, m.nameSlice(), name)) {
-            sendTo(m, bytes);
+    const m = findByFdLocked(fd) orelse return;
+    const n: u8 = @intCast(@min(msg.len, max_status));
+    @memcpy(m.away[0..n], msg[0..n]);
+    m.away_len = n;
+}
+/// Set/clear this connection's /dnd (Do-Not-Disturb) message.
+pub fn setDnd(fd: net.Socket, msg: []const u8) void {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByFdLocked(fd) orelse return;
+    const n: u8 = @intCast(@min(msg.len, max_status));
+    @memcpy(m.dnd[0..n], msg[0..n]);
+    m.dnd_len = n;
+}
+
+/// Copy the channel `name` is in into `out`, returning its length; null if offline.
+pub fn whereIs(name: []const u8, out: []u8) ?usize {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByNameLocked(name) orelse return null;
+    const ch = m.channelSlice();
+    const n = @min(ch.len, out.len);
+    @memcpy(out[0..n], ch[0..n]);
+    return n;
+}
+
+/// Add `name` to this connection's squelch list. False if full / already present.
+pub fn addIgnore(fd: net.Socket, name: []const u8) bool {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByFdLocked(fd) orelse return false;
+    if (m.ignoresName(name) or m.ignore_count >= max_ignores) return false;
+    const i = m.ignore_count;
+    const n: u8 = @intCast(@min(name.len, max_name));
+    @memcpy(m.ignores[i][0..n], name[0..n]);
+    m.ignore_lens[i] = n;
+    m.ignore_count += 1;
+    return true;
+}
+/// Remove `name` from this connection's squelch list. False if it wasn't present.
+pub fn removeIgnore(fd: net.Socket, name: []const u8) bool {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByFdLocked(fd) orelse return false;
+    var i: usize = 0;
+    while (i < m.ignore_count) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(m.ignores[i][0..m.ignore_lens[i]], name)) {
+            const last = m.ignore_count - 1;
+            if (i != last) {
+                m.ignores[i] = m.ignores[last];
+                m.ignore_lens[i] = m.ignore_lens[last];
+            }
+            m.ignore_count = last;
             return true;
         }
     }
     return false;
+}
+
+/// Does the member on `recipient_fd` squelch `sender`? Used by the talk broadcast.
+pub fn recipientIgnores(recipient_fd: net.Socket, sender: []const u8) bool {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByFdLocked(recipient_fd) orelse return false;
+    return m.ignoresName(sender);
+}
+
+/// Whisper that reports the target's presence so the caller can auto-reply.
+/// Delivers unless the target is in DND.
+pub const WhisperResult = struct {
+    found: bool = false,
+    dnd_len: u8 = 0,
+    dnd: [max_status]u8 = undefined,
+    away_len: u8 = 0,
+    away: [max_status]u8 = undefined,
+    pub fn dndSlice(w: *const WhisperResult) []const u8 {
+        return w.dnd[0..w.dnd_len];
+    }
+    pub fn awaySlice(w: *const WhisperResult) []const u8 {
+        return w.away[0..w.away_len];
+    }
+};
+pub fn whisperEx(name: []const u8, bytes: []const u8) WhisperResult {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByNameLocked(name) orelse return .{};
+    var res = WhisperResult{ .found = true, .dnd_len = m.dnd_len, .away_len = m.away_len };
+    @memcpy(res.dnd[0..m.dnd_len], m.dndSlice());
+    @memcpy(res.away[0..m.away_len], m.awaySlice());
+    if (m.dnd_len == 0) sendTo(m, bytes); // DND suppresses delivery
+    return res;
+}
+
+/// The fd of an online member by name (for ops /kick), or null. The caller acts on
+/// the socket (e.g. send a kick event then close it).
+pub fn fdOf(name: []const u8) ?net.Socket {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByNameLocked(name) orelse return null;
+    return m.fd;
 }
