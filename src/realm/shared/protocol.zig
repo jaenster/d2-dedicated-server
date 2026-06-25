@@ -116,6 +116,15 @@ pub const JoinGameReply = extern struct {
     gameid: u32,
 };
 
+/// CLOSEGAME (0x23). GS -> D2CS when a game is destroyed. The handler reads the
+/// gameid at body offset 4 (the reserved word mirrors CreateGameReply's result
+/// slot), then removeGameById drops it from the join list + redis indexes.
+pub const CloseGame = extern struct {
+    h: Header,
+    reserved: u32 = 0,
+    gameid: u32,
+};
+
 /// UPDATEGAMEINFO (0x22). flag: 0=update, 1=enter, 2=leave; then charname cstr.
 pub const UpdateGameInfo = extern struct {
     h: Header,
