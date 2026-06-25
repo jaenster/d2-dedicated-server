@@ -341,8 +341,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("[LOGONRESPONSE2] account=\"{s}\" result={d}  => {s}\n", .{ acct, lres, meaning });
         if (lres != 0) return; // can't query realms without a logged-in account
 
-        // ── SID_QUERYREALMS2 — the realm list ──
-        try send(fd, SID_QUERYREALMS2, &[_]u8{0} ** 8);
+        // ── SID_QUERYREALMS2 — the realm list (EMPTY body; real bnet closes on a non-empty one) ──
+        try send(fd, SID_QUERYREALMS2, &[_]u8{});
         var qbuf: [4096]u8 = undefined;
         const qr = try recvUntil(fd, SID_QUERYREALMS2, &qbuf);
         var first_realm: []const u8 = "";
