@@ -219,6 +219,26 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_probe.addArgs(args);
     b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
 
+    // checkrev-probe — clientless BNCS *version-check* client (selector 0x01): runs
+    // SID_AUTH_INFO -> compute response (shared checkrev_core) -> SID_AUTH_CHECK
+    // against a real bnet and prints the result code. Separate from BNFTP.
+    const crprobe = b.addExecutable(.{
+        .name = "checkrev-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/checkrev-probe/main.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    crprobe.root_module.addAnonymousImport("checkrev_core", .{
+        .root_source_file = b.path("src/checkrev/checkrev_core.zig"),
+    });
+    b.installArtifact(crprobe);
+    const run_crprobe = b.addRunArtifact(crprobe);
+    if (b.args) |args| run_crprobe.addArgs(args);
+    b.step("checkrev-probe", "Replay the BNCS version-check against a real Battle.net").dependOn(&run_crprobe.step);
+
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_realmd.addArgs(args);
