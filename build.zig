@@ -151,6 +151,22 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(huffman_tests).step);
 
+    // BNCS auth crypto unit tests (all self-contained, std-only): the standard-SHA-1
+    // CheckRevision core, the broken-SHA-1 OLS password hash, and the CD-key decode —
+    // each carries vectors verified against a real 1.14d client. No real keys committed.
+    inline for (.{
+        "src/checkrev/checkrev_core.zig",
+        "src/realm/server/xsha1.zig",
+        "src/realm/shared/cdkey.zig",
+    }) |src| {
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = realmd_target,
+            .optimize = optimize,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
     // qqserver — the cloud-native game-traffic gateway: a token-translating, fully
     // non-blocking poll() splice proxy fronting the GS fleet. ZERO heap, bare libc sockets,
     // and its OWN async redis client (route lookups over a non-blocking redis connection in
