@@ -17,6 +17,8 @@
 //!   zig build checkrev-probe -- <host> [product] [gameVersion] [--sig0]
 const std = @import("std");
 const core = @import("checkrev_core");
+const cdkey = @import("cdkey");
+const xsha1 = @import("xsha1");
 
 // ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -130,6 +132,16 @@ fn send(fd: Socket, id: u8, body: []const u8) !void {
     try writeAll(fd, body);
 }
 
+const SID_LOGONRESPONSE2 = 0x3a;
+const SID_QUERYREALMS2 = 0x40;
+const SID_LOGONREALMEX = 0x3e;
+const CLIENT_TOKEN: u32 = 0xCAFEBABE;
+
+fn lower(s: []const u8, buf: []u8) []const u8 {
+    for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf[0..s.len];
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.page_allocator;
 
@@ -139,20 +151,28 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var product: []const u8 = "D2XP";
     var game_ver: []const u8 = "1.14.3.71";
     var sig_ok: u8 = 1;
+    var keys_arg: ?[]const u8 = null; // "KEY1,KEY2" (26-char each)
+    var login_arg: ?[]const u8 = null; // "account:password"
     var pos: usize = 0;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--sig0")) {
             sig_ok = 0;
-        } else switch (pos) {
-            0 => host = a,
-            1 => product = a,
-            2 => game_ver = a,
-            else => {},
+        } else if (std.mem.eql(u8, a, "--keys")) {
+            keys_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--login")) {
+            login_arg = args.next();
+        } else if (!std.mem.startsWith(u8, a, "--")) {
+            switch (pos) {
+                0 => host = a,
+                1 => product = a,
+                2 => game_ver = a,
+                else => {},
+            }
+            pos += 1;
         }
-        if (!std.mem.startsWith(u8, a, "--")) pos += 1;
     }
     const h = host orelse {
-        std.debug.print("usage: checkrev-probe <host> [product] [gameVersion] [--sig0]\n", .{});
+        std.debug.print("usage: checkrev-probe <host> [product] [gameVersion] [--sig0] [--keys K1,K2] [--login acct:pass]\n", .{});
         return;
     };
 
@@ -182,26 +202,39 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const challenge = cstrAt(ai, 20 + mpq.len + 1);
     std.debug.print("\n[AUTH_INFO] serverToken=0x{x:0>8}  mpq=\"{s}\"  challenge=\"{s}\"\n", .{ stoken, mpq, challenge });
 
-    // ── compute the response with our portable core ──
+    // ── compute the CheckRevision response with our portable core ──
     var full_buf: [64]u8 = undefined;
     const full = core.response(challenge, game_ver, sig_ok, &full_buf) orelse return error.ShortChallenge;
-    const exe_hash = @as(u32, full[0]) | (@as(u32, full[1]) << 8) | (@as(u32, full[2]) << 16) | (@as(u32, full[3]) << 24);
+    // modern split: first 4 base64 bytes -> EXE Hash (u32 LE); rest -> EXE Info string; EXE Version = 0
+    const exe_hash = std.mem.readInt(u32, full[0..4], .little);
     const exe_info = full[4..];
-    std.debug.print("[compute] response=\"{s}\"  -> exeHash=0x{x:0>8}  exeInfo=\"{s}\"\n", .{ full, exe_hash, exe_info });
+    std.debug.print("[checkrev] response=\"{s}\"  -> exeHash=0x{x:0>8}  exeInfo=\"{s}\"\n", .{ full, exe_hash, exe_info });
 
-    // ── SID_AUTH_CHECK (modern layout, no CD keys) ──
-    var cb: [256]u8 = undefined;
+    // ── SID_AUTH_CHECK (with real CD-key blocks, computed clientless) ──
+    var cb: [512]u8 = undefined;
     var cw: usize = 0;
-    for ([_]u32{
-        0xCAFEBABE, // client token
-        0, // EXE Version  (modern: dialog result = 0)
-        exe_hash, // EXE Hash     (first 4 base64 bytes of the response)
-        0, // number of CD keys
-        0, // using spawn
-    }) |v| {
-        std.mem.writeInt(u32, cb[cw..][0..4], v, .little);
-        cw += 4;
+    var nkeys: u32 = 0;
+    var keyit = std.mem.tokenizeScalar(u8, keys_arg orelse "", ',');
+    // header (we backfill numKeys after counting): clientToken, exeVersion(0), exeHash, numKeys, spawn(0)
+    const hdr_keys_off = 12; // offset of the numKeys field in the header
+    std.mem.writeInt(u32, cb[0..4], CLIENT_TOKEN, .little);
+    std.mem.writeInt(u32, cb[4..8], 0, .little);
+    std.mem.writeInt(u32, cb[8..12], exe_hash, .little);
+    std.mem.writeInt(u32, cb[16..20], 0, .little); // spawn
+    cw = 20;
+    while (keyit.next()) |k| {
+        const blk = cdkey.keyBlock26(k, CLIENT_TOKEN, stoken) orelse {
+            std.debug.print("[keys] bad 26-char key: {s}\n", .{k});
+            return;
+        };
+        var wire: [36]u8 = undefined;
+        blk.writeWire(&wire);
+        @memcpy(cb[cw .. cw + 36], &wire);
+        cw += 36;
+        nkeys += 1;
+        std.debug.print("[keys] key[{d}] product=0x{x:0>8} public=0x{x:0>8}\n", .{ nkeys - 1, blk.product, blk.public });
     }
+    std.mem.writeInt(u32, cb[hdr_keys_off..][0..4], nkeys, .little);
     @memcpy(cb[cw .. cw + exe_info.len], exe_info); // EXE Information string
     cw += exe_info.len;
     cb[cw] = 0;
@@ -214,15 +247,76 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var acbuf: [1024]u8 = undefined;
     const ac = recvUntil(fd, SID_AUTH_CHECK, &acbuf) catch |e| {
-        std.debug.print("\n[AUTH_CHECK] no reply ({s}) — server dropped the packet.\n", .{@errorName(e)});
-        std.debug.print("  D2 expects a well-formed SID_AUTH_CHECK WITH CD-key block(s); a keyless/\n" ++
-            "  wrong-layout packet is silently closed (no result code). Need a real-client\n" ++
-            "  capture of the modern AUTH_CHECK to confirm the exact field layout + key structure.\n", .{});
+        std.debug.print("\n[AUTH_CHECK] no reply ({s}) — server dropped the packet (malformed/keyless).\n", .{@errorName(e)});
         return;
     };
     if (ac.len < 4) return error.ShortAuthCheck;
     const result = std.mem.readInt(u32, ac[0..4], .little);
-    const info = cstrAt(ac, 4);
-    std.debug.print("\n[AUTH_CHECK] result=0x{x:0>4}  info=\"{s}\"\n", .{ result, info });
-    std.debug.print("  => {s}\n", .{authMeaning(result)});
+    std.debug.print("\n[AUTH_CHECK] result=0x{x:0>4}  info=\"{s}\"  => {s}\n", .{ result, cstrAt(ac, 4), authMeaning(result) });
+
+    // ── SID_LOGONRESPONSE2 (OLS account login) ──
+    if (login_arg) |la| {
+        const sep = std.mem.indexOfScalar(u8, la, ':') orelse la.len;
+        const acct = la[0..sep];
+        const pass = if (sep < la.len) la[sep + 1 ..] else "";
+        var lb: [64]u8 = undefined;
+        const inner = xsha1.xsha1(lower(pass, &lb)); // xsha1(lowercase(password))
+        const pwhash = xsha1.doubleHash(CLIENT_TOKEN, stoken, inner);
+        var pb: [320]u8 = undefined;
+        std.mem.writeInt(u32, pb[0..4], CLIENT_TOKEN, .little);
+        std.mem.writeInt(u32, pb[4..8], stoken, .little);
+        @memcpy(pb[8..28], &pwhash);
+        @memcpy(pb[28 .. 28 + acct.len], acct);
+        pb[28 + acct.len] = 0;
+        try send(fd, SID_LOGONRESPONSE2, pb[0 .. 28 + acct.len + 1]);
+        var lbuf: [256]u8 = undefined;
+        const lr = try recvUntil(fd, SID_LOGONRESPONSE2, &lbuf);
+        const lres = if (lr.len >= 4) std.mem.readInt(u32, lr[0..4], .little) else 0xffffffff;
+        const meaning = switch (lres) {
+            0 => "OK — account+password accepted",
+            1 => "no such account",
+            2 => "incorrect password",
+            else => "other",
+        };
+        std.debug.print("[LOGONRESPONSE2] account=\"{s}\" result={d}  => {s}\n", .{ acct, lres, meaning });
+        if (lres != 0) return; // can't query realms without a logged-in account
+
+        // ── SID_QUERYREALMS2 — the realm list ──
+        try send(fd, SID_QUERYREALMS2, &[_]u8{0} ** 8);
+        var qbuf: [4096]u8 = undefined;
+        const qr = try recvUntil(fd, SID_QUERYREALMS2, &qbuf);
+        var first_realm: []const u8 = "";
+        if (qr.len >= 8) {
+            const count = std.mem.readInt(u32, qr[4..8], .little);
+            std.debug.print("[QUERYREALMS2] {d} realm(s):\n", .{count});
+            var off: usize = 8;
+            var n: u32 = 0;
+            while (n < count and off + 4 <= qr.len) : (n += 1) {
+                off += 4; // per-realm unknown dword
+                const title = cstrAt(qr, off);
+                off += title.len + 1;
+                const desc = cstrAt(qr, off);
+                off += desc.len + 1;
+                if (n == 0) first_realm = title;
+                std.debug.print("  - \"{s}\"  ({s})\n", .{ title, desc });
+            }
+        }
+        if (first_realm.len == 0) return;
+
+        // ── SID_LOGONREALMEX — log on to the first realm (closed-bnet realm password = "password") ──
+        const realm_pw = xsha1.doubleHash(CLIENT_TOKEN, stoken, xsha1.xsha1("password"));
+        var rb: [128]u8 = undefined;
+        std.mem.writeInt(u32, rb[0..4], CLIENT_TOKEN, .little);
+        @memcpy(rb[4..24], &realm_pw);
+        @memcpy(rb[24 .. 24 + first_realm.len], first_realm);
+        rb[24 + first_realm.len] = 0;
+        try send(fd, SID_LOGONREALMEX, rb[0 .. 24 + first_realm.len + 1]);
+        var rrbuf: [256]u8 = undefined;
+        const rr = try recvUntil(fd, SID_LOGONREALMEX, &rrbuf);
+        if (rr.len >= 8) {
+            const cookie = std.mem.readInt(u32, rr[0..4], .little);
+            const status = std.mem.readInt(u32, rr[4..8], .little);
+            std.debug.print("[LOGONREALMEX] realm=\"{s}\" cookie=0x{x:0>8} status=0x{x:0>8}  => {s}\n", .{ first_realm, cookie, status, if (status == 0) "OK — MCP handoff (reached the realm)" else "realm logon failed" });
+        }
+    }
 }

@@ -250,6 +250,12 @@ pub fn build(b: *std.Build) void {
     crprobe.root_module.addAnonymousImport("checkrev_core", .{
         .root_source_file = b.path("src/checkrev/checkrev_core.zig"),
     });
+    crprobe.root_module.addAnonymousImport("cdkey", .{
+        .root_source_file = b.path("src/realm/shared/cdkey.zig"),
+    });
+    crprobe.root_module.addAnonymousImport("xsha1", .{
+        .root_source_file = b.path("src/realm/server/xsha1.zig"),
+    });
     b.installArtifact(crprobe);
     const run_crprobe = b.addRunArtifact(crprobe);
     if (b.args) |args| run_crprobe.addArgs(args);
