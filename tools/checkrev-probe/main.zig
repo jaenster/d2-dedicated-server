@@ -133,9 +133,47 @@ fn send(fd: Socket, id: u8, body: []const u8) !void {
 }
 
 const SID_LOGONRESPONSE2 = 0x3a;
+const SID_CREATEACCOUNT2 = 0x3d;
 const SID_QUERYREALMS2 = 0x40;
 const SID_LOGONREALMEX = 0x3e;
+const MCP_STARTUP = 0x01;
+const MCP_MOTD = 0x12;
+const MCP_CHARLIST2 = 0x19;
 const CLIENT_TOKEN: u32 = 0xCAFEBABE;
+
+// MCP (realm/character server) framing: [u16 len incl header][u8 id][body]. Separate
+// connection + buffer from BNCS (which uses the 0xFF framing).
+var mrx: [16384]u8 = undefined;
+var mrxlen: usize = 0;
+fn mcpSend(fd: Socket, id: u8, body: []const u8) !void {
+    var hdr: [3]u8 = undefined;
+    std.mem.writeInt(u16, hdr[0..2], @intCast(body.len + 3), .little);
+    hdr[2] = id;
+    try writeAll(fd, &hdr);
+    if (body.len > 0) try writeAll(fd, body);
+}
+fn mcpRecv(fd: Socket, want: u8, out: []u8) ![]const u8 {
+    while (true) {
+        while (mrxlen >= 3) {
+            const plen = std.mem.readInt(u16, mrx[0..2], .little);
+            if (plen < 3 or plen > mrx.len) return error.BadFrame;
+            if (mrxlen < plen) break;
+            const id = mrx[2];
+            const blen = plen - 3;
+            if (id == want) {
+                @memcpy(out[0..blen], mrx[3..plen]);
+                std.mem.copyForwards(u8, mrx[0 .. mrxlen - plen], mrx[plen..mrxlen]);
+                mrxlen -= plen;
+                return out[0..blen];
+            }
+            std.mem.copyForwards(u8, mrx[0 .. mrxlen - plen], mrx[plen..mrxlen]);
+            mrxlen -= plen;
+        }
+        const got = read(fd, mrx[mrxlen..].ptr, mrx.len - mrxlen);
+        if (got <= 0) return error.Closed;
+        mrxlen += @intCast(got);
+    }
+}
 
 fn lower(s: []const u8, buf: []u8) []const u8 {
     for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
@@ -153,6 +191,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var sig_ok: u8 = 1;
     var keys_arg: ?[]const u8 = null; // "KEY1,KEY2" (26-char each)
     var login_arg: ?[]const u8 = null; // "account:password"
+    var create_arg: ?[]const u8 = null; // "account:password" to register first
     var pos: usize = 0;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--sig0")) {
@@ -161,6 +200,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             keys_arg = args.next();
         } else if (std.mem.eql(u8, a, "--login")) {
             login_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--create")) {
+            create_arg = args.next();
         } else if (!std.mem.startsWith(u8, a, "--")) {
             switch (pos) {
                 0 => host = a,
@@ -254,6 +295,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const result = std.mem.readInt(u32, ac[0..4], .little);
     std.debug.print("\n[AUTH_CHECK] result=0x{x:0>4}  info=\"{s}\"  => {s}\n", .{ result, cstrAt(ac, 4), authMeaning(result) });
 
+    // ── SID_CREATEACCOUNT2 (register — single broken-SHA-1 of the password) ──
+    if (create_arg) |ca| {
+        const sep = std.mem.indexOfScalar(u8, ca, ':') orelse ca.len;
+        const acct = ca[0..sep];
+        const pass = if (sep < ca.len) ca[sep + 1 ..] else "";
+        var lb: [64]u8 = undefined;
+        const pwhash = xsha1.xsha1(lower(pass, &lb)); // single hash for CREATE (login uses double)
+        var nb: [320]u8 = undefined;
+        @memcpy(nb[0..20], &pwhash);
+        @memcpy(nb[20 .. 20 + acct.len], acct);
+        nb[20 + acct.len] = 0;
+        try send(fd, SID_CREATEACCOUNT2, nb[0 .. 20 + acct.len + 1]);
+        var nrbuf: [256]u8 = undefined;
+        const nr = try recvUntil(fd, SID_CREATEACCOUNT2, &nrbuf);
+        const st = if (nr.len >= 4) std.mem.readInt(u32, nr[0..4], .little) else 0xffffffff;
+        std.debug.print("[CREATEACCOUNT2] account=\"{s}\" status={d}  => {s}\n", .{ acct, st, if (st == 0) "created" else "failed/exists" });
+        if (login_arg == null) login_arg = create_arg; // auto-login as the freshly-created account
+    }
+
     // ── SID_LOGONRESPONSE2 (OLS account login) ──
     if (login_arg) |la| {
         const sep = std.mem.indexOfScalar(u8, la, ':') orelse la.len;
@@ -313,10 +373,61 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try send(fd, SID_LOGONREALMEX, rb[0 .. 24 + first_realm.len + 1]);
         var rrbuf: [256]u8 = undefined;
         const rr = try recvUntil(fd, SID_LOGONREALMEX, &rrbuf);
-        if (rr.len >= 8) {
-            const cookie = std.mem.readInt(u32, rr[0..4], .little);
-            const status = std.mem.readInt(u32, rr[4..8], .little);
-            std.debug.print("[LOGONREALMEX] realm=\"{s}\" cookie=0x{x:0>8} status=0x{x:0>8}  => {s}\n", .{ first_realm, cookie, status, if (status == 0) "OK — MCP handoff (reached the realm)" else "realm logon failed" });
+        if (rr.len < 24) return;
+        const cookie = std.mem.readInt(u32, rr[0..4], .little);
+        const status = std.mem.readInt(u32, rr[4..8], .little);
+        std.debug.print("[LOGONREALMEX] realm=\"{s}\" cookie=0x{x:0>8} status=0x{x:0>8}  => {s}\n", .{ first_realm, cookie, status, if (status == 0) "OK — MCP handoff" else "realm logon failed" });
+        if (status != 0) return;
+
+        // ── MCP (realm/character server) — connect to the addr the realm gave us ──
+        const ip4 = rr[16..20];
+        const mport = std.mem.readInt(u16, rr[20..22], .big);
+        var ipstr: [20]u8 = undefined;
+        const ips = std.fmt.bufPrint(&ipstr, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch return;
+        std.debug.print("[MCP] connecting to {s}:{d}\n", .{ ips, mport });
+        const mfd = connectResolved(gpa, ips, mport) catch {
+            std.debug.print("[MCP] connect failed\n", .{});
+            return;
+        };
+        defer _ = close(mfd);
+        mrxlen = 0;
+        try writeAll(mfd, &[_]u8{0x01}); // MCP protocol selector
+
+        // MCP_STARTUP: forward cookie+status+chunk1(8)+chunk2(48) from the realm reply
+        var sb: [64]u8 = [_]u8{0} ** 64;
+        @memcpy(sb[0..16], rr[0..16]);
+        if (rr.len >= 72) @memcpy(sb[16..64], rr[24..72]);
+        try mcpSend(mfd, MCP_STARTUP, &sb);
+        var mb: [8192]u8 = undefined;
+        const sr = try mcpRecv(mfd, MCP_STARTUP, &mb);
+        const sres = if (sr.len >= 4) std.mem.readInt(u32, sr[0..4], .little) else 0xffffffff;
+        std.debug.print("[MCP_STARTUP] result=0x{x}  => {s}\n", .{ sres, if (sres == 0) "session accepted (in the realm)" else "rejected" });
+        if (sres != 0) return;
+
+        // MCP_MOTD — the realm's welcome/message-of-the-day text
+        try mcpSend(mfd, MCP_MOTD, &[_]u8{});
+        const mo = mcpRecv(mfd, MCP_MOTD, &mb) catch &[_]u8{};
+        if (mo.len > 1) std.debug.print("[MCP_MOTD] \"{s}\"\n", .{cstrAt(mo, 1)});
+
+        // MCP_CHARLIST2 — the account's characters on this realm
+        var clreq: [4]u8 = undefined;
+        std.mem.writeInt(u32, &clreq, 8, .little);
+        try mcpSend(mfd, MCP_CHARLIST2, &clreq);
+        const cl = mcpRecv(mfd, MCP_CHARLIST2, &mb) catch &[_]u8{};
+        if (cl.len >= 8) {
+            const total = std.mem.readInt(u32, cl[2..6], .little);
+            const ret = std.mem.readInt(u16, cl[6..8], .little);
+            std.debug.print("[MCP_CHARLIST2] total={d} returned={d}\n", .{ total, ret });
+            var off2: usize = 8;
+            var ci: usize = 0;
+            while (ci < ret and off2 + 4 < cl.len) : (ci += 1) {
+                off2 += 4; // expiry
+                const name = cstrAt(cl, off2);
+                off2 += name.len + 1;
+                const stat = cstrAt(cl, off2);
+                off2 += stat.len + 1;
+                std.debug.print("  - char \"{s}\"\n", .{name});
+            }
         }
     }
 }
