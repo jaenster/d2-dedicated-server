@@ -8,6 +8,7 @@
 //! games to our injected d2gs (Game.exe) over the same d2cs<->d2gs protocol the
 //! GS already speaks.
 const std = @import("std");
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const config = @import("realm_infra").config;
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
@@ -195,6 +196,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (cfg.shared) log.line("realmd", "multi-instance mode: sessions/games in shared store {s} (instance hash 0x{x})", .{ cfg.data_dir, state.instance_hash });
     bncs.realm_name = cfg.realm_name;
     bncs.permissive_auth = cfg.permissive_auth;
+    if (getenv("REALMD_TRACE") != null) bncs.trace_packets = true; // hexdump the client stream
+    if (getenv("REALMD_MODERN_CHALLENGE") != null) bncs.modern_challenge = true; // CheckRevision.mpq+base64 (clientless probe)
     bncs.admin_accounts = cfg.admins;
     bncs.d2cs_port = cfg.d2cs_port;
     gslink.realm_name = cfg.realm_name;
