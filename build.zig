@@ -62,6 +62,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Module-definition file: export `CheckRevision` UNDECORATED (ordinal 1) so the
+    // client's GetProcAddress("CheckRevision") resolves it (stdcall would otherwise
+    // mangle it to CheckRevision@28).
+    checkrev.root_module.addObjectFile(b.path("src/checkrev/checkrev.def"));
     b.installArtifact(checkrev);
 
     // `zig build dlls` — install ONLY the injected DLLs (no realmd, no pg fetch).
@@ -133,7 +137,19 @@ pub fn build(b: *std.Build) void {
     realm_tests.root_module.addImport("realm_infra", realm_infra);
     realm_tests.root_module.addImport("realm_adapter", realm_adapter);
     const run_realm_tests = b.addRunArtifact(realm_tests);
-    b.step("test", "Run realm-server unit tests").dependOn(&run_realm_tests.step);
+    const test_step = b.step("test", "Run realm-server unit tests");
+    test_step.dependOn(&run_realm_tests.step);
+
+    // D2GS Huffman codec unit tests (the clientless game-protocol decoder, reconstructed
+    // from Game.exe's static table — verified against a real captured GS frame).
+    const huffman_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/e2e/huffman.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(huffman_tests).step);
 
     // qqserver — the cloud-native game-traffic gateway: a token-translating, fully
     // non-blocking poll() splice proxy fronting the GS fleet. ZERO heap, bare libc sockets,
