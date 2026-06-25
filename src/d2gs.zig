@@ -33,6 +33,7 @@ const autoenter = @import("test/autoenter.zig");
 const autologin = @import("test/autologin.zig");
 const screenshot = @import("test/screenshot.zig");
 const log = @import("log.zig");
+const cdkeydump = @import("runtime/cdkeydump.zig");
 
 var use_realm: bool = false;
 var d2cs_host: [64]u8 = undefined; // null-terminated IPv4
@@ -389,6 +390,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             feature.installAll();
             if (hasFlag("mapunits") or hasFlag("mapreveal") or hasFlag("guild-panel")) drawing.install();
             if (hasFlag("screenshot")) screenshot.install();
+            if (hasFlag("dump-cdkeys")) cdkeydump.install(); // log decoded CD keys for verification
             if (hasFlag("suppress-halts")) halt_hook.enableSuppress(); // sub-mode, not a toggle
             // Install the Battle.net gateway list in-process so the client always has a
             // valid gateway and never hits the crashing default-ini path (lets clients

@@ -240,7 +240,7 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
     switch (id) {
         SID_NULL => {}, // keepalive
         SID_AUTH_INFO => onAuthInfo(c, tag, body),
-        SID_AUTH_CHECK => onAuthCheck(c, tag),
+        SID_AUTH_CHECK => onAuthCheck(c, tag, body),
         SID_LOGONRESPONSE2 => onLogon(c, tag, body),
         SID_CREATEACCOUNT2 => onCreateAccount(c, tag, body),
         SID_ENTERCHAT => onEnterChat(c, tag, body),
@@ -301,11 +301,35 @@ fn onAuthInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-fn onAuthCheck(c: *Conn, tag: []const u8) void {
-    log.line(tag, "auth_check -> passed", .{});
+fn onAuthCheck(c: *Conn, tag: []const u8, body: []const u8) void {
+    // Capture the EXACT client packet — ground truth for the modern SID_AUTH_CHECK
+    // envelope (how CheckRevision's outputs map into the fields + the CD-key block
+    // shape). realmd accepts any result regardless; this is purely for fidelity.
+    log.line(tag, "auth_check raw ({d} bytes):", .{body.len});
+    log.hexdump(tag, body);
+    var r = proto.Reader.init(body);
+    const client_token = r.getU32();
+    const exe_version = r.getU32();
+    const exe_hash = r.getU32();
+    const num_keys = r.getU32();
+    const spawn = r.getU32();
+    log.line(tag, "  serverToken=0x{x:0>8} clientToken=0x{x:0>8} exeVersion=0x{x:0>8} exeHash=0x{x:0>8} numKeys={d} spawn={d}", .{ c.server_token, client_token, exe_version, exe_hash, num_keys, spawn });
+    var k: u32 = 0;
+    while (k < num_keys and k < 8) : (k += 1) {
+        const klen = r.getU32();
+        const product = r.getU32();
+        const public = r.getU32();
+        _ = r.getU32(); // reserved (0)
+        inline for (0..5) |_| _ = r.getU32(); // 5-dword hashed key data
+        log.line(tag, "  key[{d}] len={d} product=0x{x:0>8} public=0x{x:0>8}", .{ k, klen, product, public });
+    }
+    const exe_info = r.getStr();
+    const owner = r.getStr();
+    log.line(tag, "  exeInfo=\"{s}\" owner=\"{s}\"", .{ exe_info, owner });
+
     var buf: [64]u8 = undefined;
     var w = startPacket(&buf, SID_AUTH_CHECK);
-    w.putU32(0x000); // passed
+    w.putU32(0x000); // passed (we trust the client; capture above is for fidelity)
     w.putStr(""); // extra info (only meaningful on failure)
     finish(c, &w);
 }
@@ -334,15 +358,12 @@ fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// Permissive auth (REALMD_PERMISSIVE_AUTH): the legacy/test policy — unknown accounts
-// auto-register password-less, and password-protected accounts get their OLS double-hash
-// verified. Set by the e2e harness, whose synthetic client shares xsha1.zig so the
-// create/verify round-trip is self-consistent. Default OFF (strict) for real deployments:
-// the real 1.14d client's SID_LOGONRESPONSE2 hash is NOT reproduced by xsha1.zig (probing a
-// live login with "secret" gave got=0x403e2744 / ct=0xe56678a5 st=0x1234abcd, and none of the
-// four inner/outer × {broken,standard}-SHA1 combos match), so verifying real logins would
-// reject every one. Until that hash is reversed in Game.exe, strict mode enforces account
-// EXISTENCE only (no silent auto-register) and admits a known account without a password check.
+// Auth policy: realmd VERIFIES OLS passwords for any account that has one. The
+// broken-SHA-1 double-hash is reverse-engineered from Game.exe (D2Client::_net_sid::SHA1)
+// and verified bit-for-bit against a real 1.14d client login (see xsha1.zig tests), so
+// SID_LOGONRESPONSE2 hashes from the genuine client now match. REALMD_PERMISSIVE_AUTH only
+// governs UNKNOWN accounts: permissive auto-registers them password-less (legacy/test
+// convenience); strict (default) rejects them with LOGON_NO_ACCOUNT.
 pub var permissive_auth: bool = false;
 
 fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
@@ -355,7 +376,7 @@ fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
         }
         return LOGON_NO_ACCOUNT; // strict: a brand-new name is rejected, not auto-created
     };
-    if (!has_pw or !permissive_auth) return LOGON_OK;
+    if (!has_pw) return LOGON_OK; // password-less account: nothing to verify
     const expect = xsha1.doubleHash(c.client_token, server_token, stored);
     return if (std.mem.eql(u8, &expect, &got)) LOGON_OK else LOGON_BAD_PASSWORD;
 }

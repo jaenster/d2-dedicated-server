@@ -1,7 +1,8 @@
 //! Battle.net "Broken SHA-1" (xSHA-1) — mirror of src/realm/server/xsha1.zig so
 //! the clientless harness computes the SAME OLS password hashes the server does
 //! (create/verify round-trip is internally consistent). See that file for the
-//! deviations from standard SHA-1 (little-endian words; expansion without rotl).
+//! deviations from standard SHA-1 (little-endian words; mangled expansion
+//! w[i]=rotl(1,(xor)&0x1f); RE'd from Game.exe, verified vs a real client login).
 const std = @import("std");
 
 /// xSHA-1 of a single block; `data` must be <= 64 bytes.
@@ -13,7 +14,7 @@ pub fn xsha1(data: []const u8) [20]u8 {
     var w: [80]u32 = undefined;
     var i: usize = 0;
     while (i < 16) : (i += 1) w[i] = std.mem.readInt(u32, block[i * 4 ..][0..4], .little);
-    while (i < 80) : (i += 1) w[i] = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+    while (i < 80) : (i += 1) w[i] = std.math.rotl(u32, 1, @as(u5, @intCast((w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]) & 0x1f)));
 
     var h0: u32 = 0x67452301;
     var h1: u32 = 0xEFCDAB89;
