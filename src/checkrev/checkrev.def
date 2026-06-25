@@ -1,0 +1,3 @@
+LIBRARY ver-IX86-1
+EXPORTS
+    CheckRevision @1
