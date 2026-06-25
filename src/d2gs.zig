@@ -403,6 +403,13 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
                     if (len > 0 and tmp[0] >= '0' and tmp[0] <= '9') realmgw.apply(tmp[0..len]);
                 } else if (hasFlag("realm-gw")) {
                     realmgw.apply("127.0.0.1");
+                } else {
+                    // No realm flag: still route the gateway list through memory so the stock
+                    // loader (Load @0x5186d0) never reads the contended registry and asserts
+                    // (line 0x6c — that assert, not the guild stone, was the no-realm crash).
+                    // Use the REAL Battle.net gateways, not localhost — a plain client isn't
+                    // ours to pin to 127.0.0.1.
+                    realmgw.applyDefault();
                 }
             }
             // Drive the bnet login form: --auto-login <account>:<password>.

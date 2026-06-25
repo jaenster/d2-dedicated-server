@@ -33,12 +33,25 @@ const UPDATEGATEWAYS_ADDR: usize = 0x00518850;
 // Fog::SMem::SMemAlloc(size, file, line, flags) -> ptr  (__stdcall: callee cleans 16 bytes)
 const SMemAlloc: *const fn (u32, [*:0]const u8, u32, u32) callconv(.winapi) ?[*]u8 = @ptrFromInt(0x00413020);
 
+// Our realm entries — all resolve to the injected realm IP (filled by apply()).
 const Gateway = struct { tz: []const u8, name: []const u8 };
 const gateways = [_]Gateway{
     .{ .tz = "8", .name = "TypeGuru" },
     .{ .tz = "6", .name = "Realm2" },
     .{ .tz = "-9", .name = "Realm3" },
     .{ .tz = "-1", .name = "Realm4" },
+};
+
+// The real Battle.net gateways (server hostname + timezone + display name), used by
+// applyDefault() when the client is launched with NO realm flag: we still must supply a
+// valid list so the loader never reads the registry (→ no contention assert), but there's
+// no reason to pin it to localhost — give it the genuine gateways instead.
+const RealGateway = struct { server: []const u8, tz: []const u8, name: []const u8 };
+const real_gateways = [_]RealGateway{
+    .{ .server = "uswest.battle.net", .tz = "8", .name = "U.S. West" },
+    .{ .server = "useast.battle.net", .tz = "6", .name = "U.S. East" },
+    .{ .server = "asia.battle.net", .tz = "-9", .name = "Asia" },
+    .{ .server = "europe.battle.net", .tz = "-1", .name = "Europe" },
 };
 
 var buf: [512]u8 = undefined;
@@ -72,28 +85,61 @@ fn fillGatewaysImpl(ecx: usize, edx: usize, name_arg: usize) callconv(.c) void {
 const shim = fastcall.Callback2(1, fillGatewaysImpl).shim;
 
 /// Build the in-memory gateway list (realm entries -> `ip`) and detour GetGatewayList.
-pub fn apply(ip: []const u8) void {
-    var pos: usize = 0;
-    appendStr(&pos, "9999"); // server-list version
-    appendStr(&pos, "1"); // current gateway index (1-based)
-    for (gateways) |g| {
-        appendStr(&pos, ip);
-        appendStr(&pos, g.tz);
-        appendStr(&pos, g.name);
-    }
-    buf[pos] = 0; // MULTI_SZ double-null terminator
-    pos += 1;
-    buf_len = pos;
+/// Build the MULTI_SZ header (version + current-index) into buf at `pos`.
+fn beginList(pos: *usize) void {
+    appendStr(pos, "9999"); // server-list version
+    appendStr(pos, "1"); // current gateway index (1-based)
+}
 
+/// Close the MULTI_SZ (double-null) and publish the length.
+fn endList(pos: *usize) void {
+    buf[pos.*] = 0; // MULTI_SZ double-null terminator
+    pos.* += 1;
+    buf_len = pos.*;
+}
+
+/// Detour GetGatewayList to return the in-memory `buf`, and no-op the ini parser so a
+/// server-pushed/default list can't override it or assert. Shared by apply/applyDefault.
+fn installDetour() void {
     if (patch.MemoryPatch(GETGATEWAYLIST_ADDR).jump(@intFromPtr(&shim)).commit()) {
-        log.print("realmgw: GetGatewayList detoured (gateway list from memory, realm -> injected IP)");
+        log.print("realmgw: GetGatewayList detoured (gateway list from memory)");
     } else {
         log.print("realmgw: FAILED to detour GetGatewayList");
     }
-    // No-op the ini parser so a server-pushed/default gateway list can't override ours or assert.
     if (patch.MemoryPatch(UPDATEGATEWAYS_ADDR).retImm(8).commit()) {
         log.print("realmgw: UpdateGatewaysFromIni no-op'd (ret 8)");
     } else {
         log.print("realmgw: FAILED to no-op UpdateGatewaysFromIni");
     }
+}
+
+/// Realm mode: point every gateway entry at the injected realm `ip` so the client
+/// connects to our realmd instead of Battle.net.
+pub fn apply(ip: []const u8) void {
+    var pos: usize = 0;
+    beginList(&pos);
+    for (gateways) |g| {
+        appendStr(&pos, ip);
+        appendStr(&pos, g.tz);
+        appendStr(&pos, g.name);
+    }
+    endList(&pos);
+    installDetour();
+    log.print("realmgw: realm gateways installed (entries -> injected IP)");
+}
+
+/// No realm flag: install the genuine Battle.net gateways. This still routes the gateway
+/// list through memory (so the loader never reads the contended registry and never
+/// asserts), but does NOT pin the client to localhost — a plain client gets real gateways.
+pub fn applyDefault() void {
+    var pos: usize = 0;
+    beginList(&pos);
+    for (real_gateways) |g| {
+        appendStr(&pos, g.server);
+        appendStr(&pos, g.tz);
+        appendStr(&pos, g.name);
+    }
+    endList(&pos);
+    installDetour();
+    log.print("realmgw: default Battle.net gateways installed (no realm flag)");
 }
