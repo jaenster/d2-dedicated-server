@@ -387,7 +387,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             // are gated by their flags. The single config table is in feature.zig.
             feature.applyFlags(hasFlag);
             feature.installAll();
-            if (hasFlag("mapunits") or hasFlag("mapreveal")) drawing.install();
+            if (hasFlag("mapunits") or hasFlag("mapreveal") or hasFlag("guild-panel")) drawing.install();
             if (hasFlag("screenshot")) screenshot.install();
             if (hasFlag("suppress-halts")) halt_hook.enableSuppress(); // sub-mode, not a toggle
             // Install the Battle.net gateway list in-process so the client always has a

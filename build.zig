@@ -118,6 +118,23 @@ pub fn build(b: *std.Build) void {
     const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
     realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
 
+    // `zig build test` — realm-server unit tests. Rooted at the guild service so it
+    // pulls the store facade + realm modules; runs every `test` block reachable from
+    // there (guild model/service serialization, store helpers, …).
+    const realm_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/realm/server/guilds.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    realm_tests.root_module.addImport("realm_shared", realm_shared);
+    realm_tests.root_module.addImport("realm_infra", realm_infra);
+    realm_tests.root_module.addImport("realm_adapter", realm_adapter);
+    const run_realm_tests = b.addRunArtifact(realm_tests);
+    b.step("test", "Run realm-server unit tests").dependOn(&run_realm_tests.step);
+
     // qqserver — the cloud-native game-traffic gateway: a token-translating, fully
     // non-blocking poll() splice proxy fronting the GS fleet. ZERO heap, bare libc sockets,
     // and its OWN async redis client (route lookups over a non-blocking redis connection in

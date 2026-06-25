@@ -229,7 +229,10 @@ pub const UnitLocation = struct {
     }
 };
 
-pub const CreateUnit = fastcall(0x555230, fn (types.UnitType, DWORD, DWORD, DWORD, ?*anyopaque, ?*Room1, DWORD, DWORD, DWORD) ?*UnitAny);
+// D2Common::Unit::SUnit::CreateUnit — server-side factory for any unit type.
+// RE'd signature: (eUnitType, nClassId, nPosX, nPosY, pGame, pRoom, bPlaceInRoom, pMonsterData).
+// For an object: CreateUnit(.object, classId, x, y, pGame, pRoom, 1, null).
+pub const CreateUnit = fastcall(0x555230, fn (types.UnitType, i32, i32, i32, ?*anyopaque, ?*anyopaque, u32, ?*anyopaque) ?*UnitAny);
 
 // ============================================================================
 // Level / Room (__stdcall)

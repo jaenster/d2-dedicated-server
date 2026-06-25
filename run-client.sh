@@ -59,7 +59,10 @@ DLL_WIN="Z:$(echo "$D2GS_CLIENTDIR/d2gs.dll" | tr '/' '\\')"
 
 # Maphack flags on by default. NO --headless (we want rendering) and NO --d2gs-boot
 # (this is a pure client, not the dedicated server).
-MAPHACK="--omnivision --mapreveal --mapunits"
+# Maphack flags on by default; override with MAPHACK="" to disable — e.g. to run the
+# guild panel without the maphack's game-entry stack overflow:
+#   MAPHACK="" ./run-client.sh --realm-gw 127.0.0.1 --auto-login me:x --guild-panel -direct
+MAPHACK="${MAPHACK-"--omnivision --mapreveal --mapunits"}"
 
 # Connecting to a realm (--realm-gw)? The Battle.net version check is pointless against
 # our realmd (it accepts any SID_AUTH_CHECK), so bypass it client-side by default —
