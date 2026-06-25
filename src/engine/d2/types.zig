@@ -503,8 +503,8 @@ pub const RECT = extern struct {
 pub const AutomapCell = extern struct {
     fSaved: DWORD, // 0x00
     nCellNo: i16, // 0x04
-    xPixel: WORD, // 0x06
-    yPixel: WORD, // 0x08
+    xPixel: i16, // 0x06 — signed: automap pixel offsets are negative for half the cells
+    yPixel: i16, // 0x08
     wWeight: WORD, // 0x0A
     pLess: ?*AutomapCell, // 0x0C
     pMore: ?*AutomapCell, // 0x10
