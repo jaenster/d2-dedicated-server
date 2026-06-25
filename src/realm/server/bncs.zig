@@ -437,6 +437,10 @@ fn sendEvent(c: *Conn, eid: u32, flags: u32, username: []const u8, text: []const
 const BcastCtx = struct { eid: u32, flags: u32, username: []const u8, text: []const u8 };
 
 fn bcastCb(ctx: *const BcastCtx, m: *chat.Member) void {
+    // Squelch: a recipient who /ignore'd the sender doesn't see their talk. Checked
+    // on the Member directly — forEachInChannel already holds the registry lock, so
+    // we must NOT call back into a lock-taking chat helper here (it would deadlock).
+    if (ctx.eid == EID_TALK and m.ignoresName(ctx.username)) return;
     var buf: [512]u8 = undefined;
     const bytes = buildChatEvent(&buf, ctx.eid, ctx.flags, ctx.username, ctx.text);
     chat.sendTo(m, bytes);
@@ -613,15 +617,36 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     const acct = c.accountName();
 
     if (parseWhisper(text)) |w| {
+        // A recipient who squelched the sender never gets the whisper, but Battle.net
+        // still shows the sender a normal "To <target>:" echo (no hint they're ignored).
+        if (chat.fdOf(w.target)) |tfd| {
+            if (chat.recipientIgnores(tfd, acct)) {
+                sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg);
+                return;
+            }
+        }
         log.line(tag, "{s} whispers {s}: {s}", .{ acct, w.target, w.msg });
         var buf: [512]u8 = undefined;
         const bytes = buildChatEvent(&buf, EID_WHISPER, c.user_flags, acct, w.msg);
-        const found = chat.whisper(w.target, bytes);
-        // Echo back to sender: EID_WHISPER (D2 shows "To <target>: msg") on success,
-        // EID_ERROR if the target isn't online.
-        if (found) sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg) else sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
+        const res = chat.whisperEx(w.target, bytes); // delivers unless target is in DND
+        if (!res.found) {
+            sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
+            return;
+        }
+        // Echo to sender (D2 shows "To <target>: msg"), then surface the target's
+        // away/DND auto-reply if they set one (DND also suppressed delivery above).
+        sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg);
+        var rb: [192]u8 = undefined;
+        if (res.dnd_len > 0) {
+            const s = std.fmt.bufPrint(&rb, "{s} is unavailable ({s})", .{ w.target, res.dndSlice() }) catch return;
+            sendEvent(c, EID_INFO, 0, w.target, s);
+        } else if (res.away_len > 0) {
+            const s = std.fmt.bufPrint(&rb, "{s} is away ({s})", .{ w.target, res.awaySlice() }) catch return;
+            sendEvent(c, EID_INFO, 0, w.target, s);
+        }
         return;
     }
+    if (handleSocialCmd(c, tag, text)) return;
     if (handleGuildCmd(c, tag, text)) return;
     if (parseFriendCmd(text)) |fc| {
         handleFriendCmd(c, tag, fc);
@@ -651,6 +676,89 @@ fn parseWhisper(text: []const u8) ?Whisper {
         return null;
     const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
     return .{ .target = rest[0..sp], .msg = rest[sp + 1 ..] };
+}
+
+const Slash = struct { verb: []const u8, arg: []const u8 };
+
+// Split "/verb the rest" into {verb, arg}. Null if `text` isn't a slash command.
+fn parseSlash(text: []const u8) ?Slash {
+    if (text.len == 0 or text[0] != '/') return null;
+    const rest = text[1..];
+    const sp = std.mem.indexOfScalar(u8, rest, ' ');
+    const verb = if (sp) |i| rest[0..i] else rest;
+    const arg = if (sp) |i| std.mem.trim(u8, rest[i + 1 ..], " ") else "";
+    return .{ .verb = verb, .arg = arg };
+}
+fn eqCmd(verb: []const u8, name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(verb, name);
+}
+
+// Battle.net social commands driven from chat: /away, /dnd, /ignore (/squelch),
+// /unignore (/unsquelch), /whois (/where, /whereis), /kick. Returns true if consumed.
+fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
+    const acct = c.accountName();
+    const cmd = parseSlash(text) orelse return false;
+
+    // /away [msg] — set, or (no arg) clear, the whisper auto-reply.
+    if (eqCmd(cmd.verb, "away")) {
+        chat.setAway(c.fd, cmd.arg);
+        const msg = if (cmd.arg.len > 0) "You are now marked as being Away." else "You are no longer marked as being Away.";
+        sendEvent(c, EID_INFO, 0, acct, msg);
+        return true;
+    }
+    // /dnd [msg] — Do-Not-Disturb; suppresses incoming whispers while set.
+    if (eqCmd(cmd.verb, "dnd")) {
+        chat.setDnd(c.fd, cmd.arg);
+        const msg = if (cmd.arg.len > 0) "Do Not Disturb mode engaged." else "Do Not Disturb mode cancelled.";
+        sendEvent(c, EID_INFO, 0, acct, msg);
+        return true;
+    }
+    var rb: [128]u8 = undefined;
+    // /ignore <name> (alias /squelch) — stop seeing that user's talk and whispers.
+    if (eqCmd(cmd.verb, "ignore") or eqCmd(cmd.verb, "squelch")) {
+        if (cmd.arg.len == 0) {
+            sendEvent(c, EID_ERROR, 0, acct, "Usage: /ignore <name>");
+        } else if (chat.addIgnore(c.fd, cmd.arg)) {
+            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} has been squelched.", .{cmd.arg}) catch return true);
+        } else sendEvent(c, EID_ERROR, 0, acct, "Already squelched, or your ignore list is full.");
+        return true;
+    }
+    // /unignore <name> (alias /unsquelch).
+    if (eqCmd(cmd.verb, "unignore") or eqCmd(cmd.verb, "unsquelch")) {
+        if (cmd.arg.len == 0) {
+            sendEvent(c, EID_ERROR, 0, acct, "Usage: /unignore <name>");
+        } else if (chat.removeIgnore(c.fd, cmd.arg)) {
+            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} is no longer squelched.", .{cmd.arg}) catch return true);
+        } else sendEvent(c, EID_ERROR, 0, acct, "That user was not squelched.");
+        return true;
+    }
+    // /whois <name> (aliases /where, /whereis) — which channel is a user in?
+    if (eqCmd(cmd.verb, "whois") or eqCmd(cmd.verb, "where") or eqCmd(cmd.verb, "whereis")) {
+        if (cmd.arg.len == 0) {
+            sendEvent(c, EID_ERROR, 0, acct, "Usage: /whois <name>");
+            return true;
+        }
+        var chbuf: [chat.max_channel]u8 = undefined;
+        if (chat.whereIs(cmd.arg, &chbuf)) |n| {
+            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} is in channel {s}.", .{ cmd.arg, chbuf[0..n] }) catch return true);
+        } else sendEvent(c, EID_ERROR, 0, acct, "That user is not logged on.");
+        return true;
+    }
+    // /kick <name> — channel operators/admins only. shutdownSocket unblocks the
+    // victim's read thread, which runs its own leave + EID_LEAVE broadcast.
+    if (eqCmd(cmd.verb, "kick")) {
+        if (c.user_flags & FLAG_OPERATOR == 0) {
+            sendEvent(c, EID_ERROR, 0, acct, "You are not a channel operator.");
+        } else if (cmd.arg.len == 0) {
+            sendEvent(c, EID_ERROR, 0, acct, "Usage: /kick <name>");
+        } else if (chat.fdOf(cmd.arg)) |kfd| {
+            net.shutdownSocket(kfd);
+            log.line(tag, "{s} kicked {s}", .{ acct, cmd.arg });
+            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} was kicked.", .{cmd.arg}) catch return true);
+        } else sendEvent(c, EID_ERROR, 0, acct, "That user is not logged on.");
+        return true;
+    }
+    return false;
 }
 
 const FriendCmd = struct { action: enum { add, remove, list }, name: []const u8 };
