@@ -378,10 +378,13 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // be gated safely — keep full ticking there. A rare safety tick guards against a
     // count that's ever wrong: the GS steps slowly rather than freezing.
     var idle_ticks: u64 = 0;
+    var idle_dbg: u64 = 0;
     while (true) {
         command.pump(); // run queued engine commands (create game, …) on this thread
         if (use_realm) realm.pumpDelivery(); // deliver fetched char outside the join stack
         const busy = if (use_realm) d2cs.liveGames() > 0 else true;
+        idle_dbg +%= 1;
+        if (idle_dbg % 300 == 0) log.hex2("d2gs: gate realm/live=", @intFromBool(use_realm), d2cs.liveGames());
         if (busy) {
             server.tick();
         } else {
