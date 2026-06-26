@@ -34,6 +34,12 @@ fn setRecvTimeout(fd: Socket, ms: u32) void {
     const tv = std.posix.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
     _ = setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &tv, @sizeOf(std.posix.timeval));
 }
+extern "c" fn gettimeofday(tv: *std.posix.timeval, tz: ?*anyopaque) c_int;
+fn nowMs() i64 {
+    var tv: std.posix.timeval = undefined;
+    _ = gettimeofday(&tv, null);
+    return @as(i64, @intCast(tv.sec)) * 1000 + @divTrunc(@as(i64, @intCast(tv.usec)), 1000);
+}
 fn writeAll(fd: Socket, buf: []const u8) !void {
     var sent: usize = 0;
     while (sent < buf.len) {
@@ -159,6 +165,7 @@ const SID_LOGONREALMEX = 0x3e;
 const SID_ENTERCHAT = 0x0a;
 const SID_GETCHANNELLIST = 0x0b;
 const SID_JOINCHANNEL = 0x0c;
+const SID_CHATCOMMAND = 0x0e;
 const SID_CHATEVENT = 0x0f;
 const MCP_STARTUP = 0x01;
 const MCP_CHARCREATE = 0x02;
@@ -167,6 +174,58 @@ const MCP_LADDERDATA = 0x11;
 const MCP_MOTD = 0x12;
 const MCP_CHARLIST2 = 0x19;
 const CLIENT_TOKEN: u32 = 0xCAFEBABE;
+
+// Send a chat message / slash command (SID_CHATCOMMAND: STRING text).
+fn sendChat(fd: Socket, text: []const u8) void {
+    var buf: [256]u8 = undefined;
+    if (text.len + 1 > buf.len) return;
+    @memcpy(buf[0..text.len], text);
+    buf[text.len] = 0;
+    send(fd, SID_CHATCOMMAND, buf[0 .. text.len + 1]) catch {};
+}
+
+fn eidName(eid: u32) []const u8 {
+    return switch (eid) {
+        0x01 => "SHOWUSER", 0x02 => "JOIN", 0x03 => "LEAVE", 0x04 => "WHISPER",
+        0x05 => "TALK", 0x06 => "BROADCAST", 0x07 => "CHANNEL", 0x09 => "USERFLAGS",
+        0x0a => "WHISPERSENT", 0x0d => "CHANNELFULL", 0x12 => "INFO", 0x13 => "ERROR",
+        0x17 => "EMOTE", else => "EID?",
+    };
+}
+
+fn printChatEvent(body: []const u8) void {
+    if (body.len < 28) return;
+    const eid = std.mem.readInt(u32, body[0..4], .little);
+    const uname = cstrAt(body, 24);
+    const text = cstrAt(body, 24 + uname.len + 1);
+    std.debug.print("    «{s}» {s}: {s}\n", .{ eidName(eid), uname, text });
+}
+
+// Poll the BNCS socket once (uses the current SO_RCVTIMEO), parse all complete frames,
+// print chat events, auto-echo PING. Returns 0 if the peer closed, -1 on timeout, 1 on data.
+fn pumpEvents(fd: Socket) i32 {
+    const got = read(fd, rxbuf[rxlen..].ptr, rxbuf.len - rxlen);
+    if (got == 0) return 0;
+    if (got < 0) return -1;
+    rxlen += @intCast(got);
+    while (rxlen >= 4 and rxbuf[0] == 0xFF) {
+        const id = rxbuf[1];
+        const plen = std.mem.readInt(u16, rxbuf[2..4], .little);
+        if (plen < 4 or plen > rxbuf.len or rxlen < plen) break;
+        const body = rxbuf[4..plen];
+        dumpPkt("BNCS", id, body);
+        if (id == SID_PING) {
+            var echo: [8]u8 = .{ 0xFF, SID_PING, 8, 0, 0, 0, 0, 0 };
+            @memcpy(echo[4..8], body[0..4]);
+            writeAll(fd, &echo) catch {};
+        } else if (id == SID_CHATEVENT) {
+            printChatEvent(body);
+        }
+        std.mem.copyForwards(u8, rxbuf[0 .. rxlen - plen], rxbuf[plen..rxlen]);
+        rxlen -= plen;
+    }
+    return 1;
+}
 
 // MCP (realm/character server) framing: [u16 len incl header][u8 id][body]. Separate
 // connection + buffer from BNCS (which uses the 0xFF framing).
@@ -220,6 +279,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var keys_arg: ?[]const u8 = null; // "KEY1,KEY2" (26-char each)
     var login_arg: ?[]const u8 = null; // "account:password"
     var create_arg: ?[]const u8 = null; // "account:password" to register first
+    var channel_arg: []const u8 = "Diablo II"; // channel to join
+    var say_arg: ?[]const u8 = null; // chat message to send after joining
+    var kick_arg: ?[]const u8 = null; // user to /kick after joining
+    var listen_sec: u32 = 0; // stay in chat reading events for N seconds (chat-session mode)
+    var delay_sec: u32 = 0; // wait N seconds after joining before say/kick (2-client ordering)
     var pos: usize = 0;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--sig0")) {
@@ -230,6 +294,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             login_arg = args.next();
         } else if (std.mem.eql(u8, a, "--create")) {
             create_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--channel")) {
+            channel_arg = args.next() orelse channel_arg;
+        } else if (std.mem.eql(u8, a, "--say")) {
+            say_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--kick")) {
+            kick_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--listen")) {
+            listen_sec = std.fmt.parseInt(u32, args.next() orelse "0", 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--delay")) {
+            delay_sec = std.fmt.parseInt(u32, args.next() orelse "0", 10) catch 0;
         } else if (!std.mem.startsWith(u8, a, "--")) {
             switch (pos) {
                 0 => host = a,
@@ -543,16 +617,47 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const ec = recvUntil(fd, SID_ENTERCHAT, &mb) catch &[_]u8{};
         if (ec.len > 0) std.debug.print("[SID_ENTERCHAT] unique name=\"{s}\" stat=\"{s}\"\n", .{ cstrAt(ec, 0), cstrAt(ec, cstrAt(ec, 0).len + 1) });
 
-        // SID_JOINCHANNEL: flags=5 (D2 realm-lobby join), channel "Diablo II"
-        var jc: [32]u8 = undefined;
+        // SID_JOINCHANNEL: flags=5 (D2 realm-lobby join)
+        var jc: [48]u8 = undefined;
         std.mem.writeInt(u32, jc[0..4], 5, .little);
-        const chan = "Diablo II";
-        @memcpy(jc[4 .. 4 + chan.len], chan);
-        jc[4 + chan.len] = 0;
-        try send(fd, SID_JOINCHANNEL, jc[0 .. 5 + chan.len]);
+        @memcpy(jc[4 .. 4 + channel_arg.len], channel_arg);
+        jc[4 + channel_arg.len] = 0;
+        try send(fd, SID_JOINCHANNEL, jc[0 .. 5 + channel_arg.len]);
 
-        // Read several chat events to see the full channel state the server returns
-        // (EID_CHANNEL, then EID_SHOWUSER per member, EID_JOIN, etc.).
+        // ── chat-session mode (--listen): stay connected, print every chat event, and
+        //    optionally talk (--say) / kick (--kick) after --delay. Drives the 2-client demo. ──
+        if (listen_sec > 0) {
+            setRecvTimeout(fd, 400);
+            const start = nowMs();
+            const send_at = start + @as(i64, @intCast(delay_sec)) * 1000;
+            const deadline = start + @as(i64, @intCast(listen_sec)) * 1000;
+            var fired = (say_arg == null and kick_arg == null);
+            std.debug.print("[chat] joined \"{s}\" — listening {d}s\n", .{ channel_arg, listen_sec });
+            while (true) {
+                const now = nowMs();
+                if (!fired and now >= send_at) {
+                    if (say_arg) |s| {
+                        std.debug.print(">> SAY: \"{s}\"\n", .{s});
+                        sendChat(fd, s);
+                    }
+                    if (kick_arg) |k| {
+                        var kb: [128]u8 = undefined;
+                        const kc = std.fmt.bufPrint(&kb, "/kick {s}", .{k}) catch k;
+                        std.debug.print(">> CMD: \"{s}\"\n", .{kc});
+                        sendChat(fd, kc);
+                    }
+                    fired = true;
+                }
+                if (now >= deadline) break;
+                if (pumpEvents(fd) == 0) {
+                    std.debug.print("[chat] *** socket closed — kicked or disconnected ***\n", .{});
+                    break;
+                }
+            }
+            return;
+        }
+
+        // Non-session: read a few chat events to show the channel state, then the ladder.
         var evi: usize = 0;
         while (evi < 10) : (evi += 1) {
             const cev = recvUntil(fd, SID_CHATEVENT, &mb) catch break;
