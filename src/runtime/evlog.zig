@@ -187,6 +187,14 @@ pub fn EventN(comptime cap: usize) type {
             self.rawByte('}');
             log.print(self.buf[0..self.n]);
         }
+
+        /// Close and flush via the RAW sink (no structured wrapper, no 768-byte
+        /// truncation). For large complete-JSON lines that must survive intact, e.g.
+        /// the DRLG oracle's whole-level dumps.
+        pub fn endRaw(self: *Self) void {
+            self.rawByte('}');
+            log.printRaw(self.buf[0..self.n]);
+        }
     };
 }
 

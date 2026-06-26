@@ -34,6 +34,7 @@ const autoenter = @import("test/autoenter.zig");
 const autologin = @import("test/autologin.zig");
 const screenshot = @import("test/screenshot.zig");
 const log = @import("log.zig");
+const obs = @import("realm/shared/obs.zig");
 const cdkeydump = @import("runtime/cdkeydump.zig");
 
 var use_realm: bool = false;
@@ -289,6 +290,8 @@ fn parseEndpoints() void {
         }
     }
     gsid = computeGsId();
+    log.initObs(); // wire obs.zig to the GS clock + span sink
+    obs.gsid = gsid; // every log line + event carries the GS id
     @import("runtime/feature/srvtrace.zig").gsid = gsid; // so the srvtrace tick line carries the GS id
 }
 

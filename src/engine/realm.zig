@@ -18,6 +18,7 @@ const server = @import("server.zig");
 const fastcall = @import("../runtime/fastcall.zig");
 const d2dbs = @import("../realm/client/d2dbs.zig");
 const joinctx = @import("../realm/client/joinctx.zig");
+const obs = @import("../realm/shared/obs.zig");
 const patch = @import("../runtime/patch.zig");
 const log = @import("../log.zig");
 
@@ -79,6 +80,9 @@ var pending: Pending = .{};
 // synchronously via CLIENT_OnDatabaseCharacterReceived, which advances the join.
 fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize) callconv(.c) usize {
     _ = .{ edx, account };
+    // Start the GS-side join trace (Phase 3 will adopt realmd's trace id from the wire
+    // instead). Every log line through the rest of this join carries this trace id.
+    _ = obs.startTrace();
     // ECX = &pClient->pRealm (offset 0x68). The client the engine built: szCharName
     // @0x0D (ECX-0x5B), szAccName @0x1D (ECX-0x4B), pClientContainer @0x60 (ECX-8).
     const sz_char: [*:0]u8 = @ptrFromInt(ecx -% 0x5B);
@@ -105,6 +109,8 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
 
     var save_len: usize = 0;
     if (dbs_ready and d2dbs.connectTo(dbs_host, dbs_port)) {
+        var sp = obs.enter("char_fetch"); // timed span over the d2dbs round-trip
+        defer sp.exit();
         save_len = d2dbs.fetchCharSave(acct_name, char_name, &save_buf);
         d2dbs.disconnect();
     }

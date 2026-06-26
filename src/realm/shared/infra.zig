@@ -4,6 +4,7 @@
 //! imports) so libc-socket / POSIX code never gets dragged into the DLL build.
 pub const net = @import("net.zig");
 pub const log = @import("log.zig");
+pub const obs = @import("obs.zig"); // per-thread trace/span context (log.zig stamps it)
 pub const config = @import("config.zig");
 pub const lock = @import("lock.zig");
 pub const types = @import("store_types.zig");
