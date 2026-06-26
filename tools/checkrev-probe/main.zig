@@ -432,10 +432,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("[MCP_STARTUP] result=0x{x}  => {s}\n", .{ sres, if (sres == 0) "session accepted (in the realm)" else "rejected" });
         if (sres != 0) return;
 
-        // MCP_MOTD — the realm's welcome/message-of-the-day text
-        try mcpSend(mfd, MCP_MOTD, &[_]u8{});
-        const mo = mcpRecv(mfd, MCP_MOTD, &mb) catch &[_]u8{};
-        if (mo.len > 1) std.debug.print("[MCP_MOTD] \"{s}\"\n", .{cstrAt(mo, 1)});
+        // NOTE: the real 1.14d client does NOT send MCP_MOTD (0x12) here — its MCP
+        // sequence is STARTUP -> CHARLIST2 -> CHARLOGON (captured via REALMD_TRACE).
+        // The chat-screen MOTD arrives over BNCS SID_NEWS_INFO instead. Sending MCP_MOTD
+        // derails real bnet's MCP (it goes silent after STARTUP).
 
         // MCP_CHARLIST2 — the account's characters on this realm
         var clreq: [4]u8 = undefined;

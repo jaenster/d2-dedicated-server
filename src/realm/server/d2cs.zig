@@ -137,7 +137,15 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }
 
+// REALMD_TRACE=1 -> hexdump every inbound MCP packet (the full client MCP sequence)
+// while still serving normally. Set from main alongside bncs.trace_packets.
+pub var trace_packets: bool = false;
+
 fn dispatch(c: *DConn, tag: []const u8, id: u8, body: []const u8) void {
+    if (trace_packets) {
+        log.line(tag, "rx MCP 0x{x:0>2} ({d} bytes)", .{ id, body.len });
+        if (body.len > 0) log.hexdump(tag, body);
+    }
     switch (id) {
         MCP_STARTUP => onStartup(c, tag, body),
         MCP_CHARLIST2 => onCharList(c, tag, body),
