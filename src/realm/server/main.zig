@@ -16,6 +16,7 @@ const bncs = @import("bncs.zig");
 const d2cs = @import("d2cs.zig");
 const d2dbs = @import("d2dbs.zig");
 const gslink = @import("gslink.zig");
+const gameedge = @import("gameedge.zig");
 const store = @import("store.zig");
 const state = @import("state.zig");
 const health = @import("health.zig");
@@ -247,10 +248,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const t_d2cs = try std.Thread.spawn(.{}, net.serve, .{ "d2cs", d2cs_fd, d2cs_handler });
     const t_dbs = try std.Thread.spawn(.{}, net.serve, .{ "d2dbs", d2dbs_fd, d2dbs_handler });
     const t_health = try std.Thread.spawn(.{}, net.serve, .{ "health", health_fd, health.handle });
+
+    // Optional embedded game edge: realmd fronts game traffic itself (in-process token
+    // splice) instead of a standalone qqserver — the lightweight single-binary path.
+    var t_game: ?std.Thread = null;
+    if (cfg.game_port != 0) {
+        const game_fd = try net.listenTcp(cfg.bind, cfg.game_port);
+        log.line("realmd", "embedded game edge on {d} (in-process splice; no standalone qqserver needed)", .{cfg.game_port});
+        t_game = try std.Thread.spawn(.{}, net.serve, .{ "game", game_fd, gameedge.handle });
+    }
+
     health.markStarted(); // all listeners bound → probes may go green
     net.serve("gs", gs_fd, gs_handler); // main thread runs the GS link listener
     t_bnet.join();
     t_d2cs.join();
     t_dbs.join();
     t_health.join();
+    if (t_game) |t| t.join();
 }
