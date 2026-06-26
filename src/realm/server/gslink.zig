@@ -17,6 +17,7 @@
 const std = @import("std");
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
+const obs = @import("realm_infra").obs;
 const state = @import("state.zig");
 const Spinlock = @import("realm_infra").lock.Spinlock;
 const p = @import("realm_shared").protocol;
@@ -186,6 +187,7 @@ pub fn ready() bool {
 // ── connection handler (a GS connects to us) ─────────────────────────────────
 
 pub fn handle(fd: net.Socket, tag: []const u8) void {
+    obs.setSystem(); // GS control link — not a user's connection
     const g = registry.alloc() orelse {
         log.line(tag, "GS registry full ({d}); rejecting connection", .{max_gs});
         return;

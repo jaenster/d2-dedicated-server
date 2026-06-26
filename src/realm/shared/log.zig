@@ -3,6 +3,7 @@
 //! (std.Thread.Mutex moved in 0.16's Io migration; a flag spinlock has no such
 //! dependency and is fine for log contention.)
 const std = @import("std");
+const obs = @import("obs.zig"); // per-thread trace/span/account context, stamped on every JSON line
 
 extern "c" fn time(t: ?*c_long) c_long; // unix seconds (std.time.timestamp went through Io in 0.16)
 
@@ -34,7 +35,17 @@ pub fn line(tag: []const u8, comptime fmt: []const u8, args: anytype) void {
             '\t' => std.debug.print("\\t", .{}),
             else => std.debug.print("{c}", .{c}),
         };
-        std.debug.print("\"}}\n", .{});
+        std.debug.print("\"", .{});
+        // ambient per-thread trace/span + the user this connection is acting for
+        const c = obs.current();
+        if (c.hasTrace()) {
+            var th: [32]u8 = undefined;
+            std.debug.print(",\"trace\":\"{s}\",\"span\":{d}", .{ obs.traceHex(&th, c.trace_hi, c.trace_lo), c.span });
+            if (c.parent != 0) std.debug.print(",\"parent\":{d}", .{c.parent});
+        }
+        if (c.acct_len != 0) std.debug.print(",\"acct\":\"{s}\"", .{c.account()});
+        if (c.token != 0) std.debug.print(",\"token\":{d}", .{c.token});
+        std.debug.print("}}\n", .{});
     } else {
         std.debug.print("[{s}] ", .{tag});
         std.debug.print(fmt ++ "\n", args);

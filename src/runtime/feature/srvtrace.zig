@@ -20,6 +20,7 @@ const patch = @import("../patch.zig");
 const trampoline = @import("../trampoline.zig");
 const log = @import("../../log.zig");
 const evlog = @import("../evlog.zig");
+const obs = @import("../../realm/shared/obs.zig");
 const t = @import("../../engine/d2/types.zig");
 const fns = @import("../../engine/d2/functions.zig");
 const game = @import("../../engine/d2types.zig");
@@ -118,13 +119,12 @@ fn ascii(base: usize, max: usize) []const u8 {
     return p[0..i];
 }
 
-/// The game whose handler is in flight, set by every shim before it calls the
-/// handler (0 when no game pointer is available). Lets ev() stamp the game token
-/// on every event without threading pGame through each handler's args.
-var cur_game: usize = 0;
-
+/// Each shim sets the in-flight game's token into the per-thread obs context before
+/// calling its handler — so ev() AND every plain log line during in-game work auto-
+/// carry the game token, without threading pGame through each handler's args. The
+/// engine ticks games on one thread, so this is the right thread's context. (0 = none.)
 fn setCurGame(pg: usize) callconv(.c) void {
-    cur_game = pg;
+    obs.current().token = if (pg == 0) 0 else readU32(pg, 0); // token @ offset 0
 }
 
 /// Begin an event, auto-stamping the game "token" (the per-game trace id) whenever
@@ -132,7 +132,8 @@ fn setCurGame(pg: usize) callconv(.c) void {
 /// their token explicitly so they call evlog.Event.begin directly.
 fn ev(name: []const u8) evlog.Event {
     var e = evlog.Event.begin(name);
-    if (cur_game != 0) e.int("token", @as(i64, readU32(cur_game, 0)));
+    const tok = obs.current().token;
+    if (tok != 0) e.int("token", @as(i64, tok));
     return e;
 }
 
@@ -523,8 +524,45 @@ const DRLG_NEAR_CAP: i32 = 64;
 const GetLevelAndAlloc: *const fn (usize, i32) callconv(.winapi) usize = @ptrFromInt(0x642BB0);
 const InitLevel: *const fn (usize) callconv(.winapi) void = @ptrFromInt(0x6424A0);
 
+/// Engine globals for data-driven act/level ranges (no hardcoded ids).
+///   0x6E7D1C: int[5] town-level id per act (read by GetTownLevelIdFromActNo via
+///             `[EAX*4 + 0x6e7d1c]`) = {1, 40, 75, 103, 109}.
+///   0x744304: -> sgptDataTable; [+0xC5C] = nTxtLevelsSize (Levels.txt row count),
+///             the exclusive upper bound for valid level ids (TXT_LevelDefs_GetLine
+///             returns null past it → AllocDrlgLevel would null-deref).
+const TOWN_ID_TABLE: usize = 0x6E7D1C;
+const DATATABLE_PTR: usize = 0x744304;
+const DATATABLE_LEVELS_SIZE_OFF: usize = 0xC5C;
+
 fn readU8(base: usize, off: usize) u8 {
     return @as(*const u8, @ptrFromInt(base + off)).*;
+}
+
+/// InitDrlgAct(pGame, nActNo) @0x53AC70 — the server's own "create act N for this
+/// game" routine: derives the town level id, calls AllocAct with the game's init
+/// seed / difficulty / memory pool, stores pGame->pAct[nActNo], and inits the act's
+/// quest state. One game init seed (pGame->pInitSeed) deterministically derives each
+/// act's independent dwStartSeed inside AllocDrlgActMisc. Custom register convention
+/// (verified by disassembly): pGame in ESI, nActNo in BL, no stack args. We overwrite
+/// ESI/EBX so they are marked clobbered (Zig saves the caller's); [buf] stays in a
+/// non-clobbered reg (EDI/EBP, both callee-saved by InitDrlgAct).
+fn initDrlgAct(pGame: usize, nActNo: u8) void {
+    var buf = [3]u32{ @truncate(pGame), nActNo, 0x53AC70 };
+    asm volatile (
+        \\movl (%[buf]), %%esi
+        \\movl 4(%[buf]), %%ebx
+        \\call *8(%[buf])
+        :
+        : [buf] "r" (&buf),
+        : .{ .eax = true, .ecx = true, .edx = true, .esi = true, .ebx = true, .memory = true, .cc = true });
+}
+
+/// Levels.txt row count from the live data table (act-4 upper bound). Falls back to
+/// the 1.14d vanilla size if the table pointer isn't populated yet.
+fn levelsTxtCount() i32 {
+    const tbl = readU32(DATATABLE_PTR, 0);
+    if (tbl == 0) return 137;
+    return s32(readU32(tbl, DATATABLE_LEVELS_SIZE_OFF));
 }
 
 /// DefineRoomsNear(pMemory, pRoomEx) @0x66BC20 builds a room's geometric near-room
@@ -650,7 +688,7 @@ fn emitLevel(pLevel: usize) void {
         room = readU32(room, 0x24); // pRoomExNext
     }
     e.arrayEnd();
-    e.end();
+    e.endRaw(); // raw sink: these lines can be 100s of KB; must not be wrapped/capped
 }
 
 /// Dump-all state. `dumpall_done` ensures the forced pass runs once per process;
@@ -659,36 +697,64 @@ fn emitLevel(pLevel: usize) void {
 var dumpall_done: bool = false;
 var in_dumpall: bool = false;
 
-/// Inclusive [lo,hi] level-id range owned by each act (nActNo 0..4), from the
-/// town-level table {RogueEncampment=1, LutGholein=40, KurastDocktown=75,
-/// PandemoniumFortress=103, Harrogath=109}; act 5 tops out at the last 1.14d
-/// Levels.txt id (Uber Tristram = 136). Levels are only correct on their OWN
-/// act's pDrlg (each act rolls an independent dwStartSeed), so we never cross acts.
+/// Inclusive [lo,hi] level-id range owned by act `nActNo` (0..4): lo = that act's
+/// town id, hi = (next act's town id − 1), or the last Levels.txt id for act 4.
+/// All read live from the engine town-id table / data table — no hardcoded ids.
 fn actLevelRange(nActNo: u8) ?struct { lo: i32, hi: i32 } {
-    return switch (nActNo) {
-        0 => .{ .lo = 1, .hi = 39 },
-        1 => .{ .lo = 40, .hi = 74 },
-        2 => .{ .lo = 75, .hi = 102 },
-        3 => .{ .lo = 103, .hi = 108 },
-        4 => .{ .lo = 109, .hi = 136 },
-        else => null,
-    };
+    if (nActNo > 4) return null;
+    const lo = s32(readU32(TOWN_ID_TABLE, @as(usize, nActNo) * 4));
+    const hi = if (nActNo < 4)
+        s32(readU32(TOWN_ID_TABLE, (@as(usize, nActNo) + 1) * 4)) - 1
+    else
+        levelsTxtCount() - 1;
+    if (hi < lo) return null;
+    return .{ .lo = lo, .hi = hi };
 }
 
-/// Force-generate every level in the current act so the oracle captures them all.
-/// For each level id: GetLevelAndAlloc, then InitLevel iff not yet generated
-/// (pRoomExFirst null). InitLevel fires our hook → emitLevel dumps it. Robust:
-/// skips ids the engine couldn't allocate; the [lo,hi] range stays within
+/// Force-generate every level of one act on its own pDrlg. For each level id:
+/// GetLevelAndAlloc, then InitLevel iff not yet generated (pRoomExFirst null).
+/// InitLevel fires our hook → emitLevel dumps it. The [lo,hi] range stays within
 /// Levels.txt bounds so TXT_LevelDefs_GetLine never returns null.
-fn runDumpAll(pDrlg: usize) void {
+fn dumpActLevels(pDrlg: usize) void {
     const nActNo = readU8(pDrlg, 0x480);
     const range = actLevelRange(nActNo) orelse return;
-    log.hex2("srvtrace: DRLG dump-all act", nActNo, @as(usize, @intCast(range.hi)));
+    log.hex2("srvtrace: DRLG dump act", nActNo, @as(usize, @intCast(range.hi)));
     var id: i32 = range.lo;
     while (id <= range.hi) : (id += 1) {
         const pLevel = GetLevelAndAlloc(pDrlg, id);
         if (pLevel == 0) continue;
         if (readU32(pLevel, 0x10) == 0) InitLevel(pLevel); // not yet generated
+    }
+}
+
+/// Drive DRLG generation for ALL FIVE acts of the game in a single pass. The spawn
+/// act (whose town gen invoked us, still mid-init) uses the live pDrlg directly; the
+/// other four are created the server way via InitDrlgAct(pGame, act) when absent,
+/// then force-generated. pGame = pDrlg->pGame @0x9C; pGame->pAct[5] @0xBC;
+/// D2DrlgActStrc->pDrlg @0x48; pDrlg->nActNo @0x480.
+fn runDumpAll(pSpawnDrlg: usize) void {
+    const pGame = readU32(pSpawnDrlg, 0x9C);
+    const spawnActNo = readU8(pSpawnDrlg, 0x480);
+    // Classic (no-expansion) games have NO act 5 (nActNo 4) — only acts 1-4 (0..3).
+    // pGame->bExpansion @0x70. Forcing nActNo 4 on a classic game would create an act
+    // the game mode doesn't have, so cap the loop at 4 acts there.
+    const nActs: u8 = if (pGame != 0 and readU32(pGame, 0x70) == 0) 4 else 5;
+    var act: u8 = 0;
+    while (act < nActs) : (act += 1) {
+        var pDrlg: usize = 0;
+        if (act == spawnActNo) {
+            // Already-in-flight spawn act — reuse the live pDrlg (re-creating it would
+            // double-alloc the slot the engine is mid-way through filling).
+            pDrlg = pSpawnDrlg;
+        } else if (pGame != 0) {
+            var pAct = readU32(pGame, 0xBC + @as(usize, act) * 4);
+            if (pAct == 0) {
+                initDrlgAct(pGame, act);
+                pAct = readU32(pGame, 0xBC + @as(usize, act) * 4);
+            }
+            if (pAct != 0) pDrlg = readU32(pAct, 0x48);
+        }
+        if (pDrlg != 0) dumpActLevels(pDrlg);
     }
 }
 

@@ -15,6 +15,7 @@
 const std = @import("std");
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
+const obs = @import("realm_infra").obs;
 const proto = @import("proto.zig");
 const protocol = @import("bncs_protocol.zig");
 const state = @import("state.zig");
@@ -153,6 +154,7 @@ const Conn = struct {
         const n: u8 = @intCast(@min(name.len, state.max_name));
         @memcpy(c.account[0..n], name[0..n]);
         c.account_len = n;
+        obs.setAccount(name); // mirror into the per-thread trace context (every log line gets it)
     }
     fn accountName(c: *Conn) []const u8 {
         return c.account[0..c.account_len];
@@ -180,6 +182,7 @@ fn finish(c: *Conn, w: *proto.Writer) void {
 }
 
 pub fn handle(fd: net.Socket, tag: []const u8) void {
+    _ = obs.startTrace(); // one trace per client connection — every line on this thread carries it
     var c = Conn{ .fd = fd, .server_token = nextToken() };
     log.line(tag, "client connected", .{});
 

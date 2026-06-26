@@ -12,6 +12,7 @@
 const std = @import("std");
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
+const obs = @import("realm_infra").obs;
 const proto = @import("proto.zig");
 const store = @import("store.zig");
 
@@ -20,6 +21,7 @@ const TYPE_GET = 0x31;
 const DATATYPE_CHARSAVE = 0x01;
 
 pub fn handle(fd: net.Socket, tag: []const u8) void {
+    obs.setSystem(); // multiplexed GS→DB link; each request switches to its own user below
     log.line(tag, "client connected", .{});
     while (true) {
         var hbuf: [8]u8 = undefined;
@@ -52,6 +54,8 @@ fn onGet(fd: net.Socket, tag: []const u8, seq: u32, body: []const u8) void {
     _ = r.getU16(); // datatype
     const account = r.getStr();
     const charname = r.getStr();
+    _ = obs.startTrace(); // this char-fetch is its own operation…
+    obs.setAccount(account); // …for THIS user (per-packet switch on the multiplexed link)
 
     var save: [8192]u8 = undefined;
     const n = store.getCharD2s(account, charname, &save);
@@ -78,6 +82,8 @@ fn onSave(fd: net.Socket, tag: []const u8, seq: u32, body: []const u8) void {
     _ = r.getU16(); // datatype
     const account = r.getStr();
     const charname = r.getStr();
+    _ = obs.startTrace(); // per-packet switch: this save belongs to THIS user
+    obs.setAccount(account);
     const datalen = r.getU16();
     const avail = r.remaining();
     const take = @min(datalen, avail);

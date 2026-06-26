@@ -12,6 +12,15 @@ extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const config = @import("realm_infra").config;
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
+const obs = @import("realm_infra").obs;
+
+extern "c" fn time(t: ?*c_long) c_long; // unix seconds — portable (Linux + macOS), no struct-layout traps
+/// Milliseconds for obs span durations. Seconds-resolution (×1000) keeps it portable
+/// and trap-free across libc/OS; precise sub-second span timing can come later behind a
+/// per-OS monotonic clock. The trace/span ids — the correlation value — are exact.
+fn nowMs() u64 {
+    return @as(u64, @intCast(time(null))) *% 1000;
+}
 const bncs = @import("bncs.zig");
 const d2cs = @import("d2cs.zig");
 const d2dbs = @import("d2dbs.zig");
@@ -144,6 +153,7 @@ fn runSubcommand(cfg: config.Config, args: std.process.Args) bool {
 pub fn main(init: std.process.Init.Minimal) !void {
     const cfg = config.fromEnv();
     log.json = cfg.log_json;
+    obs.nowMsFn = &nowMs; // span durations
     if (runSubcommand(cfg, init.args)) return;
     log.line("realmd", "starting instance={s} bind={s} bnet={d} d2cs={d} d2dbs={d} realm={s}@{s} capture={}", .{
         cfg.instance_id, cfg.bind,       cfg.bnet_port,  cfg.d2cs_port,
