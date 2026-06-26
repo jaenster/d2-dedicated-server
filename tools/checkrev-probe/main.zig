@@ -130,6 +130,8 @@ fn recvUntil(fd: Socket, want: u8, out: []u8) ![]const u8 {
             if (rxlen < plen) break; // need more bytes
             const body = rxbuf[4..plen];
             dumpPkt("BNCS", id, body);
+            if (id == 0x4a or id == 0x4c) // SID_OPTIONALWORK / SID_REQUIREDWORK: a work MPQ name
+                std.debug.print("[WORK 0x{x:0>2}] \"{s}\"\n", .{ id, cstrAt(body, 0) });
             if (id == SID_PING) {
                 var echo: [8]u8 = .{ 0xFF, SID_PING, 8, 0, 0, 0, 0, 0 };
                 @memcpy(echo[4..8], body[0..4]);
@@ -167,8 +169,11 @@ const SID_GETCHANNELLIST = 0x0b;
 const SID_JOINCHANNEL = 0x0c;
 const SID_CHATCOMMAND = 0x0e;
 const SID_CHATEVENT = 0x0f;
+const SID_GETADVLISTEX = 0x09; // open-bnet public game list (peer-hosted games)
 const MCP_STARTUP = 0x01;
 const MCP_CHARCREATE = 0x02;
+const MCP_CREATEGAME = 0x03;
+const MCP_JOINGAME = 0x04;
 const MCP_CHARLOGON = 0x07;
 const MCP_LADDERDATA = 0x11;
 const MCP_MOTD = 0x12;
@@ -284,6 +289,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var kick_arg: ?[]const u8 = null; // user to /kick after joining
     var listen_sec: u32 = 0; // stay in chat reading events for N seconds (chat-session mode)
     var delay_sec: u32 = 0; // wait N seconds after joining before say/kick (2-client ordering)
+    var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
+    var gs_port: u16 = 4000; // GS game port (qqserver public port)
+    var ver_byte: u8 = 0; // GAMELOGON version byte (GetGameVersion)
     var pos: usize = 0;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--sig0")) {
@@ -304,6 +312,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             listen_sec = std.fmt.parseInt(u32, args.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, a, "--delay")) {
             delay_sec = std.fmt.parseInt(u32, args.next() orelse "0", 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--game")) {
+            game_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--gs-port")) {
+            gs_port = std.fmt.parseInt(u16, args.next() orelse "4000", 10) catch 4000;
+        } else if (std.mem.eql(u8, a, "--verbyte")) {
+            ver_byte = std.fmt.parseInt(u8, args.next() orelse "0", 10) catch 0;
         } else if (!std.mem.startsWith(u8, a, "--")) {
             switch (pos) {
                 0 => host = a,
@@ -587,6 +601,97 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const clr = mcpRecv(mfd, MCP_CHARLOGON, &mb) catch &[_]u8{};
         const clres = if (clr.len >= 4) std.mem.readInt(u32, clr[0..4], .little) else 0xffffffff;
         std.debug.print("[MCP_CHARLOGON] \"{s}\" result=0x{x}  => {s}\n", .{ charname, clres, if (clres == 0) "logged onto char" else "failed" });
+
+        // ── enter a GAME on the GS (clientless): CREATEGAME -> JOINGAME -> connect GS ->
+        //    GAMELOGON(0x68) -> JOINGAME(0x6b) -> read the world stream. Real GS only. ──
+        if (game_arg) |gname| {
+            // MCP_CREATEGAME (0x03): reqid, flags(u32), unk(1), playerDiff, maxPlayers, name, pass, desc
+            var cgb: [128]u8 = undefined;
+            std.mem.writeInt(u16, cgb[0..2], 1, .little);
+            std.mem.writeInt(u32, cgb[2..6], 0, .little); // flags: normal difficulty
+            cgb[6] = 1;
+            cgb[7] = 0;
+            cgb[8] = 8;
+            var co: usize = 9;
+            @memcpy(cgb[co..][0..gname.len], gname);
+            co += gname.len;
+            cgb[co] = 0;
+            co += 1;
+            cgb[co] = 0;
+            co += 1; // pass ""
+            cgb[co] = 'd';
+            cgb[co + 1] = 0;
+            co += 2; // desc "d"
+            try mcpSend(mfd, MCP_CREATEGAME, cgb[0..co]);
+            const cgr = mcpRecv(mfd, MCP_CREATEGAME, &mb) catch &[_]u8{};
+            // reply: u16 reqid, u16 token, u16 unk, u32 result
+            const cg_token = if (cgr.len >= 4) std.mem.readInt(u16, cgr[2..4], .little) else 0;
+            const cg_result = if (cgr.len >= 10) std.mem.readInt(u32, cgr[6..10], .little) else 0xffffffff;
+            _ = cg_token;
+            std.debug.print("[MCP_CREATEGAME] \"{s}\" result=0x{x}  => {s}\n", .{ gname, cg_result, if (cg_result == 0) "created" else "failed (no GS available?)" });
+            if (cg_result != 0) return;
+
+            // MCP_JOINGAME (0x04): reqid, name, pass
+            var jgb: [64]u8 = undefined;
+            std.mem.writeInt(u16, jgb[0..2], 2, .little);
+            var jo: usize = 2;
+            @memcpy(jgb[jo..][0..gname.len], gname);
+            jo += gname.len;
+            jgb[jo] = 0;
+            jo += 1;
+            jgb[jo] = 0;
+            jo += 1; // pass ""
+            try mcpSend(mfd, MCP_JOINGAME, jgb[0..jo]);
+            const jgr = mcpRecv(mfd, MCP_JOINGAME, &mb) catch &[_]u8{};
+            if (jgr.len < 18) {
+                std.debug.print("[MCP_JOINGAME] short reply ({d} B)\n", .{jgr.len});
+                return;
+            }
+            const gtoken = std.mem.readInt(u16, jgr[2..4], .little);
+            const gsip = jgr[6..10];
+            const ghash = std.mem.readInt(u32, jgr[10..14], .little);
+            const jresult = std.mem.readInt(u32, jgr[14..18], .little);
+            var gsipbuf: [20]u8 = undefined;
+            const gsips = std.fmt.bufPrint(&gsipbuf, "{d}.{d}.{d}.{d}", .{ gsip[0], gsip[1], gsip[2], gsip[3] }) catch return;
+            std.debug.print("[MCP_JOINGAME] token=0x{x} gs={s}:{d} hash=0x{x} result=0x{x}\n", .{ gtoken, gsips, gs_port, ghash, jresult });
+            if (jresult != 0) return;
+
+            // Connect to the GS game port (qqserver) and play the entry sequence.
+            const gsfd = connectResolved(gpa, gsips, gs_port) catch {
+                std.debug.print("[GS] connect to {s}:{d} failed\n", .{ gsips, gs_port });
+                return;
+            };
+            defer _ = close(gsfd);
+            setRecvTimeout(gsfd, 5000);
+            // GAMELOGON (0x68), 37 bytes (D2GSPacketClt0x68 — raw, no framing)
+            var gl: [37]u8 = [_]u8{0} ** 37;
+            gl[0] = 0x68;
+            std.mem.writeInt(u32, gl[1..5], ghash, .little);
+            std.mem.writeInt(u16, gl[5..7], gtoken, .little);
+            gl[7] = ver_byte;
+            std.mem.writeInt(u32, gl[8..12], 0xed5fcc50, .little); // expansion version constant
+            std.mem.writeInt(u32, gl[12..16], 0x91a519b6, .little); // constant
+            gl[16] = 0; // language code
+            gl[17] = 1; // char class (Sorceress — matches our created char)
+            @memcpy(gl[18..][0..@min(charname.len, 18)], charname[0..@min(charname.len, 18)]);
+            try writeAll(gsfd, &gl);
+            std.debug.print("[GS] -> GAMELOGON (0x68) token=0x{x} char=\"{s}\"\n", .{ gtoken, charname });
+            var gbuf: [8192]u8 = undefined;
+            const n1 = read(gsfd, gbuf[0..].ptr, gbuf.len);
+            if (n1 <= 0) {
+                std.debug.print("[GS] no response to GAMELOGON — refused/closed (try --verbyte)\n", .{});
+                return;
+            }
+            std.debug.print("[GS] <- {d} bytes after GAMELOGON (GS accepted + streaming)\n", .{n1});
+            try writeAll(gsfd, &[_]u8{0x6b}); // JOINGAME (0x6b), 1 byte
+            std.debug.print("[GS] -> JOINGAME (0x6b)\n", .{});
+            const n2 = read(gsfd, gbuf[0..].ptr, gbuf.len);
+            if (n2 > 0)
+                std.debug.print("[GS] <- {d} bytes after JOINGAME  => IN GAME (world stream)\n", .{n2})
+            else
+                std.debug.print("[GS] no further data after 0x6b\n", .{});
+            return;
+        }
 
         // ── enter chat (BNCS), byte-for-byte like the real 1.14d client (captured via
         //    REALMD_TRACE): GETCHANNELLIST(product 4cc) -> ENTERCHAT(char + "realm,char")
