@@ -5,16 +5,26 @@
 const std = @import("std");
 const rc = @import("realmclient");
 extern "c" fn usleep(usec: c_uint) c_int;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 pub fn main() !void {
-    const n: usize = 5;
+    // GS_ACCT lets several copies run concurrently as different users (multi-client
+    // trace-isolation test); GS_HOLD_MS holds the connection open so they overlap.
+    const acct: []const u8 = if (getenv("GS_ACCT")) |a| std.mem.span(a) else "StressGuy";
+    const hold: c_uint = if (getenv("GS_HOLD_MS")) |h| (std.fmt.parseInt(c_uint, std.mem.span(h), 10) catch 0) else 0;
+
     var c = rc.RealmClient{};
     defer c.close();
     try c.connectBnet();
     try c.auth();
-    _ = c.createAccount("StressGuy", "x") catch 0; // idempotent (no-op if already created)
-    if ((try c.loginPwResult("StressGuy", "x")) != 0) return error.LogonFailed;
+    _ = c.createAccount(acct, "x") catch 0; // idempotent (no-op if already created)
+    if ((try c.loginPwResult(acct, "x")) != 0) return error.LogonFailed;
     try c.enterRealm();
+    std.debug.print("client {s}: logged in + entered realm\n", .{acct});
+    if (hold > 0) {
+        _ = usleep(hold * 1000); // overlap with other concurrent clients
+        return; // login-only mode (no GS needed): exercises realmd per-connection traces
+    }
     try c.connectD2cs();
     _ = c.startup() catch 0;
 
@@ -26,6 +36,7 @@ pub fn main() !void {
     const jg = try c.joinGame("smoke");
     std.debug.print("join   'smoke' -> token={d} result={d} gs={d}.{d}.{d}.{d}\n", .{ jg.token, jg.result, jg.ip[0], jg.ip[1], jg.ip[2], jg.ip[3] });
 
+    const n: usize = 5;
     var ok: usize = 0;
     var fail: usize = 0;
     var i: usize = 0;
