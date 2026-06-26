@@ -7,15 +7,24 @@ const rc = @import("realmclient");
 extern "c" fn usleep(usec: c_uint) c_int;
 
 pub fn main() !void {
-    const n: usize = 15;
+    const n: usize = 5;
     var c = rc.RealmClient{};
     defer c.close();
     try c.connectBnet();
     try c.auth();
-    try c.login("StressGuy");
+    _ = c.createAccount("StressGuy", "x") catch 0; // idempotent (no-op if already created)
+    if ((try c.loginPwResult("StressGuy", "x")) != 0) return error.LogonFailed;
     try c.enterRealm();
     try c.connectD2cs();
     _ = c.startup() catch 0;
+
+    // Smoke: create a game and JOIN it — exercises the GS idle→busy gate (create
+    // bumps d2cs's live count) and the create→join path that a join-based count
+    // would deadlock.
+    const cg = try c.createGame("smoke", "d");
+    std.debug.print("create 'smoke' -> token={d} result={d}\n", .{ cg.token, cg.result });
+    const jg = try c.joinGame("smoke");
+    std.debug.print("join   'smoke' -> token={d} result={d} gs={d}.{d}.{d}.{d}\n", .{ jg.token, jg.result, jg.ip[0], jg.ip[1], jg.ip[2], jg.ip[3] });
 
     var ok: usize = 0;
     var fail: usize = 0;

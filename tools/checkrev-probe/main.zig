@@ -663,17 +663,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
             };
             defer _ = close(gsfd);
             setRecvTimeout(gsfd, 5000);
-            // GAMELOGON (0x68), 37 bytes (D2GSPacketClt0x68 — raw, no framing)
+            // GAMELOGON_MULTI (0x68), 37 bytes (D2GSPacketClt0x68 — raw, no framing).
+            // Field layout (the qqserver/edge rewrites nGameToken@5 -> gameid):
+            //   [0]=id [1..5]=nGameHash [5..7]=nGameToken [7]=nCharClass [8..12]=nVerByte
+            //   [12..16]=nVersionConstant(0xED5DCC50) [16..20]=nConstant(0x91A519B6)
+            //   [20]=nLanguageCode [21..37]=szCharName[16].
             var gl: [37]u8 = [_]u8{0} ** 37;
             gl[0] = 0x68;
-            std.mem.writeInt(u32, gl[1..5], ghash, .little);
-            std.mem.writeInt(u16, gl[5..7], gtoken, .little);
-            gl[7] = ver_byte;
-            std.mem.writeInt(u32, gl[8..12], 0xed5fcc50, .little); // expansion version constant
-            std.mem.writeInt(u32, gl[12..16], 0x91a519b6, .little); // constant
-            gl[16] = 0; // language code
-            gl[17] = 1; // char class (Sorceress — matches our created char)
-            @memcpy(gl[18..][0..@min(charname.len, 18)], charname[0..@min(charname.len, 18)]);
+            std.mem.writeInt(u32, gl[1..5], ghash, .little); // nGameHash
+            std.mem.writeInt(u16, gl[5..7], gtoken, .little); // nGameToken
+            gl[7] = 1; // nCharClass (Sorceress — our EpicSorc char is class 1)
+            std.mem.writeInt(u32, gl[8..12], if (ver_byte != 0) ver_byte else 0x0E, .little); // nVerByte
+            std.mem.writeInt(u32, gl[12..16], 0xED5DCC50, .little); // nVersionConstant (expansion)
+            std.mem.writeInt(u32, gl[16..20], 0x91A519B6, .little); // nConstant
+            gl[20] = 0; // nLanguageCode
+            @memcpy(gl[21..][0..@min(charname.len, 15)], charname[0..@min(charname.len, 15)]);
             try writeAll(gsfd, &gl);
             std.debug.print("[GS] -> GAMELOGON (0x68) token=0x{x} char=\"{s}\"\n", .{ gtoken, charname });
             var gbuf: [8192]u8 = undefined;
@@ -683,13 +687,80 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 return;
             }
             std.debug.print("[GS] <- {d} bytes after GAMELOGON (GS accepted + streaming)\n", .{n1});
-            try writeAll(gsfd, &[_]u8{0x6b}); // JOINGAME (0x6b), 1 byte
-            std.debug.print("[GS] -> JOINGAME (0x6b)\n", .{});
-            const n2 = read(gsfd, gbuf[0..].ptr, gbuf.len);
-            if (n2 > 0)
-                std.debug.print("[GS] <- {d} bytes after JOINGAME  => IN GAME (world stream)\n", .{n2})
+            // Server-driven load: GS streams AF00/AF01 -> 0x01 GameFlags -> (loads char) ->
+            // 0x02 LoadSuccess. The JOINGAME (0x6b) must be sent ONLY AFTER 0x02 (char fully
+            // loaded) — sending it earlier makes SrvJoinAct hit a save-load error (JOIN
+            // REFUSED). Then 0x6a enters the world -> burst (0x59 AssignPlayer). Requires the
+            // GS to run with --no-compress so the S->C frames are plaintext-parseable here.
+            var jb: [65536]u8 = undefined;
+            var have: usize = @intCast(n1);
+            @memcpy(jb[0..have], gbuf[0..have]);
+            var joined = false;
+            var got_world = false;
+            var got_flags = false;
+            var timeouts: usize = 0;
+            var rounds: usize = 0;
+            while (rounds < 400) : (rounds += 1) {
+                var i: usize = 0;
+                while (i < have) {
+                    const b0 = jb[i];
+                    const is_hs = (b0 == 0xAF);
+                    var total: usize = 0;
+                    var idoff: usize = 1;
+                    if (is_hs) {
+                        total = 2;
+                    } else if (b0 < 0xF0) {
+                        total = b0;
+                        idoff = 1;
+                    } else {
+                        if (i + 1 >= have) break;
+                        total = (@as(usize, b0 & 0x0F) << 8) | jb[i + 1];
+                        idoff = 2;
+                    }
+                    if (total == 0) total = 1;
+                    if (i + total > have) break; // incomplete frame; wait for more bytes
+                    if (!is_hs) {
+                        const pid = jb[i + idoff];
+                        if (pid == 0x01) got_flags = true;
+                        if (pid == 0x02 and !joined) {
+                            try writeAll(gsfd, &[_]u8{0x6b}); // JOINGAME
+                            try writeAll(gsfd, &[_]u8{0x6a}); // enter world
+                            joined = true;
+                            std.debug.print("[GS] <- 0x02 LoadSuccess -> sent JOINGAME(0x6b)+ENTERWORLD(0x6a)\n", .{});
+                        }
+                        if (pid == 0x59) got_world = true;
+                    }
+                    i += total;
+                }
+                // keep the incomplete tail
+                if (i > 0 and i <= have) {
+                    const rem = have - i;
+                    std.mem.copyForwards(u8, jb[0..rem], jb[i..have]);
+                    have = rem;
+                }
+                if (got_world) break;
+                const n = read(gsfd, jb[have..].ptr, jb.len - have);
+                if (n <= 0) {
+                    // char-load can lag behind GameFlags; tolerate a few recv timeouts.
+                    timeouts += 1;
+                    // Fallback: GameFlags arrived but LoadSuccess is slow -> prod the join anyway.
+                    if (got_flags and !joined) {
+                        try writeAll(gsfd, &[_]u8{0x6b});
+                        try writeAll(gsfd, &[_]u8{0x6a});
+                        joined = true;
+                        std.debug.print("[GS] (fallback) GameFlags seen, 0x02 lagging -> sent 0x6b/0x6a\n", .{});
+                    }
+                    if (timeouts >= 4) break;
+                    continue;
+                }
+                have += @intCast(n);
+            }
+            if (got_world)
+                std.debug.print("[GS] => IN GAME — world burst (0x59 AssignPlayer) received\n", .{})
+            else if (joined)
+                std.debug.print("[GS] joined (0x6b/0x6a sent) but no 0x59 seen (check GS log SrvJoinAct ENTER)\n", .{})
             else
-                std.debug.print("[GS] no further data after 0x6b\n", .{});
+                std.debug.print("[GS] never saw 0x02 LoadSuccess (char load failed?)\n", .{});
             return;
         }
 
