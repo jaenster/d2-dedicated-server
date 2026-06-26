@@ -1,0 +1,91 @@
+{
+  "title": "D2 Realm & Game Servers",
+  "uid": "typeguru-d2-realm",
+  "tags": ["typeguru", "d2", "realmd", "loki"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true, "hide": true, "name": "Annotations & Alerts", "type": "dashboard"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      { "name": "prom", "label": "Prometheus", "type": "datasource", "query": "prometheus", "current": {}, "hide": 0, "refresh": 1, "regex": "" },
+      { "name": "loki", "label": "Loki", "type": "datasource", "query": "loki", "current": {}, "hide": 0, "refresh": 1, "regex": "" }
+    ]
+  },
+  "panels": [
+    { "type": "row", "title": "Resource usage (realmd namespace)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false, "id": 1 },
+
+    { "id": 2, "type": "stat", "title": "CPU now (cores) by pod", "datasource": { "type": "prometheus", "uid": "${prom}" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 3, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.2 }, { "color": "red", "value": 0.5 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "orientation": "horizontal", "colorMode": "value", "graphMode": "area", "textMode": "value_and_name" },
+      "targets": [ { "refId": "A", "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"realmd\", container!=\"\", container!=\"POD\"}[5m]))", "legendFormat": "{{pod}}" } ] },
+
+    { "id": 3, "type": "timeseries", "title": "CPU (cores) over time", "datasource": { "type": "prometheus", "uid": "${prom}" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 3, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"realmd\", container!=\"\", container!=\"POD\"}[5m]))", "legendFormat": "{{pod}}" } ] },
+
+    { "id": 4, "type": "timeseries", "title": "Memory (working set) over time", "datasource": { "type": "prometheus", "uid": "${prom}" },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"realmd\", container!=\"\", container!=\"POD\"})", "legendFormat": "{{pod}}" } ] },
+
+    { "type": "row", "title": "Realm activity (from logs)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 }, "collapsed": false, "id": 10 },
+
+    { "id": 11, "type": "stat", "title": "Games created (range)", "datasource": { "type": "loki", "uid": "${loki}" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "refId": "A", "expr": "sum(count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json | evt=`game_create` [$__range]))", "queryType": "instant" } ] },
+
+    { "id": 12, "type": "stat", "title": "Player joins (range)", "datasource": { "type": "loki", "uid": "${loki}" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "refId": "A", "expr": "sum(count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json | evt=`player_join` [$__range]))", "queryType": "instant" } ] },
+
+    { "id": 13, "type": "stat", "title": "Join refusals (range)", "datasource": { "type": "loki", "uid": "${loki}" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "refId": "A", "expr": "sum(count_over_time({namespace=\"realmd\", app=\"d2gs\"} |= `JOIN REFUSED` [$__range]))", "queryType": "instant" } ] },
+
+    { "id": 14, "type": "stat", "title": "qqserver dropped conns (range)", "datasource": { "type": "loki", "uid": "${loki}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "orange" } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "refId": "A", "expr": "sum(count_over_time({namespace=\"realmd\", app=\"qqserver\"} |= `dropping` [$__range]))", "queryType": "instant" } ] },
+
+    { "id": 15, "type": "timeseries", "title": "Realm events / min", "datasource": { "type": "loki", "uid": "${loki}" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 13 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "sum(count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json | evt=`game_create` [1m]))", "legendFormat": "game_create" },
+        { "refId": "B", "expr": "sum(count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json | evt=`player_join` [1m]))", "legendFormat": "player_join" },
+        { "refId": "C", "expr": "sum(count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json | evt=`player_leave` [1m]))", "legendFormat": "player_leave" },
+        { "refId": "D", "expr": "sum(count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json | evt=`game_destroy` [1m]))", "legendFormat": "game_destroy" }
+      ] },
+
+    { "type": "row", "title": "Logs", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 }, "collapsed": false, "id": 20 },
+
+    { "id": 21, "type": "logs", "title": "realmd namespace — live", "datasource": { "type": "loki", "uid": "${loki}" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 21 },
+      "options": { "showTime": true, "wrapLogMessage": true, "prettifyLogMessage": true, "enableLogDetails": true, "dedupStrategy": "none", "sortOrder": "Descending" },
+      "targets": [ { "refId": "A", "expr": "{namespace=\"realmd\"} | json" } ] }
+  ]
+}
