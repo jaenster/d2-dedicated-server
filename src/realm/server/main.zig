@@ -202,7 +202,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     if (getenv("REALMD_MODERN_CHALLENGE") != null) bncs.modern_challenge = true; // CheckRevision.mpq+base64 (clientless probe)
     bncs.admin_accounts = cfg.admins;
-    bncs.d2cs_port = cfg.d2cs_port;
+    // Advertise the realm/MCP address on the BNCS port: bncs.handle selector-muxes
+    // MCP (0x01 + non-0xFF) onto :6112, like real bnet. The standalone d2cs listener
+    // on cfg.d2cs_port stays up for back-compat / direct tests.
+    bncs.d2cs_port = cfg.bnet_port;
     gslink.realm_name = cfg.realm_name;
     if (parseIp4(cfg.realm_addr)) |ip| {
         bncs.d2cs_ip = ip;

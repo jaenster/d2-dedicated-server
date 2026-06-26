@@ -19,6 +19,7 @@ const proto = @import("proto.zig");
 const protocol = @import("bncs_protocol.zig");
 const state = @import("state.zig");
 const bnftp = @import("bnftp.zig");
+const d2cs = @import("d2cs.zig");
 const chat = @import("chat.zig");
 const friends = @import("friends.zig");
 const store = @import("store.zig");
@@ -199,6 +200,15 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
             }
             if (acc[0] != 0x01) {
                 log.line(tag, "unexpected protocol byte 0x{x:0>2}", .{acc[0]});
+                return;
+            }
+            // 0x01 fronts BOTH BNCS and MCP — real bnet tells them apart by host,
+            // not by selector. Demux on the byte AFTER 0x01: a BNCS packet starts
+            // 0xFF; an MCP packet is u16-length-prefixed (low length byte, never
+            // 0xFF). Both clients speak first, so the discriminator always arrives.
+            if (len < 2) continue; // wait for the discriminator byte
+            if (acc[1] != 0xff) { // MCP realm session riding :6112
+                d2cs.handleFrom(fd, tag, acc[1..len]);
                 return;
             }
             got_proto = true;

@@ -93,21 +93,33 @@ fn finish(c: *DConn, w: *proto.Writer) void {
     _ = net.writeAll(c.fd, w.slice());
 }
 
+/// Standalone listener entry (the dedicated d2cs port): the leading 0x01 protocol
+/// selector is still on the wire and is consumed here.
 pub fn handle(fd: net.Socket, tag: []const u8) void {
+    serve(fd, tag, &.{}, false);
+}
+
+/// Entry from the bnetd selector-mux (bncs.zig) when an MCP connection rides the
+/// shared :6112 port: the 0x01 selector is already consumed and `initial` holds the
+/// bytes read after it. Lets MCP share the BNCS/BNFTP port, like real Battle.net.
+pub fn handleFrom(fd: net.Socket, tag: []const u8, initial: []const u8) void {
+    serve(fd, tag, initial, true);
+}
+
+fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: bool) void {
     var c = DConn{ .fd = fd };
     log.line(tag, "client connected", .{});
 
     var acc: [16384]u8 = undefined;
-    var len: usize = 0;
-    var got_proto = false;
+    var len: usize = @min(initial.len, acc.len);
+    @memcpy(acc[0..len], initial[0..len]);
+    var got_proto = proto_consumed;
 
     while (true) {
-        const n = net.readSome(fd, acc[len..]);
-        if (n == 0) break;
-        len += n;
-
+        // Process buffered bytes BEFORE blocking on another read — a seeded
+        // MCP_STARTUP must be dispatched (and replied to) or the client hangs.
         var off: usize = 0;
-        if (!got_proto) {
+        if (!got_proto and len >= 1) {
             if (acc[0] != 0x01) {
                 log.line(tag, "unexpected protocol byte 0x{x:0>2}", .{acc[0]});
                 return;
@@ -115,15 +127,17 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
             got_proto = true;
             off = 1;
         }
-        while (len - off >= 3) {
-            const plen = std.mem.readInt(u16, acc[off..][0..2], .little);
-            if (plen < 3) {
-                log.line(tag, "bad packet length {d}", .{plen});
-                return;
+        if (got_proto) {
+            while (len - off >= 3) {
+                const plen = std.mem.readInt(u16, acc[off..][0..2], .little);
+                if (plen < 3) {
+                    log.line(tag, "bad packet length {d}", .{plen});
+                    return;
+                }
+                if (len - off < plen) break; // wait for the rest
+                dispatch(&c, tag, acc[off + 2], acc[off + 3 .. off + plen]);
+                off += plen;
             }
-            if (len - off < plen) break; // wait for the rest
-            dispatch(&c, tag, acc[off + 2], acc[off + 3 .. off + plen]);
-            off += plen;
         }
         if (off > 0) {
             std.mem.copyForwards(u8, acc[0 .. len - off], acc[off..len]);
@@ -133,6 +147,9 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
             log.line(tag, "oversized packet, dropping connection", .{});
             return;
         }
+        const n = net.readSome(fd, acc[len..]);
+        if (n == 0) break;
+        len += n;
     }
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }

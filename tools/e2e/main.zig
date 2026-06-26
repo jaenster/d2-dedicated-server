@@ -82,6 +82,39 @@ fn scLogin() Result {
     return .{ .name = name, .status = .pass, .msg = msg("session minted id={d} cookie=0x{x}", .{ c.sessionId(), c.cookie }) };
 }
 
+// Proves BNCS login AND the MCP realm session run over a SINGLE port (:6112) via
+// the selector-mux in bncs.handle (0x01 + non-0xFF -> d2cs.handleFrom). The client
+// points its MCP socket at 6112 instead of the dedicated d2cs port.
+fn scMcpOn6112() Result {
+    const name = "mcp_over_6112";
+    const acct = "MuxGuy";
+    const char = "MuxSorc";
+    var d2s: [0x40]u8 = undefined;
+    const blob = minimalD2s(&d2s, char, 1, 7); // 1 = Sorceress
+    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+
+    var c = rc.RealmClient{ .d2cs_port = 6112 }; // MCP on the SAME port as BNCS
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "connectBnet {s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "auth {s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "login {s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "enterRealm {s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "connectD2cs(6112) {s}", .{@errorName(e)});
+    const su = c.startup() catch |e| return fail(name, "MCP startup over 6112: {s}", .{@errorName(e)});
+    if (su != 0) return fail(name, "MCP startup result=0x{x}", .{su});
+
+    var entries: [16]rc.CharEntry = undefined;
+    var dst: [2048]u8 = undefined;
+    const cl = c.charList(&entries, &dst) catch |e| return fail(name, "charList over 6112: {s}", .{@errorName(e)});
+    var found = false;
+    for (entries[0..cl.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) found = true;
+    }
+    if (!found) return fail(name, "char {s} not in MCP list over 6112", .{char});
+    return .{ .name = name, .status = .pass, .msg = msg("BNCS+MCP both served on :6112 (char {s} listed)", .{char}) };
+}
+
 fn scCharListStatstring() Result {
     const name = "char_list_statstring";
     const acct = "EpicAma";
@@ -945,6 +978,7 @@ pub fn main() !void {
 
     const results = [_]Result{
         scLogin(),
+        scMcpOn6112(),
         scCharListStatstring(),
         scCreateJoinGame(),
         scFleetCapacity(),
