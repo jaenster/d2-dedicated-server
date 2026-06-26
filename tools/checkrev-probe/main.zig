@@ -401,8 +401,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const ip4 = rr[16..20];
         const mport = std.mem.readInt(u16, rr[20..22], .big);
         var ipstr: [20]u8 = undefined;
-        const ips = std.fmt.bufPrint(&ipstr, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch return;
-        std.debug.print("[MCP] connecting to {s}:{d}\n", .{ ips, mport });
+        const ipfmt = std.fmt.bufPrint(&ipstr, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch return;
+        // Real bnet returns the d2cs server's PRIVATE (NATed) IP — unreachable externally.
+        // Fall back to the gateway host (the addr we connected to), in case it proxies MCP.
+        const priv = ip4[0] == 10 or (ip4[0] == 192 and ip4[1] == 168) or (ip4[0] == 172 and ip4[1] >= 16 and ip4[1] <= 31) or ip4[0] == 127 or ip4[0] == 0;
+        const ips = if (priv) (host orelse ipfmt) else ipfmt;
+        if (priv)
+            std.debug.print("[MCP] realm returned PRIVATE ip {s}:{d} (Blizzard NAT) -> retrying via gateway {s}:{d}\n", .{ ipfmt, mport, ips, mport })
+        else
+            std.debug.print("[MCP] connecting to {s}:{d}\n", .{ ips, mport });
         const mfd = connectResolved(gpa, ips, mport) catch {
             std.debug.print("[MCP] connect failed\n", .{});
             return;
@@ -417,7 +424,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (rr.len >= 72) @memcpy(sb[16..64], rr[24..72]);
         try mcpSend(mfd, MCP_STARTUP, &sb);
         var mb: [8192]u8 = undefined;
-        const sr = try mcpRecv(mfd, MCP_STARTUP, &mb);
+        const sr = mcpRecv(mfd, MCP_STARTUP, &mb) catch {
+            std.debug.print("[MCP_STARTUP] no MCP reply from {s}:{d} — d2cs is unreachable (internal-only; realm logon succeeded but the char/game server is NATed)\n", .{ ips, mport });
+            return;
+        };
         const sres = if (sr.len >= 4) std.mem.readInt(u32, sr[0..4], .little) else 0xffffffff;
         std.debug.print("[MCP_STARTUP] result=0x{x}  => {s}\n", .{ sres, if (sres == 0) "session accepted (in the realm)" else "rejected" });
         if (sres != 0) return;
