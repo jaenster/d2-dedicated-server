@@ -511,16 +511,72 @@ const GAME_SEED_GLOBAL: usize = 0x00731004;
 
 /// Room walk cap — bounds the linked-list traversal against a corrupt pointer.
 const DRLG_ROOM_CAP: usize = 4096;
+/// Per-room near/orth array cap (defensive).
+const DRLG_NEAR_CAP: i32 = 64;
 
-fn onDrlgLevel(pLevel: usize, _: usize, _: usize) callconv(.c) void {
-    if (pLevel == 0) return;
+/// Native engine entry points, both __stdcall (verified by disassembly of the
+/// prologues: args read from [EBP+8...], RET n). Used by the optional dump-all
+/// pass to force every level in the current act to generate.
+///   GetLevelAndAlloc(pDrlg, eLevelId) -> pLevel   @0x642BB0  (RET 8)
+///   InitLevel(pLevel)                              @0x6424A0  (RET 4) — runs the
+///     DRLG generator, which calls DRLG_ApplyRoomExStateFlags → our hook → dump.
+const GetLevelAndAlloc: *const fn (usize, i32) callconv(.winapi) usize = @ptrFromInt(0x642BB0);
+const InitLevel: *const fn (usize) callconv(.winapi) void = @ptrFromInt(0x6424A0);
+
+fn readU8(base: usize, off: usize) u8 {
+    return @as(*const u8, @ptrFromInt(base + off)).*;
+}
+
+/// DefineRoomsNear(pMemory, pRoomEx) @0x66BC20 builds a room's geometric near-room
+/// list (nDrlgRoomsExNearCount @0x2C + ppDrlgRoomsExNear @0x08). The engine only
+/// calls this at room-activation, never during DRLG layout, so at our hook the list
+/// is empty — we invoke it ourselves to capture authoritative adjacency. Custom ABI:
+/// pRoomEx in EDI, pMemory pushed as the single stack arg (RET 4 cleans it), and the
+/// callee clobbers EBX/ESI/EDI without restoring, so we save/restore them here and
+/// only report EAX/ECX/EDX clobbered to Zig.
+fn defineRoomsNear(pMemory: usize, pRoomEx: usize) void {
+    // buf[0]=pMemory (the stack arg), buf[1]=pRoomEx (-> EDI), buf[2]=call target.
+    // EDI is marked clobbered so the allocator never puts [buf] there (we overwrite
+    // EDI). EBX/ESI are clobbered by the callee without restore, so we save them.
+    var buf = [3]u32{ @truncate(pMemory), @truncate(pRoomEx), 0x66BC20 };
+    asm volatile (
+        \\pushl %%ebx
+        \\pushl %%esi
+        \\movl 4(%[buf]), %%edi
+        \\pushl (%[buf])
+        \\call *8(%[buf])
+        \\popl %%esi
+        \\popl %%ebx
+        :
+        : [buf] "r" (&buf),
+        : .{ .eax = true, .ecx = true, .edx = true, .edi = true, .memory = true, .cc = true });
+}
+
+/// Index of `target` within pLevel's pRoomExFirst→pRoomExNext chain, or -1.
+/// Lets adjacency be expressed as stable integer indices comparable across runs.
+fn roomIndexInLevel(pLevel: usize, target: usize) i32 {
+    var room: usize = readU32(pLevel, 0x10); // pRoomExFirst
+    var idx: i32 = 0;
+    var guard: usize = 0;
+    while (room != 0 and guard < DRLG_ROOM_CAP) : (guard += 1) {
+        if (room == target) return idx;
+        room = readU32(room, 0x24); // pRoomExNext
+        idx += 1;
+    }
+    return -1;
+}
+
+/// Emit one `drlg_level` JSON line for a fully generated level. Kept in its own
+/// stack frame so the big line buffer is freed before any dump-all recursion runs
+/// (only ever one buffer live at a time).
+fn emitLevel(pLevel: usize) void {
     const levelId = @as(i32, @bitCast(readU32(pLevel, 0x1D0)));
     // sSeed is consumed by generation at this point — recompute the INITIAL level
     // seed = pDrlg->dwStartSeed + eD2LevelId (what InitLevel originally stored).
     const pDrlg: usize = readU32(pLevel, 0x1B4);
     const seed: u32 = if (pDrlg != 0) readU32(pDrlg, 0x470) +% @as(u32, @bitCast(levelId)) else 0;
-    // Big line buffer: a full level (all rooms) on one JSON line for the oracle.
-    var e = evlog.EventN(65536).begin("drlg_level");
+    // Big line buffer: a full level (all rooms + adjacency) on one JSON line.
+    var e = evlog.EventN(131072).begin("drlg_level");
     e.int("levelId", levelId);
     e.int("drlgType", @as(i32, @bitCast(readU32(pLevel, 0x00))));
     e.int("seed", seed);
@@ -532,7 +588,11 @@ fn onDrlgLevel(pLevel: usize, _: usize, _: usize) callconv(.c) void {
     e.int("w", @as(i32, @bitCast(readU32(pLevel, 0x24))));
     e.int("h", @as(i32, @bitCast(readU32(pLevel, 0x28))));
     e.objClose();
-    // Rooms: walk pRoomExFirst -> pRoomExNext, emit {x,y,w,h,seed} per room.
+    // Rooms: walk pRoomExFirst -> pRoomExNext. Per room (D2RoomExStrc offsets):
+    //   coords @0x34, sSeed.nSeedLow @0x14, nType @0x10, eRoomExFlags @0x28,
+    //   nPresetType @0x48 (1=maze/outdoor, 2=preset), nDT1Mask @0x50,
+    //   dwOtherFlags @0x60, pRoomExData @0x20, ppDrlgRoomsExNear @0x08,
+    //   nDrlgRoomsExNearCount @0x2C, pOrth @0x00.
     e.arrayField("rooms");
     var room: usize = readU32(pLevel, 0x10); // pRoomExFirst
     var i: usize = 0;
@@ -544,11 +604,127 @@ fn onDrlgLevel(pLevel: usize, _: usize, _: usize) callconv(.c) void {
         e.int("w", @as(i32, @bitCast(readU32(room, 0x3C))));
         e.int("h", @as(i32, @bitCast(readU32(room, 0x40))));
         e.int("seed", readU32(room, 0x14)); // sSeed.nSeedLow
+        const presetType = s32(readU32(room, 0x48));
+        e.int("nType", s32(readU32(room, 0x10)));
+        e.int("nPresetType", presetType);
+        e.int("flags", s32(readU32(room, 0x28))); // eRoomExFlags
+        e.int("oflags", s32(readU32(room, 0x60))); // dwOtherFlags
+        e.int("dt1mask", s32(readU32(room, 0x50))); // nDT1Mask
+        // DS1 selection from pRoomExData. Preset room (nPresetType==2):
+        //   D2DrlgPresetRoomStrc as int[]: [0]=Def(LvlPrest id), [3]=nPickedFile.
+        // Maze/outdoor room (nPresetType==1): D2DrlgRoomExDataMazeStrc:
+        //   nSubType @0x64, nSubTheme @0x68, nSubThemePicked @0x6C.
+        const pData = readU32(room, 0x20);
+        if (presetType == 2 and pData != 0) {
+            e.int("def", s32(readU32(pData, 0x00)));
+            e.int("pickedFile", s32(readU32(pData, 0x0C)));
+        } else if (presetType == 1 and pData != 0) {
+            e.int("subType", s32(readU32(pData, 0x64)));
+            e.int("subTheme", s32(readU32(pData, 0x68)));
+            e.int("subThemePicked", s32(readU32(pData, 0x6C)));
+        }
+        // Adjacency: near count + list of adjacent room indices (within this level).
+        // The near list isn't built during layout, so populate it via the engine's
+        // own DefineRoomsNear (pMemory = pDrlg->pMemoryPool @0x478).
+        if (pDrlg != 0) defineRoomsNear(readU32(pDrlg, 0x478), room);
+        const nearCount = s32(readU32(room, 0x2C));
+        e.int("near", nearCount);
+        const ppNear = readU32(room, 0x08);
+        if (ppNear != 0 and nearCount > 0) {
+            e.arrayField("adj");
+            const cap: i32 = if (nearCount > DRLG_NEAR_CAP) DRLG_NEAR_CAP else nearCount;
+            var j: i32 = 0;
+            while (j < cap and !e.full) : (j += 1) {
+                if (j != 0) e.comma();
+                const nearRoom = readU32(ppNear + @as(usize, @intCast(j)) * 4, 0);
+                e.numVal(roomIndexInLevel(pLevel, nearRoom));
+            }
+            e.arrayEnd();
+        }
+        // Orth (orthogonal connection) count — walk pOrth->pNext (@0x14), capped.
+        var orth: i32 = 0;
+        var po = readU32(room, 0x00);
+        while (po != 0 and orth < 256) : (orth += 1) po = readU32(po, 0x14);
+        e.int("orth", orth);
         e.objClose();
         room = readU32(room, 0x24); // pRoomExNext
     }
     e.arrayEnd();
     e.end();
+}
+
+/// Dump-all state. `dumpall_done` ensures the forced pass runs once per process;
+/// `in_dumpall` guards against the forced InitLevel calls re-triggering the pass
+/// (their generated levels still dump normally via emitLevel).
+var dumpall_done: bool = false;
+var in_dumpall: bool = false;
+
+/// Inclusive [lo,hi] level-id range owned by each act (nActNo 0..4), from the
+/// town-level table {RogueEncampment=1, LutGholein=40, KurastDocktown=75,
+/// PandemoniumFortress=103, Harrogath=109}; act 5 tops out at the last 1.14d
+/// Levels.txt id (Uber Tristram = 136). Levels are only correct on their OWN
+/// act's pDrlg (each act rolls an independent dwStartSeed), so we never cross acts.
+fn actLevelRange(nActNo: u8) ?struct { lo: i32, hi: i32 } {
+    return switch (nActNo) {
+        0 => .{ .lo = 1, .hi = 39 },
+        1 => .{ .lo = 40, .hi = 74 },
+        2 => .{ .lo = 75, .hi = 102 },
+        3 => .{ .lo = 103, .hi = 108 },
+        4 => .{ .lo = 109, .hi = 136 },
+        else => null,
+    };
+}
+
+/// Force-generate every level in the current act so the oracle captures them all.
+/// For each level id: GetLevelAndAlloc, then InitLevel iff not yet generated
+/// (pRoomExFirst null). InitLevel fires our hook → emitLevel dumps it. Robust:
+/// skips ids the engine couldn't allocate; the [lo,hi] range stays within
+/// Levels.txt bounds so TXT_LevelDefs_GetLine never returns null.
+fn runDumpAll(pDrlg: usize) void {
+    const nActNo = readU8(pDrlg, 0x480);
+    const range = actLevelRange(nActNo) orelse return;
+    log.hex2("srvtrace: DRLG dump-all act", nActNo, @as(usize, @intCast(range.hi)));
+    var id: i32 = range.lo;
+    while (id <= range.hi) : (id += 1) {
+        const pLevel = GetLevelAndAlloc(pDrlg, id);
+        if (pLevel == 0) continue;
+        if (readU32(pLevel, 0x10) == 0) InitLevel(pLevel); // not yet generated
+    }
+}
+
+/// True once `D2GS_DRLG_DUMPALL` is set to a non-empty value (checked once).
+fn dumpAllEnabled() bool {
+    const S = struct {
+        var checked: bool = false;
+        var on: bool = false;
+    };
+    if (!S.checked) {
+        S.checked = true;
+        var buf: [8]u8 = undefined;
+        const n = GetEnvironmentVariableA("D2GS_DRLG_DUMPALL", &buf, buf.len);
+        S.on = n != 0 and n < buf.len and buf[0] != '0';
+    }
+    return S.on;
+}
+
+fn onDrlgLevel(pLevel: usize, _: usize, _: usize) callconv(.c) void {
+    if (pLevel == 0) return;
+    emitLevel(pLevel); // own frame — buffer freed before any dump-all recursion
+
+    if (!dumpall_done and !in_dumpall and dumpAllEnabled()) {
+        // Trigger on the first generated level (the town, generated during act init).
+        // DRLG *layout* generation only needs pDrlg, which is fully seeded before the
+        // town generates (dwStartSeed/pMemoryPool/pLevel all set in
+        // DRLG_AllocDrlgActMisc before its InitLevel(town) call), so it is safe to
+        // force the rest of the act here. The forced InitLevels dump via emitLevel;
+        // in_dumpall stops them re-triggering this pass.
+        const pDrlg: usize = readU32(pLevel, 0x1B4);
+        if (pDrlg == 0) return;
+        dumpall_done = true;
+        in_dumpall = true;
+        runDumpAll(pDrlg);
+        in_dumpall = false;
+    }
 }
 
 /// Pin the engine's game seed to D2GS_DRLG_SEED (decimal u32) for reproducible DRLG

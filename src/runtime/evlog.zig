@@ -176,6 +176,12 @@ pub fn EventN(comptime cap: usize) type {
             self.rawByte(',');
         }
 
+        /// A bare number as an array element (no key, no comma — caller emits comma()
+        /// between elements). For integer arrays like adjacency lists `[2,5,7]`.
+        pub fn numVal(self: *Self, v: i64) void {
+            self.num(v);
+        }
+
         /// Close and flush the line.
         pub fn end(self: *Self) void {
             self.rawByte('}');
