@@ -563,8 +563,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("[CHATEVENT] eid=0x{x} user=\"{s}\" text=\"{s}\"\n", .{ eid, uname, text });
         }
 
-        // ── MCP_LADDERDATA (0x11) — request the ladder; mode 0 ──
-        try mcpSend(mfd, MCP_LADDERDATA, &[_]u8{0});
+        // ── MCP_LADDERDATA (0x11) — the real client sends 3 bytes: mode 0x1b + u16(0)
+        //    (captured via REALMD_TRACE). A 1-byte request makes real bnet reply 0x00. ──
+        try mcpSend(mfd, MCP_LADDERDATA, &[_]u8{ 0x1b, 0, 0 });
         const ld = mcpRecv(mfd, MCP_LADDERDATA, &mb) catch &[_]u8{};
         if (ld.len < 19) {
             std.debug.print("[MCP_LADDERDATA] empty ladder (no ranked chars)\n", .{});
