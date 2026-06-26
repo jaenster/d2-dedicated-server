@@ -25,6 +25,7 @@ const health = @import("runtime/feature/health.zig"); // hacky in-process HTTP h
 const gsport = @import("runtime/gsport.zig");
 const gamereap = @import("runtime/gamereap.zig");
 const roominit = @import("runtime/roominit.zig");
+const gameloop = @import("runtime/gameloop.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
 const realmgw = @import("runtime/realmgw.zig");
@@ -333,6 +334,10 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // default server path stays byte-identical.
     // Always install the per-game RoomInit fan-out (cainfix/srvdiag/ubers all consume it).
     roominit.install();
+    // Pace the engine's WinMain out-of-game loop: on a headless GS it runs forever and
+    // is the real idle-CPU cost (~50% of a core on the cluster). ~10 Hz is plenty for a
+    // server with no menu UI.
+    gameloop.installServerOogPacing();
     if (use_realm) {
         if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         joindiag.install(); // log nReason when the engine refuses a join
