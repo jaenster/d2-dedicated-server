@@ -78,6 +78,7 @@ const registry = [_]Feature{
     .{ .mod = @import("../runtime/feature/srvdiag.zig"), .name = "srvdiag" },
     .{ .mod = @import("../runtime/feature/srvtrace.zig"), .name = "srvtrace" },
     .{ .mod = @import("../runtime/feature/cainfix.zig"), .name = "cainfix" },
+    .{ .mod = @import("../runtime/feature/ladderitems.zig"), .name = "ladderitems" },
     .{ .mod = @import("../runtime/feature/arena.zig"), .name = "arena", .flag = "arena", .default = false },
     .{ .mod = @import("../runtime/feature/expmod.zig"), .name = "expmod", .flag = "expmod", .default = false },
     .{ .mod = @import("../runtime/feature/ubers.zig"), .name = "ubers", .flag = "ubers", .default = false },
