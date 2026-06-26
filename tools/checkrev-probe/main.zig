@@ -136,7 +136,14 @@ const SID_LOGONRESPONSE2 = 0x3a;
 const SID_CREATEACCOUNT2 = 0x3d;
 const SID_QUERYREALMS2 = 0x40;
 const SID_LOGONREALMEX = 0x3e;
+const SID_ENTERCHAT = 0x0a;
+const SID_GETCHANNELLIST = 0x0b;
+const SID_JOINCHANNEL = 0x0c;
+const SID_CHATEVENT = 0x0f;
 const MCP_STARTUP = 0x01;
+const MCP_CHARCREATE = 0x02;
+const MCP_CHARLOGON = 0x07;
+const MCP_LADDERDATA = 0x11;
 const MCP_MOTD = 0x12;
 const MCP_CHARLIST2 = 0x19;
 const CLIENT_TOKEN: u32 = 0xCAFEBABE;
@@ -414,6 +421,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.mem.writeInt(u32, &clreq, 8, .little);
         try mcpSend(mfd, MCP_CHARLIST2, &clreq);
         const cl = mcpRecv(mfd, MCP_CHARLIST2, &mb) catch &[_]u8{};
+        var cname_buf: [32]u8 = undefined;
+        var cname_len: usize = 0;
         if (cl.len >= 8) {
             const total = std.mem.readInt(u32, cl[2..6], .little);
             const ret = std.mem.readInt(u16, cl[6..8], .little);
@@ -427,7 +436,80 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 const stat = cstrAt(cl, off2);
                 off2 += stat.len + 1;
                 std.debug.print("  - char \"{s}\"\n", .{name});
+                if (cname_len == 0 and name.len > 0 and name.len < cname_buf.len) {
+                    @memcpy(cname_buf[0..name.len], name);
+                    cname_len = name.len;
+                }
             }
+        }
+
+        // ── MCP_CHARCREATE — make a character if the account has none ──
+        if (cname_len == 0) {
+            const newname = "Clientella"; // <=15 chars
+            var ccb: [64]u8 = undefined;
+            std.mem.writeInt(u32, ccb[0..4], 1, .little); // class 1 = Sorceress
+            std.mem.writeInt(u16, ccb[4..6], 0x20, .little); // status: 0x20 = expansion (LoD), softcore
+            @memcpy(ccb[6 .. 6 + newname.len], newname);
+            ccb[6 + newname.len] = 0;
+            try mcpSend(mfd, MCP_CHARCREATE, ccb[0 .. 7 + newname.len]);
+            const ccr = mcpRecv(mfd, MCP_CHARCREATE, &mb) catch &[_]u8{};
+            const ccres = if (ccr.len >= 4) std.mem.readInt(u32, ccr[0..4], .little) else 0xffffffff;
+            std.debug.print("[MCP_CHARCREATE] \"{s}\" class=Sorceress(exp) result=0x{x}  => {s}\n", .{ newname, ccres, if (ccres == 0) "created" else "failed" });
+            if (ccres == 0) {
+                @memcpy(cname_buf[0..newname.len], newname);
+                cname_len = newname.len;
+            }
+        }
+        if (cname_len == 0) return;
+        const charname = cname_buf[0..cname_len];
+
+        // ── MCP_CHARLOGON — select the character ──
+        var clb: [40]u8 = undefined;
+        @memcpy(clb[0..cname_len], charname);
+        clb[cname_len] = 0;
+        try mcpSend(mfd, MCP_CHARLOGON, clb[0 .. cname_len + 1]);
+        const clr = mcpRecv(mfd, MCP_CHARLOGON, &mb) catch &[_]u8{};
+        const clres = if (clr.len >= 4) std.mem.readInt(u32, clr[0..4], .little) else 0xffffffff;
+        std.debug.print("[MCP_CHARLOGON] \"{s}\" result=0x{x}  => {s}\n", .{ charname, clres, if (clres == 0) "logged onto char" else "failed" });
+
+        // ── MCP_LADDERDATA (0x11) — request the ladder; mode 0 ──
+        try mcpSend(mfd, MCP_LADDERDATA, &[_]u8{0});
+        const ld = mcpRecv(mfd, MCP_LADDERDATA, &mb) catch &[_]u8{};
+        if (ld.len < 19) {
+            std.debug.print("[MCP_LADDERDATA] empty ladder (no ranked chars)\n", .{});
+        } else {
+            const count = std.mem.readInt(u32, ld[11..][0..4], .little);
+            const esize = std.mem.readInt(u32, ld[15..][0..4], .little);
+            std.debug.print("[MCP_LADDERDATA] {d} ranked entries (name width {d})\n", .{ count, esize });
+            var lo: usize = 19;
+            var li: usize = 0;
+            while (li < count and lo + 12 + esize <= ld.len) : (li += 1) {
+                lo += 8; // experience lo/hi
+                const stats = std.mem.readInt(u32, ld[lo..][0..4], .little);
+                lo += 4;
+                const nm = cstrAt(ld, lo);
+                lo += esize;
+                std.debug.print("  #{d} \"{s}\" stats=0x{x}\n", .{ li + 1, nm, stats });
+            }
+        }
+
+        // ── back on the BNCS connection: enter chat + join the realm channel ──
+        try send(fd, SID_ENTERCHAT, &[_]u8{ 0, 0 }); // empty username + empty statstring
+        const ec = recvUntil(fd, SID_ENTERCHAT, &mb) catch &[_]u8{};
+        if (ec.len > 0) std.debug.print("[SID_ENTERCHAT] unique name=\"{s}\"\n", .{cstrAt(ec, 0)});
+        try send(fd, SID_GETCHANNELLIST, &[_]u8{ 0, 0, 0, 0 });
+        const ch = recvUntil(fd, SID_GETCHANNELLIST, &mb) catch &[_]u8{};
+        if (ch.len > 1) std.debug.print("[SID_GETCHANNELLIST] first channel=\"{s}\"\n", .{cstrAt(ch, 0)});
+        var jc: [32]u8 = undefined;
+        std.mem.writeInt(u32, jc[0..4], 0, .little); // flags
+        const chan = "Diablo II";
+        @memcpy(jc[4 .. 4 + chan.len], chan);
+        jc[4 + chan.len] = 0;
+        try send(fd, SID_JOINCHANNEL, jc[0 .. 5 + chan.len]);
+        const ce = recvUntil(fd, SID_CHATEVENT, &mb) catch &[_]u8{};
+        if (ce.len >= 24) {
+            const eid = std.mem.readInt(u32, ce[0..4], .little);
+            std.debug.print("[SID_CHATEVENT] eid=0x{x} channel=\"{s}\"  => IN CHAT\n", .{ eid, cstrAt(ce, 24) });
         }
     }
 }
