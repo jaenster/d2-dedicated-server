@@ -380,11 +380,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try send(fd, SID_LOGONREALMEX, rb[0 .. 24 + first_realm.len + 1]);
         var rrbuf: [256]u8 = undefined;
         const rr = try recvUntil(fd, SID_LOGONREALMEX, &rrbuf);
-        if (rr.len < 24) return;
-        const cookie = std.mem.readInt(u32, rr[0..4], .little);
-        const status = std.mem.readInt(u32, rr[4..8], .little);
-        std.debug.print("[LOGONREALMEX] realm=\"{s}\" cookie=0x{x:0>8} status=0x{x:0>8}  => {s}\n", .{ first_realm, cookie, status, if (status == 0) "OK — MCP handoff" else "realm logon failed" });
-        if (status != 0) return;
+        // Dump the raw reply — real bnet's success layout differs from realmd's, so we read it
+        // from the bytes rather than assuming a status DWORD at offset 4.
+        std.debug.print("[LOGONREALMEX] realm=\"{s}\" reply {d} bytes:\n", .{ first_realm, rr.len });
+        {
+            var hi: usize = 0;
+            while (hi < rr.len) : (hi += 1) std.debug.print("{x:0>2} ", .{rr[hi]});
+            std.debug.print("\n", .{});
+        }
+        // Short reply (~8 bytes = cookie+status) is a real failure; a long reply carries the
+        // MCP handoff (cookie, status, chunk1, ip, port, chunk2, unique name) = success.
+        if (rr.len < 30) {
+            const status = if (rr.len >= 8) std.mem.readInt(u32, rr[4..8], .little) else 0xffffffff;
+            std.debug.print("  => realm logon FAILED (status=0x{x})\n", .{status});
+            return;
+        }
+        std.debug.print("  => OK — MCP handoff ({d}-byte reply)\n", .{rr.len});
 
         // ── MCP (realm/character server) — connect to the addr the realm gave us ──
         const ip4 = rr[16..20];
@@ -472,6 +483,55 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const clres = if (clr.len >= 4) std.mem.readInt(u32, clr[0..4], .little) else 0xffffffff;
         std.debug.print("[MCP_CHARLOGON] \"{s}\" result=0x{x}  => {s}\n", .{ charname, clres, if (clres == 0) "logged onto char" else "failed" });
 
+        // ── enter chat (BNCS), byte-for-byte like the real 1.14d client (captured via
+        //    REALMD_TRACE): GETCHANNELLIST(product 4cc) -> ENTERCHAT(char + "realm,char")
+        //    -> JOINCHANNEL(flags=5, "Diablo II"). The real client enters chat before
+        //    accessing the ladder. ──
+        var prodcode: [4]u8 = .{ 'P', 'X', '2', 'D' }; // D2XP reversed
+        if (product.len == 4) prodcode = .{ product[3], product[2], product[1], product[0] };
+        try send(fd, SID_GETCHANNELLIST, &prodcode);
+        const ch = recvUntil(fd, SID_GETCHANNELLIST, &mb) catch &[_]u8{};
+        if (ch.len > 1) std.debug.print("[SID_GETCHANNELLIST] first channel=\"{s}\"\n", .{cstrAt(ch, 0)});
+
+        // SID_ENTERCHAT: username = char name, statstring = "<realm>,<charname>"
+        var ecb: [128]u8 = undefined;
+        var eo: usize = 0;
+        @memcpy(ecb[eo..][0..cname_len], charname);
+        eo += cname_len;
+        ecb[eo] = 0;
+        eo += 1;
+        @memcpy(ecb[eo..][0..first_realm.len], first_realm);
+        eo += first_realm.len;
+        ecb[eo] = ',';
+        eo += 1;
+        @memcpy(ecb[eo..][0..cname_len], charname);
+        eo += cname_len;
+        ecb[eo] = 0;
+        eo += 1;
+        try send(fd, SID_ENTERCHAT, ecb[0..eo]);
+        const ec = recvUntil(fd, SID_ENTERCHAT, &mb) catch &[_]u8{};
+        if (ec.len > 0) std.debug.print("[SID_ENTERCHAT] unique name=\"{s}\" stat=\"{s}\"\n", .{ cstrAt(ec, 0), cstrAt(ec, cstrAt(ec, 0).len + 1) });
+
+        // SID_JOINCHANNEL: flags=5 (D2 realm-lobby join), channel "Diablo II"
+        var jc: [32]u8 = undefined;
+        std.mem.writeInt(u32, jc[0..4], 5, .little);
+        const chan = "Diablo II";
+        @memcpy(jc[4 .. 4 + chan.len], chan);
+        jc[4 + chan.len] = 0;
+        try send(fd, SID_JOINCHANNEL, jc[0 .. 5 + chan.len]);
+
+        // Read several chat events to see the full channel state the server returns
+        // (EID_CHANNEL, then EID_SHOWUSER per member, EID_JOIN, etc.).
+        var evi: usize = 0;
+        while (evi < 10) : (evi += 1) {
+            const cev = recvUntil(fd, SID_CHATEVENT, &mb) catch break;
+            if (cev.len < 28) break;
+            const eid = std.mem.readInt(u32, cev[0..4], .little);
+            const uname = cstrAt(cev, 24);
+            const text = cstrAt(cev, 24 + uname.len + 1);
+            std.debug.print("[CHATEVENT] eid=0x{x} user=\"{s}\" text=\"{s}\"\n", .{ eid, uname, text });
+        }
+
         // ── MCP_LADDERDATA (0x11) — request the ladder; mode 0 ──
         try mcpSend(mfd, MCP_LADDERDATA, &[_]u8{0});
         const ld = mcpRecv(mfd, MCP_LADDERDATA, &mb) catch &[_]u8{};
@@ -491,25 +551,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 lo += esize;
                 std.debug.print("  #{d} \"{s}\" stats=0x{x}\n", .{ li + 1, nm, stats });
             }
-        }
-
-        // ── back on the BNCS connection: enter chat + join the realm channel ──
-        try send(fd, SID_ENTERCHAT, &[_]u8{ 0, 0 }); // empty username + empty statstring
-        const ec = recvUntil(fd, SID_ENTERCHAT, &mb) catch &[_]u8{};
-        if (ec.len > 0) std.debug.print("[SID_ENTERCHAT] unique name=\"{s}\"\n", .{cstrAt(ec, 0)});
-        try send(fd, SID_GETCHANNELLIST, &[_]u8{ 0, 0, 0, 0 });
-        const ch = recvUntil(fd, SID_GETCHANNELLIST, &mb) catch &[_]u8{};
-        if (ch.len > 1) std.debug.print("[SID_GETCHANNELLIST] first channel=\"{s}\"\n", .{cstrAt(ch, 0)});
-        var jc: [32]u8 = undefined;
-        std.mem.writeInt(u32, jc[0..4], 0, .little); // flags
-        const chan = "Diablo II";
-        @memcpy(jc[4 .. 4 + chan.len], chan);
-        jc[4 + chan.len] = 0;
-        try send(fd, SID_JOINCHANNEL, jc[0 .. 5 + chan.len]);
-        const ce = recvUntil(fd, SID_CHATEVENT, &mb) catch &[_]u8{};
-        if (ce.len >= 24) {
-            const eid = std.mem.readInt(u32, ce[0..4], .little);
-            std.debug.print("[SID_CHATEVENT] eid=0x{x} channel=\"{s}\"  => IN CHAT\n", .{ eid, cstrAt(ce, 24) });
         }
     }
 }
