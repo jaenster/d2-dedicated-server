@@ -24,6 +24,8 @@ const t = @import("../../engine/d2/types.zig");
 const fns = @import("../../engine/d2/functions.zig");
 const game = @import("../../engine/d2types.zig");
 
+extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
+
 // ── decode helpers ───────────────────────────────────────────────────────────
 
 fn unit(v: usize) ?*t.UnitAny {
@@ -482,6 +484,84 @@ fn onItemUse(pplayer: usize, _: usize, _: usize) callconv(.c) void {
     e.end();
 }
 
+// ── DRLG oracle ──────────────────────────────────────────────────────────────
+// Hooked at DRLG_ApplyRoomExStateFlags(D2DrlgLevelStrc* pLevel) @0x642390, which
+// InitLevel @0x6424A0 calls in EVERY generation path (maze/preset/wilderness) AFTER
+// the per-type generator has linked the rooms. (We do NOT hook InitLevel's entry:
+// there pLevel->pRoomExFirst is still null because InitLevel BUILDS the rooms, so a
+// v1 entry hook always saw roomCount 0.) pLevel arrives in EDX (fastcall-style; a1 =
+// .edx). We dump the full room layout as a single JSON line so a separate Zig DRLG
+// reimplementation can be verified offset-for-offset against the real 1.14d engine.
+//
+// At this hook the level's own sSeed has ALREADY been consumed by generation, so we
+// do NOT read pLevel->sSeed. Instead we recompute the INITIAL level seed exactly as
+// InitLevel did: pLevel->pDrlg->dwStartSeed + pLevel->eD2LevelId.
+//
+// D2DrlgLevelStrc: +0x00 eDrlgType(i32), +0x08 nRoomExCount(i32), +0x10 pRoomExFirst,
+//   +0x1C sCoordsAndSize (POINT WorldPos@+0x1C, POINT WorldSize@+0x24),
+//   +0x1B4 pDrlg(D2DrlgStrc*), +0x1D0 eD2LevelId(i32).
+// D2DrlgStrc: +0x470 dwStartSeed(u32).
+// D2RoomExStrc: +0x14 sSeed.nSeedLow, +0x24 pRoomExNext, +0x34 sCoords (WorldPos@+0x34,
+//   WorldSize@+0x3C).
+
+/// 1.14d GameSeed static global (D2Game::Game::Server). RollSeed @0x52C280 uses it as
+/// a forced game seed when != -1; default is -1 (random). Pin it via D2GS_DRLG_SEED
+/// for reproducible dumps. Writer of record: GAME_SetForcedGameSeed @0x52C320.
+const GAME_SEED_GLOBAL: usize = 0x00731004;
+
+/// Room walk cap — bounds the linked-list traversal against a corrupt pointer.
+const DRLG_ROOM_CAP: usize = 4096;
+
+fn onDrlgLevel(pLevel: usize, _: usize, _: usize) callconv(.c) void {
+    if (pLevel == 0) return;
+    const levelId = @as(i32, @bitCast(readU32(pLevel, 0x1D0)));
+    // sSeed is consumed by generation at this point — recompute the INITIAL level
+    // seed = pDrlg->dwStartSeed + eD2LevelId (what InitLevel originally stored).
+    const pDrlg: usize = readU32(pLevel, 0x1B4);
+    const seed: u32 = if (pDrlg != 0) readU32(pDrlg, 0x470) +% @as(u32, @bitCast(levelId)) else 0;
+    // Big line buffer: a full level (all rooms) on one JSON line for the oracle.
+    var e = evlog.EventN(65536).begin("drlg_level");
+    e.int("levelId", levelId);
+    e.int("drlgType", @as(i32, @bitCast(readU32(pLevel, 0x00))));
+    e.int("seed", seed);
+    e.int("roomCount", @as(i32, @bitCast(readU32(pLevel, 0x08))));
+    // Level coords {x,y,w,h} (POINT WorldPosition @+0x1C, POINT WorldSize @+0x24).
+    e.objField("coords");
+    e.intFirst("x", @as(i32, @bitCast(readU32(pLevel, 0x1C))));
+    e.int("y", @as(i32, @bitCast(readU32(pLevel, 0x20))));
+    e.int("w", @as(i32, @bitCast(readU32(pLevel, 0x24))));
+    e.int("h", @as(i32, @bitCast(readU32(pLevel, 0x28))));
+    e.objClose();
+    // Rooms: walk pRoomExFirst -> pRoomExNext, emit {x,y,w,h,seed} per room.
+    e.arrayField("rooms");
+    var room: usize = readU32(pLevel, 0x10); // pRoomExFirst
+    var i: usize = 0;
+    while (room != 0 and i < DRLG_ROOM_CAP and !e.full) : (i += 1) {
+        if (i != 0) e.comma();
+        e.objOpen();
+        e.intFirst("x", @as(i32, @bitCast(readU32(room, 0x34))));
+        e.int("y", @as(i32, @bitCast(readU32(room, 0x38))));
+        e.int("w", @as(i32, @bitCast(readU32(room, 0x3C))));
+        e.int("h", @as(i32, @bitCast(readU32(room, 0x40))));
+        e.int("seed", readU32(room, 0x14)); // sSeed.nSeedLow
+        e.objClose();
+        room = readU32(room, 0x24); // pRoomExNext
+    }
+    e.arrayEnd();
+    e.end();
+}
+
+/// Pin the engine's game seed to D2GS_DRLG_SEED (decimal u32) for reproducible DRLG
+/// dumps. No-op when unset → normal random seeding is untouched.
+fn pinDrlgSeed() void {
+    var buf: [16]u8 = undefined;
+    const n = GetEnvironmentVariableA("D2GS_DRLG_SEED", &buf, buf.len);
+    if (n == 0 or n >= buf.len) return;
+    const seed = std.fmt.parseInt(u32, buf[0..n], 10) catch return;
+    @as(*volatile u32, @ptrFromInt(GAME_SEED_GLOBAL)).* = seed;
+    log.hex("srvtrace: DRLG game seed pinned to 0x", seed);
+}
+
 // ── hook framework ───────────────────────────────────────────────────────────
 
 /// Where a captured value comes from at function entry. `.stack` is the original
@@ -528,6 +608,10 @@ const Hook = struct {
     /// Where the game pointer is at entry (usually .ecx). Captured into cur_game
     /// before the handler runs so ev() can stamp the game token. .none = no game.
     game: Src = .none,
+    /// Byte offsets within the prologue of any rel8 short branch (Jcc 0x70-0x7F /
+    /// JMP 0xEB) the trampoline must expand to rel32. Verified by hand alongside
+    /// the prologue length; empty for prologues with no short branches.
+    rel8: []const usize = &.{},
 };
 
 fn TraceHook(comptime h: Hook) type {
@@ -559,7 +643,7 @@ fn TraceHook(comptime h: Hook) type {
         /// Returns true if the hook installed. Logs only on FAILURE — success is
         /// rolled into a single summary line by install() to keep the log quiet.
         fn install() bool {
-            const tr = trampoline.build(h.addr, h.prologue) orelse {
+            const tr = trampoline.build(h.addr, h.prologue, h.rel8) orelse {
                 log.print("srvtrace: trampoline FAILED — " ++ h.label);
                 return false;
             };
@@ -624,9 +708,15 @@ const hooks = [_]Hook{
     .{ .addr = 0x54AD90, .prologue = 6, .label = "item_equip", .handler = &onItemEquip, .game = .ecx, .a1 = .edx }, // 0x1A EquipItem
     .{ .addr = 0x54B1E0, .prologue = 6, .label = "item_use", .handler = &onItemUse, .game = .ecx, .a1 = .edx }, // 0x20 UseItemAtLocation
     .{ .addr = 0x54B560, .prologue = 6, .label = "item_use", .handler = &onItemUse, .game = .ecx, .a1 = .edx }, // 0x26 UseItemAtPlayerCoords
+
+    // -- DRLG oracle: DRLG_ApplyRoomExStateFlags(pLevel) — called by InitLevel in
+    // every path AFTER rooms are linked; pLevel in EDX. Prologue = CMP [EDX+8],0 (4)
+    // + JZ rel8 (2) = 6; the JZ at +4 is relocated by the trampoline (.rel8 = {4}). --
+    .{ .addr = 0x642390, .prologue = 6, .label = "drlg_level", .handler = &onDrlgLevel, .a1 = .edx, .rel8 = &.{4} },
 };
 
 pub fn install() void {
+    pinDrlgSeed();
     var ok: usize = 0;
     inline for (hooks) |h| {
         if (TraceHook(h).install()) ok += 1;

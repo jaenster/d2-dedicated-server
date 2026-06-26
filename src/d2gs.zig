@@ -25,6 +25,7 @@ const health = @import("runtime/feature/health.zig"); // hacky in-process HTTP h
 const gsport = @import("runtime/gsport.zig");
 const gamereap = @import("runtime/gamereap.zig");
 const roominit = @import("runtime/roominit.zig");
+const gameloop = @import("runtime/gameloop.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
 const realmgw = @import("runtime/realmgw.zig");
@@ -33,6 +34,7 @@ const autoenter = @import("test/autoenter.zig");
 const autologin = @import("test/autologin.zig");
 const screenshot = @import("test/screenshot.zig");
 const log = @import("log.zig");
+const cdkeydump = @import("runtime/cdkeydump.zig");
 
 var use_realm: bool = false;
 var d2cs_host: [64]u8 = undefined; // null-terminated IPv4
@@ -332,6 +334,10 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // default server path stays byte-identical.
     // Always install the per-game RoomInit fan-out (cainfix/srvdiag/ubers all consume it).
     roominit.install();
+    // Pace the engine's WinMain out-of-game loop: on a headless GS it runs forever and
+    // is the real idle-CPU cost (~50% of a core on the cluster). ~10 Hz is plenty for a
+    // server with no menu UI.
+    gameloop.installServerOogPacing();
     if (use_realm) {
         if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         joindiag.install(); // log nReason when the engine refuses a join
@@ -364,10 +370,29 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         _ = CreateThread(null, 0, fetchCharThread, null, 0, null);
     }
 
+    // Idle fast-path: the engine's per-tick server work (packet handling + stepping
+    // every game) runs flat-out even with zero games — pure overhead that pegs ~0.7
+    // of a core on the cluster. When no game is live we skip it and the GS idles like
+    // a bare Sleep loop. The control path (command/realm) is still pumped every tick,
+    // so a realm CREATEGAME runs and bumps d2cs's live count (set at create, before
+    // the join) — we resume full ticking before the joining client ever connects.
+    //
+    // d2cs's count covers the whole create→join→destroy span; a join-based count
+    // would deadlock (the join can't be serviced while we skip the network). Open
+    // mode has no d2cs control path (clients connect to QServer to host), so it can't
+    // be gated safely — keep full ticking there. A rare safety tick guards against a
+    // count that's ever wrong: the GS steps slowly rather than freezing.
+    var idle_ticks: u64 = 0;
     while (true) {
         command.pump(); // run queued engine commands (create game, …) on this thread
         if (use_realm) realm.pumpDelivery(); // deliver fetched char outside the join stack
-        server.tick();
+        const busy = if (use_realm) d2cs.liveGames() > 0 else true;
+        if (busy) {
+            server.tick();
+        } else {
+            idle_ticks +%= 1;
+            if (idle_ticks % 100 == 0) server.tick(); // ~1 Hz safety tick (accept + reap)
+        }
         health.tick(); // heartbeat for the health endpoint (liveness = this advancing)
         Sleep(10); // ~100 Hz; D2 logic runs at 25 fps, tune later
     }
@@ -387,8 +412,9 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             // are gated by their flags. The single config table is in feature.zig.
             feature.applyFlags(hasFlag);
             feature.installAll();
-            if (hasFlag("mapunits") or hasFlag("mapreveal")) drawing.install();
+            if (hasFlag("mapunits") or hasFlag("mapreveal") or hasFlag("guild-panel")) drawing.install();
             if (hasFlag("screenshot")) screenshot.install();
+            if (hasFlag("dump-cdkeys")) cdkeydump.install(); // log decoded CD keys for verification
             if (hasFlag("suppress-halts")) halt_hook.enableSuppress(); // sub-mode, not a toggle
             // Install the Battle.net gateway list in-process so the client always has a
             // valid gateway and never hits the crashing default-ini path (lets clients
@@ -403,6 +429,13 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
                     if (len > 0 and tmp[0] >= '0' and tmp[0] <= '9') realmgw.apply(tmp[0..len]);
                 } else if (hasFlag("realm-gw")) {
                     realmgw.apply("127.0.0.1");
+                } else {
+                    // No realm flag: still route the gateway list through memory so the stock
+                    // loader (Load @0x5186d0) never reads the contended registry and asserts
+                    // (line 0x6c — that assert, not the guild stone, was the no-realm crash).
+                    // Use the REAL Battle.net gateways, not localhost — a plain client isn't
+                    // ours to pin to 127.0.0.1.
+                    realmgw.applyDefault();
                 }
             }
             // Drive the bnet login form: --auto-login <account>:<password>.

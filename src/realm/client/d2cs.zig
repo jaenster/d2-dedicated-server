@@ -178,6 +178,17 @@ const GameSlot = struct { name: [16]u8 = undefined, len: u8 = 0, gameid: u32 = 0
 var games_lock: SpinLock = .{};
 var games_tracked = [_]GameSlot{.{}} ** 256;
 
+// Count of games that exist on this GS, from CREATE (recordGame, before the first
+// join) to DESTROY (takeGameId). The tick loop reads this to skip the engine's
+// per-tick server work when zero — covering the create→join gap that a join-based
+// count would miss (and would deadlock: the join can't be serviced if we skip).
+var live_count = std.atomic.Value(u32).init(0);
+
+/// Number of games live on this GS (create→destroy). Lock-free, called every tick.
+pub fn liveGames() u32 {
+    return live_count.load(.monotonic);
+}
+
 fn recordGame(name: []const u8, gameid: u32) void {
     games_lock.lock();
     defer games_lock.unlock();
@@ -190,6 +201,7 @@ fn recordGame(name: []const u8, gameid: u32) void {
         if (!g.used and free == null) free = i;
     }
     const idx = free orelse return; // table full — let the realmd-side TTL reap it
+    if (!games_tracked[idx].used) _ = live_count.fetchAdd(1, .monotonic); // fresh slot, not a reuse
     const n = @min(name.len, 16);
     @memcpy(games_tracked[idx].name[0..n], name[0..n]);
     games_tracked[idx].len = @intCast(n);
@@ -204,6 +216,7 @@ fn takeGameId(name: []const u8) ?u32 {
     for (&games_tracked) |*g| {
         if (g.used and std.mem.eql(u8, g.name[0..g.len], name)) {
             g.used = false;
+            _ = live_count.fetchSub(1, .monotonic);
             return g.gameid;
         }
     }
@@ -268,14 +281,17 @@ fn handleJoinGame(body: []const u8) void {
     var off: usize = 8;
     const charname = p.readCStr(body, &off);
     const account = p.readCStr(body, &off);
+    // Optional 3rd cstr: the joining player's guild tag (cut Guild Halls feature),
+    // resolved by realmd. Absent from older realmd builds → empty.
+    const guild_tag = if (off < body.len) p.readCStr(body, &off) else "";
     // The game's own token was registered by GAME_CreateBattleNetGame; this join
     // token authorizes a client to enter `gameid`, validated when the client
     // connects to :4000 (engine calls fpFindPlayerToken). We don't touch the
     // engine token table here — just remember who is joining so we can resolve
-    // the account when the engine asks us for the character save.
+    // the account (and guild) when the engine asks us for the character save.
     if (charname.len > 0 and account.len > 0) {
-        joinctx.remember(token, charname, account);
-        log.print("d2cs: JOINGAME cached char/account for fetch");
+        joinctx.remember(token, charname, account, guild_tag);
+        if (guild_tag.len > 0) log.print("d2cs: JOINGAME cached char/account/guild for fetch") else log.print("d2cs: JOINGAME cached char/account for fetch");
     }
     sendJoinGameReply(if (command.allow_create) 0 else 1, gameid);
     log.hex("d2cs: JOINGAME ack for gameid=0x", gameid);

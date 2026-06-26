@@ -216,7 +216,7 @@ fn EntryHook(
         }
 
         fn install(comptime label: []const u8) void {
-            const t = trampoline.build(addr, prologue) orelse {
+            const t = trampoline.build(addr, prologue, &.{}) orelse {
                 log.print("arena: trampoline FAILED — " ++ label);
                 return;
             };

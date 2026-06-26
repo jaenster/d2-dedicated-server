@@ -178,6 +178,69 @@ pub fn listChars(account: []const u8, names: []Name) usize {
     return count;
 }
 
+// ── guilds (durable) ─────────────────────────────────────────────────────────
+// One file per guild at guilds/<name>.guild — an opaque serialized Guild blob
+// (the realm guild service owns the format). Mirrors the char .d2s blob store;
+// like accounts, guilds are always fs-backed regardless of the durable backend.
+fn guildPath(buf: []u8, name: []const u8) ?[]const u8 {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/guilds/{s}.guild", .{ data_dir, safe }) catch null;
+}
+
+pub fn saveGuild(name: []const u8, bytes: []const u8) bool {
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var dbuf: [320]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dbuf, "{s}/guilds", .{data_dir}) catch return false;
+    Dir.cwd().createDirPath(io, dir) catch return false;
+    var pbuf: [512]u8 = undefined;
+    const path = guildPath(&pbuf, name) orelse return false;
+    return atomicWrite(path, bytes);
+}
+
+pub fn getGuild(name: []const u8, out: []u8) usize {
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var pbuf: [512]u8 = undefined;
+    const path = guildPath(&pbuf, name) orelse return 0;
+    const f = Dir.cwd().openFile(io, path, .{}) catch return 0;
+    defer f.close(io);
+    return f.readPositionalAll(io, out, 0) catch 0;
+}
+
+pub fn deleteGuild(name: []const u8) bool {
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var pbuf: [512]u8 = undefined;
+    const path = guildPath(&pbuf, name) orelse return false;
+    Dir.cwd().deleteFile(io, path) catch |e| return e == error.FileNotFound;
+    return true;
+}
+
+pub fn listGuilds(names: []Name) usize {
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var dbuf: [320]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dbuf, "{s}/guilds", .{data_dir}) catch return 0;
+    var d = Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var it = d.iterate();
+    var count: usize = 0;
+    while (it.next(io) catch null) |entry| {
+        if (count >= names.len) break;
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".guild")) continue;
+        const stem = entry.name[0 .. entry.name.len - 6];
+        if (stem.len == 0 or stem.len > names[count].buf.len) continue;
+        @memset(&names[count].buf, 0);
+        @memcpy(names[count].buf[0..stem.len], stem);
+        names[count].len = @intCast(stem.len);
+        count += 1;
+    }
+    return count;
+}
+
 pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     if (filename.len == 0 or filename.len >= 128) return null;
     if (std.mem.indexOfScalar(u8, filename, '/') != null) return null;
@@ -239,6 +302,47 @@ pub fn accountIsAdmin(name: []const u8) bool {
     return raw.len >= account_rec_len and raw[21] == 1;
 }
 
+// ── per-account userdata (BNCS SID_READ/WRITEUSERDATA: profile\sex etc.) ──────
+// bnet userdata keys are "\"-separated paths ("profile\\sex"); map to a safe
+// filename by replacing every non-[A-Za-z0-9_-] char with '_'.
+fn safeKey(key: []const u8, out: []u8) ?[]const u8 {
+    if (key.len == 0 or key.len > out.len) return null;
+    for (key, 0..) |ch, i| {
+        const okc = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '_' or ch == '-';
+        out[i] = if (okc) ch else '_';
+    }
+    return out[0..key.len];
+}
+
+/// Read one userdata value for `account`/`key` into `out`; returns its length
+/// (0 = unset / bad name).
+pub fn getUserData(account: []const u8, key: []const u8, out: []u8) usize {
+    var nb: [64]u8 = undefined;
+    const a = sanitize(account, &nb) orelse return 0;
+    var kb: [128]u8 = undefined;
+    const k = safeKey(key, &kb) orelse return 0;
+    var sb: [96]u8 = undefined;
+    const sub = std.fmt.bufPrint(&sb, "userdata/{s}", .{a}) catch return 0;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    const v = readSmall(sub, k, out) orelse return 0;
+    return v.len;
+}
+
+/// Store one userdata value for `account`/`key`. False on a bad name / IO error.
+pub fn setUserData(account: []const u8, key: []const u8, value: []const u8) bool {
+    var nb: [64]u8 = undefined;
+    const a = sanitize(account, &nb) orelse return false;
+    var kb: [128]u8 = undefined;
+    const k = safeKey(key, &kb) orelse return false;
+    var sb: [96]u8 = undefined;
+    const sub = std.fmt.bufPrint(&sb, "userdata/{s}", .{a}) catch return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    return writeSmall(sub, k, value);
+}
+
 pub fn accountExists(name: []const u8) bool {
     var nb: [64]u8 = undefined;
     const safe = sanitize(name, &nb) orelse return false;
@@ -260,6 +364,23 @@ pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
     if (raw.len < 21 or raw[0] == 0) return false;
     @memcpy(out, raw[1..21]);
     return true;
+}
+
+/// Set the account's password to `hash` (single xSHA-1 of the new password),
+/// preserving its other record fields (admin flag). False if no such account.
+/// Used by SID_CHANGEPASSWORD.
+pub fn setAccountPassword(name: []const u8, hash: [20]u8) bool {
+    var nb: [64]u8 = undefined;
+    const safe = sanitize(name, &nb) orelse return false;
+    fs_lock.lock();
+    defer fs_lock.unlock();
+    var rb: [32]u8 = undefined;
+    const raw = readSmall("accounts", safe, &rb) orelse return false;
+    var rec: [account_rec_len]u8 = [_]u8{0} ** account_rec_len;
+    @memcpy(rec[0..@min(raw.len, account_rec_len)], raw[0..@min(raw.len, account_rec_len)]);
+    rec[0] = 1;
+    @memcpy(rec[1..21], &hash);
+    return writeSmall("accounts", safe, &rec);
 }
 
 /// List account names (one file per account under accounts/). Fills `names`,

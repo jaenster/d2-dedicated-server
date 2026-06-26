@@ -40,6 +40,10 @@ pub const Config = struct {
     /// Public port the qqserver listens on for game traffic (consumed by the qqserver
     /// binary; parsed here so realmd and qqserver share one config surface).
     qq_port: u16 = 4000,
+    /// When non-zero, realmd runs the EMBEDDED game-traffic edge (gameedge.zig) on this
+    /// port itself — the lightweight, single-binary alternative to a standalone qqserver
+    /// (in-process token-route lookup, thread-per-conn splice). 0 = off (use qqserver).
+    game_port: u16 = 0,
 
     /// Directory for durable data (character saves). A shared volume here is
     /// what lets multiple instances see the same characters.
@@ -144,6 +148,7 @@ pub fn fromEnv() Config {
     if (env("REALMD_GAME_ADDR")) |v| c.game_addr = v;
     if (env("REALMD_ROUTE_TTL_S")) |v| c.route_ttl_s = std.fmt.parseInt(u32, v, 10) catch c.route_ttl_s;
     c.qq_port = envPort("REALMD_QQ_PORT", c.qq_port);
+    c.game_port = envPort("REALMD_GAME_PORT", c.game_port);
     if (env("REALMD_REALM_NAME")) |v| c.realm_name = v;
     if (env("REALMD_ADMINS")) |v| c.admins = v;
     if (env("REALMD_REALM_ADDR")) |v| c.realm_addr = v;
