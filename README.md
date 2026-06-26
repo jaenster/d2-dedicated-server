@@ -50,6 +50,23 @@ shutdown make it a first-class **cloud-native** workload. Logs stream to **stdou
 - **shared realm contract** (`src/realm/shared/`): the d2cs↔d2gs wire protocol both ends
   import (the `realm_shared` module), so client and server agree on the wire by construction.
 
+## Resource footprint (idle)
+
+A common worry with a wine-based D2 server is that it idles hot — the 1.14d engine's
+main loop busy-spins by default (it was written to render a client as fast as it can).
+It doesn't here: the engine's out-of-game loop is frame-paced, so an **idle game server
+sits near-zero**. Measured on a real Hetzner k3s node with no players online:
+
+| service | CPU | memory | image |
+|-|-|-|-|
+| `realmd` (bnetd + d2cs + d2dbs + gslink) | ~1m | ~6 MiB | scratch, static musl |
+| `qqserver` (game-traffic gateway) | **~0m** | **~1 MiB** | scratch, static musl |
+| `d2gs` (wine, headless `Game.exe`) | ~15m | ~300 MiB | debian + wine32 |
+
+The clean-room Zig services are effectively free (a few millicores, single-digit MiB);
+the game server's footprint is just wine plus the loaded engine. Postgres/Redis are
+optional — `fs` persistence drops them entirely.
+
 ## Architecture
 
 The full model lives in [`docs/architecture/`](docs/architecture/) (LikeC4) and can
