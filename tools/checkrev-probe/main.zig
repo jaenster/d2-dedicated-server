@@ -95,6 +95,25 @@ fn authMeaning(r: u32) []const u8 {
 var rxbuf: [16384]u8 = undefined;
 var rxlen: usize = 0;
 
+// Hexdump every packet the server sends (matched or not), across BNCS + MCP, so we see
+// ALL traffic. On by default.
+var verbose: bool = true;
+fn dumpPkt(proto: []const u8, id: u8, body: []const u8) void {
+    if (!verbose) return;
+    std.debug.print("  [rx {s} 0x{x:0>2}] {d} bytes\n", .{ proto, id, body.len });
+    var i: usize = 0;
+    while (i < body.len) : (i += 16) {
+        const end = @min(i + 16, body.len);
+        std.debug.print("    ", .{});
+        for (body[i..end]) |b| std.debug.print("{x:0>2} ", .{b});
+        var pad = end;
+        while (pad < i + 16) : (pad += 1) std.debug.print("   ", .{});
+        std.debug.print(" |", .{});
+        for (body[i..end]) |b| std.debug.print("{c}", .{if (b >= 0x20 and b < 0x7f) b else '.'});
+        std.debug.print("|\n", .{});
+    }
+}
+
 /// Read framed BNCS packets until one with id == want; auto-echo SID_PING.
 fn recvUntil(fd: Socket, want: u8, out: []u8) ![]const u8 {
     while (true) {
@@ -104,6 +123,7 @@ fn recvUntil(fd: Socket, want: u8, out: []u8) ![]const u8 {
             if (plen < 4 or plen > rxbuf.len) return error.BadFrame;
             if (rxlen < plen) break; // need more bytes
             const body = rxbuf[4..plen];
+            dumpPkt("BNCS", id, body);
             if (id == SID_PING) {
                 var echo: [8]u8 = .{ 0xFF, SID_PING, 8, 0, 0, 0, 0, 0 };
                 @memcpy(echo[4..8], body[0..4]);
@@ -167,6 +187,7 @@ fn mcpRecv(fd: Socket, want: u8, out: []u8) ![]const u8 {
             if (mrxlen < plen) break;
             const id = mrx[2];
             const blen = plen - 3;
+            dumpPkt("MCP", id, mrx[3..plen]);
             if (id == want) {
                 @memcpy(out[0..blen], mrx[3..plen]);
                 std.mem.copyForwards(u8, mrx[0 .. mrxlen - plen], mrx[plen..mrxlen]);
