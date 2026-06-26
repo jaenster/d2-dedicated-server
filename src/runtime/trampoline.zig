@@ -29,51 +29,80 @@ pub const Trampoline = struct {
     }
 };
 
+fn writeI32(buf: [*]BYTE, off: usize, v: i32) void {
+    const b: [4]u8 = @bitCast(v);
+    buf[off] = b[0];
+    buf[off + 1] = b[1];
+    buf[off + 2] = b[2];
+    buf[off + 3] = b[3];
+}
+
+fn inList(offsets: []const usize, off: usize) bool {
+    for (offsets) |o| if (o == off) return true;
+    return false;
+}
+
 /// Build a trampoline for a detour hook.
 ///
 /// Copies `hook_size` bytes from `target_addr` into an executable buffer, fixes
-/// up any relative E8 (CALL) / E9 (JMP) within those bytes, then appends a JMP
-/// back to `target_addr + hook_size`. `hook_size` must be >= 5 (room for the
-/// 5-byte JMP we overwrite the prologue with) and land on an instruction
-/// boundary. Returns null on allocation failure.
-pub fn build(target_addr: usize, hook_size: usize) ?Trampoline {
-    const alloc_size = hook_size + 5; // copied bytes + JMP back
+/// up any relative E8 (CALL) / E9 (JMP) within them, expands the rel8 short
+/// branches listed in `rel8_offsets` (Jcc 0x70-0x7F / JMP 0xEB) to their rel32
+/// forms so they still reach their absolute targets from the trampoline's new
+/// location, then appends a JMP back to `target_addr + hook_size`. `hook_size`
+/// must be >= 5 (room for the 5-byte JMP we overwrite the prologue with) and
+/// land on an instruction boundary. `rel8_offsets` are the byte offsets WITHIN
+/// the prologue of any rel8 branch first byte (the maintainer verifies the
+/// prologue by hand; we never byte-scan for these because a modrm/disp byte can
+/// alias a Jcc opcode). Returns null on allocation failure.
+pub fn build(target_addr: usize, hook_size: usize, rel8_offsets: []const usize) ?Trampoline {
+    // Each expanded rel8 grows by at most 4 bytes (rel8 -> rel32); + JMP back.
+    const alloc_size = hook_size + 5 + 4 * rel8_offsets.len;
     const buf = VirtualAlloc(null, alloc_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) orelse return null;
 
-    // Copy original bytes.
     const src: [*]const BYTE = @ptrFromInt(target_addr);
-    @memcpy(buf[0..hook_size], src[0..hook_size]);
-
-    // Fix up relative CALL (E8) / JMP (E9) instructions so they still reach
-    // their absolute targets from the trampoline's new location.
-    var i: usize = 0;
+    var i: usize = 0; // read cursor in the source prologue
+    var o: usize = 0; // write cursor in the trampoline buffer
     while (i < hook_size) {
-        if ((buf[i] == 0xE8 or buf[i] == 0xE9) and i + 5 <= hook_size) {
-            const orig_rel: i32 = @bitCast([4]u8{ buf[i + 1], buf[i + 2], buf[i + 3], buf[i + 4] });
-            const abs_target: usize = @intCast(@as(isize, @intCast(target_addr + i + 5)) + @as(isize, orig_rel));
-            const tramp_insn_addr: usize = @intFromPtr(buf) + i;
-            const new_rel = patch.calcRelAddr(tramp_insn_addr, abs_target, 5);
-            const new_bytes: [4]u8 = @bitCast(new_rel);
-            buf[i + 1] = new_bytes[0];
-            buf[i + 2] = new_bytes[1];
-            buf[i + 3] = new_bytes[2];
-            buf[i + 4] = new_bytes[3];
-            i += 5;
-        } else {
-            i += 1;
+        // Explicit rel8 short branch -> rel32, recomputed against the new location.
+        if (inList(rel8_offsets, i)) {
+            const op = src[i];
+            const disp: i8 = @bitCast(src[i + 1]);
+            const abs_target: usize = @intCast(@as(isize, @intCast(target_addr + i + 2)) + @as(isize, disp));
+            const insn_addr: usize = @intFromPtr(buf) + o;
+            if (op == 0xEB) { // JMP rel8 -> E9 rel32
+                buf[o] = 0xE9;
+                writeI32(buf, o + 1, patch.calcRelAddr(insn_addr, abs_target, 5));
+                o += 5;
+            } else { // Jcc rel8 (0x70-0x7F) -> 0F 8x rel32
+                buf[o] = 0x0F;
+                buf[o + 1] = 0x80 | (op - 0x70);
+                writeI32(buf, o + 2, patch.calcRelAddr(insn_addr, abs_target, 6));
+                o += 6;
+            }
+            i += 2;
+            continue;
         }
+        // Near CALL (E8) / JMP (E9) rel32 fixup.
+        if ((src[i] == 0xE8 or src[i] == 0xE9) and i + 5 <= hook_size) {
+            const orig_rel: i32 = @bitCast([4]u8{ src[i + 1], src[i + 2], src[i + 3], src[i + 4] });
+            const abs_target: usize = @intCast(@as(isize, @intCast(target_addr + i + 5)) + @as(isize, orig_rel));
+            const insn_addr: usize = @intFromPtr(buf) + o;
+            buf[o] = src[i];
+            writeI32(buf, o + 1, patch.calcRelAddr(insn_addr, abs_target, 5));
+            i += 5;
+            o += 5;
+            continue;
+        }
+        buf[o] = src[i];
+        i += 1;
+        o += 1;
     }
 
-    // Append JMP back to original + hook_size.
-    const jmp_back_addr: usize = @intFromPtr(buf) + hook_size;
+    // Append JMP back to original + hook_size at the output cursor.
+    const jmp_back_addr: usize = @intFromPtr(buf) + o;
     const return_addr = target_addr + hook_size;
-    const jmp_rel = patch.calcRelAddr(jmp_back_addr, return_addr, 5);
-    const jmp_bytes: [4]u8 = @bitCast(jmp_rel);
-    buf[hook_size] = 0xE9;
-    buf[hook_size + 1] = jmp_bytes[0];
-    buf[hook_size + 2] = jmp_bytes[1];
-    buf[hook_size + 3] = jmp_bytes[2];
-    buf[hook_size + 4] = jmp_bytes[3];
+    buf[o] = 0xE9;
+    writeI32(buf, o + 1, patch.calcRelAddr(jmp_back_addr, return_addr, 5));
 
     return .{ .buffer = buf, .buffer_size = alloc_size };
 }

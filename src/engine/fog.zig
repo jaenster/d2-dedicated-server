@@ -166,7 +166,7 @@ fn hookFreeMemoryPool(this: *D2PoolManagerStrc) callconv(ThiscallConv) void {
 
 pub fn installFreePoolHook() void {
     if (free_pool_trampoline != null) return;
-    if (trampoline.build(ADDR_FREE_MEMORY_POOL, 5)) |tramp| {
+    if (trampoline.build(ADDR_FREE_MEMORY_POOL, 5, &.{})) |tramp| {
         free_pool_trampoline = tramp;
         original_free_pool = @ptrCast(@alignCast(tramp.buffer));
         _ = patch.MemoryPatch(ADDR_FREE_MEMORY_POOL).jump(@intFromPtr(&hookFreeMemoryPool)).commit();
