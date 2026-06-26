@@ -18,6 +18,7 @@ const server = @import("server.zig");
 const fastcall = @import("../runtime/fastcall.zig");
 const d2dbs = @import("../realm/client/d2dbs.zig");
 const joinctx = @import("../realm/client/joinctx.zig");
+const patch = @import("../runtime/patch.zig");
 const log = @import("../log.zig");
 
 /// The table we register via SetupAsBnetServer.
@@ -107,6 +108,7 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
         save_len = d2dbs.fetchCharSave(acct_name, char_name, &save_buf);
         d2dbs.disconnect();
     }
+
 
     // Queue the delivery for the tick loop; do NOT call OnDatabaseCharacterReceived
     // synchronously here (see Pending).
@@ -220,6 +222,27 @@ pub fn init() void {
     table.fpLeaveGame = @ptrCast(&leaveGameStub);
     table.fpGetDatabaseFileTime = @ptrCast(&getFileTimeStub);
     enableTokenValidation(); // register fpFindPlayerToken (engine IsBadCodePtr-checks it)
+    allowLadderAndLadderless();
+}
+
+// Charon-style "enable ladder + ladderless joins". CalculateGetFlags @0x569d80 runs a
+// closed-realm save-freshness / ladder anti-rollback gate (CompareFileTime vs the d2dbs
+// per-char filetime) that refuses ladder chars with nReason 0x1a on our realm (we don't
+// track per-char DB filetimes — fpGetDatabaseFileTime returns "oldest"). The gate is
+// guarded by `if (IsBattleNetServer) {...}`, entered via a `JZ 0x569e17` that skips it
+// when NOT a bnet server. Flip that JZ (74) to an unconditional JMP (EB) so the gate is
+// ALWAYS skipped: both ladder and ladderless chars fall through to the normal
+// expansion/hardcore/title checks (unchanged). This is what the real closed-realm build
+// effectively bypasses; the anti-rollback check is meaningless for our single-authority store.
+fn allowLadderAndLadderless() void {
+    const addr: usize = 0x00569dc3; // JZ 0x569e17 (74 52) after the IsBattleNetServer CMP
+    const cur: *const u8 = @ptrFromInt(addr);
+    if (cur.* == 0x74) {
+        _ = patch.writeBytes(addr, &[_]u8{0xEB}); // JZ -> JMP: always skip the freshness gate
+        log.print("realm: ladder gate patched (ladder + ladderless joins enabled)");
+    } else {
+        log.hex("realm: ladder-gate patch SKIPPED, unexpected byte 0x", cur.*);
+    }
 }
 
 // ── fpFindPlayerToken (slot 0x18) ────────────────────────────────────────────
@@ -249,7 +272,23 @@ fn findPlayerTokenImpl(
     log.hex("realm:   s5=0x", s5);
     log.hex("realm:   s6=0x", s6);
     log.hex("realm:   s7=0x", s7);
-    return 1; // accept (token valid) — join proceeds to char load
+
+    // Token validation ported from D2Server.dll 1.00 PlayerToken_ValidateAndConsume:
+    // the realm (realmd/d2cs) issued this join token via joinctx.remember; the GS
+    // validates it here — known + unconsumed + within the 120s TTL — and consumes it
+    // once so it can't be replayed. Default is OBSERVE-ONLY: the legacy path accepted
+    // every join, and s1==issued-token isn't yet confirmed in a live join, so we only
+    // log the verdict. Flip `enforce_token` true once a live join shows "token VALID"
+    // to close the accept-all gap (then unknown/stale/replayed tokens are rejected).
+    const enforce_token = false;
+    const token = @as(u32, @truncate(s1));
+    const token_valid = joinctx.validate(token);
+    log.print(if (token_valid) "realm:   token VALID (known, fresh)" else "realm:   token UNKNOWN/STALE/USED");
+    if (enforce_token) {
+        if (!token_valid) return 0; // reject: unknown, replayed, or expired token
+        joinctx.consume(token);
+    }
+    return 1; // accept — join proceeds to char load
 }
 
 pub const findPlayerTokenShim = fastcall.Callback2(7, findPlayerTokenImpl).shim;

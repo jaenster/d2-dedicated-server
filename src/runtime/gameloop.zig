@@ -43,3 +43,21 @@ pub fn install() void {
     _ = patch.MemoryPatch(ADDR_GAME_LOOP).call(@intFromPtr(&hookGameLoop)).nops(2).commit();
     _ = patch.MemoryPatch(ADDR_OOG_LOOP).call(@intFromPtr(&hookOogLoop)).nops(18).commit();
 }
+
+// A headless dedicated server never enters a game locally, so the engine's WinMain
+// sits in the out-of-game (main-menu) loop forever — and that loop's frame work pegs
+// ~50% of a core on the cluster (verified: tid 1, the unparked WinMain, is the idle
+// cost — NOT the server tick). It has no UI to drive, so just pace it down hard.
+const SERVER_OOG_SLEEP_MS: u32 = 100; // ~10 Hz menu loop instead of ~50 Hz
+
+fn serverOogPacer() callconv(.c) void {
+    Sleep(SERVER_OOG_SLEEP_MS);
+}
+
+/// Replace the OOG loop's per-frame sleep with a long one for a headless GS. Same
+/// patch site/shape as install()'s OOG hook, but a Sleep-only callback (no async/
+/// feature fan-out — a dedicated server has no menu to drive). Idempotent-safe to
+/// call once at GS boot.
+pub fn installServerOogPacing() void {
+    _ = patch.MemoryPatch(ADDR_OOG_LOOP).call(@intFromPtr(&serverOogPacer)).nops(18).commit();
+}

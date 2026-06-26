@@ -32,12 +32,13 @@ const readCStr = (b,o) => { let e=o; while(e<b.length && b[e]!==0) e++; return {
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
 class BncsClient {
-  constructor(name){ this.name=name; this.buf=Buffer.alloc(0); this.events=[]; this.friends=null; this.sock=null; }
+  constructor(name){ this.name=name; this.buf=Buffer.alloc(0); this.events=[]; this.friends=null; this.sock=null; this.closed=false; }
   async connect(){
     this.sock = net.connect(BNET_PORT, HOST);
     await once(this.sock, 'connect');
     this.sock.write(Buffer.from([0x01])); // protocol selector
     this.sock.on('data', d => this._onData(d));
+    this.sock.on('close', () => { this.closed = true; });
   }
   _send(id, body){ this.sock.write(pkt(id, body)); }
   _onData(d){
@@ -167,4 +168,75 @@ test('friend add / list (shows online) / remove', async () => {
     a.requestFriends();
     await a.waitFor(c => c.friends !== null && !c.friends.some(f=>f.name==='frB'));
   } finally { a.end(); b.end(); }
+});
+
+test('/away delivers the whisper but tells the sender the target is away', async () => {
+  const a = await newClient('awaySend'), b = await newClient('awayRecv');
+  try {
+    a.join('away-chan'); b.join('away-chan'); await sleep(200);
+    b.talk('/away at lunch');
+    await b.waitFor(c => c.events.some(e=>e.eid==='INFO' && /Away/.test(e.text)));
+    a.talk('/w awayRecv you there?');
+    await b.waitFor(c => c.events.some(e=>e.eid==='WHISPER' && e.text==='you there?')); // still delivered
+    await a.waitFor(c => c.events.some(e=>e.eid==='INFO' && /is away \(at lunch\)/.test(e.text)));
+  } finally { a.end(); b.end(); }
+});
+
+test('/dnd suppresses delivery and reports the target as unavailable', async () => {
+  const a = await newClient('dndSend'), b = await newClient('dndRecv');
+  try {
+    a.join('dnd-chan'); b.join('dnd-chan'); await sleep(200);
+    b.talk('/dnd do not disturb');
+    await b.waitFor(c => c.events.some(e=>e.eid==='INFO' && /Do Not Disturb mode engaged/.test(e.text)));
+    a.talk('/w dndRecv ping');
+    await a.waitFor(c => c.events.some(e=>e.eid==='INFO' && /is unavailable \(do not disturb\)/.test(e.text)));
+    await sleep(200);
+    assert.ok(!b.events.some(e=>e.eid==='WHISPER'), 'DND target received no whisper');
+  } finally { a.end(); b.end(); }
+});
+
+test('/ignore squelches a user\'s talk; /unignore restores it', async () => {
+  const a = await newClient('igMe'), b = await newClient('igThem');
+  try {
+    a.join('ig-chan'); b.join('ig-chan'); await sleep(200);
+    a.talk('/ignore igThem');
+    await a.waitFor(c => c.events.some(e=>e.eid==='INFO' && /squelched/.test(e.text)));
+    b.talk('first message'); await sleep(250);
+    assert.ok(!a.events.some(e=>e.eid==='TALK' && e.user==='igThem'), 'squelched talk not seen');
+    a.talk('/unignore igThem');
+    await a.waitFor(c => c.events.some(e=>e.eid==='INFO' && /no longer squelched/.test(e.text)));
+    b.talk('second message');
+    await a.waitFor(c => c.events.some(e=>e.eid==='TALK' && e.user==='igThem' && e.text==='second message'));
+  } finally { a.end(); b.end(); }
+});
+
+test('/whois reports the channel a user is in', async () => {
+  const a = await newClient('whoMe'), b = await newClient('whoThem');
+  try {
+    a.join('whois-here'); b.join('whois-here'); await sleep(200);
+    a.talk('/whois whoThem');
+    await a.waitFor(c => c.events.some(e=>e.eid==='INFO' && /whoThem is in channel whois-here/.test(e.text)));
+    a.talk('/whois NoSuchUser');
+    await a.waitFor(c => c.events.some(e=>e.eid==='ERROR' && /not logged on/.test(e.text)));
+  } finally { a.end(); b.end(); }
+});
+
+test('an operator can /kick a user out of the channel', async () => {
+  const op = await newClient('kickOp'), victim = await newClient('kickVic');
+  try {
+    op.join('kick-chan'); // first joiner -> operator
+    await op.waitFor(c => c.events.some(e=>e.eid==='CHANNEL'));
+    victim.join('kick-chan');
+    await op.waitFor(c => c.events.some(e=>e.eid==='JOIN' && e.user==='kickVic'));
+    op.talk('/kick kickVic');
+    await op.waitFor(c => c.events.some(e=>e.eid==='INFO' && /kicked/.test(e.text)));
+    await op.waitFor(c => c.events.some(e=>e.eid==='LEAVE' && e.user==='kickVic')); // victim's thread announces leave
+    await victim.waitFor(c => c.closed, 3000); // socket torn down
+    // A non-operator can't kick.
+    const plain = await newClient('kickPlain');
+    plain.join('kick-chan'); await sleep(200);
+    plain.talk('/kick kickOp');
+    await plain.waitFor(c => c.events.some(e=>e.eid==='ERROR' && /not a channel operator/.test(e.text)));
+    plain.end();
+  } finally { op.end(); victim.end(); }
 });

@@ -62,6 +62,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Module-definition file: export `CheckRevision` UNDECORATED (ordinal 1) so the
+    // client's GetProcAddress("CheckRevision") resolves it (stdcall would otherwise
+    // mangle it to CheckRevision@28).
+    checkrev.root_module.addObjectFile(b.path("src/checkrev/checkrev.def"));
     b.installArtifact(checkrev);
 
     // `zig build dlls` — install ONLY the injected DLLs (no realmd, no pg fetch).
@@ -117,6 +121,51 @@ pub fn build(b: *std.Build) void {
     // Used by the realmd container image.
     const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
     realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
+
+    // `zig build test` — realm-server unit tests. Rooted at the guild service so it
+    // pulls the store facade + realm modules; runs every `test` block reachable from
+    // there (guild model/service serialization, store helpers, …).
+    const realm_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/realm/server/guilds.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    realm_tests.root_module.addImport("realm_shared", realm_shared);
+    realm_tests.root_module.addImport("realm_infra", realm_infra);
+    realm_tests.root_module.addImport("realm_adapter", realm_adapter);
+    const run_realm_tests = b.addRunArtifact(realm_tests);
+    const test_step = b.step("test", "Run realm-server unit tests");
+    test_step.dependOn(&run_realm_tests.step);
+
+    // D2GS Huffman codec unit tests (the clientless game-protocol decoder, reconstructed
+    // from Game.exe's static table — verified against a real captured GS frame).
+    const huffman_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/e2e/huffman.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(huffman_tests).step);
+
+    // BNCS auth crypto unit tests (all self-contained, std-only): the standard-SHA-1
+    // CheckRevision core, the broken-SHA-1 OLS password hash, and the CD-key decode —
+    // each carries vectors verified against a real 1.14d client. No real keys committed.
+    inline for (.{
+        "src/checkrev/checkrev_core.zig",
+        "src/realm/server/xsha1.zig",
+        "src/realm/shared/cdkey.zig",
+    }) |src| {
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = realmd_target,
+            .optimize = optimize,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 
     // qqserver — the cloud-native game-traffic gateway: a token-translating, fully
     // non-blocking poll() splice proxy fronting the GS fleet. ZERO heap, bare libc sockets,
@@ -185,6 +234,32 @@ pub fn build(b: *std.Build) void {
     const run_probe = b.addRunArtifact(probe);
     if (b.args) |args| run_probe.addArgs(args);
     b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
+
+    // checkrev-probe — clientless BNCS *version-check* client (selector 0x01): runs
+    // SID_AUTH_INFO -> compute response (shared checkrev_core) -> SID_AUTH_CHECK
+    // against a real bnet and prints the result code. Separate from BNFTP.
+    const crprobe = b.addExecutable(.{
+        .name = "checkrev-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/checkrev-probe/main.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    crprobe.root_module.addAnonymousImport("checkrev_core", .{
+        .root_source_file = b.path("src/checkrev/checkrev_core.zig"),
+    });
+    crprobe.root_module.addAnonymousImport("cdkey", .{
+        .root_source_file = b.path("src/realm/shared/cdkey.zig"),
+    });
+    crprobe.root_module.addAnonymousImport("xsha1", .{
+        .root_source_file = b.path("src/realm/server/xsha1.zig"),
+    });
+    b.installArtifact(crprobe);
+    const run_crprobe = b.addRunArtifact(crprobe);
+    if (b.args) |args| run_crprobe.addArgs(args);
+    b.step("checkrev-probe", "Replay the BNCS version-check against a real Battle.net").dependOn(&run_crprobe.step);
 
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());

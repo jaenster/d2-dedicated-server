@@ -45,3 +45,6 @@ tools/mpqcat/mpqcat
 
 # arena-mode design/worklist — local planning doc, not in VCS
 ARENA.md
+
+# clientless-join.mjs harness work dir
+.clientless/
