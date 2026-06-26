@@ -365,10 +365,29 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         _ = CreateThread(null, 0, fetchCharThread, null, 0, null);
     }
 
+    // Idle fast-path: the engine's per-tick server work (packet handling + stepping
+    // every game) runs flat-out even with zero games — pure overhead that pegs ~0.7
+    // of a core on the cluster. When no game is live we skip it and the GS idles like
+    // a bare Sleep loop. The control path (command/realm) is still pumped every tick,
+    // so a realm CREATEGAME runs and bumps d2cs's live count (set at create, before
+    // the join) — we resume full ticking before the joining client ever connects.
+    //
+    // d2cs's count covers the whole create→join→destroy span; a join-based count
+    // would deadlock (the join can't be serviced while we skip the network). Open
+    // mode has no d2cs control path (clients connect to QServer to host), so it can't
+    // be gated safely — keep full ticking there. A rare safety tick guards against a
+    // count that's ever wrong: the GS steps slowly rather than freezing.
+    var idle_ticks: u64 = 0;
     while (true) {
         command.pump(); // run queued engine commands (create game, …) on this thread
         if (use_realm) realm.pumpDelivery(); // deliver fetched char outside the join stack
-        server.tick();
+        const busy = if (use_realm) d2cs.liveGames() > 0 else true;
+        if (busy) {
+            server.tick();
+        } else {
+            idle_ticks +%= 1;
+            if (idle_ticks % 100 == 0) server.tick(); // ~1 Hz safety tick (accept + reap)
+        }
         health.tick(); // heartbeat for the health endpoint (liveness = this advancing)
         Sleep(10); // ~100 Hz; D2 logic runs at 25 fps, tune later
     }
