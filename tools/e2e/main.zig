@@ -701,6 +701,7 @@ fn scMultiInstance() Result {
         .{ .name = "REALMD_D2DBS_PORT", .value = "16114" },
         .{ .name = "REALMD_GS_PORT", .value = "16115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (avoid 14001 clash)
     };
     const a_pid = spawnRealmd(bin, &envs_a, 16112) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
 
@@ -713,6 +714,7 @@ fn scMultiInstance() Result {
         .{ .name = "REALMD_D2DBS_PORT", .value = "17114" },
         .{ .name = "REALMD_GS_PORT", .value = "17115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "17118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (avoid 14001 clash)
     };
     const b_pid = spawnRealmd(bin, &envs_b, 17112) catch |e| {
         _ = kill(a_pid, 15);
@@ -972,6 +974,100 @@ fn scQqserverTokenTranslate() Result {
     return .{ .name = name, .status = .pass, .msg = msg("token 0x{x} translated to gameid {d}, packet rewritten + spliced to backend :{d}", .{ token, GS_GAMEID, echo.port }) };
 }
 
+// Same token-translate splice as the qqserver test, but through realmd's EMBEDDED game
+// edge (gameedge.zig) instead of a standalone qqserver — proves the lightweight single-
+// binary path: in-process route lookup + thread-per-conn splice. Runs in a DEDICATED
+// realmd instance (sharing the redis store) because the embedded edge and a standalone
+// qqserver are mutually-exclusive deploy modes — we don't want both in one process.
+fn scEmbeddedGameEdge() Result {
+    const name = "embedded_game_edge";
+    const EDGE_PORT: u16 = 14001;
+    const GS_GAMEID: u32 = 5;
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+
+    const data_dir = "/tmp/e2e-realmd-edge";
+    var rmbuf: [256]u8 = undefined;
+    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+        _ = system(cmd.ptr);
+    } else |_| {}
+    _ = mkdir(data_dir, 0o755);
+    const envs = [_]EnvVar{
+        .{ .name = "REALMD_SHARED", .value = "1" },
+        .{ .name = "REALMD_INSTANCE", .value = "E" },
+        .{ .name = "REALMD_DATA_DIR", .value = data_dir },
+        .{ .name = "REALMD_BNET_PORT", .value = "18112" },
+        .{ .name = "REALMD_D2CS_PORT", .value = "18113" },
+        .{ .name = "REALMD_D2DBS_PORT", .value = "18114" },
+        .{ .name = "REALMD_GS_PORT", .value = "18115" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "18118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "14001" }, // the embedded edge under test
+    };
+    const pid = spawnRealmd(bin, &envs, 18112) catch |e| return fail(name, "spawn edge realmd {s}", .{@errorName(e)});
+    defer {
+        _ = kill(pid, 15);
+        _ = waitpid(pid, null, 0);
+    }
+    if (!waitPort(EDGE_PORT, 5000)) return fail(name, "embedded edge never bound :{d}", .{EDGE_PORT});
+
+    var echo = EchoServer{};
+    echo.start() catch |e| return fail(name, "echo start {s}", .{@errorName(e)});
+    defer echo.stop();
+
+    var gs = FakeGS{ .gsid = 0x8888, .ip = .{ 127, 0, 0, 1 }, .gs_port = echo.port, .connect_port = 18115, .maxgame = 10, .gameid = GS_GAMEID };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    var c = rc.RealmClient{ .bnet_port = 18112, .d2cs_port = 18113, .d2dbs_port = 18114 };
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("EdgeGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const cg = c.createGame("edgegame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    const jg = c.joinGame("edgegame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
+    const token = jg.token;
+    if (token == 0) return fail(name, "join returned token=0", .{});
+
+    // Craft a GAMELOGON with the minted token, then drive it through realmd's edge.
+    const tail = "PAYLOAD";
+    var logon: [QQ_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
+    @memset(&logon, 0);
+    logon[0] = 0x68;
+    std.mem.writeInt(u16, logon[QQ_TOKEN_OFFSET..][0..2], token, .little);
+    @memcpy(logon[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
+
+    const fd = net.connectLocal(EDGE_PORT) catch |e| return fail(name, "connect edge {s}", .{@errorName(e)});
+    defer net.closeSocket(fd);
+
+    var hs: [2]u8 = undefined;
+    net.readFull(fd, &hs) catch |e| return fail(name, "no 0xAF00 handshake ({s})", .{@errorName(e)});
+    if (hs[0] != 0xaf or hs[1] != 0x00) return fail(name, "handshake={x:0>2}{x:0>2}, want af00", .{ hs[0], hs[1] });
+
+    net.writeAll(fd, &logon) catch |e| return fail(name, "send {s}", .{@errorName(e)});
+
+    var back: [logon.len]u8 = undefined;
+    net.readFull(fd, &back) catch |e| return fail(name, "no echo back through edge ({s})", .{@errorName(e)});
+
+    var waited: u32 = 0;
+    while (echo.received().len < logon.len and waited < 1000) : (waited += 20) _ = net.usleep(20_000);
+    const got = echo.received();
+    if (got.len < logon.len) return fail(name, "backend saw {d} bytes, want {d}", .{ got.len, logon.len });
+    if (got[0] != 0x68) return fail(name, "backend first byte 0x{x:0>2}, want 0x68", .{got[0]});
+    const got_token = std.mem.readInt(u16, got[QQ_TOKEN_OFFSET..][0..2], .little);
+    if (got_token != @as(u16, @truncate(GS_GAMEID)))
+        return fail(name, "rewritten token={d}, want {d} (GS gameid)", .{ got_token, GS_GAMEID });
+    if (!std.mem.eql(u8, got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
+        return fail(name, "tail mismatch", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("embedded edge: token 0x{x} -> gameid {d}, rewritten + spliced (no qqserver)", .{ token, GS_GAMEID }) };
+}
+
 pub fn main() !void {
     startRedis();
     const child = try maybeStartRealmd();
@@ -985,6 +1081,7 @@ pub fn main() !void {
         scAdminApi(),
         scMultiGameOneGs(),
         scQqserverTokenTranslate(),
+        scEmbeddedGameEdge(),
         scCreateAccountRealAuth(),
         scCharCreate(),
         scClassicChar(),
