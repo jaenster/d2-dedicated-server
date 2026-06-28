@@ -191,6 +191,13 @@ fn untrackGame(pg: usize) void {
 }
 
 pub fn serverTick() void {
+    // Fire deferred seed loop: runs once, right after game init completes.
+    // QSERVER_TickAllGames (which contains game init + our gen hook) has already
+    // returned by the time serverTick() is called, so FreeAct on every act is safe.
+    if (seed_loop_pending) {
+        seed_loop_pending = false;
+        runSeedLoop(seed_loop_pgame, seed_loop_nacts, seed_loop_lo, seed_loop_hi);
+    }
     tick_n += 1;
     if (tick_n % TICK_EVERY != 0) return;
     for (games) |pg| {
@@ -701,6 +708,17 @@ fn emitLevel(pLevel: usize) void {
 var dumpall_done: bool = false;
 var in_dumpall: bool = false;
 
+/// Deferred seed loop: set by runDumpAll (called mid-gen-hook, while the spawn
+/// act is still mid-init) so that runSeedLoop runs from serverTick() instead —
+/// AFTER QSERVER_TickAllGames returns and the game is fully initialized.
+/// FreeAct on the spawn act is only safe once its own InitLevel has returned up
+/// the whole call stack, which is guaranteed by the time serverTick() fires.
+var seed_loop_pending: bool = false;
+var seed_loop_pgame: usize = 0;
+var seed_loop_nacts: u8 = 0;
+var seed_loop_lo: u32 = 0;
+var seed_loop_hi: u32 = 0;
+
 /// Inclusive [lo,hi] level-id range owned by act `nActNo` (0..4): lo = that act's
 /// town id, hi = (next act's town id − 1), or the last Levels.txt id for act 4.
 /// All read live from the engine town-id table / data table — no hardcoded ids.
@@ -784,9 +802,17 @@ fn runDumpAll(pSpawnDrlg: usize) void {
         if (pDrlg != 0) dumpActLevels(pDrlg);
     }
 
-    // Multi-seed capture: iterate [lo, hi], freeing+recreating all acts per seed.
-    // runSeedLoop emits its own drlg_seed markers so output is splittable by seed.
-    if (pGame != 0) if (seedRange()) |r| runSeedLoop(pGame, nActs, r.lo, r.hi);
+    // Multi-seed capture: stash args and defer to serverTick() so runSeedLoop runs
+    // AFTER the spawn act's InitLevel has fully returned (game idle, no act mid-init).
+    // Running FreeAct here would free the spawn act while the engine is still inside
+    // its InitLevel call stack → use-after-free crash on resumption.
+    if (pGame != 0) if (seedRange()) |r| {
+        seed_loop_pending = true;
+        seed_loop_pgame = pGame;
+        seed_loop_nacts = nActs;
+        seed_loop_lo = r.lo;
+        seed_loop_hi = r.hi;
+    };
 }
 
 /// D2GS_DRLG_DIFF override for the difficulty-invariance test: null if unset, else
@@ -818,7 +844,7 @@ fn seedRange() ?struct { lo: u32, hi: u32 } {
 fn emitSeedMarker(seed: u32) void {
     var e = evlog.Event.begin("drlg_seed");
     e.int("seed", seed);
-    e.end();
+    e.endRaw(); // raw sink: keep consistent with drlg_level so capture tools can grep both
 }
 
 /// Multi-seed capture loop: for each seed in [lo, hi] (inclusive), free and recreate
