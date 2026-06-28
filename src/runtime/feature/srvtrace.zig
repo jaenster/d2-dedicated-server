@@ -26,6 +26,8 @@ const fns = @import("../../engine/d2/functions.zig");
 const game = @import("../../engine/d2types.zig");
 
 extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
+extern "kernel32" fn EnterCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
+extern "kernel32" fn LeaveCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
 
 // ── decode helpers ───────────────────────────────────────────────────────────
 
@@ -857,6 +859,15 @@ fn emitSeedMarker(seed: u32) void {
 /// directly alongside GAME_SEED_GLOBAL so both bookkeeping paths agree on the seed.
 fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
     log.hex2("srvtrace: DRLG seed loop", lo, hi);
+    // Hold pGame->lpCriticalSection (@0x18) across the entire seed loop.
+    // TASK_GameTickCallback fires ServerGameLoop on the BNet task-scheduler thread;
+    // without the lock it races with FreeAct/initDrlgAct and crashes at
+    // GetLevelId(pRoomEx) when pRoomEx->pLevel has been freed mid-loop.
+    // This is the same per-game lock that QSERVER_TickAllGames acquires before
+    // each ServerGameLoop call — holding it here blocks the task thread until done.
+    const lpCS: usize = readU32(pGame, 0x18);
+    if (lpCS != 0) EnterCriticalSection(@ptrFromInt(lpCS));
+    defer if (lpCS != 0) LeaveCriticalSection(@ptrFromInt(lpCS));
     var seed: u32 = lo;
     while (seed <= hi) : (seed +%= 1) {
         emitSeedMarker(seed);
@@ -889,6 +900,22 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
         // Overflow guard: if hi == maxInt(u32), seed+%=1 wraps to 0 and the loop
         // never terminates — break early after processing the final seed.
         if (seed == std.math.maxInt(u32)) break;
+    }
+    // Tear down all acts BEFORE releasing the game lock (the defer above fires on
+    // return). This leaves the game with no acts so that when TASK_GameTickCallback
+    // fires ServerGameLoop after we unlock, InitNewRooms finds no act slots to walk
+    // and therefore never reaches the D2RoomStrc objects whose pRoomEx pointers have
+    // been freed. Without this teardown those stale pRoomEx pointers crash GetLevelId.
+    {
+        var act: u8 = 0;
+        while (act < nActs) : (act += 1) {
+            const slot: usize = pGame + 0xBC + @as(usize, act) * 4;
+            const pAct = readU32(pGame, 0xBC + @as(usize, act) * 4);
+            if (pAct != 0) {
+                FreeActFn(pAct);
+                @as(*volatile u32, @ptrFromInt(slot)).* = 0;
+            }
+        }
     }
     log.hex("srvtrace: DRLG seed loop done, seeds captured up to 0x", hi);
 }
