@@ -9,6 +9,7 @@ const async_ = @import("../runtime/async.zig");
 const gameloop = @import("../runtime/gameloop.zig");
 const fastcall = @import("../runtime/fastcall.zig");
 const log = @import("../log.zig");
+const srvtrace = @import("../runtime/feature/srvtrace.zig");
 
 // ── game addresses / globals (retail 1.14d) ─────────────────────────────────
 const OogCurrentCharSelectionMode: *u32 = @ptrFromInt(0x007795ec);
@@ -92,7 +93,13 @@ fn frame() void {
         return;
     }
     // Task finished (SelectedChar issued) — let the engine load the game, then verify.
-    if (verified) return;
+    // Once in-game, drive srvtrace.serverTick each frame so the deferred DRLG
+    // seed loop (D2GS_DRLG_SEED_LO/HI) fires — autoenter owns on_game, so without
+    // this the multi-seed dump never runs under --test-enter.
+    if (verified) {
+        srvtrace.serverTick();
+        return;
+    }
     verify_frames += 1;
     if (playerUnit.* != null) {
         verified = true;
