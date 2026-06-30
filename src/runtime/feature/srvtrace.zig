@@ -639,6 +639,15 @@ fn emitLevel(pLevel: usize) void {
     e.int("w", @as(i32, @bitCast(readU32(pLevel, 0x24))));
     e.int("h", @as(i32, @bitCast(readU32(pLevel, 0x28))));
     e.objClose();
+    // Level-level preset pick (the "jail-exit variant"). For a PresetArea level
+    // (drlgType==2) pLevel->pDrlgLevelData @0x14 -> D2DrlgLevelDataPresetArea
+    // {pDrlgMap@0, nPickedFile@4}. GenerateBarracksLayout reads this off Courtyard 1
+    // (level 0x1b) to choose the jail exit direction — the field the port needs to
+    // diff offline. -1 means "not yet resolved" (set by InitializeRoomEx later).
+    if (readU32(pLevel, 0x00) == 2) {
+        const pLvlData = readU32(pLevel, 0x14);
+        if (pLvlData != 0) e.int("lvlPick", s32(readU32(pLvlData, 0x4)));
+    }
     // Rooms: walk pRoomExFirst -> pRoomExNext. Per room (D2RoomExStrc offsets):
     //   coords @0x34, sSeed.nSeedLow @0x14, nType @0x10, eRoomExFlags @0x28,
     //   nPresetType @0x48 (1=maze/outdoor, 2=preset), nDT1Mask @0x50,
