@@ -26,6 +26,8 @@ const fns = @import("../../engine/d2/functions.zig");
 const game = @import("../../engine/d2types.zig");
 
 extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
+extern "kernel32" fn EnterCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
+extern "kernel32" fn LeaveCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
 
 // ── decode helpers ───────────────────────────────────────────────────────────
 
@@ -191,6 +193,13 @@ fn untrackGame(pg: usize) void {
 }
 
 pub fn serverTick() void {
+    // Fire deferred seed loop: runs once, right after game init completes.
+    // QSERVER_TickAllGames (which contains game init + our gen hook) has already
+    // returned by the time serverTick() is called, so FreeAct on every act is safe.
+    if (seed_loop_pending) {
+        seed_loop_pending = false;
+        runSeedLoop(seed_loop_pgame, seed_loop_nacts, seed_loop_lo, seed_loop_hi);
+    }
     tick_n += 1;
     if (tick_n % TICK_EVERY != 0) return;
     for (games) |pg| {
@@ -521,8 +530,12 @@ const DRLG_NEAR_CAP: i32 = 64;
 ///   GetLevelAndAlloc(pDrlg, eLevelId) -> pLevel   @0x642BB0  (RET 8)
 ///   InitLevel(pLevel)                              @0x6424A0  (RET 4) — runs the
 ///     DRLG generator, which calls DRLG_ApplyRoomExStateFlags → our hook → dump.
+///   FreeAct(pDrlgAct)                             @0x61afd0  (RET 4) — frees the
+///     act struct and all its DRLG data (D2DrlgActMisc, rooms, environment).
+///     __stdcall verified: @calling annotation in Dungeon.cpp reconstruction.
 const GetLevelAndAlloc: *const fn (usize, i32) callconv(.winapi) usize = @ptrFromInt(0x642BB0);
 const InitLevel: *const fn (usize) callconv(.winapi) void = @ptrFromInt(0x6424A0);
+const FreeActFn: *const fn (usize) callconv(.winapi) void = @ptrFromInt(0x61afd0);
 
 /// Engine globals for data-driven act/level ranges (no hardcoded ids).
 ///   0x6E7D1C: int[5] town-level id per act (read by GetTownLevelIdFromActNo via
@@ -688,6 +701,44 @@ fn emitLevel(pLevel: usize) void {
         room = readU32(room, 0x24); // pRoomExNext
     }
     e.arrayEnd();
+    // Outdoor (wilderness, drlgType==3) road A* geometry — ground truth for the Zig
+    // port's road pathfinder (DRLGOUTROOM_FindPathBetweenExits builds these per-exit
+    // vertex chains in pAdjacentVertices). Per exit slot, dump the road vertex (x,y)
+    // chain. Engine offsets (Ghidra 1.14d 62fbfe69, D2DrlgLevelDataWildernessLevel):
+    //   D2DrlgLevelStrc.pDrlgLevelData @0x14; pAdjacentVertices[6] @0x68;
+    //   D2DrlgVertexStrc nPosX@0x0 nPosY@0x4 pNext@0x10.
+    if (readU32(pLevel, 0x00) == 3) {
+        const pData = readU32(pLevel, 0x14);
+        if (pData != 0) {
+            e.arrayField("roads");
+            var ex: usize = 0;
+            var firstEx = true;
+            while (ex < 6) : (ex += 1) {
+                const head = readU32(pData + 0x68 + ex * 4, 0);
+                if (head == 0) continue;
+                if (!firstEx) e.comma();
+                firstEx = false;
+                e.objOpen();
+                e.intFirst("exit", @as(i64, @intCast(ex)));
+                e.arrayField("v");
+                var v = head;
+                var vi: usize = 0;
+                var firstV = true;
+                while (v != 0 and vi < 4096 and !e.full) : (vi += 1) {
+                    if (!firstV) e.comma();
+                    firstV = false;
+                    e.objOpen();
+                    e.intFirst("x", s32(readU32(v, 0x00)));
+                    e.int("y", s32(readU32(v, 0x04)));
+                    e.objClose();
+                    v = readU32(v, 0x10); // pNext
+                }
+                e.arrayEnd();
+                e.objClose();
+            }
+            e.arrayEnd();
+        }
+    }
     e.endRaw(); // raw sink: these lines can be 100s of KB; must not be wrapped/capped
 }
 
@@ -696,6 +747,17 @@ fn emitLevel(pLevel: usize) void {
 /// (their generated levels still dump normally via emitLevel).
 var dumpall_done: bool = false;
 var in_dumpall: bool = false;
+
+/// Deferred seed loop: set by runDumpAll (called mid-gen-hook, while the spawn
+/// act is still mid-init) so that runSeedLoop runs from serverTick() instead —
+/// AFTER QSERVER_TickAllGames returns and the game is fully initialized.
+/// FreeAct on the spawn act is only safe once its own InitLevel has returned up
+/// the whole call stack, which is guaranteed by the time serverTick() fires.
+var seed_loop_pending: bool = false;
+var seed_loop_pgame: usize = 0;
+var seed_loop_nacts: u8 = 0;
+var seed_loop_lo: u32 = 0;
+var seed_loop_hi: u32 = 0;
 
 /// Inclusive [lo,hi] level-id range owned by act `nActNo` (0..4): lo = that act's
 /// town id, hi = (next act's town id − 1), or the last Levels.txt id for act 4.
@@ -732,13 +794,36 @@ fn dumpActLevels(pDrlg: usize) void {
 /// other four are created the server way via InitDrlgAct(pGame, act) when absent,
 /// then force-generated. pGame = pDrlg->pGame @0x9C; pGame->pAct[5] @0xBC;
 /// D2DrlgActStrc->pDrlg @0x48; pDrlg->nActNo @0x480.
+///
+/// Multi-seed mode: if D2GS_DRLG_SEED_LO + D2GS_DRLG_SEED_HI are set, after the
+/// first-seed pass this function calls runSeedLoop to iterate the full [lo, hi] range,
+/// freeing and recreating all acts per seed. Pair with D2GS_DRLG_DUMPALL=1.
 fn runDumpAll(pSpawnDrlg: usize) void {
     const pGame = readU32(pSpawnDrlg, 0x9C);
     const spawnActNo = readU8(pSpawnDrlg, 0x480);
+    // DIFFICULTY-AXIS test (D2GS_DRLG_DIFF=0/1/2): override pGame->nDifficulty (@0x6D)
+    // around the forced-act generation. The acts we InitDrlgAct here are then created
+    // at that difficulty (AllocAct reads pGame->nDifficulty), so a diff vs the normal
+    // dump shows whether the difficulty arg to AllocAct changes DRLG geometry. We use
+    // a normal game + override rather than creating a Nightmare/Hell game because the
+    // latter crashes the headless GS during game creation. Restored afterward.
+    const diffOverride = drlgDiffOverride();
+    const savedDiff: u8 = if (pGame != 0) readU8(pGame, 0x6D) else 0;
+    if (diffOverride) |d| if (pGame != 0) {
+        @as(*volatile u8, @ptrFromInt(pGame + 0x6D)).* = d;
+    };
+    defer if (diffOverride != null) if (pGame != 0) {
+        @as(*volatile u8, @ptrFromInt(pGame + 0x6D)).* = savedDiff;
+    };
     // Classic (no-expansion) games have NO act 5 (nActNo 4) — only acts 1-4 (0..3).
     // pGame->bExpansion @0x70. Forcing nActNo 4 on a classic game would create an act
     // the game mode doesn't have, so cap the loop at 4 acts there.
     const nActs: u8 = if (pGame != 0 and readU32(pGame, 0x70) == 0) 4 else 5;
+
+    // Emit a seed marker for the first (natural) seed so the JSONL stream is
+    // consistently prefixed with drlg_seed even for single-seed runs.
+    if (pGame != 0) emitSeedMarker(readU32(pGame, 0x7C)); // pInitSeed.nSeedLow
+
     var act: u8 = 0;
     while (act < nActs) : (act += 1) {
         var pDrlg: usize = 0;
@@ -756,6 +841,121 @@ fn runDumpAll(pSpawnDrlg: usize) void {
         }
         if (pDrlg != 0) dumpActLevels(pDrlg);
     }
+
+    // Multi-seed capture: stash args and defer to serverTick() so runSeedLoop runs
+    // AFTER the spawn act's InitLevel has fully returned (game idle, no act mid-init).
+    // Running FreeAct here would free the spawn act while the engine is still inside
+    // its InitLevel call stack → use-after-free crash on resumption.
+    if (pGame != 0) if (seedRange()) |r| {
+        seed_loop_pending = true;
+        seed_loop_pgame = pGame;
+        seed_loop_nacts = nActs;
+        seed_loop_lo = r.lo;
+        seed_loop_hi = r.hi;
+    };
+}
+
+/// D2GS_DRLG_DIFF override for the difficulty-invariance test: null if unset, else
+/// 0/1/2 (normal/nightmare/hell), clamped.
+fn drlgDiffOverride() ?u8 {
+    var buf: [8]u8 = undefined;
+    const n = GetEnvironmentVariableA("D2GS_DRLG_DIFF", &buf, buf.len);
+    if (n == 0 or n >= buf.len) return null;
+    const v = std.fmt.parseInt(u8, buf[0..n], 10) catch return null;
+    return @min(v, 2);
+}
+
+/// Multi-seed capture range from D2GS_DRLG_SEED_LO + D2GS_DRLG_SEED_HI. Both must
+/// be set and parseable for multi-seed mode to activate; returns null otherwise.
+fn seedRange() ?struct { lo: u32, hi: u32 } {
+    var buf: [16]u8 = undefined;
+    const nlo = GetEnvironmentVariableA("D2GS_DRLG_SEED_LO", &buf, buf.len);
+    if (nlo == 0 or nlo >= buf.len) return null;
+    const lo = std.fmt.parseInt(u32, buf[0..nlo], 10) catch return null;
+    const nhi = GetEnvironmentVariableA("D2GS_DRLG_SEED_HI", &buf, buf.len);
+    if (nhi == 0 or nhi >= buf.len) return null;
+    const hi = std.fmt.parseInt(u32, buf[0..nhi], 10) catch return null;
+    if (hi < lo) return null;
+    return .{ .lo = lo, .hi = hi };
+}
+
+/// Emit a `drlg_seed` marker line so downstream consumers can split the JSONL stream
+/// into per-seed golden files. Must appear BEFORE the drlg_level lines for that seed.
+fn emitSeedMarker(seed: u32) void {
+    var e = evlog.Event.begin("drlg_seed");
+    e.int("seed", seed);
+    e.endRaw(); // raw sink: keep consistent with drlg_level so capture tools can grep both
+}
+
+/// Multi-seed capture loop: for each seed in [lo, hi] (inclusive), free and recreate
+/// all acts with that seed then dump all their levels. Runs synchronously after the
+/// first-seed dumpall pass has finished, so the game is idle (no players). Memory is
+/// stable: FreeAct returns each act's allocations to the game pool, and InitDrlgAct
+/// re-uses the same pool, so RSS stays bounded for any range size.
+///
+/// pGame->pInitSeed.nSeedLow @0x7C is what InitDrlgAct → AllocAct reads; we write it
+/// directly alongside GAME_SEED_GLOBAL so both bookkeeping paths agree on the seed.
+fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
+    log.hex2("srvtrace: DRLG seed loop", lo, hi);
+    // Hold pGame->lpCriticalSection (@0x18) across the entire seed loop.
+    // TASK_GameTickCallback fires ServerGameLoop on the BNet task-scheduler thread;
+    // without the lock it races with FreeAct/initDrlgAct and crashes at
+    // GetLevelId(pRoomEx) when pRoomEx->pLevel has been freed mid-loop.
+    // This is the same per-game lock that QSERVER_TickAllGames acquires before
+    // each ServerGameLoop call — holding it here blocks the task thread until done.
+    const lpCS: usize = readU32(pGame, 0x18);
+    if (lpCS != 0) EnterCriticalSection(@ptrFromInt(lpCS));
+    defer if (lpCS != 0) LeaveCriticalSection(@ptrFromInt(lpCS));
+    var seed: u32 = lo;
+    while (seed <= hi) : (seed +%= 1) {
+        emitSeedMarker(seed);
+        // Update both the engine's forced-seed global and the game's own pInitSeed.nSeedLow.
+        // InitDrlgAct → AllocAct reads pGame->pInitSeed.nSeedLow directly (@0x7C);
+        // GAME_SEED_GLOBAL is kept in sync so any internal DRLG path that re-reads it agrees.
+        @as(*volatile u32, @ptrFromInt(GAME_SEED_GLOBAL)).* = seed;
+        @as(*volatile u32, @ptrFromInt(pGame + 0x7C)).* = seed;
+        var act: u8 = 0;
+        while (act < nActs) : (act += 1) {
+            const actSlot: usize = pGame + 0xBC + @as(usize, act) * 4;
+            const pAct = readU32(pGame, 0xBC + @as(usize, act) * 4);
+            if (pAct != 0) {
+                FreeActFn(pAct);
+                // Zero the slot so the engine doesn't see a stale pointer.
+                @as(*volatile u32, @ptrFromInt(actSlot)).* = 0;
+            }
+            // Re-create the act: derives dwStartSeed from pGame->pInitSeed.nSeedLow,
+            // allocates D2DrlgActStrc from the game pool, initialises the town level.
+            // The town's InitLevel call fires DRLG_ApplyRoomExStateFlags → our hook →
+            // emitLevel (town). dumpall_done=true so no re-entry into runDumpAll.
+            initDrlgAct(pGame, act);
+            const pActNew = readU32(pGame, 0xBC + @as(usize, act) * 4);
+            if (pActNew != 0) {
+                const pDrlg = readU32(pActNew, 0x48);
+                // Force all non-town levels for this act; each InitLevel → hook → emitLevel.
+                if (pDrlg != 0) dumpActLevels(pDrlg);
+            }
+        }
+        // Overflow guard: if hi == maxInt(u32), seed+%=1 wraps to 0 and the loop
+        // never terminates — break early after processing the final seed.
+        if (seed == std.math.maxInt(u32)) break;
+    }
+    // Tear down all acts BEFORE releasing the game lock (the defer above fires on
+    // return). This leaves the game with no acts so that when TASK_GameTickCallback
+    // fires ServerGameLoop after we unlock, InitNewRooms finds no act slots to walk
+    // and therefore never reaches the D2RoomStrc objects whose pRoomEx pointers have
+    // been freed. Without this teardown those stale pRoomEx pointers crash GetLevelId.
+    {
+        var act: u8 = 0;
+        while (act < nActs) : (act += 1) {
+            const slot: usize = pGame + 0xBC + @as(usize, act) * 4;
+            const pAct = readU32(pGame, 0xBC + @as(usize, act) * 4);
+            if (pAct != 0) {
+                FreeActFn(pAct);
+                @as(*volatile u32, @ptrFromInt(slot)).* = 0;
+            }
+        }
+    }
+    log.hex("srvtrace: DRLG seed loop done, seeds captured up to 0x", hi);
 }
 
 /// True once `D2GS_DRLG_DUMPALL` is set to a non-empty value (checked once).
