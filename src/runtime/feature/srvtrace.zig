@@ -701,6 +701,44 @@ fn emitLevel(pLevel: usize) void {
         room = readU32(room, 0x24); // pRoomExNext
     }
     e.arrayEnd();
+    // Outdoor (wilderness, drlgType==3) road A* geometry — ground truth for the Zig
+    // port's road pathfinder (DRLGOUTROOM_FindPathBetweenExits builds these per-exit
+    // vertex chains in pAdjacentVertices). Per exit slot, dump the road vertex (x,y)
+    // chain. Engine offsets (Ghidra 1.14d 62fbfe69, D2DrlgLevelDataWildernessLevel):
+    //   D2DrlgLevelStrc.pDrlgLevelData @0x14; pAdjacentVertices[6] @0x68;
+    //   D2DrlgVertexStrc nPosX@0x0 nPosY@0x4 pNext@0x10.
+    if (readU32(pLevel, 0x00) == 3) {
+        const pData = readU32(pLevel, 0x14);
+        if (pData != 0) {
+            e.arrayField("roads");
+            var ex: usize = 0;
+            var firstEx = true;
+            while (ex < 6) : (ex += 1) {
+                const head = readU32(pData + 0x68 + ex * 4, 0);
+                if (head == 0) continue;
+                if (!firstEx) e.comma();
+                firstEx = false;
+                e.objOpen();
+                e.intFirst("exit", @as(i64, @intCast(ex)));
+                e.arrayField("v");
+                var v = head;
+                var vi: usize = 0;
+                var firstV = true;
+                while (v != 0 and vi < 4096 and !e.full) : (vi += 1) {
+                    if (!firstV) e.comma();
+                    firstV = false;
+                    e.objOpen();
+                    e.intFirst("x", s32(readU32(v, 0x00)));
+                    e.int("y", s32(readU32(v, 0x04)));
+                    e.objClose();
+                    v = readU32(v, 0x10); // pNext
+                }
+                e.arrayEnd();
+                e.objClose();
+            }
+            e.arrayEnd();
+        }
+    }
     e.endRaw(); // raw sink: these lines can be 100s of KB; must not be wrapped/capped
 }
 
