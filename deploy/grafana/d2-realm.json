@@ -8,7 +8,7 @@
     "loki"
   ],
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "graphTooltip": 1,
   "refresh": "30s",
@@ -28,6 +28,20 @@
         "hide": true,
         "name": "Annotations & Alerts",
         "type": "dashboard"
+      },
+      {
+        "name": "Deploys / boots",
+        "datasource": {
+          "type": "loki",
+          "uid": "${loki}"
+        },
+        "enable": true,
+        "iconColor": "yellow",
+        "target": {
+          "expr": "{namespace=\"realmd\"} |~ `(?i)(listening on|starting realmd|version=)`",
+          "refId": "Anno"
+        },
+        "textFormat": "{{app}}: boot"
       }
     ]
   },
@@ -225,12 +239,208 @@
     },
     {
       "type": "row",
-      "title": "Realm activity (from logs)",
+      "title": "Live state (now)",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
         "y": 9
+      },
+      "collapsed": false,
+      "id": 30
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "Active games (now)",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (game) (count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json evt=\"evt\", game=\"game\", players=\"players\", gsid=\"gsid\" | evt=`tick` [5m])))",
+          "queryType": "instant"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 10
+      }
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Players in-game (now)",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(max by (game) (max_over_time({namespace=\"realmd\", app=\"d2gs\"} | json evt=\"evt\", game=\"game\", players=\"players\", gsid=\"gsid\" | evt=`tick` | unwrap players [5m])))",
+          "queryType": "instant"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 10
+      }
+    },
+    {
+      "id": 33,
+      "type": "bargauge",
+      "title": "Active games by GS (now)",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "noValue": "0",
+          "min": 0,
+          "max": 12
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count by (gsid) (max by (gsid, game) (count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json evt=\"evt\", game=\"game\", players=\"players\", gsid=\"gsid\" | evt=`tick` [5m])))",
+          "legendFormat": "GS {{gsid}}",
+          "queryType": "instant"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 10
+      }
+    },
+    {
+      "id": 34,
+      "type": "bargauge",
+      "title": "Players by GS (now)",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "noValue": "0",
+          "min": 0,
+          "max": 50
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (gsid) (max by (gsid, game) (max_over_time({namespace=\"realmd\", app=\"d2gs\"} | json evt=\"evt\", game=\"game\", players=\"players\", gsid=\"gsid\" | evt=`tick` | unwrap players [5m])))",
+          "legendFormat": "GS {{gsid}}",
+          "queryType": "instant"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 10
+      }
+    },
+    {
+      "type": "row",
+      "title": "Realm activity (from logs)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 16
       },
       "collapsed": false,
       "id": 10
@@ -247,7 +457,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 10
+        "y": 17
       },
       "fieldConfig": {
         "defaults": {
@@ -292,7 +502,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 10
+        "y": 17
       },
       "fieldConfig": {
         "defaults": {
@@ -337,7 +547,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 10
+        "y": 17
       },
       "fieldConfig": {
         "defaults": {
@@ -394,7 +604,7 @@
         "h": 5,
         "w": 6,
         "x": 18,
-        "y": 10
+        "y": 17
       },
       "fieldConfig": {
         "defaults": {
@@ -439,7 +649,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 22
       },
       "fieldConfig": {
         "defaults": {
@@ -491,12 +701,293 @@
     },
     {
       "type": "row",
+      "title": "GS fleet",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 29
+      },
+      "collapsed": false,
+      "id": 40
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Games created by GS / min",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (gsid) (count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json evt=\"evt\", gsid=\"gsid\" | evt=`game_create` [1m]))",
+          "legendFormat": "GS {{gsid}}"
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Active games by GS over time",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count by (gsid) (max by (gsid, game) (count_over_time({namespace=\"realmd\", app=\"d2gs\"} | json evt=\"evt\", game=\"game\", players=\"players\", gsid=\"gsid\" | evt=`tick` [$__interval])))",
+          "legendFormat": "GS {{gsid}}"
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      }
+    },
+    {
+      "type": "row",
+      "title": "Health",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "collapsed": false,
+      "id": 50
+    },
+    {
+      "id": 51,
+      "type": "stat",
+      "title": "Engine halts / faults (range)",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({namespace=\"realmd\"} |~ `(?i)(halt|panic|assert|fatal|fault)` [$__range]))",
+          "queryType": "instant"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 38
+      }
+    },
+    {
+      "id": 52,
+      "type": "stat",
+      "title": "Pod restarts (range)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prom}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=\"realmd\"}[$__range]))"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 38
+      }
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Errors + halts / min",
+      "datasource": {
+        "type": "loki",
+        "uid": "${loki}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({namespace=\"realmd\"} |~ `(?i)(error|halt|panic|assert|fatal|fault|refused)` [1m]))",
+          "legendFormat": "errors/halts"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 38
+      }
+    },
+    {
+      "type": "row",
       "title": "Logs",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 44
       },
       "collapsed": false,
       "id": 20
@@ -513,7 +1004,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 23
+        "y": 45
       },
       "options": {
         "showTime": true,
