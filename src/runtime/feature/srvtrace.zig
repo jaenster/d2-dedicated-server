@@ -831,7 +831,7 @@ fn runDumpAll(pSpawnDrlg: usize) void {
 
     // Emit a seed marker for the first (natural) seed so the JSONL stream is
     // consistently prefixed with drlg_seed even for single-seed runs.
-    if (pGame != 0) emitSeedMarker(readU32(pGame, 0x7C)); // pInitSeed.nSeedLow
+    if (pGame != 0) emitSeedMarker(readU32(pGame, 0x7C), readU8(pGame, 0x6D)); // pInitSeed.nSeedLow, difficulty
 
     var act: u8 = 0;
     while (act < nActs) : (act += 1) {
@@ -890,9 +890,10 @@ fn seedRange() ?struct { lo: u32, hi: u32 } {
 
 /// Emit a `drlg_seed` marker line so downstream consumers can split the JSONL stream
 /// into per-seed golden files. Must appear BEFORE the drlg_level lines for that seed.
-fn emitSeedMarker(seed: u32) void {
+fn emitSeedMarker(seed: u32, diff: u8) void {
     var e = evlog.Event.begin("drlg_seed");
     e.int("seed", seed);
+    e.int("diff", diff); // 0/1/2: lets consumers split goldens per difficulty
     e.endRaw(); // raw sink: keep consistent with drlg_level so capture tools can grep both
 }
 
@@ -915,9 +916,19 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
     const lpCS: usize = readU32(pGame, 0x18);
     if (lpCS != 0) EnterCriticalSection(@ptrFromInt(lpCS));
     defer if (lpCS != 0) LeaveCriticalSection(@ptrFromInt(lpCS));
+    // Re-apply the D2GS_DRLG_DIFF override for the whole loop: runDumpAll's override
+    // was already restored by its defer before this deferred loop runs, so without
+    // this every seed here would regenerate at Normal regardless of the env.
+    const diffOverride = drlgDiffOverride();
+    const savedDiff: u8 = readU8(pGame, 0x6D);
+    if (diffOverride) |d| @as(*volatile u8, @ptrFromInt(pGame + 0x6D)).* = d;
+    defer if (diffOverride != null) {
+        @as(*volatile u8, @ptrFromInt(pGame + 0x6D)).* = savedDiff;
+    };
+    const curDiff: u8 = readU8(pGame, 0x6D);
     var seed: u32 = lo;
     while (seed <= hi) : (seed +%= 1) {
-        emitSeedMarker(seed);
+        emitSeedMarker(seed, curDiff);
         // Update both the engine's forced-seed global and the game's own pInitSeed.nSeedLow.
         // InitDrlgAct → AllocAct reads pGame->pInitSeed.nSeedLow directly (@0x7C);
         // GAME_SEED_GLOBAL is kept in sync so any internal DRLG path that re-reads it agrees.
