@@ -200,6 +200,9 @@ pub fn serverTick() void {
         seed_loop_pending = false;
         runSeedLoop(seed_loop_pgame, seed_loop_nacts, seed_loop_lo, seed_loop_hi);
     }
+    // Runtime collision (pColl) capture: dump each live game's rooms once it has a
+    // player-loaded act. Off unless D2GS_DRLG_COLL=1.
+    if (collEnabled()) maybeDumpColl();
     tick_n += 1;
     if (tick_n % TICK_EVERY != 0) return;
     for (games) |pg| {
@@ -976,6 +979,160 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
         }
     }
     log.hex("srvtrace: DRLG seed loop done, seeds captured up to 0x", hi);
+}
+
+// ── Runtime CollMap (pColl) capture ──────────────────────────────────────────
+// The DRLG oracle above dumps the LAYOUT layer (D2DrlgLevelStrc/D2RoomExStrc),
+// where the runtime collision map does NOT exist yet: pColl lives on Room1, and
+// Room1 is only built when a room is ACTIVATED (AddRoomData). The direct-load
+// seed loop never activates rooms (no unit ever enters), so it cannot see pColl.
+//
+// This capture therefore runs on a LIVE game: once a player unit is present, we
+// walk its runtime act (pAct->pMisc->pLevelFirst), activate every room of every
+// level (AddRoomData), read Room1->pColl->pMapStart, dump it, then RemoveRoomData
+// to leave the game state untouched. This is the same walk mapreveal.zig uses for
+// the in-game automap, sourced from the SERVER player-unit hash instead of the
+// client's local player. One game covers the act(s) that game has loaded; for a
+// full multi-seed golden run one game per seed (pin the seed via the forced-seed
+// global / D2GS_DRLG_SEED). Gate: D2GS_DRLG_COLL=1. Optional D2GS_DRLG_COLL_FORCE=1
+// force-inits levels the game hasn't loaded yet (fns.InitLevel on a null-room2
+// level) for fuller coverage — off by default since forcing is the riskier path.
+
+const UNITLIST_OFF: usize = 0x1120; // D2GameStrc.pUnitList[5][128]; type 0 = players
+const COLL_ROWS_BUDGET: u32 = 20000; // cells per drlg_coll line (row-strip), keeps EventN(131072) from overflowing
+
+var coll_done_games: [32]usize = [_]usize{0} ** 32;
+
+fn envOn(comptime name: [*:0]const u8) bool {
+    var buf: [8]u8 = undefined;
+    const n = GetEnvironmentVariableA(name, &buf, buf.len);
+    return n != 0 and n < buf.len and buf[0] != '0';
+}
+
+fn collEnabled() bool {
+    const S = struct {
+        var checked: bool = false;
+        var on: bool = false;
+    };
+    if (!S.checked) {
+        S.checked = true;
+        S.on = envOn("D2GS_DRLG_COLL");
+    }
+    return S.on;
+}
+
+/// First player unit (type 0) in the server game's unit hash, or null.
+fn firstPlayer(pGame: usize) ?*t.UnitAny {
+    var b: usize = 0;
+    while (b < 128) : (b += 1) {
+        const head = readU32(pGame, UNITLIST_OFF + b * 4);
+        if (head != 0) return @ptrFromInt(head);
+    }
+    return null;
+}
+
+/// Emit one room's CollMap as one or more `drlg_coll` lines (row-strips so a large
+/// room stays inside the EventN buffer). Cells are the raw u16 COLBIT flags in
+/// row-major order (i = row*w + col); at capture time (no live units) only the
+/// static-terrain bits are set (WALL 0x01, VISIBLE 0x02, MISSILE_BARRIER 0x04,
+/// NOPLAYER 0x08, PRESET 0x10). px/py = room world SUBTILE origin (dwPosGameX/Y).
+fn emitRoomColl(seed: u32, diff: u8, levelId: u32, lx: u32, ly: u32, coll: *t.CollMap) void {
+    const w = coll.dwSizeGameX;
+    const h = coll.dwSizeGameY;
+    const map = coll.pMapStart orelse return;
+    if (w == 0 or h == 0 or w > 4096 or h > 4096) return;
+    const rows_per: u32 = @max(1, COLL_ROWS_BUDGET / @max(@as(u32, 1), w));
+    var y0: u32 = 0;
+    while (y0 < h) {
+        const rows = @min(rows_per, h - y0);
+        var e = evlog.EventN(131072).begin("drlg_coll");
+        e.int("seed", seed);
+        e.int("diff", diff);
+        e.int("levelId", levelId);
+        e.int("lx", lx);
+        e.int("ly", ly);
+        e.int("px", coll.dwPosGameX);
+        e.int("py", coll.dwPosGameY);
+        e.int("w", w);
+        e.int("h", rows);
+        e.int("y0", y0);
+        e.arrayField("cells");
+        var first = true;
+        var yy: u32 = 0;
+        while (yy < rows and !e.full) : (yy += 1) {
+            const row = y0 + yy;
+            var x: u32 = 0;
+            while (x < w) : (x += 1) {
+                if (!first) e.comma();
+                first = false;
+                e.numVal(@as(i64, map[row * w + x]));
+            }
+        }
+        e.arrayEnd();
+        e.endRaw();
+        y0 += rows;
+    }
+}
+
+/// Walk a live runtime act and dump every room's CollMap. Activates each room via
+/// AddRoomData (reading Room1->pColl), then RemoveRoomData to restore state. When
+/// D2GS_DRLG_COLL_FORCE is set, levels the game hasn't loaded (pRoom2First==null)
+/// are force-generated with fns.InitLevel first.
+fn dumpActColl(pGame: usize, player: *t.UnitAny) void {
+    const pAct = player.pAct orelse return;
+    const misc = pAct.pMisc orelse return;
+    const seed = readU32(pGame, 0x7C); // pInitSeed.nSeedLow
+    const diff = readU8(pGame, 0x6D); // nDifficulty
+    const force = envOn("D2GS_DRLG_COLL_FORCE");
+    emitSeedMarker(seed, diff);
+
+    var lvl = misc.pLevelFirst;
+    var lguard: u32 = 0;
+    while (lvl) |L| : (lvl = L.pNextLevel) {
+        lguard += 1;
+        if (lguard > 256) break;
+        const lno = L.dwLevelNo;
+        if (lno == 0 or lno >= 256) continue;
+        if (L.pRoom2First == null) {
+            if (force) fns.InitLevel.call(L) else continue;
+        }
+        var r2 = L.pRoom2First;
+        var rguard: u32 = 0;
+        while (r2) |room2| : (r2 = room2.pRoom2Next) {
+            rguard += 1;
+            if (rguard > 4096) break;
+            var added = false;
+            if (room2.pRoom1 == null) {
+                fns.AddRoomData.call(pAct, @intCast(lno), @intCast(room2.dwPosX), @intCast(room2.dwPosY), room2.pRoom1);
+                added = true;
+            }
+            if (room2.pRoom1) |room1| {
+                if (room1.pColl) |coll| emitRoomColl(seed, diff, lno, L.dwPosX, L.dwPosY, coll);
+            }
+            if (added) fns.RemoveRoomData.call(pAct, @intCast(lno), @intCast(room2.dwPosX), @intCast(room2.dwPosY), room2.pRoom1);
+        }
+    }
+    log.hex("srvtrace: DRLG coll dump done for seed 0x", seed);
+}
+
+/// Per-tick check (gated by D2GS_DRLG_COLL): dump each tracked game's runtime
+/// collision once, as soon as it has a player unit (i.e. an act is loaded).
+fn maybeDumpColl() void {
+    for (games) |pg| {
+        if (pg == 0) continue;
+        var seen = false;
+        for (coll_done_games) |d| if (d == pg) {
+            seen = true;
+        };
+        if (seen) continue;
+        const player = firstPlayer(pg) orelse continue;
+        // Record before dumping so a mid-dump re-entry can't double-fire.
+        for (&coll_done_games) |*d| if (d.* == 0) {
+            d.* = pg;
+            break;
+        };
+        dumpActColl(pg, player);
+    }
 }
 
 /// True once `D2GS_DRLG_DUMPALL` is set to a non-empty value (checked once).
