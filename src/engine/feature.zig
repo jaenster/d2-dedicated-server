@@ -88,6 +88,8 @@ const registry = [_]Feature{
     .{ .mod = @import("../runtime/feature/omnivision.zig"), .name = "omnivision", .flag = "omnivision", .default = false },
     .{ .mod = @import("../runtime/feature/mapunits.zig"), .name = "mapunits", .flag = "mapunits", .default = false },
     .{ .mod = @import("../runtime/feature/mapreveal.zig"), .name = "mapreveal", .flag = "mapreveal", .default = false },
+    // Debug: draw our clean-room collision diff vs the engine as colored automap dots (SEED 1 only).
+    .{ .mod = @import("../runtime/feature/colloverlay.zig"), .name = "colloverlay", .flag = "colloverlay", .default = false },
     // Cut Guild Halls: the client-side Steeg Stone panel (ported from GuildStone.cpp).
     .{ .mod = @import("../runtime/feature/guild_panel.zig"), .name = "guild_panel", .flag = "guild-panel", .default = false },
 };
