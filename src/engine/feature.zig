@@ -180,6 +180,14 @@ pub fn fanGameAutomapPostDraw() void {
     }
 }
 
+/// After the in-game viewport is rendered (world-space overlays / HUD text
+/// drawn on top of the scene). Driven by runtime/drawing.zig's post-draw hook.
+pub fn fanGamePostDraw() void {
+    inline for (registry, 0..) |f, i| {
+        if (@hasDecl(f.mod, "gamePostDraw") and enabled[i]) f.mod.gamePostDraw();
+    }
+}
+
 // ── server domain dispatch ───────────────────────────────────────────────────
 
 pub fn fanServerTick() void {

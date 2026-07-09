@@ -16,6 +16,7 @@ const feature = @import("../engine/feature.zig");
 const d2fn = @import("../engine/d2/functions.zig");
 
 const AUTOMAP_DRAW_CALLSITE: usize = 0x00456fa5; // `call DrawAutomap` inside DRAW_UI
+const GAME_POST_DRAW_CALLSITE: usize = 0x0044cb14; // CALL after the viewport render — replaceable, no original to chain
 
 /// Replaces the engine's `call DrawAutomap`. cdecl/void is call-compatible with the
 /// original fastcall-0-arg site (both clobber only eax/ecx/edx, no args, no result).
@@ -25,10 +26,23 @@ fn automapDrawHook() callconv(.c) void {
     feature.fanGameAutomapPostDraw();
 }
 
+/// Replaces the post-viewport CALL (the same site aether/d2probe hook for their
+/// gamePostDraw). Font is saved/restored around the fan so features can SetFont.
+fn gamePostDrawHook() callconv(.c) void {
+    const old = d2fn.SetFont.call(.{1});
+    feature.fanGamePostDraw();
+    _ = d2fn.SetFont.call(.{old});
+}
+
 pub fn install() void {
     if (patch.MemoryPatch(AUTOMAP_DRAW_CALLSITE).call(@intFromPtr(&automapDrawHook)).commit()) {
         log.print("drawing: automap draw hook installed (gameAutomapPre/PostDraw)");
     } else {
         log.print("drawing: FAILED to hook automap draw");
+    }
+    if (patch.MemoryPatch(GAME_POST_DRAW_CALLSITE).call(@intFromPtr(&gamePostDrawHook)).commit()) {
+        log.print("drawing: game post-draw hook installed (gamePostDraw)");
+    } else {
+        log.print("drawing: FAILED to hook game post-draw");
     }
 }

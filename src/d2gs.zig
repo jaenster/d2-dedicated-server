@@ -415,7 +415,7 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             // are gated by their flags. The single config table is in feature.zig.
             feature.applyFlags(hasFlag);
             feature.installAll();
-            if (hasFlag("mapunits") or hasFlag("mapreveal") or hasFlag("guild-panel")) drawing.install();
+            if (hasFlag("mapunits") or hasFlag("mapreveal") or hasFlag("guild-panel") or hasFlag("colloverlay")) drawing.install();
             if (hasFlag("screenshot")) screenshot.install();
             if (hasFlag("dump-cdkeys")) cdkeydump.install(); // log decoded CD keys for verification
             if (hasFlag("suppress-halts")) halt_hook.enableSuppress(); // sub-mode, not a toggle
