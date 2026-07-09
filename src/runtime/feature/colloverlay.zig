@@ -61,10 +61,56 @@ pub fn gameAutomapPostDraw() void {
     }
 }
 
+/// Live-engine collision lattice: the LIVE pColl of the player's room + near
+/// rooms, drawn as small crosses at blocked subtile CENTERS. This is the engine
+/// truth in this very game — if the diff outlines (drawn on the same lattice)
+/// ever sit offset from these crosses, our subtile spacing/parse is wrong; if
+/// they coincide, the diffs are content-level. White = block-walk (0x01), dark
+/// grey = LOS/missile-only bits.
+const LIVE_RADIUS: i32 = 14;
+
+fn drawLiveColl(player: *const d2.types.UnitAny, pp: anytype) void {
+    const r1 = player.getRoom1() orelse return;
+    var ri: i32 = -1; // -1 = own room, then the near list
+    const nnear: i32 = @intCast(r1.dwRoomsNear);
+    while (ri < nnear) : (ri += 1) {
+        const room: *d2.types.Room1 = if (ri < 0)
+            r1
+        else
+            ((r1.pRoomsNear orelse return)[@intCast(ri)] orelse continue);
+        const coll = room.pColl orelse continue;
+        const map = coll.pMapStart orelse continue;
+        const ox: i32 = @intCast(coll.dwPosGameX);
+        const oy: i32 = @intCast(coll.dwPosGameY);
+        const w: i32 = @intCast(coll.dwSizeGameX);
+        const h: i32 = @intCast(coll.dwSizeGameY);
+        var y: i32 = @max(oy, pp.y - LIVE_RADIUS);
+        const y_end: i32 = @min(oy + h, pp.y + LIVE_RADIUS);
+        const x_lo: i32 = @max(ox, pp.x - LIVE_RADIUS);
+        const x_end: i32 = @min(ox + w, pp.x + LIVE_RADIUS);
+        while (y < y_end) : (y += 1) {
+            var x: i32 = x_lo;
+            while (x < x_end) : (x += 1) {
+                const v = map[@intCast((y - oy) * w + (x - ox))] & 0x1F;
+                if (v == 0) continue;
+                const col: u32 = if (v & 0x01 != 0) 0xFF else 0x05;
+                d2.automap.drawScreenCross(
+                    @as(f64, @floatFromInt(x)) + 0.5,
+                    @as(f64, @floatFromInt(y)) + 0.5,
+                    col,
+                    2,
+                );
+            }
+        }
+    }
+}
+
 pub fn gamePostDraw() void {
     const player = d2.globals.playerUnit().* orelse return;
     const lvl = currentLevelNo() orelse return;
     const pp = player.getPos();
+
+    drawLiveColl(player, pp);
 
     const count = recordCount();
     var on_level: u32 = 0;
