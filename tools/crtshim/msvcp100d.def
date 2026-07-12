@@ -1,0 +1,7 @@
+LIBRARY msvcp100d.dll
+EXPORTS
+?max@?$numeric_limits@H@std@@SAHXZ = msvcp100.?max@?$numeric_limits@H@std@@SAHXZ
+?max@?$numeric_limits@I@std@@SAIXZ = msvcp100.?max@?$numeric_limits@I@std@@SAIXZ
+?max@?$numeric_limits@_J@std@@SA_JXZ = msvcp100.?max@?$numeric_limits@_J@std@@SA_JXZ
+?min@?$numeric_limits@H@std@@SAHXZ = msvcp100.?min@?$numeric_limits@H@std@@SAHXZ
+?min@?$numeric_limits@_J@std@@SA_JXZ = msvcp100.?min@?$numeric_limits@_J@std@@SA_JXZ

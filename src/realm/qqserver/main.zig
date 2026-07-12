@@ -232,6 +232,13 @@ const Conn = struct {
     gs_eof: bool = false,
     c2g_bytes: u64 = 0, // total bytes spliced client->GS (diagnostics)
     g2c_bytes: u64 = 0, // total bytes spliced GS->client
+    // qq already ran the client<->qq compression negotiate by sending its own 0xAF00 before
+    // it knew the backend. The REAL 1.14d engine ALSO sends a 0xAF NEGOTIATE_COMPRESSION as
+    // its first game-port byte(s); forwarding that verbatim double-negotiates and the client
+    // rejects the join (the ~49-byte reject). So we SWALLOW exactly one leading 0xAF frame
+    // from the GS before splicing. False until we've inspected the GS's first bytes. (Our
+    // standalone GS never sends a leading 0xAF, so the peek-and-drop is a no-op there.)
+    gs_af_checked: bool = false,
 };
 
 const RedisState = enum { disconnected, connecting, ready };
@@ -698,7 +705,13 @@ const Gateway = struct {
     fn serviceOpen(g: *Gateway, c: *Conn, gs_side: bool, re: i16) void {
         if (gs_side) {
             if (re & posix.POLL.OUT != 0) g.flush(c.gs, &c.c2g, &c.c2g_off, &c.c2g_len, &c.gs_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes);
+            if (re & posix.POLL.IN != 0) {
+                if (!c.gs_af_checked and c.g2c < 0) {
+                    g.pumpGsFirst(c);
+                } else {
+                    g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes);
+                }
+            }
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.gs_eof = true;
         } else {
             if (re & posix.POLL.OUT != 0) g.flush(c.cli, &c.g2c, &c.g2c_off, &c.g2c_len, &c.cli_eof);
@@ -741,6 +754,62 @@ const Gateway = struct {
         idx.* = @intCast(bi);
         off.* = if (w > 0) @intCast(w) else 0;
         len.* = un;
+    }
+
+    /// First GS->client read: strip a leading 0xAF NEGOTIATE_COMPRESSION frame (the real
+    /// 1.14d engine sends one; our standalone GS does not) so it isn't double-forwarded to a
+    /// client that already negotiated with qq's own 0xAF00. The 0xAF frame is 2 bytes when
+    /// byte[1]==0, else byte[1]+1 bytes (matches the client's packet demux). Forward whatever
+    /// follows the stripped frame normally; if nothing followed yet, wait for the next read.
+    fn pumpGsFirst(g: *Gateway, c: *Conn) void {
+        const bi = g.poolAcquire() orelse return;
+        const got = read(c.gs, &g.pool[bi], BUF_SZ);
+        if (got == 0) {
+            c.gs_eof = true;
+            g.poolRelease(bi);
+            return;
+        }
+        if (got < 0) {
+            g.poolRelease(bi);
+            if (lastErrno() == EAGAIN) return;
+            c.gs_eof = true;
+            return;
+        }
+        c.gs_af_checked = true; // only inspect the very first GS bytes once
+        const un: u32 = @intCast(got);
+        var start: u32 = 0;
+        if (un >= 2 and g.pool[bi][0] == 0xAF) {
+            const af_len: u32 = if (g.pool[bi][1] == 0) 2 else @as(u32, g.pool[bi][1]) + 1;
+            if (af_len <= un) {
+                if (trace) log.line("qq", "swallowed engine's leading 0xAF negotiate ({d}B) — not forwarding", .{af_len});
+                start = af_len;
+            }
+        }
+        const payload = g.pool[bi][start..un];
+        if (payload.len == 0) { // nothing but the negotiate — done, splice the rest later
+            g.poolRelease(bi);
+            return;
+        }
+        c.g2c_bytes += payload.len;
+        if (trace) log.hexdump("qq GS->C", payload);
+        const w = write(c.cli, payload.ptr, payload.len);
+        if (w == @as(isize, @intCast(payload.len))) {
+            g.poolRelease(bi);
+            return;
+        }
+        if (w < 0 and lastErrno() != EAGAIN) {
+            g.poolRelease(bi);
+            c.cli_eof = true;
+            return;
+        }
+        // Partial write: park the unsent remainder of the payload for a later POLLOUT. Shift
+        // it to the buffer start so the existing flush(off..len) logic sends exactly it.
+        const sent: u32 = if (w > 0) @intCast(w) else 0;
+        const rem = payload[sent..];
+        std.mem.copyForwards(u8, g.pool[bi][0..rem.len], rem);
+        c.g2c = @intCast(bi);
+        c.g2c_off = 0;
+        c.g2c_len = @intCast(rem.len);
     }
 
     fn flush(g: *Gateway, dst: c_int, idx: *i32, off: *u32, len: *u32, dst_eof: *bool) void {

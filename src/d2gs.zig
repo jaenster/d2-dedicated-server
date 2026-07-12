@@ -29,6 +29,7 @@ const gameloop = @import("runtime/gameloop.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
 const realmgw = @import("runtime/realmgw.zig");
+const d2bsload = @import("runtime/d2bsload.zig"); // deferred D2BS.dll injection (post game-window)
 const drawing = @import("runtime/drawing.zig");
 const autoenter = @import("test/autoenter.zig");
 const autologin = @import("test/autologin.zig");
@@ -260,6 +261,39 @@ fn parseEndpoints() void {
         }
     }
 
+    // `--realm [ip]` (GS mode) implies pointing this GS's gslink at a realmd and
+    // advertising a client-dialable public address. If no explicit --realmd/--d2cs
+    // was given, default the realmd host + the public IP from the `--realm <ip>`
+    // token (numeric only; bare `--realm` → localhost). Without this the GS boots
+    // its tick loop but never opens the gslink control conn, so realmd reports
+    // "no GS available" on every create.
+    if (use_realm and !d2cs_enabled) {
+        var rip: [64]u8 = undefined;
+        var riplen: usize = 0;
+        if (flagToken("realm", &rip)) |len| {
+            if (len > 0 and rip[0] >= '0' and rip[0] <= '9') riplen = len;
+        }
+        const rhost = if (riplen > 0) rip[0..riplen] else "127.0.0.1";
+        setHost(&d2cs_host, rhost);
+        d2cs_port = 6115;
+        d2cs_enabled = true;
+        // Also derive the d2dbs character store (:6114) from the same realm host. Without
+        // this the GS never calls realm.setDatabaseSource → dbs_ready stays false → the
+        // join-time fpGetDatabaseCharacter fetch is skipped → save_len=0 → the engine
+        // REFUSES the join ("char fetch FAILED"). This is the actual join-refusal bug.
+        if (!d2dbs_enabled) {
+            setHost(&d2dbs_host, rhost);
+            d2dbs_port = 6114;
+            d2dbs_enabled = true;
+        }
+        // Topology: qqserver owns the client-facing :4000 and splices game traffic to
+        // this GS's real QServer, which we relocate to :4100 (gsport patch below reads
+        // gs_public_port). The GS self-reports :4100 via ADDRINFO; realmd records that as
+        // the per-game route in redis so qqserver knows the backend. Overridable by --gs-addr.
+        if (parseDottedQuad(rhost)) |oct| gs_public_ip = oct;
+        gs_public_port = 4100;
+    }
+
     // Public game address clients dial — flag, then env (k8s passes it via env).
     {
         const got = flagToken("gs-addr", &tmp) orelse envToken("D2GS_GS_ADDR", &tmp);
@@ -419,6 +453,12 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             if (hasFlag("screenshot")) screenshot.install();
             if (hasFlag("dump-cdkeys")) cdkeydump.install(); // log decoded CD keys for verification
             if (hasFlag("suppress-halts")) halt_hook.enableSuppress(); // sub-mode, not a toggle
+            // Side-load blizzhackers D2BS.dll (kolbot) AFTER the game window exists — its
+            // startup thread throws if LoadLibrary'd pre-WinMain (see d2bsload.zig).
+            {
+                var tmp: [512]u8 = undefined;
+                if (flagToken("d2bs", &tmp)) |len| d2bsload.install(tmp[0..len]);
+            }
             // Install the Battle.net gateway list in-process so the client always has a
             // valid gateway and never hits the crashing default-ini path (lets clients
             // share one wineprefix). --realm <ip> sets the realm IP (default 127.0.0.1).
@@ -501,7 +541,9 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
                 autoenter.install();
             } else if (hasFlag("d2gs-boot")) {
                 use_realm = hasFlag("realm");
-                command.allow_create = hasFlag("create-games");
+                // Realm mode is pointless without game creation: a realmd CREATEGAME
+                // must reach command.createGame and joins must be ACKed. --realm implies it.
+                command.allow_create = hasFlag("create-games") or use_realm;
                 parseEndpoints();
                 log.print("d2gs: --d2gs-boot set, spawning server thread");
                 _ = CreateThread(null, 0, serverThread, null, 0, null);
