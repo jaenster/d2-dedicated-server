@@ -43,6 +43,17 @@ const forwarded_names = [_][:0]const u8{
     "SymSetOptions",
     "UnDecorateSymbolName",
     "MiniDumpWriteDump",
+    // Additional exports blizzhackers D2BS.dll resolves for its own crash reporter
+    // (were "not found in dbghelp.dll" when D2BS side-loads through this proxy).
+    "SymGetLineFromAddr",
+    "SymGetModuleInfo",
+    "SymGetOptions",
+    "SymLoadModule",
+    "SymUnloadModule",
+    "SymGetSearchPath",
+    "SymSetSearchPath",
+    "SymFromAddr",
+    "SymGetLineFromAddr64",
 };
 
 var real_dbghelp: ?HMODULE = null;

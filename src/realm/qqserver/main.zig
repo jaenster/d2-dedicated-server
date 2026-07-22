@@ -232,6 +232,7 @@ const Conn = struct {
     gs_eof: bool = false,
     c2g_bytes: u64 = 0, // total bytes spliced client->GS (diagnostics)
     g2c_bytes: u64 = 0, // total bytes spliced GS->client
+    gs_greet_skip: u32 = 2, // swallow the GS's leading 0xAF00 greeting (qq already sent its own)
 };
 
 const RedisState = enum { disconnected, connecting, ready };
@@ -256,6 +257,7 @@ const Gateway = struct {
     active: [MAX_CONN]usize = undefined,
     n_active: usize = 0,
     gen_ctr: u32 = 0,
+    zero_skip: u32 = 0, // shared no-op skip for the C->GS direction (never decremented)
 
     // Redis: one persistent non-blocking connection in the poll set, plus a pipelined send
     // buffer, a reply parse buffer, and the FIFO matching outstanding GETs to connections.
@@ -698,11 +700,19 @@ const Gateway = struct {
     fn serviceOpen(g: *Gateway, c: *Conn, gs_side: bool, re: i16) void {
         if (gs_side) {
             if (re & posix.POLL.OUT != 0) g.flush(c.gs, &c.c2g, &c.c2g_off, &c.c2g_len, &c.gs_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes);
+            // SWALLOW the GS's leading 0xAF00 greeting (gs_greet_skip=2): qq's own accept-time
+            // 0xAF00 already put the client in the RAW handshake phase to prompt GAMELOGON, and the
+            // GS now streams the whole session RAW (AF00 greeting + GameFlags + world, no framing,
+            // no compression). Forwarding the GS's second 0xAF00 verbatim leaves the client reading
+            // that stray 0xAF as a bogus opcode — a desync that hangs before ENTERGAME. The client
+            // must see exactly ONE AF greeting, so we drop the GS's copy here.
+            if (re & posix.POLL.IN != 0) {
+                g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes, &c.gs_greet_skip);
+            }
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.gs_eof = true;
         } else {
             if (re & posix.POLL.OUT != 0) g.flush(c.cli, &c.g2c, &c.g2c_off, &c.g2c_len, &c.cli_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.cli, &c.c2g, &c.c2g_off, &c.c2g_len, c.gs, &c.cli_eof, &c.gs_eof, "qq C->GS", &c.c2g_bytes);
+            if (re & posix.POLL.IN != 0) g.pump(c.cli, &c.c2g, &c.c2g_off, &c.c2g_len, c.gs, &c.cli_eof, &c.gs_eof, "qq C->GS", &c.c2g_bytes, &g.zero_skip);
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.cli_eof = true;
         }
         g.propagateEofAndMaybeClose(c);
@@ -711,7 +721,7 @@ const Gateway = struct {
     /// Read from `src` into a pooled buffer, then TRY to write it all to `dst` at once. Full
     /// write → release immediately (no retention, low latency). Partial/EAGAIN → park the
     /// remainder for a later POLLOUT. Gated to only run when idx.* == -1 and the pool has room.
-    fn pump(g: *Gateway, src: c_int, idx: *i32, off: *u32, len: *u32, dst: c_int, src_eof: *bool, dst_eof: *bool, dir: []const u8, total: *u64) void {
+    fn pump(g: *Gateway, src: c_int, idx: *i32, off: *u32, len: *u32, dst: c_int, src_eof: *bool, dst_eof: *bool, dir: []const u8, total: *u64, skip: *u32) void {
         const bi = g.poolAcquire() orelse return;
         const got = read(src, &g.pool[bi], BUF_SZ);
         if (got == 0) {
@@ -725,11 +735,23 @@ const Gateway = struct {
             src_eof.* = true;
             return;
         }
-        const un: u32 = @intCast(got);
+        var un: u32 = @intCast(got);
+        // Drop up to skip.* leading bytes once (the GS's duplicate 0xAF00 greeting), compacting
+        // the buffer so the rest forwards untouched.
+        if (skip.* > 0) {
+            const drop = @min(skip.*, un);
+            skip.* -= drop;
+            std.mem.copyForwards(u8, g.pool[bi][0 .. un - drop], g.pool[bi][drop..un]);
+            un -= drop;
+            if (un == 0) {
+                g.poolRelease(bi);
+                return;
+            }
+        }
         total.* += un;
         if (trace) log.hexdump(dir, g.pool[bi][0..un]);
         const w = write(dst, &g.pool[bi], un);
-        if (w == got) {
+        if (w > 0 and @as(u32, @intCast(w)) == un) {
             g.poolRelease(bi);
             return;
         }

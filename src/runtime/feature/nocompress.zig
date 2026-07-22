@@ -8,6 +8,16 @@
 //! around whatever the codec returns, so an identity codec keeps the framing intact and
 //! only drops the bit-packing — the payloads go out verbatim.
 //!
+//! The wire also opens with a 2-byte greeting `0xAF <flag>` (flag 0x01 = server Huffman-
+//! compresses S->C, 0x00 = uncompressed) that the client's recv demux reads to pick its
+//! decode path (ParseRecvBufferIntoPacketQueues @0x52a8d0). The greeting is the "client
+//! accepted" QServer callback NET_D2GS_SERVER_Send_0xAF01 @0x52b720, which stores the flag
+//! byte with `mov byte [ebp-5], 0x01` at 0x52b734; SendPacketToClient already ships an 0xAF
+//! packet RAW (Server.cpp: `if (nMode!=0 || *pBytes!=0xAF)` gates the compress branch), so
+//! the greeting itself is never Huffman-packed either way. To keep greeting + payload
+//! CONSISTENT we also flip that flag immediate 0x01 -> 0x00 so the engine declares 0xAF00,
+//! matching the identity codec (and the pure-Zig standalone GS, which speaks 0xAF00 + raw).
+//!
 //! ⚠ This is symmetric: it ONLY works when BOTH ends run this DLL (our GS + our injected
 //! clients). A stock retail client would still Huffman-decode the verbatim bytes and get
 //! garbage. So it's a closed-ecosystem / debugging switch (readable qqserver traces, no
@@ -17,6 +27,8 @@ const log = @import("../../log.zig");
 
 const COMPRESS_ADDR: usize = 0x0040b1b0;
 const DECOMPRESS_ADDR: usize = 0x0040b260;
+// The 0x01 immediate of `mov byte [ebp-5], 0x01` inside NET_D2GS_SERVER_Send_0xAF01 @0x52b720.
+const GREETING_FLAG_ADDR: usize = 0x0052b734;
 
 // Identity __fastcall codec: memcpy(dst=ECX, src=[esp+0xc after 2 pushes], srcSize), return
 // srcSize in EAX, `ret 8`. Equivalent to `{ @memcpy(dst, src[0..n]); return n; }`.
@@ -40,9 +52,12 @@ fn identityCodec() callconv(.naked) void {
 pub fn install() void {
     const ok1 = patch.MemoryPatch(COMPRESS_ADDR).jump(@intFromPtr(&identityCodec)).commit();
     const ok2 = patch.MemoryPatch(DECOMPRESS_ADDR).jump(@intFromPtr(&identityCodec)).commit();
-    if (ok1 and ok2) {
-        log.print("nocompress: D2GS compress + decompress patched to identity (uncompressed wire)");
+    // Flip the S->C greeting flag 0x01 -> 0x00 so the engine declares 0xAF00 (uncompressed),
+    // consistent with the identity codec above. Both must agree or the client decodes garbage.
+    const ok3 = patch.MemoryPatch(GREETING_FLAG_ADDR).byte(0x00).commit();
+    if (ok1 and ok2 and ok3) {
+        log.print("nocompress: D2GS codec->identity + greeting 0xAF01->0xAF00 (uncompressed wire)");
     } else {
-        log.print("nocompress: FAILED to patch one or both codecs");
+        log.print("nocompress: FAILED to patch codec or greeting");
     }
 }
