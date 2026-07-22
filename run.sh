@@ -47,7 +47,21 @@ EXTRA=""
 for a in "$@"; do
     case "$a" in
         --boot)  EXTRA="$EXTRA --d2gs-boot" ;;
-        --realm) EXTRA="$EXTRA --d2gs-boot --realm" ;;  # realm implies boot
+        # --realm implies server-boot in the DLL (no separate --d2gs-boot needed). --no-compress
+        # is REQUIRED: the D2GS game-stream Huffman codec is SYMMETRIC — the GS and every client
+        # it serves must agree. Our injected maphack clients AND the clientless test bot
+        # both expect an uncompressed GS. Without this the client reads the GS's compressed world
+        # as garbage and bails right after the 0xAF handshake — the join never completes and
+        # SrvJoinAct never fires (the "failed to join" bug: qq showed GS->client=49B instead of
+        # the kilobytes of a real world).
+        --realm) EXTRA="$EXTRA --realm --no-compress" ;;
+    esac
+done
+# Pass any extra flags through unchanged (e.g. --pkttrace).
+for a in "$@"; do
+    case "$a" in
+        --boot|--realm) ;;
+        *) EXTRA="$EXTRA $a" ;;
     esac
 done
 
