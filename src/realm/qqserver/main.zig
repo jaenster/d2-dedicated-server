@@ -232,6 +232,7 @@ const Conn = struct {
     gs_eof: bool = false,
     c2g_bytes: u64 = 0, // total bytes spliced client->GS (diagnostics)
     g2c_bytes: u64 = 0, // total bytes spliced GS->client
+    gs_greeted: bool = false, // stripped the GS's one leading 0xAF00 greeting yet?
 };
 
 const RedisState = enum { disconnected, connecting, ready };
@@ -698,7 +699,14 @@ const Gateway = struct {
     fn serviceOpen(g: *Gateway, c: *Conn, gs_side: bool, re: i16) void {
         if (gs_side) {
             if (re & posix.POLL.OUT != 0) g.flush(c.gs, &c.c2g, &c.c2g_off, &c.c2g_len, &c.gs_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes);
+            // First GS read carries the leading 0xAF greeting that qq must strip (see
+            // stripGsGreeting); every read after that is a verbatim splice.
+            if (re & posix.POLL.IN != 0) {
+                if (c.gs_greeted)
+                    g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes)
+                else
+                    g.stripGsGreeting(c);
+            }
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.gs_eof = true;
         } else {
             if (re & posix.POLL.OUT != 0) g.flush(c.cli, &c.g2c, &c.g2c_off, &c.g2c_len, &c.cli_eof);
@@ -741,6 +749,63 @@ const Gateway = struct {
         idx.* = @intCast(bi);
         off.* = if (w > 0) @intCast(w) else 0;
         len.* = un;
+    }
+
+    /// Pre-splice phase: the real 1.14d engine opens the game stream with one leading 0xAF
+    /// greeting (nocompress forces 0xAF00). qq already sent the client its OWN 0xAF00 to prompt
+    /// GAMELOGON, so the GS's copy MUST be dropped — forwarding it leaves the client reading a
+    /// stray 0xAF as a bogus opcode, desyncing before ENTERGAME (the classic ~49-byte stall).
+    /// We strip ONE validated 0xAF frame (2 bytes for 0xAF00, byte[1]+1 in general) on the first
+    /// GS read, forward whatever follows, then hand the session to pump(). If the first byte is
+    /// NOT 0xAF, something upstream is wrong: forward as-is and log — never silently eat payload.
+    /// (Assumes the 2-byte greeting arrives in one read, which it does on the loopback splice.)
+    fn stripGsGreeting(g: *Gateway, c: *Conn) void {
+        const bi = g.poolAcquire() orelse return;
+        const got = read(c.gs, &g.pool[bi], BUF_SZ);
+        if (got == 0) {
+            c.gs_eof = true;
+            g.poolRelease(bi);
+            return;
+        }
+        if (got < 0) {
+            g.poolRelease(bi);
+            if (lastErrno() != EAGAIN) c.gs_eof = true;
+            return;
+        }
+        c.gs_greeted = true; // only the first GS read carries the greeting
+        const un: u32 = @intCast(got);
+        var start: u32 = 0;
+        if (un >= 2 and g.pool[bi][0] == 0xAF) {
+            const af_len: u32 = if (g.pool[bi][1] == 0) 2 else @as(u32, g.pool[bi][1]) + 1;
+            if (af_len <= un) start = af_len;
+        } else if (g.pool[bi][0] != 0xAF) {
+            log.line("qq", "GS's first byte is 0x{x:0>2}, not a 0xAF greeting — forwarding as-is", .{g.pool[bi][0]});
+        }
+        const payload = g.pool[bi][start..un];
+        if (payload.len == 0) { // greeting only; splice the rest on the next read
+            g.poolRelease(bi);
+            return;
+        }
+        c.g2c_bytes += payload.len;
+        if (trace) log.hexdump("qq GS->C", payload);
+        const w = write(c.cli, payload.ptr, payload.len);
+        if (w == @as(isize, @intCast(payload.len))) {
+            g.poolRelease(bi);
+            return;
+        }
+        if (w < 0 and lastErrno() != EAGAIN) {
+            g.poolRelease(bi);
+            c.cli_eof = true;
+            return;
+        }
+        // Partial write: park the unsent remainder for a later POLLOUT, shifted to buffer start
+        // so the existing flush(off..len) logic sends exactly it.
+        const sent: u32 = if (w > 0) @intCast(w) else 0;
+        const rem = payload[sent..];
+        std.mem.copyForwards(u8, g.pool[bi][0..rem.len], rem);
+        c.g2c = @intCast(bi);
+        c.g2c_off = 0;
+        c.g2c_len = @intCast(rem.len);
     }
 
     fn flush(g: *Gateway, dst: c_int, idx: *i32, off: *u32, len: *u32, dst_eof: *bool) void {
