@@ -39,6 +39,45 @@ const TOKEN_OFFSET: usize = 5;
 const GAMELOGON_ID: u8 = 0x68;
 const MIN_LOGON_BYTES: usize = TOKEN_OFFSET + 2;
 
+/// How many leading bytes of a GS→client buffer are the engine's 0xAF greeting frame that qq
+/// must strip (see stripGsGreeting). Returns 0 when `buf` does not begin with a COMPLETE 0xAF
+/// frame — not 0xAF, too short to read the flag byte, or a declared frame longer than what's
+/// buffered — so the caller forwards those bytes verbatim rather than eating payload. The 0xAF
+/// frame is 2 bytes for 0xAF00, else byte[1]+1 (mirrors the client's packet demux @0x52a8d0).
+fn greetingStripLen(buf: []const u8) u32 {
+    if (buf.len < 2 or buf[0] != 0xAF) return 0;
+    const af_len: u32 = if (buf[1] == 0) 2 else @as(u32, buf[1]) + 1;
+    return if (af_len <= buf.len) af_len else 0;
+}
+
+test "greetingStripLen: 0xAF00 greeting" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 2), greetingStripLen(&.{ 0xAF, 0x00 })); // exact 2-byte greeting
+    try t.expectEqual(@as(u32, 2), greetingStripLen(&.{ 0xAF, 0x00, 0x01, 0x02 })); // greeting + payload
+}
+
+test "greetingStripLen: 0xAF with non-zero flag uses byte[1]+1 length" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 2), greetingStripLen(&.{ 0xAF, 0x01, 0x99 })); // 0xAF01 = 2 bytes
+    try t.expectEqual(@as(u32, 6), greetingStripLen(&.{ 0xAF, 0x05, 1, 2, 3, 4, 5, 6 })); // len byte[1]+1=6
+}
+
+test "greetingStripLen: does not strip when frame is incomplete or absent" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{0xAF})); // 1 byte: can't read the flag
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{ 0xAF, 0x05, 1, 2 })); // declares 6, only 4 buffered
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{ 0x6B, 0x00 })); // not a 0xAF frame (ENTERGAME)
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{})); // empty
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{ 0x01, 0xAF })); // 0xAF not first
+}
+
+test "greetingStripLen: strips exactly the greeting, leaving the payload intact" {
+    const t = std.testing;
+    const buf = [_]u8{ 0xAF, 0x00, 0x02, 0xDE, 0xAD }; // greeting then a 3-byte world packet
+    const n = greetingStripLen(&buf);
+    try t.expectEqualSlices(u8, &.{ 0x02, 0xDE, 0xAD }, buf[n..]);
+}
+
 // Redis token-route value is a packed 10 bytes: ip[4] ++ port(u16 LE) ++ gameid(u32 LE),
 // written by realmd's redis adapter. Key: "realmd:troute:<token-hex, no pad>".
 const ROUTE_BYTES: usize = 10;
@@ -755,9 +794,9 @@ const Gateway = struct {
     /// greeting (nocompress forces 0xAF00). qq already sent the client its OWN 0xAF00 to prompt
     /// GAMELOGON, so the GS's copy MUST be dropped — forwarding it leaves the client reading a
     /// stray 0xAF as a bogus opcode, desyncing before ENTERGAME (the classic ~49-byte stall).
-    /// We strip ONE validated 0xAF frame (2 bytes for 0xAF00, byte[1]+1 in general) on the first
-    /// GS read, forward whatever follows, then hand the session to pump(). If the first byte is
-    /// NOT 0xAF, something upstream is wrong: forward as-is and log — never silently eat payload.
+    /// We strip ONE validated 0xAF frame (see greetingStripLen) on the first GS read, forward
+    /// whatever follows, then hand the session to pump(). If the first byte is NOT 0xAF,
+    /// something upstream is wrong: forward as-is and log — never silently eat payload.
     /// (Assumes the 2-byte greeting arrives in one read, which it does on the loopback splice.)
     fn stripGsGreeting(g: *Gateway, c: *Conn) void {
         const bi = g.poolAcquire() orelse return;
@@ -774,13 +813,9 @@ const Gateway = struct {
         }
         c.gs_greeted = true; // only the first GS read carries the greeting
         const un: u32 = @intCast(got);
-        var start: u32 = 0;
-        if (un >= 2 and g.pool[bi][0] == 0xAF) {
-            const af_len: u32 = if (g.pool[bi][1] == 0) 2 else @as(u32, g.pool[bi][1]) + 1;
-            if (af_len <= un) start = af_len;
-        } else if (g.pool[bi][0] != 0xAF) {
+        const start = greetingStripLen(g.pool[bi][0..un]);
+        if (start == 0 and g.pool[bi][0] != 0xAF)
             log.line("qq", "GS's first byte is 0x{x:0>2}, not a 0xAF greeting — forwarding as-is", .{g.pool[bi][0]});
-        }
         const payload = g.pool[bi][start..un];
         if (payload.len == 0) { // greeting only; splice the rest on the next read
             g.poolRelease(bi);
@@ -865,6 +900,34 @@ fn parseReply(buf: []const u8) ?ParsedReply {
         },
         else => return .{ .consumed = crlf + 2, .found = false }, // -err / +ok / :int → no route
     }
+}
+
+test "parseReply: complete 10-byte route decodes ip/port/gameid" {
+    const t = std.testing;
+    // ip 127.0.0.1, port 4100 (LE 04 10), gameid 10 (LE 0A 00 00 00)
+    const reply = "$10\r\n" ++ [_]u8{ 127, 0, 0, 1, 0x04, 0x10, 0x0A, 0, 0, 0 } ++ "\r\n";
+    const pr = parseReply(reply) orelse return error.ExpectedReply;
+    try t.expect(pr.found);
+    try t.expectEqual(reply.len, pr.consumed);
+    try t.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &pr.ip);
+    try t.expectEqual(@as(u16, 4100), pr.port);
+    try t.expectEqual(@as(u32, 10), pr.gameid);
+}
+
+test "parseReply: nil / error / short-bulk are 'no route' (found=false)" {
+    const t = std.testing;
+    const nil = parseReply("$-1\r\n") orelse return error.ExpectedReply;
+    try t.expect(!nil.found);
+    try t.expectEqual(@as(usize, 5), nil.consumed);
+    try t.expect(!(parseReply("-ERR nope\r\n").?.found)); // redis error reply
+    try t.expect(!(parseReply("$4\r\nabcd\r\n").?.found)); // bulk shorter than a route
+}
+
+test "parseReply: returns null until a full reply has arrived" {
+    const t = std.testing;
+    try t.expectEqual(@as(?ParsedReply, null), parseReply("")); // empty
+    try t.expectEqual(@as(?ParsedReply, null), parseReply("$10")); // no CRLF yet
+    try t.expectEqual(@as(?ParsedReply, null), parseReply("$10\r\n" ++ [_]u8{ 1, 2, 3 })); // payload partial
 }
 
 pub fn main() !void {
