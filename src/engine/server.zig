@@ -11,6 +11,8 @@
 
 const std = @import("std");
 const feature = @import("feature.zig");
+const log = @import("../log.zig");
+const fastcall = @import("../runtime/fastcall.zig");
 
 extern "kernel32" fn GetModuleHandleA(name: ?[*:0]const u8) callconv(.winapi) ?*anyopaque;
 
@@ -250,6 +252,20 @@ fn gptr(comptime abs_addr: usize, comptime T: type) *T {
 /// OBNET/LAN-host tail, minus the host-as-player-1 NET_D2GS_ConnectToServer, plus
 /// SetupAsBnetServer to enable realm mode. `realm` may be null to run open (no
 /// D2CS) — then BattleNetServerService stays null and the realm path no-ops.
+// StrTable::LoadStringTable-equivalent @0x005259c0 (__fastcall, `ret 4`: ECX=
+// unused context (its provider @0x004fac80 is `xor eax,eax; ret`, always 0),
+// EDX=locale name ptr (0 = default/LATIN), one stack arg = bIsExpansion (0/1,
+// retail computes this via a GetFileAttributesA("d2exp.mpq") check @0x00408f20
+// — we just pass 1 since a GS deployment always has the expansion MPQ).
+// Lazily populates the global string-table pointer @0x008829b4 by loading
+// data\local\lng\<locale>\string.tbl. Retail's own dedicated-server bootstrap
+// (Game/Server.cpp tail, e.g. @0x0044b8a0) always calls this immediately before
+// TXT_InitTxtFiles — skip it and 0x8829b4 stays null, and something inside
+// TXT_InitTxtFiles/its callees asserts on that null (halt caller=0x524d51,
+// nLine=0x2ba — see [[d2gs-bootstrap-crash]]). Returns 1 on success, 0 on failure
+// (NOT the string-table pointer itself — that's the side effect on 0x8829b4).
+const LoadStringTable = fastcall.fastcall_call(0x005259c0, fn (usize, usize, usize) i32);
+
 pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     if (realm) |t| SetupAsBnetServer(t);
     QSERVER_CreateAndInit(.server, .bnet); // allocs pQServer, opens :4000 listener
@@ -258,6 +274,8 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     QSERVER_SetGlobalInstance(@ptrFromInt(at(globals.gQServerGameState)), 1); // cookie≠0 → no halt
     gptr(globals.gbQServerRunning, u32).* = 1;
     QSERVER_InitializeServerState();
+    const str_table_ok = LoadStringTable.call(.{ 0, 0, 1 });
+    log.hex("server: string table load result=0x", @as(usize, @intCast(str_table_ok)));
     // Game-data tables load AFTER server-state init. Loading them BEFORE the whole server
     // bootstrap (the retail app-mode order) corrupts pool state and breaks the network join
     // path (tables load into a NULL pool because the 52-entry LoadDataForGame init never ran).
