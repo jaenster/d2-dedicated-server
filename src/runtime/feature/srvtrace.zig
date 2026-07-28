@@ -1347,8 +1347,30 @@ fn dumpAllEnabled() bool {
     return S.on;
 }
 
+/// The DRLG level dump is an ORACLE tool: emitLevel calls DefineRoomsNear, which MUTATES each
+/// room's near-room list during layout — fine for a headless capture, but on a LIVE game it
+/// corrupts on-demand area generation so new levels the player enters don't render. So the whole
+/// dump only runs when a DRLG capture is explicitly requested (any D2GS_DRLG_* capture env);
+/// a normal game never touches it.
+fn drlgCaptureOn() bool {
+    const S = struct {
+        var checked: bool = false;
+        var on: bool = false;
+    };
+    if (!S.checked) {
+        S.checked = true;
+        var buf: [8]u8 = undefined;
+        S.on = dumpAllEnabled() or
+            GetEnvironmentVariableA("D2GS_DRLG_SEED_LO", &buf, buf.len) != 0 or
+            GetEnvironmentVariableA("D2GS_DRLG_SEED", &buf, buf.len) != 0 or
+            GetEnvironmentVariableA("D2GS_DRLG_DUMP", &buf, buf.len) != 0;
+    }
+    return S.on;
+}
+
 fn onDrlgLevel(pLevel: usize, _: usize, _: usize) callconv(.c) void {
     if (pLevel == 0) return;
+    if (!drlgCaptureOn()) return; // never dump/mutate on a normal live game
     emitLevel(pLevel); // own frame — buffer freed before any dump-all recursion
     emitGridForLevel(pLevel); // per-tile grid cells for L57/L80 (CollMap diff)
 
