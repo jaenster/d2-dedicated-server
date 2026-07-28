@@ -540,10 +540,17 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     _ = chat.join(c.fd, acct, channel, flags, c.statSlice());
 
     // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
-    // then list existing members, then announce the join to everyone else.
+    // then list existing members (forEachInChannel excludes the joiner's own fd —
+    // correct there, since the joiner isn't an "existing" member relative to itself),
+    // then the joiner's OWN EID_SHOWUSER (real BNCS always includes the joining
+    // client itself in the show-user list; without it a real client's channel/user
+    // list stays empty for the local player — confirmed: joining an otherwise-empty
+    // channel showed no users at all, including self), then announce the join to
+    // everyone else.
     sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), channel, "");
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
+    sendEvent(c, EID_SHOWUSER, flags, acct, c.statSlice());
     broadcastEvent(c, EID_JOIN, flags, acct, c.statSlice());
 }
 

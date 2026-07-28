@@ -35,10 +35,24 @@ pub fn b64Encode(data: []const u8, out: []u8) usize {
 pub fn response(challenge: []const u8, version: []const u8, sig_ok: u8, out: []u8) ?[]const u8 {
     var dec: [256]u8 = undefined;
     const dn = b64Decode(challenge, &dec);
-    if (dn < 4) return null;
+    // realmd accepts any SID_AUTH_CHECK result, so the actual hash value is never
+    // validated — but the client itself treats an EMPTY response as "check failed"
+    // and silently disconnects before ever sending SID_AUTH_CHECK. That happens for
+    // real under realmd's DEFAULT config: onAuthInfo advertises the classic bnetdocs
+    // A/B/C formula string (e.g. "A=1 B=1 C=1 4 A=A^S B=B^C C=C^A A=A^B") — matching
+    // what real PvPGN servers send, and what unmodified 1.13c/1.14d clients expect —
+    // which is NOT valid base64 (spaces, '=', '^'), so b64Decode legitimately fails.
+    // Falling back to 4 zero bytes instead of bailing keeps the flow alive for any
+    // client, on any formula shape, without changing behavior for a real base64
+    // challenge (REALMD_MODERN_CHALLENGE), which still decodes normally above.
     var input: [128]u8 = undefined;
     var il: usize = 0;
-    @memcpy(input[0..4], dec[0..4]); il = 4;
+    if (dn >= 4) {
+        @memcpy(input[0..4], dec[0..4]);
+    } else {
+        @memset(input[0..4], 0);
+    }
+    il = 4;
     input[il] = ':'; il += 1;
     @memcpy(input[il..il+version.len], version); il += version.len;
     input[il] = ':'; il += 1;
