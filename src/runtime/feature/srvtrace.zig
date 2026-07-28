@@ -688,8 +688,10 @@ fn emitLevel(pLevel: usize) void {
         }
         // Adjacency: near count + list of adjacent room indices (within this level).
         // The near list isn't built during layout, so populate it via the engine's
-        // own DefineRoomsNear (pMemory = pDrlg->pMemoryPool @0x478).
-        if (pDrlg != 0) defineRoomsNear(readU32(pDrlg, 0x478), room);
+        // own DefineRoomsNear (pMemory = pDrlg->pMemoryPool @0x478). Opt-in only
+        // (D2GS_DRLG_ADJ) — see adjEnabled()/defineRoomsNear() doc comments for why
+        // this is unsafe to run unconditionally in production.
+        if (pDrlg != 0 and adjEnabled()) defineRoomsNear(readU32(pDrlg, 0x478), room);
         const nearCount = s32(readU32(room, 0x2C));
         e.int("near", nearCount);
         const ppNear = readU32(room, 0x08);
@@ -1017,6 +1019,24 @@ fn collEnabled() bool {
     if (!S.checked) {
         S.checked = true;
         S.on = envOn("D2GS_DRLG_COLL");
+    }
+    return S.on;
+}
+
+/// Gates defineRoomsNear() (see its doc comment): forcing the engine's real
+/// DefineRoomsNear at DRLG layout time — instead of its normal room-activation
+/// time — is a production-unsafe diagnostic. Suspected root cause of levels
+/// beyond the entrance area rendering black: the premature call corrupts the
+/// per-room near-list/pool state the engine's own activation-time call later
+/// depends on. Opt-in only, never on by default.
+fn adjEnabled() bool {
+    const S = struct {
+        var checked: bool = false;
+        var on: bool = false;
+    };
+    if (!S.checked) {
+        S.checked = true;
+        S.on = envOn("D2GS_DRLG_ADJ");
     }
     return S.on;
 }
