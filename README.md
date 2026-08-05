@@ -24,6 +24,8 @@ and structured stdout logging (JSON optional) make it a first-class **cloud-nati
 [Grafana dashboard](#observability). A [Helm chart](#kubernetes-helm) and a
 [Docker Compose](#docker-compose) stack are both in [`deploy/`](deploy/).
 
+If you run this, you can [sponsor the work](https://github.com/sponsors/jaenster).
+
 ## The three packages
 
 The project is three independently-deployable pieces. Two are **pure-Zig native binaries** (no
