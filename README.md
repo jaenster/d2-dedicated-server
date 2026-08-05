@@ -1,5 +1,7 @@
 # d2-dedicated-server: headless, cloud-native Diablo II 1.14d dedicated game server + realm
 
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/MHK2Dg9)
+
 A **self-hosted, open-source Diablo II dedicated game server** for retail **1.14d**, plus a
 clean-room **Battle.net realm server** -- a modern, **cloud-native PvPGN replacement** you run
 with Docker / Kubernetes. All in **Zig**.
