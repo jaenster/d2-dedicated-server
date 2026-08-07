@@ -255,6 +255,11 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
                 g.pub_ip = body[8..12].*;
                 g.port = std.mem.readInt(u16, body[12..14], .little);
             }
+            // A GS that just came up hosts nothing, so any game record still naming it is a
+            // leftover — from a GS that died without deregistering, or from records that
+            // outlived a realmd restart in the shared store. They must go, or their names
+            // stay taken forever and create-game rejects them as duplicates.
+            state.global.expireGamesByGs(g.gsid);
             g.registered.store(true, .release);
             const a = g.ip();
             log.line(tag, "GS ADDRINFO gsid=0x{x} addr={d}.{d}.{d}.{d}:{d} maxgame={d} -> registered", .{ g.gsid, a[0], a[1], a[2], a[3], g.port, g.maxgame });

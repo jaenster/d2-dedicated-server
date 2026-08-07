@@ -394,6 +394,17 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         finish(c, &w);
         return;
     }
+    // A name already in the realm registry is a DIFFERENT failure than "no GS took it":
+    // the client shows "a game with that name already exists" and offers to join instead.
+    // Asking the GS first would just get a refusal we'd report as the generic 0x1e.
+    if (state.global.findGame(name) != null) {
+        log.line(tag, "create game '{s}' -> name already exists", .{name});
+        w.putU16(0);
+        w.putU16(0);
+        w.putU32(0x1f); // result: a game with that name already exists
+        finish(c, &w);
+        return;
+    }
     // Expansion (LOD), softcore, non-ladder; difficulty from the client's request.
     // The registry picks the least-loaded GS with capacity and gives us its address.
     log.line(tag, "create game '{s}' diff={d} (flags=0x{x})", .{ name, difficulty, create_flags });

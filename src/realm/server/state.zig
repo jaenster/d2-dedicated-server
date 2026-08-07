@@ -99,14 +99,30 @@ pub const State = struct {
         return null;
     }
 
+    /// Longest game name we key on. Battle.net caps game names well under this.
+    const max_key = 64;
+
+    /// Game names are CASE-INSENSITIVE on Battle.net: a player who makes "Jan" is joined by
+    /// someone typing "jan". Every lookup and every registration therefore keys on a folded
+    /// name, while the record keeps whatever casing the creator used for display. Without this
+    /// the two spellings are two different games, and the second player silently ends up alone
+    /// in an empty one.
+    fn foldName(name: []const u8, buf: *[max_key]u8) []const u8 {
+        const n = @min(name.len, max_key);
+        for (name[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        return buf[0..n];
+    }
+
     /// Register (or replace, by name) a hosted game. Returns false if full.
     pub fn registerGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8) bool {
-        if (shared) return store.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password);
+        var kb: [max_key]u8 = undefined;
+        const key = foldName(name, &kb);
+        if (shared) return store.registerGame(key, gameid, gs_ip, gs_port, gsid, players, password);
         st.lock.lock();
         defer st.lock.unlock();
         var slot: ?*Game = null;
         for (&st.games) |*g| {
-            if (g.in_use and std.mem.eql(u8, g.name_slice(), name)) {
+            if (g.in_use and std.ascii.eqlIgnoreCase(g.name_slice(), name)) {
                 slot = g;
                 break;
             }
@@ -130,8 +146,10 @@ pub const State = struct {
 
     /// Look up a game by name; copies the record out under lock.
     pub fn findGame(st: *State, name: []const u8) ?Game {
+        var kb: [max_key]u8 = undefined;
+        const key = foldName(name, &kb);
         if (shared) {
-            const rec = store.findGame(name) orelse return null;
+            const rec = store.findGame(key) orelse return null;
             var g = Game{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .in_use = true };
             const n: u8 = @intCast(@min(name.len, max_name));
             @memcpy(g.name[0..n], name[0..n]);
@@ -144,7 +162,7 @@ pub const State = struct {
         st.lock.lock();
         defer st.lock.unlock();
         for (&st.games) |*g| {
-            if (g.in_use and std.mem.eql(u8, g.name_slice(), name)) return g.*;
+            if (g.in_use and std.ascii.eqlIgnoreCase(g.name_slice(), name)) return g.*;
         }
         return null;
     }
@@ -161,10 +179,12 @@ pub const State = struct {
 
     /// Mark a game not-in-use by name (admin close). Returns true if one was found.
     pub fn closeGameByName(st: *State, name: []const u8) bool {
+        var kb: [max_key]u8 = undefined;
+        const name_folded = foldName(name, &kb);
         st.lock.lock();
         defer st.lock.unlock();
         for (&st.games) |*g| {
-            if (g.in_use and std.mem.eql(u8, g.name_slice(), name)) {
+            if (g.in_use and std.ascii.eqlIgnoreCase(g.name_slice(), name_folded)) {
                 g.in_use = false;
                 return true;
             }
