@@ -621,18 +621,22 @@ const Gateway = struct {
             };
             c.state = .handshake;
             c.cli = cfd;
-            // The real client's setup waits for a connection-established (0xAF) packet
-            // promptly after connect — without it it never advances into connecting-mode
-            // (GameLoopFuncInitGame/Unused3). The gateway can't reach the GS yet (it needs the
-            // GAMELOGON token to route), so it speaks for the GS and sends one now.
+            // The real client's setup waits for a connection-established (0xAF) packet promptly
+            // after connect — without it it never advances into connecting-mode. The gateway
+            // can't reach the GS yet (it needs the GAMELOGON token to route), so it speaks for
+            // the GS and sends one now.
             //
-            // It sends 0xAF00, NOT 0xAF01. The client's receive demux (ParseRecvBufferIntoPacketQueues
-            // @0x52a8d0) reads 0xAF's SECOND byte as a phase flag: `af 00` = ack only (stay in the
-            // raw handshake phase); `af 01` = ack AND flip to the compressed game phase. If the
-            // gateway sent `af 01` it would flip the client to game phase early, and the GS's own
-            // `af 01` (relayed once we dial it) would then land mid-game-phase, be misread as a
-            // length header (0xaf), and desync the stream. With `af 00` the client stays in the
-            // handshake phase and the GS's `af 01` does the real switch — no duplicate, no desync.
+            // We send 0xAF00. The client's receive demux reads 0xAF's SECOND byte as a phase
+            // flag, and the two phases are disjoint receive paths in ThreadClientToServer
+            // @0x52ab30 (gated on the flag ParseRecvBufferIntoPacketQueues @0x52a8d0 returns):
+            //   `af 00` -> recv straight into the packet buffer and parse. No length framing,
+            //              and DecompressPacket is never called on this path at all.
+            //   `af 01` -> the length-framed loop that Huffman-decodes every frame.
+            // We pick 0x00 and have the GS send with the engine's own raw mode (nMode==2 in
+            // SendPacketToClient @0x52b330, the same exemption the 0xAF greeting itself uses), so
+            // a STOCK client reads the stream natively with nothing patched on its side. Every
+            // backend must agree on this byte, because we have to greet before we know which one
+            // we'll route to.
             const af00 = [2]u8{ 0xaf, 0x00 };
             _ = write(cfd, &af00, af00.len);
             log.line("qq", "accepted game connection (fd={d}) — sent 0xAF00, awaiting GAMELOGON", .{cfd});

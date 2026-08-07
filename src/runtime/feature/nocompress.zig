@@ -1,48 +1,51 @@
-//! Disable the D2GS game-protocol compression by replacing both codec functions with
-//! an identity copy. The server→client game stream is Huffman bit-packed end-to-end:
-//!   NET_D2GS_SERVER_CompressPacket   @0x40b1b0 (GS packs outgoing packets)
-//!   NET_D2GS_CLIENT_DecompressPacket @0x40b260 (client unpacks incoming packets)
-//! Both share the signature `(dst, dstSize, src, srcSize) -> bytesWritten`, __fastcall
-//! (ECX=dst, EDX=dstSize, [esp+4]=src, [esp+8]=srcSize, callee-cleans `ret 8`). The
-//! caller (NET_D2GS_SERVER_SendPacketToClient @0x52b330) keeps its 1/2-byte length header
-//! around whatever the codec returns, so an identity codec keeps the framing intact and
-//! only drops the bit-packing — the payloads go out verbatim.
+//! Serve the game stream UNCOMPRESSED and UNFRAMED, using the engine's own raw send mode.
 //!
-//! ⚠ This is symmetric: it ONLY works when BOTH ends run this DLL (our GS + our injected
-//! clients). A stock retail client would still Huffman-decode the verbatim bytes and get
-//! garbage. So it's a closed-ecosystem / debugging switch (readable qqserver traces, no
-//! codec-desync fragility), not something to enable against arbitrary players.
+//! NET_D2GS_SERVER_SendPacketToClient @0x52b330 already has a verbatim path — the one the
+//! 0xAF greeting itself rides:
+//!
+//!     if (nMode != 0 || pBytes[0] != 0xAF) {
+//!         LogSentPacket(pBytes, nSize);
+//!         if (nMode != 2) {                                  <- 0x52b3b5
+//!             CompressPacket(pBuffer + 2, 1032, pBytes, nSize);
+//!             SendPacketByClientId(... 1/2-byte length prefix ...);
+//!             return;
+//!         }
+//!     }
+//!     SendPacketByClientId(pQServer, nClientId, pBytes, nSize);   // raw, no prefix
+//!
+//! So mode 2 means "send exactly these bytes". Forcing the `nMode != 2` test to fall through
+//! turns every server packet into a raw one: no Huffman, no length header. One 6-byte patch,
+//! no detour, no codec of our own — we just take a road the engine already paves.
+//!
+//! This pairs with the 0xAF00 greeting. The client's receive thread has two disjoint paths
+//! (ThreadClientToServer @0x52ab30, gated on the phase flag that
+//! NET_D2GS_CLIENT_ParseRecvBufferIntoPacketQueues returns):
+//!   * flag 0 (after 0xAF00) — recv straight into the packet buffer, then parse. NO length
+//!     framing and NO DecompressPacket call anywhere on this path.
+//!   * flag 1 (after 0xAF01) — the length-framed loop that decompresses every frame.
+//! A STOCK client greeted with 0xAF00 therefore reads our raw stream natively. Nothing is
+//! patched on the client, which is the point: the previous approach replaced BOTH codec
+//! functions with an identity `rep movsb` that ignored the destination size, so a verbatim
+//! world packet memcpy'd into a buffer sized for a decompressed one and corrupted the
+//! client's heap during world-load.
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");
 
-const COMPRESS_ADDR: usize = 0x0040b1b0;
-const DECOMPRESS_ADDR: usize = 0x0040b260;
+/// The `CMP byte ptr [EBP+8], 2` / `JZ 0x52b45f` pair that decides compressed vs raw.
+const MODE_GATE_JZ: usize = 0x0052b3b9;
+/// Where that JZ lands: the raw SendPacketByClientId tail.
+const RAW_SEND_PATH: usize = 0x0052b45f;
 
-// Identity __fastcall codec: memcpy(dst=ECX, src=[esp+0xc after 2 pushes], srcSize), return
-// srcSize in EAX, `ret 8`. Equivalent to `{ @memcpy(dst, src[0..n]); return n; }`.
-fn identityCodec() callconv(.naked) void {
-    asm volatile (
-        \\push %esi
-        \\push %edi
-        \\cld
-        \\mov %ecx, %edi
-        \\mov 0xc(%esp), %esi
-        \\mov 0x10(%esp), %ecx
-        \\mov %ecx, %eax
-        \\rep movsb
-        \\pop %edi
-        \\pop %esi
-        \\ret $8
-    );
-}
-
-/// Patch both codecs to the identity stub. Call once at process attach (GS or client).
+/// Rewrite `JZ RAW_SEND_PATH` (0f 84 rel32, 6 bytes) as a 5-byte `JMP RAW_SEND_PATH` plus one
+/// NOP, so the compressed branch becomes unreachable for every mode, not just mode 2.
 pub fn install() void {
-    const ok1 = patch.MemoryPatch(COMPRESS_ADDR).jump(@intFromPtr(&identityCodec)).commit();
-    const ok2 = patch.MemoryPatch(DECOMPRESS_ADDR).jump(@intFromPtr(&identityCodec)).commit();
-    if (ok1 and ok2) {
-        log.print("nocompress: D2GS compress + decompress patched to identity (uncompressed wire)");
+    const ok = patch.MemoryPatch(MODE_GATE_JZ)
+        .jump(RAW_SEND_PATH)
+        .nops(1)
+        .commit();
+    if (ok) {
+        log.print("nocompress: SendPacketToClient forced to raw mode (no huffman, no length prefix)");
     } else {
-        log.print("nocompress: FAILED to patch one or both codecs");
+        log.print("nocompress: FAILED to patch the SendPacketToClient mode gate");
     }
 }
