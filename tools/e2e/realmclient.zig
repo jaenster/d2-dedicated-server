@@ -19,6 +19,7 @@ const SID_CHATCOMMAND = 0x0E;
 const SID_LOGONRESPONSE2 = 0x3A;
 const SID_CREATEACCOUNT2 = 0x3D;
 const SID_LOGONREALMEX = 0x3E;
+const SID_FRIENDSLIST = 0x65;
 
 // Fixed client token used for OLS login double-hashing (any non-zero value works;
 // the server combines it with the per-connection server_token it sent us).
@@ -352,6 +353,37 @@ pub const RealmClient = struct {
     /// The unique name SID_ENTERCHAT came back with (valid after enterChatAs).
     pub fn uniqueName(self: *RealmClient) []const u8 {
         return self.unique_name_buf[0..self.unique_name_len];
+    }
+
+    /// SID_FRIENDSLIST (0x65): u8 count, then per friend cstr name, u8 status,
+    /// u8 location, u32 product, cstr location-string. Names are copied into `dst`.
+    pub fn friendsList(self: *RealmClient, out: [][]const u8, dst: []u8) !usize {
+        const fd = self.bnet.?;
+        try bncsSend(fd, SID_FRIENDSLIST, "");
+        // Chat events queue up on the same socket, so skip whatever is already in flight
+        // rather than mistaking the first packet back for the reply.
+        var r = try bncsRecv(fd, &self.rxbuf);
+        var tries: usize = 0;
+        while (r.id != SID_FRIENDSLIST) : (tries += 1) {
+            if (tries >= 16) return error.FriendsListBadId;
+            r = try bncsRecv(fd, &self.rxbuf);
+        }
+        if (r.body.len < 1) return error.FriendsListShort;
+        const count = r.body[0];
+        var off: usize = 1;
+        var di: usize = 0;
+        var n: usize = 0;
+        while (n < count and n < out.len) : (n += 1) {
+            if (off >= r.body.len) break;
+            const nm = std.mem.sliceTo(r.body[off..], 0);
+            @memcpy(dst[di .. di + nm.len], nm);
+            out[n] = dst[di .. di + nm.len];
+            di += nm.len;
+            off += nm.len + 1 + 1 + 1 + 4; // name NUL, status, location, product
+            const loc = std.mem.sliceTo(r.body[@min(off, r.body.len)..], 0);
+            off += loc.len + 1;
+        }
+        return n;
     }
 
     /// SID_JOINCHANNEL — body is u32 flags + cstr channel name.

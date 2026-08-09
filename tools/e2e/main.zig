@@ -988,7 +988,24 @@ fn stopRedis() void {
 
 fn maybeStartRealmd() !?c_int {
     if (net.portOpen(rc.HOST_BNET)) {
-        std.debug.print("using existing realmd on 127.0.0.1:{d}\n", .{rc.HOST_BNET});
+        // Reusing whatever answers on the port is convenient when you are iterating
+        // against a realm you already have up — and a trap the rest of the time. That
+        // server is not the binary that was just built, was not given this harness's
+        // data dir, admin token or permissive-auth setting, and carries state from
+        // whatever else has been talking to it. Failures then look like code bugs.
+        // Set E2E_NO_REUSE=1 to refuse instead of guessing.
+        std.debug.print(
+            \\
+            \\!! REUSING an existing realmd on 127.0.0.1:{d} — NOT the freshly built one.
+            \\!! It has its own data dir and env, so failures below may say nothing about
+            \\!! your changes. Stop that process (or set E2E_NO_REUSE=1) for a real run.
+            \\
+            \\
+        , .{rc.HOST_BNET});
+        if (std.mem.eql(u8, envOr("E2E_NO_REUSE", "0"), "1")) {
+            std.debug.print("E2E_NO_REUSE=1 and port {d} is taken — refusing to test a server I did not start.\n", .{rc.HOST_BNET});
+            std.process.exit(2);
+        }
         return null;
     }
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
@@ -1062,6 +1079,91 @@ fn scMultiGameOneGs() Result {
     while (std.mem.indexOfPos(u8, r.body, idx, "0xd2d2")) |p| : (idx = p + 1) count += 1;
     if (count < 3) return fail(name, "expected 3 games on gsid 0xd2d2, found {d}", .{count});
     return .{ .name = name, .status = .pass, .msg = msg("one GS hosts 3 games (creates={d}), all tracked under gsid 0xd2d2", .{gs.creates}) };
+}
+
+/// Friends have to outlive the process that heard about them. The list used to be an
+/// in-memory table, so every restart silently emptied everyone's friends.
+///
+/// A second realmd over the same data dir is a stronger test than a restart: it has an
+/// empty table AND never saw the /f add, so the only way it can list the friend is by
+/// reading it back from the store. Presence is deliberately NOT asserted — who is online
+/// is a fact about live connections, and the friend has none on that instance.
+fn scFriendsPersist() Result {
+    const name = "friends_persist";
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+    const acct = "FriendKeeper";
+
+    // Add two friends through the running realmd.
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterChat() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.joinChannel("Diablo II") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.chatCommand("/f add Gheed") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.chatCommand("/f add Charsi") catch |e| return fail(name, "{s}", .{@errorName(e)});
+
+    var names: [8][]const u8 = undefined;
+    var dst: [256]u8 = undefined;
+    const before = c.friendsList(&names, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (before != 2) return fail(name, "added 2 friends, list reports {d}", .{before});
+
+    // A second instance over the same data dir: cold table, never saw the adds.
+    const envs = [_]EnvVar{
+        .{ .name = "REALMD_DATA_DIR", .value = data_dir },
+        .{ .name = "REALMD_INSTANCE", .value = "F" },
+        .{ .name = "REALMD_BNET_PORT", .value = "19112" },
+        .{ .name = "REALMD_D2CS_PORT", .value = "19113" },
+        .{ .name = "REALMD_D2DBS_PORT", .value = "19114" },
+        .{ .name = "REALMD_GS_PORT", .value = "19115" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "19118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (port clash)
+    };
+    const pid = spawnRealmd(bin, &envs, 19112) catch |e| return fail(name, "spawn {s}", .{@errorName(e)});
+    defer {
+        _ = kill(pid, 15);
+        _ = waitpid(pid, null, 0);
+    }
+
+    var fresh = rc.RealmClient{ .bnet_port = 19112, .d2cs_port = 19113 };
+    defer fresh.close();
+    fresh.connectBnet() catch |e| return fail(name, "fresh {s}", .{@errorName(e)});
+    fresh.auth() catch |e| return fail(name, "fresh {s}", .{@errorName(e)});
+    fresh.login(acct) catch |e| return fail(name, "fresh {s}", .{@errorName(e)});
+
+    var names2: [8][]const u8 = undefined;
+    var dst2: [256]u8 = undefined;
+    const after = fresh.friendsList(&names2, &dst2) catch |e| return fail(name, "fresh {s}", .{@errorName(e)});
+    if (after != 2) return fail(name, "a cold instance lists {d} friends, want the 2 that were stored", .{after});
+    var saw_gheed = false;
+    var saw_charsi = false;
+    for (names2[0..after]) |n| {
+        if (std.mem.eql(u8, n, "Gheed")) saw_gheed = true;
+        if (std.mem.eql(u8, n, "Charsi")) saw_charsi = true;
+    }
+    if (!saw_gheed or !saw_charsi) return fail(name, "cold instance listed '{s}'/'{s}', want Gheed and Charsi", .{ names2[0], names2[1] });
+
+    // And a removal has to persist too, not just an add.
+    c.chatCommand("/f remove Gheed") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var names3: [8][]const u8 = undefined;
+    var dst3: [256]u8 = undefined;
+    var left: usize = 0;
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 50) {
+        var probe = rc.RealmClient{ .bnet_port = 19112, .d2cs_port = 19113 };
+        defer probe.close();
+        probe.connectBnet() catch break;
+        probe.auth() catch break;
+        probe.login(acct) catch break;
+        left = probe.friendsList(&names3, &dst3) catch break;
+        if (left == 1) break;
+        _ = net.usleep(50_000);
+    }
+    if (left != 1) return fail(name, "after removing one, a cold instance lists {d}, want 1", .{left});
+
+    return .{ .name = name, .status = .pass, .msg = msg("2 friends readable by a cold instance over the same store; a removal persisted too", .{}) };
 }
 
 // Two realmd instances (A, B) sharing one data dir (REALMD_SHARED) keep sessions
@@ -1483,6 +1585,7 @@ pub fn main() !void {
         scCharCopy(),
         scLobbyChatAtoB(),
         scLobbyCharNames(),
+        scFriendsPersist(),
         scMultiInstance(),
     };
 

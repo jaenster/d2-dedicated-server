@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) void {
     // there (guild model/service serialization, store helpers, …).
     const realm_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/realm/server/guilds.zig"),
+            .root_source_file = b.path("src/realm/server/realm_tests.zig"),
             .target = realmd_target,
             .optimize = optimize,
             .link_libc = true,

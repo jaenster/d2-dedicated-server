@@ -174,37 +174,29 @@ pub fn attribute(data: []const u8, stat_id: u16) ?u32 {
 
 test "attribute walks the packed list and finds experience" {
     // Build a "gf" section by hand: level(12)=87, experience(13)=1_500_000, then the
-    // terminator. Written LSB-first, the same way the game packs it.
-    var bits = std.ArrayList(u1){};
-    defer bits.deinit(std.testing.allocator);
-    const push = struct {
-        fn f(list: *std.ArrayList(u1), alloc: std.mem.Allocator, value: u32, n: u8) !void {
+    // terminator, packed LSB-first exactly as the game writes it.
+    var save = [_]u8{0} ** 64;
+    @memcpy(save[0..8], "HEADERgf");
+    var bit: usize = 0;
+    const put = struct {
+        fn f(buf: []u8, at: *usize, value: u32, width: u8) void {
             var i: u8 = 0;
-            while (i < n) : (i += 1) try list.append(alloc, @intCast((value >> @intCast(i)) & 1));
+            while (i < width) : (i += 1) {
+                if ((value >> @intCast(i)) & 1 != 0) buf[8 + (at.* >> 3)] |= @as(u8, 1) << @intCast(at.* & 7);
+                at.* += 1;
+            }
         }
     }.f;
-    try push(&bits, std.testing.allocator, stat_level, 9);
-    try push(&bits, std.testing.allocator, 87, stat_bits[stat_level]);
-    try push(&bits, std.testing.allocator, stat_experience, 9);
-    try push(&bits, std.testing.allocator, 1_500_000, stat_bits[stat_experience]);
-    try push(&bits, std.testing.allocator, stat_end, 9);
+    put(&save, &bit, stat_level, 9);
+    put(&save, &bit, 87, stat_bits[stat_level]);
+    put(&save, &bit, stat_experience, 9);
+    put(&save, &bit, 1_500_000, stat_bits[stat_experience]);
+    put(&save, &bit, stat_end, 9);
+    const used = save[0 .. 8 + (bit + 7) / 8];
 
-    var save = std.ArrayList(u8){};
-    defer save.deinit(std.testing.allocator);
-    try save.appendSlice(std.testing.allocator, "HEADERgf");
-    var byte: u8 = 0;
-    for (bits.items, 0..) |b, i| {
-        byte |= @as(u8, b) << @intCast(i & 7);
-        if (i & 7 == 7) {
-            try save.append(std.testing.allocator, byte);
-            byte = 0;
-        }
-    }
-    if (bits.items.len & 7 != 0) try save.append(std.testing.allocator, byte);
-
-    try std.testing.expectEqual(@as(?u32, 87), attribute(save.items, stat_level));
-    try std.testing.expectEqual(@as(?u32, 1_500_000), attribute(save.items, stat_experience));
-    try std.testing.expectEqual(@as(?u32, null), attribute(save.items, 14)); // gold: not in the list
+    try std.testing.expectEqual(@as(?u32, 87), attribute(used, stat_level));
+    try std.testing.expectEqual(@as(?u32, 1_500_000), attribute(used, stat_experience));
+    try std.testing.expectEqual(@as(?u32, null), attribute(used, 14)); // gold: not in the list
 }
 
 test "attribute returns null for a save with no attribute section" {

@@ -1,10 +1,29 @@
 //! Friend lists + presence for the realm. Per-account friend lists (who you added)
 //! and a set of currently-online accounts, so SID_FRIENDSLIST can report each friend's
 //! online/offline location. Guarded by a spinlock — bnet connections touch this from
-//! their own threads. In-memory for now (persists for the realmd run); fs/redis-backed
-//! persistence is a follow-up.
+//! their own threads.
+//!
+//! The two halves have deliberately different lifetimes. PRESENCE is per-run by nature:
+//! who is online is a fact about live connections, and a restart makes every one of them
+//! false, so keeping it in memory is not a shortcut. The friend LIST is the opposite — a
+//! player added someone once and expects it to still be there tomorrow — so it is written
+//! through to the durable per-account key/value store on every change and read back on
+//! demand. Storing it under the same account-scoped keys the BNCS profile uses means no
+//! new schema and no new backend surface; every backend already serves it.
+//!
+//! The in-memory pair table stays as the working set so reads don't hit the store, and is
+//! seeded lazily the first time an account's list is touched after a restart.
 const std = @import("std");
 const Spinlock = @import("realm_infra").lock.Spinlock;
+const store = @import("store.zig");
+
+extern "c" fn system(cmd: [*:0]const u8) c_int;
+
+/// Key the friend list lives under, per account. The value is one name per line.
+const friends_key = "friends\\list";
+
+/// Longest serialized list: every name plus its newline.
+const max_blob = max_friends * (max_name + 1);
 
 pub const max_name = 16;
 pub const max_friends = 50;
@@ -36,6 +55,82 @@ var online: [1024]Presence = [_]Presence{.{}} ** 1024;
 
 fn eqi(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
+}
+
+/// Accounts whose stored list has already been pulled into the pair table this run, so a
+/// restart repopulates lazily and a miss doesn't re-read the store on every lookup.
+var loaded: [1024]Presence = [_]Presence{.{}} ** 1024;
+
+fn markLoadedLocked(account: []const u8) void {
+    var slot: ?*Presence = null;
+    for (&loaded) |*p| {
+        if (p.in_use and eqi(p.name[0..p.name_len], account)) return;
+        if (slot == null and !p.in_use) slot = p;
+    }
+    const p = slot orelse return;
+    const n: u8 = @intCast(@min(account.len, max_name));
+    @memcpy(p.name[0..n], account[0..n]);
+    p.name_len = n;
+    p.in_use = true;
+}
+
+fn isLoadedLocked(account: []const u8) bool {
+    for (&loaded) |*p| {
+        if (p.in_use and eqi(p.name[0..p.name_len], account)) return true;
+    }
+    return false;
+}
+
+fn addPairLocked(owner: []const u8, friend: []const u8) bool {
+    var slot: ?*Pair = null;
+    var n: usize = 0;
+    for (&pairs) |*p| {
+        if (p.in_use and eqi(p.ownerSlice(), owner)) {
+            n += 1;
+            if (eqi(p.friendSlice(), friend)) return false; // already a friend
+        }
+        if (slot == null and !p.in_use) slot = p;
+    }
+    if (n >= max_friends) return false;
+    const pr = slot orelse return false;
+    const on: u8 = @intCast(@min(owner.len, max_name));
+    @memcpy(pr.owner[0..on], owner[0..on]);
+    pr.owner_len = on;
+    const fl: u8 = @intCast(@min(friend.len, max_name));
+    @memcpy(pr.friend[0..fl], friend[0..fl]);
+    pr.friend_len = fl;
+    pr.in_use = true;
+    return true;
+}
+
+/// Pull an account's stored list into the pair table, once per run. Caller holds the lock.
+fn ensureLoadedLocked(account: []const u8) void {
+    if (isLoadedLocked(account)) return;
+    markLoadedLocked(account); // before reading, so a store miss doesn't retry forever
+    var buf: [max_blob]u8 = undefined;
+    const n = store.getUserData(account, friends_key, &buf);
+    if (n == 0) return;
+    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        _ = addPairLocked(account, line);
+    }
+}
+
+/// Write an account's list back to the store. Caller holds the lock.
+fn persistLocked(account: []const u8) void {
+    var buf: [max_blob]u8 = undefined;
+    var len: usize = 0;
+    for (&pairs) |*p| {
+        if (!p.in_use or !eqi(p.ownerSlice(), account)) continue;
+        const f = p.friendSlice();
+        if (len + f.len + 1 > buf.len) break;
+        @memcpy(buf[len..][0..f.len], f);
+        len += f.len;
+        buf[len] = '\n';
+        len += 1;
+    }
+    _ = store.setUserData(account, friends_key, buf[0..len]);
 }
 
 /// Mark `account` online (call on logon). Idempotent.
@@ -78,24 +173,9 @@ fn isOnlineLocked(account: []const u8) bool {
 pub fn add(owner: []const u8, friend: []const u8) bool {
     lock.lock();
     defer lock.unlock();
-    var slot: ?*Pair = null;
-    var n: usize = 0;
-    for (&pairs) |*p| {
-        if (p.in_use and eqi(p.ownerSlice(), owner)) {
-            n += 1;
-            if (eqi(p.friendSlice(), friend)) return false; // already a friend
-        }
-        if (slot == null and !p.in_use) slot = p;
-    }
-    if (n >= max_friends) return false;
-    const pr = slot orelse return false;
-    const on: u8 = @intCast(@min(owner.len, max_name));
-    @memcpy(pr.owner[0..on], owner[0..on]);
-    pr.owner_len = on;
-    const fn_: u8 = @intCast(@min(friend.len, max_name));
-    @memcpy(pr.friend[0..fn_], friend[0..fn_]);
-    pr.friend_len = fn_;
-    pr.in_use = true;
+    ensureLoadedLocked(owner);
+    if (!addPairLocked(owner, friend)) return false;
+    persistLocked(owner);
     return true;
 }
 
@@ -103,11 +183,13 @@ pub fn add(owner: []const u8, friend: []const u8) bool {
 pub fn remove(owner: []const u8, friend: []const u8) bool {
     lock.lock();
     defer lock.unlock();
+    ensureLoadedLocked(owner);
     for (&pairs) |*p| {
         if (p.in_use and eqi(p.ownerSlice(), owner) and eqi(p.friendSlice(), friend)) {
             p.in_use = false;
             p.owner_len = 0;
             p.friend_len = 0;
+            persistLocked(owner);
             return true;
         }
     }
@@ -127,6 +209,7 @@ pub const FriendInfo = struct {
 pub fn list(owner: []const u8, out: []FriendInfo) usize {
     lock.lock();
     defer lock.unlock();
+    ensureLoadedLocked(owner);
     var n: usize = 0;
     for (&pairs) |*p| {
         if (n >= out.len) break;
@@ -137,4 +220,76 @@ pub fn list(owner: []const u8, out: []FriendInfo) usize {
         n += 1;
     }
     return n;
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+// These exercise the durable half. The in-memory pair table is cleared between cases so
+// each one genuinely goes back to the store rather than reading its own leftovers — which
+// is the only thing that distinguishes "persisted" from "still in RAM".
+
+var test_io: std.Io.Threaded = std.Io.Threaded.init_single_threaded;
+
+fn testInitStore(dir: []const u8) void {
+    store.init(.{ .io = test_io.io(), .data_dir = dir });
+}
+
+/// Drop everything cached this run, as though realmd had just started.
+fn testForgetCache() void {
+    lock.lock();
+    defer lock.unlock();
+    for (&pairs) |*p| p.* = .{};
+    for (&loaded) |*p| p.* = .{};
+    for (&online) |*p| p.* = .{};
+}
+
+test "a friend list survives losing the in-memory table" {
+    const dir = "/tmp/realmd-friends-test";
+    var cmd: [128]u8 = undefined;
+    const rm = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{dir}) catch return error.SkipZigTest;
+    _ = system(rm.ptr);
+    testInitStore(dir);
+    testForgetCache();
+
+    try std.testing.expect(add("Owner", "Gheed"));
+    try std.testing.expect(add("Owner", "Charsi"));
+    try std.testing.expect(!add("Owner", "Gheed")); // already there
+
+    // Wipe the working set: anything that comes back now came off disk.
+    testForgetCache();
+    var out: [8]FriendInfo = undefined;
+    try std.testing.expectEqual(@as(usize, 2), list("Owner", &out));
+    try std.testing.expectEqualStrings("Gheed", out[0].nameSlice());
+    try std.testing.expectEqualStrings("Charsi", out[1].nameSlice());
+
+    // A removal has to persist too — the failure mode of writing only on add is that
+    // deleted friends reappear on the next restart.
+    try std.testing.expect(remove("Owner", "Gheed"));
+    testForgetCache();
+    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
+    try std.testing.expectEqualStrings("Charsi", out[0].nameSlice());
+
+    _ = system(rm.ptr);
+}
+
+test "presence is per-run and never persisted" {
+    const dir = "/tmp/realmd-friends-test2";
+    var cmd: [128]u8 = undefined;
+    const rm = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{dir}) catch return error.SkipZigTest;
+    _ = system(rm.ptr);
+    testInitStore(dir);
+    testForgetCache();
+
+    try std.testing.expect(add("Owner", "Gheed"));
+    setOnline("Gheed");
+    var out: [8]FriendInfo = undefined;
+    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
+    try std.testing.expect(out[0].online);
+
+    // Who is online is a fact about live connections: a restart makes it false, and it
+    // would be wrong for the store to claim otherwise.
+    testForgetCache();
+    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
+    try std.testing.expect(!out[0].online);
+
+    _ = system(rm.ptr);
 }
