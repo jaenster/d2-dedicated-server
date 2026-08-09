@@ -250,6 +250,12 @@ fn dispatch(c: *DConn, tag: []const u8, id: u8, body: []const u8) void {
         MCP_LADDERDATA => onLadderData(c, tag, body),
         MCP_CANCELCREATE => onCancelCreate(c, tag, body),
         MCP_CHARRANK => onCharRank(c, tag, body),
+        // The dispatch above is the COMPLETE 1.14d client surface. Its MCP senders are
+        // 0x01-0x07, 0x0a, 0x11-0x13, 0x16, 0x18 and 0x19, all handled. The build also
+        // contains senders for 0x08, 0x09, 0x0b, 0x0c, 0x0d, 0x0f and 0x10, and those are
+        // DEAD — zero xrefs to any of them in Game.exe, so nothing can reach them. They are
+        // deliberately not implemented rather than overlooked; if one ever shows up here it
+        // means the assumption changed and the hexdump is the thing to look at.
         else => {
             log.line(tag, "unhandled MCP 0x{x:0>2} ({d} bytes)", .{ id, body.len });
             if (body.len > 0) log.hexdump(tag, body);

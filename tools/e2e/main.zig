@@ -750,6 +750,35 @@ fn scFleetCapacity() Result {
 /// Nightmare and Hell are earned. The thresholds are the client's own: CharSel @0x4349b0
 /// offers a difficulty at all only above progression 3 (classic) / 4 (expansion), and
 /// UIMENU_SelectDifficultySinglePlayerOrTcpip @0x439780 reveals Hell above 7 / 9.
+/// The d2dbs GET_DATA reply carries a create time and a ladder flag next to the save. Both
+/// were hardcoded to zero, which told the GS every character was brand new and non-ladder.
+fn scCharFetchMeta() Result {
+    const name = "char_fetch_meta";
+    const acct = "MetaAcct";
+    var buf: [0x80]u8 = undefined;
+
+    // A ladder character (status bit 0x40) with a known create time in the header.
+    const blob = d2sWithProgression(&buf, "MetaLadder", 1, 50, 5);
+    buf[0x24] = 0x20 | 0x40; // expansion + ladder
+    std.mem.writeInt(u32, buf[0x2c..][0..4], 0x5A5A1234, .little);
+    const sr = rc.d2dbsSave(acct, "MetaLadder", blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "save result={d}", .{sr});
+
+    const got = rc.d2dbsGet(acct, "MetaLadder") catch |e| return fail(name, "get {s}", .{@errorName(e)});
+    if (got.result != 0) return fail(name, "get result={d}", .{got.result});
+    if (got.createtime != 0x5A5A1234) return fail(name, "createtime 0x{x}, want the header's 0x5a5a1234", .{got.createtime});
+    if (got.allowladder != 1) return fail(name, "a ladder character reported allowladder={d}, want 1", .{got.allowladder});
+
+    // And a non-ladder one must not claim to be.
+    const plain = d2sWithProgression(&buf, "MetaPlain", 1, 50, 5);
+    buf[0x24] = 0x20; // expansion, no ladder
+    _ = rc.d2dbsSave(acct, "MetaPlain", plain) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+    const got2 = rc.d2dbsGet(acct, "MetaPlain") catch |e| return fail(name, "get {s}", .{@errorName(e)});
+    if (got2.allowladder != 0) return fail(name, "a non-ladder character reported allowladder={d}, want 0", .{got2.allowladder});
+
+    return .{ .name = name, .status = .pass, .msg = msg("create time and ladder flag come from the save header, not zeros", .{}) };
+}
+
 fn scDifficultyGate() Result {
     const name = "difficulty_gate";
     const acct = "DiffAcct";
@@ -2012,6 +2041,7 @@ pub fn main() !void {
         scLobbyCharNames(),
         scChatCommands(),
         scLeaveChannel(),
+        scCharFetchMeta(),
         scDifficultyGate(),
         scGetFileTime(),
         scBannerAd(),

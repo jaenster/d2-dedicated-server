@@ -67,8 +67,14 @@ fn onGet(fd: net.Socket, tag: []const u8, seq: u32, body: []const u8) void {
     w.putU16(TYPE_GET);
     w.putU32(seq);
     w.putU32(if (n > 0) @as(u32, 0) else 1); // result: 0 ok, 1 not found
-    w.putU32(0); // createtime
-    w.putU32(0); // allowladder
+    // Both of these come out of the save's own header rather than being zeroed: the
+    // create time sits at 0x2c (written by d2s.newSave) and the ladder flag is bit 0x40 of
+    // the status byte at 0x24 — the same bit the join gate and the CharSel statstring read.
+    // Zeroing them told the GS every character was brand new and non-ladder.
+    const created: u32 = if (n > 0x30) std.mem.readInt(u32, save[0x2c..][0..4], .little) else 0;
+    const is_ladder: u32 = if (n > 0x24 and (save[0x24] & 0x40) != 0) 1 else 0;
+    w.putU32(created);
+    w.putU32(is_ladder);
     w.putU16(DATATYPE_CHARSAVE);
     w.putU16(@intCast(n)); // datalen
     w.putStr(charname);

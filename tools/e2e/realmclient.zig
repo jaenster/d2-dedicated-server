@@ -850,6 +850,31 @@ pub const AdInfo = struct {
 // d2dbs character-save store
 // ---------------------------------------------------------------------------
 /// SAVE_DATA 0x30 -> result (0 = ok).
+pub const CharFetch = struct { result: u32, createtime: u32, allowladder: u32, data_len: usize };
+
+/// d2dbs GET_DATA (0x31): fetch a character's save plus the metadata beside it.
+/// Reply: result:u32, createtime:u32, allowladder:u32, datatype:u16, datalen:u16, char\0, bytes.
+pub fn d2dbsGet(account: []const u8, charname: []const u8) !CharFetch {
+    const fd = try net.connectLocal(HOST_D2DBS);
+    defer net.closeSocket(fd);
+    var body: [256]u8 = undefined;
+    var w = net.Writer.init(&body);
+    w.u16v(DBS_DATATYPE_CHARSAVE);
+    w.cstr(account);
+    w.cstr(charname);
+    try ctlSend(fd, DBS_GET, w.slice());
+    var rx: [16384]u8 = undefined;
+    const c = try ctlRecv(fd, &rx);
+    if (c.typ != DBS_GET) return error.D2dbsGetBadType;
+    if (c.body.len < 16) return error.D2dbsGetShort;
+    return .{
+        .result = net.rdU32(c.body, 0),
+        .createtime = net.rdU32(c.body, 4),
+        .allowladder = net.rdU32(c.body, 8),
+        .data_len = net.rdU16(c.body, 14),
+    };
+}
+
 pub fn d2dbsSave(acct: []const u8, char: []const u8, d2s: []const u8) !u32 {
     const fd = try net.connectLocal(HOST_D2DBS);
     defer net.closeSocket(fd);
