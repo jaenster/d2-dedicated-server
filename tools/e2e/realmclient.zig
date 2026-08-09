@@ -157,6 +157,7 @@ pub const EID_WHISPER = 0x04;
 pub const EID_TALK = 0x05;
 pub const EID_CHANNEL = 0x07;
 pub const EID_INFO = 0x12;
+pub const EID_ERROR = 0x13;
 
 /// Reply to MCP_CREATEGAME / MCP_JOINGAME. Named rather than anonymous so the
 /// no-password wrappers can forward the password-carrying versions' return value.

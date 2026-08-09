@@ -728,6 +728,81 @@ fn scFleetCapacity() Result {
 /// username on '*' and draws the part after it (COMCALLBACK_FormatChannelUserData @0x4471b0);
 /// realmd used to substitute the account name, which has no '*', so the list showed accounts
 /// and the client had no character to render at all.
+/// The slash commands the 1.14d client forwards. It intercepts a few locally (/fps,
+/// /players, /nopickup) but hands the rest to the realm verbatim, including whisper
+/// aliases realmd did not recognise and /help, which it cannot answer itself.
+fn scChatCommands() Result {
+    const name = "chat_commands";
+    const channel = "Diablo II";
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("CmdAlice") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChat() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.setBnetTimeout(2000);
+
+    var b = rc.RealmClient{};
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.login("CmdBob") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChat() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.setBnetTimeout(2000);
+    _ = net.usleep(150_000);
+
+    // Every alias the client offers has to land as a whisper. /m and /msg used to fall
+    // through to the unknown-command path and do nothing.
+    const aliases = [_][]const u8{ "/w", "/whisper", "/m", "/msg", "/W", "/Msg" };
+    for (aliases) |alias| {
+        var buf: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{s} CmdBob via{s}", .{ alias, alias }) catch return fail(name, "fmt", .{});
+        a.chatCommand(line) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+
+        var got = false;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const ev = b.readChatEvent() catch break;
+            if (ev.eid != rc.EID_WHISPER) continue;
+            got = std.mem.indexOf(u8, ev.text, "via") != null;
+            break;
+        }
+        if (!got) return fail(name, "'{s}' did not arrive as a whisper", .{alias});
+    }
+
+    // /help is forwarded by the client because it cannot answer it; a blank reply is
+    // indistinguishable from the command doing nothing.
+    a.chatCommand("/help") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    var helped = false;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const ev = a.readChatEvent() catch break;
+        if (ev.eid != rc.EID_INFO) continue;
+        if (std.mem.indexOf(u8, ev.text, "whisper") != null) {
+            helped = true;
+            break;
+        }
+    }
+    if (!helped) return fail(name, "/help did not list any commands", .{});
+
+    // And a typo has to say so rather than answering with an empty line.
+    a.chatCommand("/notacommand") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    var told = false;
+    i = 0;
+    while (i < 8) : (i += 1) {
+        const ev = a.readChatEvent() catch break;
+        if (ev.eid != rc.EID_ERROR) continue;
+        told = std.mem.indexOf(u8, ev.text, "not a valid command") != null;
+        break;
+    }
+    if (!told) return fail(name, "an unknown command was not reported as one", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("6 whisper aliases delivered, /help lists commands, unknown command reported", .{}) };
+}
+
 fn scLobbyCharNames() Result {
     const name = "lobby_char_names";
     const channel = "Diablo II";
@@ -1718,6 +1793,7 @@ pub fn main() !void {
         scCharCopy(),
         scLobbyChatAtoB(),
         scLobbyCharNames(),
+        scChatCommands(),
         scBannerAd(),
         scFriendsPersist(),
         scMultiInstance(),

@@ -742,9 +742,12 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         handleFriendCmd(c, tag, fc);
         return;
     }
+    if (handleHelpCmd(c, text)) return;
     if (text.len > 0 and text[0] == '/') {
-        // Unknown slash command: acknowledge minimally, don't broadcast.
-        sendEvent(c, EID_INFO, 0, acct, "");
+        // An unknown command must never reach the channel — typing a typo should not say
+        // it out loud. It used to answer with an empty INFO line, which looks to the
+        // player exactly like the command silently working.
+        sendEvent(c, EID_ERROR, 0, acct, "That is not a valid command. Type /help for a list.");
         return;
     }
 
@@ -759,15 +762,28 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
 
 const Whisper = struct { target: []const u8, msg: []const u8 };
 
+/// If `text` starts with "<verb> " (case-insensitively), the rest after the space.
+fn afterVerb(text: []const u8, verb: []const u8) ?[]const u8 {
+    if (text.len <= verb.len) return null;
+    if (!std.ascii.eqlIgnoreCase(text[0..verb.len], verb)) return null;
+    if (text[verb.len] != ' ') return null;
+    return text[verb.len + 1 ..];
+}
+
+/// The whisper aliases the 1.14d client itself offers. CHAT_HandleWhisperCommand is tried
+/// with "/msg", "/m", "/whisper" and "/w" in turn (D2Client/UI/Chat.cpp @0x47c1e0) and the
+/// input is forwarded to the realm verbatim, so all four have to be understood here — /m
+/// and /msg used to fall through and do nothing at all. The client compares them with
+/// stricmp, so this does too.
+const whisper_verbs = [_][]const u8{ "/w", "/whisper", "/m", "/msg" };
+
 fn parseWhisper(text: []const u8) ?Whisper {
-    const rest = if (std.mem.startsWith(u8, text, "/w "))
-        text[3..]
-    else if (std.mem.startsWith(u8, text, "/whisper "))
-        text[9..]
-    else
-        return null;
-    const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
-    return .{ .target = rest[0..sp], .msg = rest[sp + 1 ..] };
+    for (whisper_verbs) |v| {
+        const rest = afterVerb(text, v) orelse continue;
+        const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+        return .{ .target = rest[0..sp], .msg = rest[sp + 1 ..] };
+    }
+    return null;
 }
 
 const Slash = struct { verb: []const u8, arg: []const u8 };
@@ -851,6 +867,27 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         return true;
     }
     return false;
+}
+
+/// "/help" and "/?" — the client forwards both to the realm rather than answering them
+/// itself (CHAT_HandleResignCommand is called with each in turn), so this is the only
+/// place a player can be told what they can type.
+fn handleHelpCmd(c: *Conn, text: []const u8) bool {
+    const cmd = parseSlash(text) orelse return false;
+    if (!eqCmd(cmd.verb, "help") and !std.mem.eql(u8, cmd.verb, "?")) return false;
+    const lines = [_][]const u8{
+        "Commands:",
+        "  /w /whisper /m /msg <name> <text>  send a private message",
+        "  /f add|remove|list <name>          manage your friends list",
+        "  /away [message]                    set or clear an away reply",
+        "  /dnd [message]                     block incoming whispers",
+        "  /ignore /unignore <name>           squelch or unsquelch someone",
+        "  /whois <name>                      find which channel someone is in",
+        "  /kick <name>                       remove someone (channel operators)",
+        "  /guild                             guild commands (/guild help)",
+    };
+    for (lines) |l| sendEvent(c, EID_INFO, 0, "", l);
+    return true;
 }
 
 const FriendCmd = struct { action: enum { add, remove, list }, name: []const u8 };
