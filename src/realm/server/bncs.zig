@@ -1030,20 +1030,34 @@ fn onLogonRealm(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// SID_GETFILETIME (0x33): client asks for a server file's timestamp (e.g.
-// bnserver-D2DV.ini) before deciding to BNFTP-download it. Replying filetime 0
-// tells the client we have no such file, so it proceeds without downloading.
+// SID_GETFILETIME (0x33): the client asking how old a server file is (bnserver-D2DV.ini,
+// the terms-of-service text, ...) before deciding whether to fetch it over BNFTP.
+//
+// The timestamp is the whole answer. NET_SID_CLIENT_Incoming_GetFileTime @0x521110 hands
+// it straight to the download layer, which compares it against whatever the client already
+// has cached — so a zero means "older than anything you own" and the file never transfers.
+// This used to reply zero unconditionally, which denied every file, INCLUDING the ones
+// realmd is sitting on and happily serves the moment it is asked. So a file dropped into
+// <data_dir>/bnftp/ could only ever be fetched by a client that already knew to ask.
+//
+// Now: the real modification time when we have the file, and zero only when we genuinely
+// do not.
 fn onGetFileTime(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU32();
     const unknown = r.getU32();
     const fname = r.getStr();
-    log.line(tag, "getfiletime '{s}' -> none", .{fname});
+    const mtime = store.bnftpMtime(fname);
+    if (mtime) |m| {
+        log.line(tag, "getfiletime '{s}' -> mtime {d}", .{ fname, m });
+    } else {
+        log.line(tag, "getfiletime '{s}' -> not held", .{fname});
+    }
     var buf: [128]u8 = undefined;
     var w = startPacket(&buf, SID_GETFILETIME);
     w.putU32(reqid);
     w.putU32(unknown);
-    w.putU64(0); // filetime 0 = not available
+    w.putU64(if (mtime) |m| unixToFiletime(m) else 0);
     w.putStr(fname);
     finish(c, &w);
 }

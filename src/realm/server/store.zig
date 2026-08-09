@@ -200,6 +200,11 @@ pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     return fs.getBnftp(filename, out);
 }
 
+/// Last-modified time of a BNFTP asset (unix seconds), or null if we don't have it.
+pub fn bnftpMtime(filename: []const u8) ?i64 {
+    return fs.bnftpMtime(filename);
+}
+
 // ── guilds (durable) ─────────────────────────────────────────────────────────
 // The cut Guild Halls feature. Like accounts, guilds are always fs-backed (low
 // volume, durable); the service layer (server/guilds.zig) owns the blob format.

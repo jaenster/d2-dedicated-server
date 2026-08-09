@@ -19,6 +19,7 @@ extern "c" fn kill(pid: c_int, sig: c_int) c_int;
 extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
 extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn system(cmd: [*:0]const u8) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 extern "c" var environ: [*:null]const ?[*:0]const u8;
 
 // libc socket bits for the echo server (mirrors net.zig's approach). We bind to an
@@ -734,6 +735,41 @@ fn scFleetCapacity() Result {
 /// Going into a game takes you out of the channel. Both signals the client sends for this
 /// — SID_NOTIFYJOIN and SID_LEAVECHAT — used to be accepted and ignored, which left a
 /// player who was off playing still listed in the lobby and still being sent its chat.
+/// SID_GETFILETIME decides whether a BNFTP asset ever transfers: the client hands the
+/// timestamp straight to its download layer, which compares it against what it has cached,
+/// so a zero means "older than anything you own" and nothing is fetched. realmd replied
+/// zero for everything — including files it was sitting on and would happily serve.
+fn scGetFileTime() Result {
+    const name = "get_file_time";
+    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+
+    var cmd: [512]u8 = undefined;
+    const staged = std.fmt.bufPrintZ(&cmd, "mkdir -p '{s}/bnftp' && printf gateways > '{s}/bnftp/bnserver-D2DV.ini'", .{ data_dir, data_dir }) catch
+        return fail(name, "could not build the staging command", .{});
+    const rc_stage = system(staged.ptr);
+    if (rc_stage != 0) return fail(name, "staging the file failed (rc={d}): {s}", .{ rc_stage, staged });
+    var vcmd: [512]u8 = undefined;
+    const verify = std.fmt.bufPrintZ(&vcmd, "test -f '{s}/bnftp/bnserver-D2DV.ini'", .{data_dir}) catch return fail(name, "fmt", .{});
+    if (system(verify.ptr) != 0) return fail(name, "the staged file is not there: {s}", .{verify});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("FileGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+
+    const held = c.getFileTime("bnserver-D2DV.ini") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (held == 0) return fail(name, "a file we serve reported filetime 0 (staged under {s})", .{data_dir});
+    // A FILETIME is 100ns ticks since 1601; anything sane is far past the 1970 epoch.
+    const epoch_1970: u64 = 11644473600 * 10_000_000;
+    if (held < epoch_1970) return fail(name, "filetime {d} predates 1970 — not a FILETIME", .{held});
+
+    const absent = c.getFileTime("no-such-file.ini") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (absent != 0) return fail(name, "a file we do NOT have reported filetime {d}, want 0", .{absent});
+
+    return .{ .name = name, .status = .pass, .msg = msg("held file reports a real FILETIME ({d}); an absent one reports 0", .{held}) };
+}
+
 fn scLeaveChannel() Result {
     const name = "leave_channel";
     const channel = "Diablo II";
@@ -1086,8 +1122,40 @@ const EnvVar = struct { name: [*:0]const u8, value: [*:0]const u8 };
 /// fork+execve a realmd child, applying `envs` to our environ first (the child
 /// inherits the augmented environ). Returns the child pid. Waits up to 10s for
 /// `wait_port` to listen; exits the harness if it never comes up.
+/// Spawn a realmd with `envs` set, WITHOUT leaving them set in this process afterwards.
+///
+/// The child inherits the environment across fork+execve, so the values have to be in our
+/// own environ at the moment we fork — but leaving them there reconfigures every scenario
+/// that runs later. That is not hypothetical: a scenario spawning an instance with its own
+/// REALMD_DATA_DIR silently redirected every subsequent scenario's idea of where the
+/// harness's data lives, so files staged for a test went to one directory while the realmd
+/// under test read another. Snapshot, fork, put it back.
 fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
-    for (envs) |e| _ = setenv(e.name, e.value, 1);
+    // COPY the old values: getenv returns a pointer into the environ block, and the
+    // setenv below overwrites that very entry, so keeping the pointer would restore
+    // whatever happened to land there afterwards.
+    var saved: [16][128]u8 = undefined;
+    var had: [16]bool = undefined;
+    for (envs, 0..) |e, i| {
+        if (i >= saved.len) break;
+        had[i] = false;
+        if (getenv(e.name)) |old| {
+            const v = std.mem.span(old);
+            if (v.len < saved[i].len) {
+                @memcpy(saved[i][0..v.len], v);
+                saved[i][v.len] = 0;
+                had[i] = true;
+            }
+        }
+        _ = setenv(e.name, e.value, 1);
+    }
+    defer for (envs, 0..) |e, i| {
+        if (i >= saved.len) break;
+        if (had[i]) {
+            const restored: [*:0]const u8 = @ptrCast(&saved[i]);
+            _ = setenv(e.name, restored, 1);
+        } else _ = unsetenv(e.name);
+    };
     const pid = fork();
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
@@ -1863,6 +1931,7 @@ pub fn main() !void {
         scLobbyCharNames(),
         scChatCommands(),
         scLeaveChannel(),
+        scGetFileTime(),
         scBannerAd(),
         scFriendsPersist(),
         scMultiInstance(),

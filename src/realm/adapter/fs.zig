@@ -255,15 +255,37 @@ pub fn listGuilds(names: []Name) usize {
     return count;
 }
 
-pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
+/// Reject anything that could escape the bnftp directory. A BNFTP filename comes straight
+/// off the wire, so this is the boundary: no separators, no parent references, no empties.
+fn bnftpPath(filename: []const u8, out: []u8) ?[]const u8 {
     if (filename.len == 0 or filename.len >= 128) return null;
     if (std.mem.indexOfScalar(u8, filename, '/') != null) return null;
     if (std.mem.indexOfScalar(u8, filename, '\\') != null) return null;
     if (std.mem.indexOf(u8, filename, "..") != null) return null;
+    return std.fmt.bufPrint(out, "{s}/bnftp/{s}", .{ data_dir, filename }) catch null;
+}
+
+/// Last-modified time of a BNFTP asset, in seconds since the unix epoch. Null when there
+/// is no such file — which is what lets SID_GETFILETIME tell the truth about what we have
+/// rather than denying everything.
+pub fn bnftpMtime(filename: []const u8) ?i64 {
+    var pbuf: [320]u8 = undefined;
+    const path = bnftpPath(filename, &pbuf) orelse return null;
     fs_lock.lock();
     defer fs_lock.unlock();
+    // Stat the OPEN HANDLE rather than the path: this is the same open that getBnftp uses
+    // to serve the file, so "we can time it" and "we can serve it" cannot disagree.
+    const f = Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    const st = f.stat(io) catch return null;
+    return @intCast(@divFloor(@as(i128, st.mtime.toNanoseconds()), std.time.ns_per_s));
+}
+
+pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
     var pbuf: [320]u8 = undefined;
-    const path = std.fmt.bufPrint(&pbuf, "{s}/bnftp/{s}", .{ data_dir, filename }) catch return null;
+    const path = bnftpPath(filename, &pbuf) orelse return null;
+    fs_lock.lock();
+    defer fs_lock.unlock();
     const f = Dir.cwd().openFile(io, path, .{}) catch return null;
     defer f.close(io);
     const n = f.readPositionalAll(io, out, 0) catch return null;

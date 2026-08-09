@@ -32,6 +32,7 @@ const SID_LOGONRESPONSE2 = 0x3A;
 const SID_CREATEACCOUNT2 = 0x3D;
 const SID_LOGONREALMEX = 0x3E;
 const SID_LEAVECHAT = 0x10;
+const SID_GETFILETIME = 0x33;
 const SID_NOTIFYJOIN = 0x22;
 const SID_FRIENDSLIST = 0x65;
 const SID_CHECKAD = 0x15;
@@ -387,6 +388,27 @@ pub const AdInfo = struct {
     /// than 0x10, a new id, and BOTH strings non-empty before it fetches anything.
     body_len: usize = 0,
 };
+
+    /// SID_GETFILETIME (0x33): how old is a server file? Request is
+    /// { u32 requestId, u32 unknown, cstr filename }; the reply echoes both dwords, then
+    /// a FILETIME and the filename. Returns the FILETIME (0 = the server has no such file).
+    pub fn getFileTime(self: *RealmClient, filename: []const u8) !u64 {
+        const fd = self.bnet.?;
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(1); // request id
+        w.u32v(0);
+        w.cstr(filename);
+        try bncsSend(fd, SID_GETFILETIME, w.slice());
+        var r = try bncsRecv(fd, &self.rxbuf);
+        var tries: usize = 0;
+        while (r.id != SID_GETFILETIME) : (tries += 1) {
+            if (tries >= 8) return error.GetFileTimeBadId;
+            r = try bncsRecv(fd, &self.rxbuf);
+        }
+        if (r.body.len < 16) return error.GetFileTimeShort;
+        return @as(u64, net.rdU32(r.body, 8)) | (@as(u64, net.rdU32(r.body, 12)) << 32);
+    }
 
     /// SID_NOTIFYJOIN (0x22): tell bnetd we went off to play. Body is
     /// { u32 product, u32 0x0e, cstr game name, cstr password } — the shape
