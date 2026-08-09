@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/realm/shared/infra.zig"),
     });
 
+
     const dbghelp = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "dbghelp",
@@ -79,6 +80,15 @@ pub fn build(b: *std.Build) void {
     // `-Dtarget=x86_64-linux-musl` for a static Linux binary.
     const realmd_target = b.standardTargetOptions(.{});
 
+    // d2-formats (libd2) — the clean-room 1.14d file formats. The realm's .d2s handling
+    // comes from here rather than from a second copy living in this repo: the header
+    // layout, the checksum and the fresh-character writer are all already modelled there,
+    // and two implementations of a byte format is one more than can stay correct.
+    const d2_formats = b.dependency("d2_formats", .{
+        .target = realmd_target,
+        .optimize = optimize,
+    }).module("d2-formats");
+
     // realm_adapter — the concrete persistence backends (fs/redis/pg) behind the store
     // facade, imported by realmd. Includes the Postgres client, so the pg dependency lives
     // here (lazy, only fetched when a step builds realmd). The qqserver does NOT use this:
@@ -103,6 +113,7 @@ pub fn build(b: *std.Build) void {
     realmd.root_module.addImport("realm_shared", realm_shared);
     realmd.root_module.addImport("realm_infra", realm_infra);
     realmd.root_module.addImport("realm_adapter", realm_adapter);
+    realmd.root_module.addImport("d2_formats", d2_formats);
 
     // Web UI: -Dwebui=true builds webui/ (Vite + React → one self-contained
     // dist/index.html) and embeds it; otherwise embed a stub page so plain builds
@@ -136,6 +147,7 @@ pub fn build(b: *std.Build) void {
     realm_tests.root_module.addImport("realm_shared", realm_shared);
     realm_tests.root_module.addImport("realm_infra", realm_infra);
     realm_tests.root_module.addImport("realm_adapter", realm_adapter);
+    realm_tests.root_module.addImport("d2_formats", d2_formats);
     const run_realm_tests = b.addRunArtifact(realm_tests);
     const test_step = b.step("test", "Run realm-server unit tests");
     test_step.dependOn(&run_realm_tests.step);
