@@ -46,8 +46,28 @@ fn parseIp4(text: []const u8) ![4]u8 {
     return octets;
 }
 
+/// Stop a write to a hung-up peer from killing the process.
+///
+/// The default disposition of SIGPIPE is to terminate, and a network server writes to closed
+/// sockets constantly — it is the normal shape of a client that walked away mid-reply. Left
+/// unhandled it exits 141 with nothing in the log, which reads as a crash and gets blamed on
+/// whatever the last connection happened to be doing. With it ignored, `write` returns EPIPE and
+/// the existing error paths handle it.
+///
+/// Every server here calls this before it listens, so a new one that forgets is the exception
+/// rather than the rule.
+pub fn ignoreBrokenPipes() void {
+    const act: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.PIPE, &act, null);
+}
+
 /// Open a listening TCP socket bound to bind_ip:port (SO_REUSEADDR set).
 pub fn listenTcp(bind_ip: []const u8, port: u16) !Socket {
+    ignoreBrokenPipes();
     const fd = socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = close(fd);

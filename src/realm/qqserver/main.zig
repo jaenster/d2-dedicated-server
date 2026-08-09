@@ -158,6 +158,11 @@ fn parseIp4(text: []const u8) ![4]u8 {
 
 /// Bare non-blocking listening socket on bind_ip:port (SO_REUSEADDR).
 fn listenTcp(bind_ip: []const u8, port: u16) !c_int {
+    // A gateway writes to hung-up sockets as a matter of routine: the client leaves the game and
+    // whatever the GS was mid-way through sending lands on a closed pipe. SIGPIPE's default is to
+    // kill the process, so without this the gateway dies on an ordinary disconnect — silently,
+    // exit 141, nothing in the log but the connection it happened to be serving.
+    infra.net.ignoreBrokenPipes();
     const fd = socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = close(fd);
