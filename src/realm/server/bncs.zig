@@ -253,14 +253,24 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
         }
         if (len == acc.len) {
             log.line(tag, "oversized packet, dropping connection", .{});
-            return;
+            break; // fall through to the teardown below; returning here leaked the member
         }
     }
-    // If this connection was in a chat channel, leave it and tell the others.
-    if (c.in_channel) {
-        chat.leave(fd);
-        broadcastEvent(&c, EID_LEAVE, c.user_flags, c.chatName(), "");
-    }
+    disconnect(&c, fd, tag);
+}
+
+/// Tear down a connection's presence. Runs on EVERY exit from the read loop.
+///
+/// The de-registration is NOT conditional on being in a channel, and that distinction is
+/// the whole bug it fixes: a client that went into a game is deliberately left registered
+/// (so whispers still find them) with `in_channel` false, so gating the cleanup on that
+/// flag left them in the registry for good — a ghost in the user list that never logs off.
+/// The BROADCAST is still conditional, because there is only someone to tell if they were
+/// actually in a channel.
+fn disconnect(c: *Conn, fd: net.Socket, tag: []const u8) void {
+    if (c.in_channel) broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
+    c.in_channel = false;
+    chat.leave(fd);
     if (c.account_len > 0) friends.setOffline(c.accountName());
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }

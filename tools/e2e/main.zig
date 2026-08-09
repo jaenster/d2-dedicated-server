@@ -888,6 +888,93 @@ fn scGetFileTime() Result {
 /// longest name and channel is ~2.8KB, against the 2048 it used to be given. Before the
 /// bounds-checked writer that was an out-of-bounds slice, i.e. the server going down
 /// because somebody had too many friends.
+/// Concurrency. Everything the realm keeps — the chat registry, the session table, the
+/// game table, the per-game rosters — sits behind spinlocks touched from one thread per
+/// connection, and every scenario up to here has been essentially single-file. This runs
+/// many clients at once through login, chat and disconnect, then checks the realm is still
+/// coherent rather than merely still running: a fresh client must log in, and the channel
+/// must not still be holding people who left.
+const stress_clients = 64;
+
+const StressWorker = struct {
+    index: usize,
+    ok: bool = false,
+    thread: ?std.Thread = null,
+
+    fn run(self: *StressWorker) void {
+        var nb: [32]u8 = undefined;
+        const acct = std.fmt.bufPrint(&nb, "Stress{d:0>3}", .{self.index}) catch return;
+        var c = rc.RealmClient{};
+        defer c.close();
+        c.connectBnet() catch return;
+        c.auth() catch return;
+        c.login(acct) catch return;
+        c.enterChat() catch return;
+        c.joinChannel("Diablo II") catch return;
+        // Say something, so other workers' broadcast paths run while this one is mutating
+        // the registry — the contention this is here to create.
+        var mb: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&mb, "worker {d} reporting", .{self.index}) catch return;
+        c.chatCommand(line) catch return;
+        c.chatCommand("/whois Stress000") catch return;
+        self.ok = true;
+    }
+};
+
+fn scConcurrentClients() Result {
+    const name = "concurrent_clients";
+
+    var workers: [stress_clients]StressWorker = undefined;
+    for (&workers, 0..) |*wk, i| wk.* = .{ .index = i };
+    for (&workers) |*wk| {
+        wk.thread = std.Thread.spawn(.{}, StressWorker.run, .{wk}) catch null;
+    }
+    var spawned: usize = 0;
+    for (&workers) |*wk| {
+        if (wk.thread) |t| {
+            t.join();
+            spawned += 1;
+        }
+    }
+    var succeeded: usize = 0;
+    for (&workers) |*wk| {
+        if (wk.ok) succeeded += 1;
+    }
+    if (spawned == 0) return fail(name, "could not spawn any workers", .{});
+    // Some churn is tolerable under load, but a broad failure means the realm stopped
+    // serving rather than merely slowed down.
+    if (succeeded * 4 < spawned * 3) return fail(name, "only {d}/{d} concurrent clients completed", .{ succeeded, spawned });
+
+    // They have all disconnected. The realm must still take a new client — the check that
+    // the listener and the tables survived the churn, not just that the process is up.
+    //
+    // The wait is for the server to NOTICE: each worker's socket close has to be observed
+    // by its own read loop before the member is gone, and joining them here only proves
+    // our side finished. Probing too early reads teardown-in-progress as a leak.
+    _ = net.usleep(1_500_000);
+    var after = rc.RealmClient{};
+    defer after.close();
+    after.connectBnet() catch |e| return fail(name, "realm stopped accepting after the load: {s}", .{@errorName(e)});
+    after.auth() catch |e| return fail(name, "auth after load: {s}", .{@errorName(e)});
+    after.login("StressAfter") catch |e| return fail(name, "login after load: {s}", .{@errorName(e)});
+    after.enterChat() catch |e| return fail(name, "enterChat after load: {s}", .{@errorName(e)});
+    after.joinChannel("Diablo II") catch |e| return fail(name, "joinChannel after load: {s}", .{@errorName(e)});
+    after.setBnetTimeout(1500);
+
+    // And the channel must not still be listing workers that disconnected: a leaked member
+    // would be shown to this client as a SHOWUSER on join.
+    var ghosts: usize = 0;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const ev = after.readChatEvent() catch break;
+        if (ev.eid != rc.EID_SHOWUSER) continue;
+        if (std.mem.indexOf(u8, ev.username, "Stress") != null) ghosts += 1;
+    }
+    if (ghosts > 0) return fail(name, "{d} disconnected clients are still in the channel", .{ghosts});
+
+    return .{ .name = name, .status = .pass, .msg = msg("{d}/{d} concurrent clients; realm still serving and the channel drained clean", .{ succeeded, spawned }) };
+}
+
 fn scFriendsListLoad() Result {
     const name = "friends_list_load";
     const acct = "LoadAcct";
@@ -2190,6 +2277,7 @@ pub fn main() !void {
         scLobbyChatAtoB(),
         scLobbyCharNames(),
         scChatCommands(),
+        scConcurrentClients(),
         scFriendsListLoad(),
         scNameResolution(),
         scLeaveChannel(),
