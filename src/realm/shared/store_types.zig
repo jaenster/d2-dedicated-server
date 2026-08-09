@@ -81,6 +81,11 @@ pub const NamedGame = struct {
     gs_port: u16 = 4000,
     gsid: u32 = 0,
     players: u16 = 0,
+    /// The creator's character status bits — what KIND of game this is (hardcore 0x04,
+    /// expansion 0x20, ladder 0x40). The join screen needs it for the same reason `GameRec`
+    /// carries it: a listed game a character cannot legally enter should say so on the list
+    /// rather than at the disconnect.
+    status: u8 = 0,
     description: [32]u8 = [_]u8{0} ** 32,
     desc_len: u8 = 0,
 

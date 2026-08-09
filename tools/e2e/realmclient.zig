@@ -6,10 +6,22 @@ const net = @import("net.zig");
 const xsha1 = @import("xsha1.zig");
 const Socket = net.Socket;
 
-pub const HOST_BNET: u16 = 6112;
-pub const HOST_D2CS: u16 = 6113;
-pub const HOST_D2DBS: u16 = 6114;
-pub const HOST_GS: u16 = 6115;
+// Ports the harness's own realmd listens on. Overridable as a block via E2E_PORT_BASE
+// (set by main() before anything connects) so a run is not at the mercy of whatever else
+// happens to be sitting on 6112 — which silently turns the whole suite into a test of
+// someone else's server.
+pub var HOST_BNET: u16 = 6112;
+pub var HOST_D2CS: u16 = 6113;
+pub var HOST_D2DBS: u16 = 6114;
+pub var HOST_GS: u16 = 6115;
+
+/// Move the block to `base`..`base+3`.
+pub fn setPortBase(base: u16) void {
+    HOST_BNET = base;
+    HOST_D2CS = base + 1;
+    HOST_D2DBS = base + 2;
+    HOST_GS = base + 3;
+}
 
 // BNCS opcodes
 const SID_ENTERCHAT = 0x0A;
@@ -205,9 +217,12 @@ pub const RealmClient = struct {
     d2cs: ?Socket = null,
     // Ports default to the single-instance harness layout; the multi-instance
     // scenario overrides these to point at a specific realmd instance.
-    bnet_port: u16 = HOST_BNET,
-    d2cs_port: u16 = HOST_D2CS,
-    d2dbs_port: u16 = HOST_D2DBS,
+    // 0 = "the harness's own realmd", resolved at connect time so the port block can be
+    // moved without every scenario having to know. A scenario that targets a specific
+    // instance sets these explicitly.
+    bnet_port: u16 = 0,
+    d2cs_port: u16 = 0,
+    d2dbs_port: u16 = 0,
     realm_name: []const u8 = "TypeGuru",
     account: []const u8 = "",
     server_token: u32 = 0,
@@ -224,7 +239,7 @@ pub const RealmClient = struct {
     }
 
     pub fn connectBnet(self: *RealmClient) !void {
-        const fd = try net.connectLocal(self.bnet_port);
+        const fd = try net.connectLocal(if (self.bnet_port != 0) self.bnet_port else HOST_BNET);
         try net.writeAll(fd, &[_]u8{0x01}); // protocol selector
         self.bnet = fd;
     }
@@ -490,7 +505,7 @@ pub const AdInfo = struct {
     }
 
     pub fn connectD2cs(self: *RealmClient) !void {
-        const fd = try net.connectLocal(self.d2cs_port);
+        const fd = try net.connectLocal(if (self.d2cs_port != 0) self.d2cs_port else HOST_D2CS);
         try net.writeAll(fd, &[_]u8{0x01});
         self.d2cs = fd;
     }

@@ -425,6 +425,11 @@ fn gameservers(fd: net.Socket) void {
 
 const gslinkMax = 64;
 
+/// JSON booleans: the format string needs a string, not a Zig bool.
+fn boolJson(v: bool) []const u8 {
+    return if (v) "true" else "false";
+}
+
 fn games(fd: net.Socket) void {
     var gms: [512]state.GameInfo = undefined;
     const n = state.snapshotGames(&gms);
@@ -433,13 +438,25 @@ fn games(fd: net.Socket) void {
     buf[w] = '[';
     w += 1;
     for (gms[0..n], 0..) |g, i| {
-        const seg = std.fmt.bufPrint(buf[w..], "{s}{{\"name\":\"{s}\",\"gameid\":{d},\"gsid\":\"0x{x}\",\"ip\":\"{d}.{d}.{d}.{d}:{d}\"}}", .{
-            if (i == 0) "" else ",",
-            g.name_slice(),
-            g.gameid,
-            g.gsid,
-            g.ip[0], g.ip[1], g.ip[2], g.ip[3], g.port,
-        }) catch break;
+        // Everything an operator would want to know about a live game and, until now, had
+        // no way to see: how full it is, what the creator called it, and which kind of
+        // game it is — the same status bits a joining character has to match.
+        const seg = std.fmt.bufPrint(
+            buf[w..],
+            "{s}{{\"name\":\"{s}\",\"gameid\":{d},\"gsid\":\"0x{x}\",\"ip\":\"{d}.{d}.{d}.{d}:{d}\"," ++
+                "\"players\":{d},\"description\":\"{s}\",\"expansion\":{s},\"hardcore\":{s},\"ladder\":{s}}}",
+            .{
+                if (i == 0) "" else ",",
+                g.name_slice(),
+                g.gameid,
+                g.gsid,
+                g.ip[0],   g.ip[1], g.ip[2], g.ip[3], g.port,
+                g.players, g.desc(),
+                boolJson(g.status & 0x20 != 0),
+                boolJson(g.status & 0x04 != 0),
+                boolJson(g.status & 0x40 != 0),
+            },
+        ) catch break;
         w += seg.len;
     }
     if (w < buf.len) {

@@ -374,6 +374,8 @@ pub const GameInfo = struct {
     ip: [4]u8 = .{ 0, 0, 0, 0 },
     port: u16 = 0,
     players: u16 = 0,
+    /// Creator's character status bits — what kind of game it is (hardcore/expansion/ladder).
+    status: u8 = 0,
     description: [32]u8 = [_]u8{0} ** 32,
     desc_len: u8 = 0,
 
@@ -395,7 +397,7 @@ pub fn snapshotGames(buf: []GameInfo) usize {
         const cap = @min(buf.len, tmp.len);
         const m = store.snapshotGames(tmp[0..cap]);
         for (tmp[0..m], 0..) |ng, i| {
-            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port, .players = ng.players };
+            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port, .players = ng.players, .status = ng.status };
             const ln: u8 = @intCast(@min(ng.name_len, max_name));
             @memcpy(gi.name[0..ln], ng.name[0..ln]);
             gi.name_len = ln;
@@ -412,7 +414,7 @@ pub fn snapshotGames(buf: []GameInfo) usize {
     for (&global.games) |*g| {
         if (n >= buf.len) break;
         if (!g.in_use) continue;
-        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .players = g.players, .name_len = g.name_len, .desc_len = g.desc_len };
+        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .players = g.players, .status = g.status, .name_len = g.name_len, .desc_len = g.desc_len };
         @memcpy(gi.name[0..g.name_len], g.name[0..g.name_len]);
         @memcpy(gi.description[0..g.desc_len], g.description[0..g.desc_len]);
         buf[n] = gi;

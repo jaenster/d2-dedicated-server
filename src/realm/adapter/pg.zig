@@ -152,6 +152,20 @@ fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
     return out[0..name.len];
 }
 
+/// A game name reduced to the key it is stored under.
+///
+/// LOWERCASED, and that is the point. Battle.net treats game names case-insensitively — "Jan" and
+/// "jan" are the same game to a player typing one into the join box — but a key that preserves
+/// case makes them two rows. The failure that produces is genuinely baffling from the outside:
+/// CREATEGAME matches one record and answers "a game already exists with that name", while
+/// JOINGAME matches the other and routes to a game that is not the one on screen, so the client
+/// says "game name and password don't match" about a game it can see in the list.
+fn gameKey(name: []const u8, out: []u8) ?[]const u8 {
+    const safe = sanitize(name, out) orelse return null;
+    for (out[0..safe.len]) |*c| c.* = std.ascii.toLower(c.*);
+    return out[0..safe.len];
+}
+
 // ── ip <-> bigint helpers ────────────────────────────────────────────────────
 
 fn ipToInt(ip: [4]u8) i64 {
@@ -276,7 +290,7 @@ fn sweepSessions(p: *pg.Pool) void {
 
 pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
-    const safe = sanitize(name, &nb) orelse return false;
+    const safe = gameKey(name, &nb) orelse return false;
     const p = ensurePool() orelse return false;
     const ip = ipToInt(gs_ip);
     if (ttl_s > 0) {
@@ -317,7 +331,7 @@ pub fn setGamePlayers(gameid: u32, players: u16) bool {
 
 pub fn findGame(name: []const u8) ?GameRec {
     var nb: [64]u8 = undefined;
-    const safe = sanitize(name, &nb) orelse return null;
+    const safe = gameKey(name, &nb) orelse return null;
     const p = ensurePool() orelse return null;
     sweepGames(p);
     var row = (p.row(
@@ -350,7 +364,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
     const p = ensurePool() orelse return 0;
     sweepGames(p); // drop lapsed rows first so the listing matches findGame's view
     var result = p.query(
-        "select name, gameid, ip, port, gsid, players, description from games where expires_at is null or expires_at > now()",
+        "select name, gameid, ip, port, gsid, players, description, status from games where expires_at is null or expires_at > now()",
         .{},
     ) catch return 0;
     defer result.deinit();
@@ -364,12 +378,14 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
         const gsid = row.get(i64, 4) catch continue;
         const players = row.get(i32, 5) catch 0;
         const description = row.get([]const u8, 6) catch "";
+        const game_status = row.get(i32, 7) catch 0;
         var ng = types.NamedGame{
             .gameid = @truncate(@as(u64, @bitCast(gameid))),
             .gs_ip = intToIp(ip),
             .gs_port = @truncate(@as(u32, @bitCast(port))),
             .gsid = @truncate(@as(u64, @bitCast(gsid))),
             .players = @truncate(@as(u32, @bitCast(players))),
+            .status = @truncate(@as(u32, @bitCast(game_status))),
         };
         ng.setDesc(description);
         const ln: u8 = @intCast(@min(nm.len, ng.name.len));

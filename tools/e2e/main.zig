@@ -44,7 +44,7 @@ const alloc = std.heap.c_allocator;
 
 // Admin API bearer token the harness starts realmd with (REALMD_ADMIN_TOKEN).
 const ADMIN_TOKEN = "testtoken";
-const HEALTH_PORT: u16 = 18080;
+var HEALTH_PORT: u16 = 18080;
 
 fn msg(comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(alloc, fmt, args) catch "(alloc failed)";
@@ -129,19 +129,21 @@ fn scMcpOn6112() Result {
     const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
     if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
 
-    var c = rc.RealmClient{ .d2cs_port = 6112 }; // MCP on the SAME port as BNCS
+    // MCP muxed onto the SAME port as BNCS — the point of the scenario, so it follows
+    // the bnet port rather than the literal 6112.
+    var c = rc.RealmClient{ .d2cs_port = rc.HOST_BNET };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "connectBnet {s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "auth {s}", .{@errorName(e)});
     c.login(acct) catch |e| return fail(name, "login {s}", .{@errorName(e)});
     c.enterRealm() catch |e| return fail(name, "enterRealm {s}", .{@errorName(e)});
-    c.connectD2cs() catch |e| return fail(name, "connectD2cs(6112) {s}", .{@errorName(e)});
-    const su = c.startup() catch |e| return fail(name, "MCP startup over 6112: {s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "connectD2cs(bnet port) {s}", .{@errorName(e)});
+    const su = c.startup() catch |e| return fail(name, "MCP startup over the bnet port: {s}", .{@errorName(e)});
     if (su != 0) return fail(name, "MCP startup result=0x{x}", .{su});
 
     var entries: [16]rc.CharEntry = undefined;
     var dst: [2048]u8 = undefined;
-    const cl = c.charList(&entries, &dst) catch |e| return fail(name, "charList over 6112: {s}", .{@errorName(e)});
+    const cl = c.charList(&entries, &dst) catch |e| return fail(name, "charList over the bnet port: {s}", .{@errorName(e)});
     var found = false;
     for (entries[0..cl.count]) |e| {
         if (std.mem.eql(u8, e.name, char)) found = true;
@@ -1020,6 +1022,20 @@ fn maybeStartRealmd() !?c_int {
     _ = mkdir(data_dir, 0o755); // ignore EEXIST; realmd creates subdirs itself
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
     _ = setenv("REALMD_HEALTH_PORT", health, 1);
+    // Tell realmd to listen where the clients are going to look. Without this an
+    // overridden port base moves only our end and realmd still fights for 6112.
+    var pbuf: [6][8]u8 = undefined;
+    const ports = [_]struct { name: [*:0]const u8, port: u16 }{
+        .{ .name = "REALMD_BNET_PORT", .port = rc.HOST_BNET },
+        .{ .name = "REALMD_D2CS_PORT", .port = rc.HOST_D2CS },
+        .{ .name = "REALMD_D2DBS_PORT", .port = rc.HOST_D2DBS },
+        .{ .name = "REALMD_GS_PORT", .port = rc.HOST_GS },
+    };
+    for (ports, 0..) |pp, i| {
+        if (std.fmt.bufPrintZ(&pbuf[i], "{d}", .{pp.port})) |v| {
+            _ = setenv(pp.name, v.ptr, 1);
+        } else |_| {}
+    }
     _ = setenv("REALMD_ADMIN_TOKEN", ADMIN_TOKEN, 1); // enable the admin API (admin_api scenario)
     _ = setenv("REALMD_PERMISSIVE_AUTH", "1", 1); // legacy auth (auto-register + verify) for the synthetic xsha1 client
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
@@ -1078,6 +1094,11 @@ fn scMultiGameOneGs() Result {
     var idx: usize = 0;
     while (std.mem.indexOfPos(u8, r.body, idx, "0xd2d2")) |p| : (idx = p + 1) count += 1;
     if (count < 3) return fail(name, "expected 3 games on gsid 0xd2d2, found {d}", .{count});
+    // The listing has to carry what an operator actually needs — how full a game is, what
+    // it was called, and which kind it is — not just an address.
+    if (std.mem.indexOf(u8, r.body, "\"players\":") == null) return fail(name, "/admin/games has no player count: {s}", .{r.body});
+    if (std.mem.indexOf(u8, r.body, "\"description\":\"d\"") == null) return fail(name, "/admin/games lost the description: {s}", .{r.body});
+    if (std.mem.indexOf(u8, r.body, "\"expansion\":") == null) return fail(name, "/admin/games does not say what kind of game it is: {s}", .{r.body});
     return .{ .name = name, .status = .pass, .msg = msg("one GS hosts 3 games (creates={d}), all tracked under gsid 0xd2d2", .{gs.creates}) };
 }
 
@@ -1635,6 +1656,14 @@ fn scEmbeddedGameEdge() Result {
 }
 
 pub fn main() !void {
+    // A whole run can be moved off the default ports. Without this, a stray realm server
+    // on 6112 quietly becomes the system under test.
+    const port_base = std.fmt.parseInt(u16, envOr("E2E_PORT_BASE", "0"), 10) catch 0;
+    if (port_base != 0) {
+        rc.setPortBase(port_base);
+        HEALTH_PORT = port_base + 1968; // keeps the usual 6112 -> 18080 relationship
+        std.debug.print("port base overridden: bnet={d} health={d}\n", .{ rc.HOST_BNET, HEALTH_PORT });
+    }
     startRedis();
     const child = try maybeStartRealmd();
 

@@ -201,6 +201,20 @@ fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
     return out[0..name.len];
 }
 
+/// A game name reduced to the key it is stored under.
+///
+/// LOWERCASED, and that is the point. Battle.net treats game names case-insensitively — "Jan" and
+/// "jan" are the same game to a player typing one into the join box — but a key that preserves
+/// case makes them two rows. The failure that produces is genuinely baffling from the outside:
+/// CREATEGAME matches one record and answers "a game already exists with that name", while
+/// JOINGAME matches the other and routes to a game that is not the one on screen, so the client
+/// says "game name and password don't match" about a game it can see in the list.
+fn gameKey(name: []const u8, out: []u8) ?[]const u8 {
+    const safe = sanitize(name, out) orelse return null;
+    for (out[0..safe.len]) |*c| c.* = std.ascii.toLower(c.*);
+    return out[0..safe.len];
+}
+
 // ── characters (durable) ─────────────────────────────────────────────────────
 
 pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8) bool {
@@ -348,7 +362,7 @@ pub fn expireSession(id: u64) void {
 
 pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
-    const safe = sanitize(name, &nb) orelse return false;
+    const safe = gameKey(name, &nb) orelse return false;
 
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
@@ -432,7 +446,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
             else => continue,
         };
         const rec = parseGame(val) orelse continue;
-        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players };
+        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status };
         ng.setDesc(rec.desc());
         const cl: u8 = @intCast(@min(gname.len, ng.name.len));
         @memcpy(ng.name[0..cl], gname[0..cl]);
@@ -445,7 +459,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
 
 pub fn findGame(name: []const u8) ?GameRec {
     var nb: [64]u8 = undefined;
-    const safe = sanitize(name, &nb) orelse return null;
+    const safe = gameKey(name, &nb) orelse return null;
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return null;
 

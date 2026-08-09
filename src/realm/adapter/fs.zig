@@ -46,6 +46,20 @@ fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
     return out[0..name.len];
 }
 
+/// A game name reduced to the key it is stored under.
+///
+/// LOWERCASED, and that is the point. Battle.net treats game names case-insensitively — "Jan" and
+/// "jan" are the same game to a player typing one into the join box — but a key that preserves
+/// case makes them two rows. The failure that produces is genuinely baffling from the outside:
+/// CREATEGAME matches one record and answers "a game already exists with that name", while
+/// JOINGAME matches the other and routes to a game that is not the one on screen, so the client
+/// says "game name and password don't match" about a game it can see in the list.
+fn gameKey(name: []const u8, out: []u8) ?[]const u8 {
+    const safe = sanitize(name, out) orelse return null;
+    for (out[0..safe.len]) |*c| c.* = std.ascii.toLower(c.*);
+    return out[0..safe.len];
+}
+
 fn dirPath(buf: []u8, account: []const u8) ?[]const u8 {
     var ab: [64]u8 = undefined;
     const a = sanitize(account, &ab) orelse return null;
@@ -448,7 +462,7 @@ pub fn expireSession(id: u64) void {
 
 pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
-    const safe = sanitize(name, &nb) orelse return false;
+    const safe = gameKey(name, &nb) orelse return false;
     var vb: [256]u8 = undefined;
     const hlen = ttlHeader(&vb, ttl_s);
     // Fields: gameid ip port gsid players status <password> <description>. Every field up to the
@@ -471,7 +485,7 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
 
 pub fn findGame(name: []const u8) ?GameRec {
     var nb: [64]u8 = undefined;
-    const safe = sanitize(name, &nb) orelse return null;
+    const safe = gameKey(name, &nb) orelse return null;
     fs_lock.lock();
     defer fs_lock.unlock();
     var vb: [256]u8 = undefined;
@@ -524,7 +538,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
         const raw = readSmall("games", entry.name, &vb) orelse continue;
         const val = unexpiredPayload(raw) orelse continue; // expired → skip
         const rec = parseGame(val) orelse continue;
-        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players };
+        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status };
         ng.setDesc(rec.desc());
         const ln: u8 = @intCast(@min(entry.name.len, ng.name.len));
         @memcpy(ng.name[0..ln], entry.name[0..ln]);
@@ -724,4 +738,25 @@ pub fn healthy() bool {
     };
     d.close(io);
     return true;
+}
+
+test "a game name is one game whatever case it is typed in" {
+    // The bug this pins: keys preserved case, so "Jan" and "jan" were two records. CREATEGAME
+    // matched one and answered "already exists"; JOINGAME matched the other and routed to a
+    // different game, which the client reports as "game name and password don't match" about a
+    // game it can see in its own list.
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    const upper = gameKey("Jan", &a).?;
+    const lower = gameKey("jan", &b).?;
+    try std.testing.expectEqualStrings(lower, upper);
+    try std.testing.expectEqualStrings("jan", upper);
+
+    var c: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("mygame-2", gameKey("MyGame-2", &c).?);
+
+    // Still refuses what it always refused: a name with characters that cannot be a key.
+    var d: [64]u8 = undefined;
+    try std.testing.expect(gameKey("bad name", &d) == null);
+    try std.testing.expect(gameKey("", &d) == null);
 }
