@@ -20,6 +20,8 @@ const SID_LOGONRESPONSE2 = 0x3A;
 const SID_CREATEACCOUNT2 = 0x3D;
 const SID_LOGONREALMEX = 0x3E;
 const SID_FRIENDSLIST = 0x65;
+const SID_CHECKAD = 0x15;
+const SID_QUERYADURL = 0x41;
 
 // Fixed client token used for OLS login double-hashing (any non-zero value works;
 // the server combines it with the per-connection server_token it sent us).
@@ -355,6 +357,18 @@ pub const RealmClient = struct {
         return self.unique_name_buf[0..self.unique_name_len];
     }
 
+/// SID_CHECKAD reply, as NET_SID_CLIENT_Incoming_CheckAd @0x521150 reads it.
+pub const AdInfo = struct {
+    id: u32 = 0,
+    extension: u32 = 0,
+    filetime: u64 = 0,
+    filename: []const u8 = "",
+    url: []const u8 = "",
+    /// Whether the client would actually act on this: the handler needs a body longer
+    /// than 0x10, a new id, and BOTH strings non-empty before it fetches anything.
+    body_len: usize = 0,
+};
+
     /// SID_FRIENDSLIST (0x65): u8 count, then per friend cstr name, u8 status,
     /// u8 location, u32 product, cstr location-string. Names are copied into `dst`.
     pub fn friendsList(self: *RealmClient, out: [][]const u8, dst: []u8) !usize {
@@ -384,6 +398,51 @@ pub const RealmClient = struct {
             off += loc.len + 1;
         }
         return n;
+    }
+
+    /// SID_CHECKAD (0x15): ask for a banner. Body is { "IX86", product, last-ad-id,
+    /// unix time } — 16 bytes, matching NET_SID_CLIENT_Send_0x15_CheckAd @0x51b010.
+    /// Returns null when the server sends nothing back (its "no ad" answer).
+    pub fn checkAd(self: *RealmClient, last_ad_id: u32, dst: []u8) !?AdInfo {
+        const fd = self.bnet.?;
+        var body: [16]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.bytes("IX86");
+        w.u32v(0x44325850); // product D2XP
+        w.u32v(last_ad_id);
+        w.u32v(0);
+        try bncsSend(fd, SID_CHECKAD, w.slice());
+        const r = bncsRecv(fd, &self.rxbuf) catch return null;
+        if (r.id != SID_CHECKAD) return error.CheckAdBadId;
+        if (r.body.len < 0x10) return error.CheckAdShort;
+        var ad = AdInfo{
+            .id = net.rdU32(r.body, 0),
+            .extension = net.rdU32(r.body, 4),
+            .body_len = r.body.len,
+        };
+        ad.filetime = @as(u64, net.rdU32(r.body, 8)) | (@as(u64, net.rdU32(r.body, 12)) << 32);
+        const fname = std.mem.sliceTo(r.body[0x10..], 0);
+        @memcpy(dst[0..fname.len], fname);
+        ad.filename = dst[0..fname.len];
+        const url = std.mem.sliceTo(r.body[0x10 + fname.len + 1 ..], 0);
+        @memcpy(dst[fname.len .. fname.len + url.len], url);
+        ad.url = dst[fname.len .. fname.len + url.len];
+        return ad;
+    }
+
+    /// SID_QUERYADURL (0x41): where a clicked banner goes. Returns { id, url }.
+    pub fn queryAdUrl(self: *RealmClient, ad_id: u32, dst: []u8) !struct { id: u32, url: []const u8 } {
+        const fd = self.bnet.?;
+        var body: [4]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(ad_id);
+        try bncsSend(fd, SID_QUERYADURL, w.slice());
+        const r = try bncsRecv(fd, &self.rxbuf);
+        if (r.id != SID_QUERYADURL) return error.QueryAdUrlBadId;
+        const id = net.rdU32(r.body, 0);
+        const url = std.mem.sliceTo(r.body[4..], 0);
+        @memcpy(dst[0..url.len], url);
+        return .{ .id = id, .url = dst[0..url.len] };
     }
 
     /// SID_JOINCHANNEL — body is u32 flags + cstr channel name.

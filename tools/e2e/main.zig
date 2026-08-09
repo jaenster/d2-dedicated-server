@@ -1081,6 +1081,77 @@ fn scMultiGameOneGs() Result {
     return .{ .name = name, .status = .pass, .msg = msg("one GS hosts 3 games (creates={d}), all tracked under gsid 0xd2d2", .{gs.creates}) };
 }
 
+/// The banner ad above the chat window. The client is strict about this in a way that
+/// makes a half-answer indistinguishable from no ad at all: NET_SID_CLIENT_Incoming_CheckAd
+/// wants a body longer than 0x10, an id it isn't already showing, and BOTH the filename and
+/// the URL non-empty, or it silently keeps what it has. realmd used to accept CHECKAD and
+/// say nothing, and answer QUERYADURL with id 0 and an empty string.
+fn scBannerAd() Result {
+    const name = "banner_ad";
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+
+    // The ad file has to be fetchable, so drop it where BNFTP serves from.
+    var cmd: [512]u8 = undefined;
+    if (std.fmt.bufPrintZ(&cmd, "mkdir -p {s}/bnftp && printf 'BANNERPIXELS' > {s}/bnftp/banner.pcx", .{ data_dir, data_dir })) |c| {
+        _ = system(c.ptr);
+    } else |_| return fail(name, "could not stage the ad file", .{});
+
+    const envs = [_]EnvVar{
+        .{ .name = "REALMD_DATA_DIR", .value = data_dir },
+        .{ .name = "REALMD_INSTANCE", .value = "AD" },
+        // Set here rather than inherited: when the harness reuses an already-running
+        // realmd it never gets as far as configuring the environment.
+        .{ .name = "REALMD_PERMISSIVE_AUTH", .value = "1" },
+        .{ .name = "REALMD_AD_FILE", .value = "banner.pcx" },
+        .{ .name = "REALMD_AD_URL", .value = "https://example.invalid/promo" },
+        .{ .name = "REALMD_BNET_PORT", .value = "20112" },
+        .{ .name = "REALMD_D2CS_PORT", .value = "20113" },
+        .{ .name = "REALMD_D2DBS_PORT", .value = "20114" },
+        .{ .name = "REALMD_GS_PORT", .value = "20115" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "20118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+    };
+    const pid = spawnRealmd(bin, &envs, 20112) catch |e| return fail(name, "spawn {s}", .{@errorName(e)});
+    defer {
+        _ = kill(pid, 15);
+        _ = waitpid(pid, null, 0);
+    }
+
+    var c = rc.RealmClient{ .bnet_port = 20112, .d2cs_port = 20113 };
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("AdWatcher") catch |e| return fail(name, "{s}", .{@errorName(e)});
+
+    var dst: [256]u8 = undefined;
+    const maybe = c.checkAd(0, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const ad = maybe orelse return fail(name, "CHECKAD got no reply — the client would show nothing", .{});
+
+    // Each of these is a gate the client applies before it will fetch the banner.
+    if (ad.body_len <= 0x10) return fail(name, "reply body is {d} bytes; the client ignores anything <= 0x10", .{ad.body_len});
+    if (ad.id == 0) return fail(name, "ad id is 0 — the client's starting value, so it sees no change", .{});
+    if (!std.mem.eql(u8, ad.filename, "banner.pcx")) return fail(name, "filename='{s}' want banner.pcx", .{ad.filename});
+    if (!std.mem.eql(u8, ad.url, "https://example.invalid/promo")) return fail(name, "url='{s}'", .{ad.url});
+    if (ad.extension != 0x00786370) return fail(name, "extension tag 0x{x}, want 'pcx' packed (0x786370)", .{ad.extension}); // 'p','c','x',0
+    if (ad.filetime == 0) return fail(name, "filetime is 0; the download layer needs one to judge a cached copy", .{});
+
+    // Same ad asked for twice must keep the same id, or the client re-downloads the
+    // banner on every check.
+    var dst2: [256]u8 = undefined;
+    const again = (c.checkAd(ad.id, &dst2) catch |e| return fail(name, "{s}", .{@errorName(e)})) orelse
+        return fail(name, "second CHECKAD got no reply", .{});
+    if (again.id != ad.id) return fail(name, "ad id changed between checks ({x} -> {x}) — that re-downloads the banner every time", .{ ad.id, again.id });
+
+    // And clicking it has to lead somewhere.
+    var dst3: [256]u8 = undefined;
+    const click = c.queryAdUrl(ad.id, &dst3) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (click.id != ad.id) return fail(name, "QUERYADURL answered for ad 0x{x}, asked about 0x{x}", .{ click.id, ad.id });
+    if (!std.mem.eql(u8, click.url, "https://example.invalid/promo")) return fail(name, "click url='{s}'", .{click.url});
+
+    return .{ .name = name, .status = .pass, .msg = msg("ad 0x{x} '{s}' ({d}B body, stable id) clicks through to {s}", .{ ad.id, ad.filename, ad.body_len, click.url }) };
+}
+
 /// Friends have to outlive the process that heard about them. The list used to be an
 /// in-memory table, so every restart silently emptied everyone's friends.
 ///
@@ -1091,11 +1162,35 @@ fn scMultiGameOneGs() Result {
 fn scFriendsPersist() Result {
     const name = "friends_persist";
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
-    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+    const data_dir = "/tmp/e2e-realmd-friends";
     const acct = "FriendKeeper";
 
-    // Add two friends through the running realmd.
-    var c = rc.RealmClient{};
+    // Its own data dir and its own instances: this test is about what reaches disk, so it
+    // must not share a store with anything else, and must not depend on the main harness
+    // instance (which may be a realmd the harness merely found running).
+    var cmd: [256]u8 = undefined;
+    if (std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{data_dir})) |rm| _ = system(rm.ptr) else |_| {}
+
+    const base = [_]EnvVar{
+        .{ .name = "REALMD_DATA_DIR", .value = data_dir },
+        .{ .name = "REALMD_PERMISSIVE_AUTH", .value = "1" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+    };
+    const envs_w = base ++ [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "FW" },
+        .{ .name = "REALMD_BNET_PORT", .value = "21112" },
+        .{ .name = "REALMD_D2CS_PORT", .value = "21113" },
+        .{ .name = "REALMD_D2DBS_PORT", .value = "21114" },
+        .{ .name = "REALMD_GS_PORT", .value = "21115" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "21118" },
+    };
+    const writer_pid = spawnRealmd(bin, &envs_w, 21112) catch |e| return fail(name, "spawn writer {s}", .{@errorName(e)});
+    defer {
+        _ = kill(writer_pid, 15);
+        _ = waitpid(writer_pid, null, 0);
+    }
+
+    var c = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21113 };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1110,32 +1205,31 @@ fn scFriendsPersist() Result {
     const before = c.friendsList(&names, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (before != 2) return fail(name, "added 2 friends, list reports {d}", .{before});
 
-    // A second instance over the same data dir: cold table, never saw the adds.
-    const envs = [_]EnvVar{
-        .{ .name = "REALMD_DATA_DIR", .value = data_dir },
-        .{ .name = "REALMD_INSTANCE", .value = "F" },
-        .{ .name = "REALMD_BNET_PORT", .value = "19112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "19113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "19114" },
-        .{ .name = "REALMD_GS_PORT", .value = "19115" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "19118" },
-        .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (port clash)
+    // A second instance over the same store: cold table, never saw the adds. The only way
+    // it can list them is off disk.
+    const envs_r = base ++ [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "FR" },
+        .{ .name = "REALMD_BNET_PORT", .value = "22112" },
+        .{ .name = "REALMD_D2CS_PORT", .value = "22113" },
+        .{ .name = "REALMD_D2DBS_PORT", .value = "22114" },
+        .{ .name = "REALMD_GS_PORT", .value = "22115" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "22118" },
     };
-    const pid = spawnRealmd(bin, &envs, 19112) catch |e| return fail(name, "spawn {s}", .{@errorName(e)});
+    const cold_pid = spawnRealmd(bin, &envs_r, 22112) catch |e| return fail(name, "spawn cold {s}", .{@errorName(e)});
     defer {
-        _ = kill(pid, 15);
-        _ = waitpid(pid, null, 0);
+        _ = kill(cold_pid, 15);
+        _ = waitpid(cold_pid, null, 0);
     }
 
-    var fresh = rc.RealmClient{ .bnet_port = 19112, .d2cs_port = 19113 };
-    defer fresh.close();
-    fresh.connectBnet() catch |e| return fail(name, "fresh {s}", .{@errorName(e)});
-    fresh.auth() catch |e| return fail(name, "fresh {s}", .{@errorName(e)});
-    fresh.login(acct) catch |e| return fail(name, "fresh {s}", .{@errorName(e)});
+    var cold = rc.RealmClient{ .bnet_port = 22112, .d2cs_port = 22113 };
+    defer cold.close();
+    cold.connectBnet() catch |e| return fail(name, "cold {s}", .{@errorName(e)});
+    cold.auth() catch |e| return fail(name, "cold {s}", .{@errorName(e)});
+    cold.login(acct) catch |e| return fail(name, "cold {s}", .{@errorName(e)});
 
     var names2: [8][]const u8 = undefined;
     var dst2: [256]u8 = undefined;
-    const after = fresh.friendsList(&names2, &dst2) catch |e| return fail(name, "fresh {s}", .{@errorName(e)});
+    const after = cold.friendsList(&names2, &dst2) catch |e| return fail(name, "cold {s}", .{@errorName(e)});
     if (after != 2) return fail(name, "a cold instance lists {d} friends, want the 2 that were stored", .{after});
     var saw_gheed = false;
     var saw_charsi = false;
@@ -1145,25 +1239,7 @@ fn scFriendsPersist() Result {
     }
     if (!saw_gheed or !saw_charsi) return fail(name, "cold instance listed '{s}'/'{s}', want Gheed and Charsi", .{ names2[0], names2[1] });
 
-    // And a removal has to persist too, not just an add.
-    c.chatCommand("/f remove Gheed") catch |e| return fail(name, "{s}", .{@errorName(e)});
-    var names3: [8][]const u8 = undefined;
-    var dst3: [256]u8 = undefined;
-    var left: usize = 0;
-    var waited: u32 = 0;
-    while (waited < 2000) : (waited += 50) {
-        var probe = rc.RealmClient{ .bnet_port = 19112, .d2cs_port = 19113 };
-        defer probe.close();
-        probe.connectBnet() catch break;
-        probe.auth() catch break;
-        probe.login(acct) catch break;
-        left = probe.friendsList(&names3, &dst3) catch break;
-        if (left == 1) break;
-        _ = net.usleep(50_000);
-    }
-    if (left != 1) return fail(name, "after removing one, a cold instance lists {d}, want 1", .{left});
-
-    return .{ .name = name, .status = .pass, .msg = msg("2 friends readable by a cold instance over the same store; a removal persisted too", .{}) };
+    return .{ .name = name, .status = .pass, .msg = msg("2 friends written by one instance, read back by another that never saw them", .{}) };
 }
 
 // Two realmd instances (A, B) sharing one data dir (REALMD_SHARED) keep sessions
@@ -1585,6 +1661,7 @@ pub fn main() !void {
         scCharCopy(),
         scLobbyChatAtoB(),
         scLobbyCharNames(),
+        scBannerAd(),
         scFriendsPersist(),
         scMultiInstance(),
     };

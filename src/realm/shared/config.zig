@@ -22,6 +22,11 @@ pub const Config = struct {
     /// Comma-separated account names granted Battle.net-admin + channel-operator flags
     /// in chat (the realm's ops). Case-insensitive. Empty = no admins.
     admins: []const u8 = "",
+    /// Banner ad shown above the chat window: the file the client downloads over BNFTP
+    /// (so it must sit in <data_dir>/bnftp/) and the URL a click opens. The client only
+    /// shows an ad when it gets BOTH, so either one empty means no ads.
+    ad_file: []const u8 = "",
+    ad_url: []const u8 = "",
 
     /// Port the game server (our injected d2gs) connects to for the control
     /// link (its own port so we never confuse it with a client MCP connection).
@@ -151,6 +156,8 @@ pub fn fromEnv() Config {
     c.game_port = envPort("REALMD_GAME_PORT", c.game_port);
     if (env("REALMD_REALM_NAME")) |v| c.realm_name = v;
     if (env("REALMD_ADMINS")) |v| c.admins = v;
+    if (env("REALMD_AD_FILE")) |v| c.ad_file = v;
+    if (env("REALMD_AD_URL")) |v| c.ad_url = v;
     if (env("REALMD_REALM_ADDR")) |v| c.realm_addr = v;
     if (env("REALMD_DATA_DIR")) |v| c.data_dir = v;
     if (env("REALMD_SHARED")) |_| c.shared = true;

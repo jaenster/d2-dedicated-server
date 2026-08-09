@@ -25,6 +25,8 @@ const chat = @import("chat.zig");
 const friends = @import("friends.zig");
 const store = @import("store.zig");
 const guilds = @import("guilds.zig");
+
+extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds, for the banner-ad FILETIME
 const guild = @import("realm_shared").guild;
 const xsha1 = @import("xsha1.zig");
 
@@ -299,7 +301,8 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         // Client notifications with no BNCS reply — accept silently so they aren't
         // logged as "unhandled". LeaveChat (left a channel), NotifyJoin (entered a
         // game), CheckAd (banner-ad poll; we serve no ads).
-        SID_LEAVECHAT, SID_NOTIFYJOIN, SID_CHECKAD => {},
+        SID_LEAVECHAT, SID_NOTIFYJOIN => {},
+        SID_CHECKAD => onCheckAd(c, tag),
         SID_STARTADVEX3 => onStartAdvex(c, tag, body),
         SID_NEWS_INFO => onNewsInfo(c, tag, body),
         SID_GETADVLISTEX => onGetAdvListEx(c, tag),
@@ -315,7 +318,12 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         // Fire-and-forget notifications (no reply expected), plus legacy SIDs
         // RE-verified DEAD in 1.14d — 0x06/0x07/0x29/0x42 have no reachable caller
         // (connect-flow RE). Accept silently so they aren't logged as "unhandled".
-        SID_LOCALEINFO, SID_CLICKAD, SID_LEAVEGAME, SID_DISPLAYAD, SID_REPORTCRASH, SID_RESETPASSWORD, SID_STARTVERSIONING, SID_REPORTVERSION, SID_LOGONRESPONSE, SID_CDKEY3 => {},
+        // Ad telemetry: the client reporting that it drew the banner / that someone
+        // clicked it. Nothing is owed in reply, but they are the only signal an operator
+        // has that the banner is actually being seen, so they are logged rather than dropped.
+        SID_DISPLAYAD => log.line(tag, "ad displayed", .{}),
+        SID_CLICKAD => log.line(tag, "ad clicked", .{}),
+        SID_LOCALEINFO, SID_LEAVEGAME, SID_REPORTCRASH, SID_RESETPASSWORD, SID_STARTVERSIONING, SID_REPORTVERSION, SID_LOGONRESPONSE, SID_CDKEY3 => {},
         else => {
             log.line(tag, "unhandled SID 0x{x:0>2} ({d} bytes)", .{ id, body.len });
             if (body.len > 0) log.hexdump(tag, body);
@@ -1058,13 +1066,89 @@ fn onClientId2(c: *Conn, tag: []const u8) void {
 
 // SID_QUERYADURL (0x41): the client asks for an ad URL { u32 adType }. We serve no
 // ads: reply ad-id 0 + an empty URL string.
-fn onQueryAdURL(c: *Conn, tag: []const u8) void {
-    var buf: [16]u8 = undefined;
-    var w = startPacket(&buf, SID_QUERYADURL);
-    w.putU32(0);
-    w.putStr("");
+// ── banner ads ───────────────────────────────────────────────────────────────
+// The banner above the chat window. The client drives the whole thing:
+//
+//   C->S SID_CHECKAD (0x15)  { platform "IX86", product, last-ad-id, unix time }
+//   S->C SID_CHECKAD (0x15)  { u32 adId, u32 fileExtension, FILETIME fileTime,
+//                              cstr filename, cstr url }
+//   ...client downloads `filename` over BNFTP, then reports SID_DISPLAYAD (0x21),
+//   and on a click sends SID_CLICKAD (0x16) followed by SID_QUERYADURL (0x41) to
+//   ask where to point the browser.
+//
+// NET_SID_CLIENT_Incoming_CheckAd @0x521150 only acts when the packet is longer than
+// 0x10 bytes, the ad id differs from the one it already has, and BOTH strings are
+// non-empty — any of those unmet and it silently keeps the current banner. That is why
+// the old empty reply was indistinguishable from having no ads at all.
+//
+// Set by main() from REALMD_AD_FILE / REALMD_AD_URL. The file is served by the same
+// BNFTP listener that serves the version-check MPQ, so it lives in <data_dir>/bnftp/.
+pub var ad_file: []const u8 = "";
+pub var ad_url: []const u8 = "";
+
+/// Pack a filename's extension into the u32 the client carries alongside the ad, the
+/// same 4-char-tag form as everything else on this wire ("pcx", "mng", …).
+fn adExtension(filename: []const u8) u32 {
+    const dot = std.mem.lastIndexOfScalar(u8, filename, '.') orelse return 0;
+    var tag: [4]u8 = .{ 0, 0, 0, 0 };
+    const ext = filename[dot + 1 ..];
+    const n = @min(ext.len, tag.len);
+    for (0..n) |i| tag[i] = ext[i];
+    return std.mem.readInt(u32, &tag, .little);
+}
+
+/// A stable id for the configured ad. The client re-downloads only when this differs
+/// from the id it is already showing, so it must NOT change per connection (that would
+/// re-fetch the banner constantly) and must not be zero (the client's initial value).
+fn adId() u32 {
+    var h: u32 = 2166136261;
+    for (ad_file) |ch| h = (h ^ ch) *% 16777619;
+    return h | 1;
+}
+
+fn onCheckAd(c: *Conn, tag: []const u8) void {
+    if (ad_file.len == 0 or ad_url.len == 0) {
+        log.line(tag, "checkad -> no ad configured (set REALMD_AD_FILE + REALMD_AD_URL)", .{});
+        return; // no reply at all: the client just keeps whatever it has
+    }
+    var buf: [512]u8 = undefined;
+    var w = startPacket(&buf, SID_CHECKAD);
+    w.putU32(adId());
+    w.putU32(adExtension(ad_file));
+    // FILETIME the download layer compares a cached copy against. We hand it "now", so a
+    // client that already has the file still treats the server's as current rather than
+    // deciding its cache is newer and skipping the fetch.
+    w.putU64(unixToFiletime(time(null)));
+    w.putStr(ad_file);
+    w.putStr(ad_url);
     finish(c, &w);
-    log.line(tag, "queryadurl -> none", .{});
+    log.line(tag, "checkad -> ad 0x{x} file='{s}' url='{s}'", .{ adId(), ad_file, ad_url });
+}
+
+/// Seconds-since-epoch to a Win32 FILETIME (100ns ticks since 1601-01-01).
+fn unixToFiletime(secs: i64) u64 {
+    const epoch_delta: u64 = 11644473600; // 1601 -> 1970 in seconds
+    const s: u64 = if (secs < 0) 0 else @intCast(secs);
+    return (s + epoch_delta) * 10_000_000;
+}
+
+// SID_QUERYADURL (0x41): the client asks where a clicked banner should take it. Reply is
+// the ad id it asked about plus the URL; answering with id 0 and an empty string, as this
+// used to, is how you get a banner that cannot be clicked.
+fn onQueryAdURL(c: *Conn, tag: []const u8) void {
+    var buf: [512]u8 = undefined;
+    var w = startPacket(&buf, SID_QUERYADURL);
+    if (ad_file.len == 0 or ad_url.len == 0) {
+        w.putU32(0);
+        w.putStr("");
+        finish(c, &w);
+        log.line(tag, "queryadurl -> none", .{});
+        return;
+    }
+    w.putU32(adId());
+    w.putStr(ad_url);
+    finish(c, &w);
+    log.line(tag, "queryadurl -> 0x{x} '{s}'", .{ adId(), ad_url });
 }
 
 // SID_CHANGEPASSWORD (0x31): { u32 clientToken, u32 serverToken, u8[20] oldProof

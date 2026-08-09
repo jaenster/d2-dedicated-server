@@ -213,6 +213,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     if (getenv("REALMD_MODERN_CHALLENGE") != null) bncs.modern_challenge = true; // CheckRevision.mpq+base64 (clientless probe)
     bncs.admin_accounts = cfg.admins;
+    bncs.ad_file = cfg.ad_file;
+    bncs.ad_url = cfg.ad_url;
+    if (cfg.ad_file.len > 0 and cfg.ad_url.len > 0)
+        log.line("realmd", "banner ad '{s}' -> {s} (served from {s}/bnftp/)", .{ cfg.ad_file, cfg.ad_url, cfg.data_dir });
     // Advertise the realm/MCP address on the BNCS port: bncs.handle selector-muxes
     // MCP (0x01 + non-0xFF) onto :6112, like real bnet. The standalone d2cs listener
     // on cfg.d2cs_port stays up for back-compat / direct tests.
