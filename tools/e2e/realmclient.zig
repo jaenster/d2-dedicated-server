@@ -31,6 +31,8 @@ const SID_CHATCOMMAND = 0x0E;
 const SID_LOGONRESPONSE2 = 0x3A;
 const SID_CREATEACCOUNT2 = 0x3D;
 const SID_LOGONREALMEX = 0x3E;
+const SID_LEAVECHAT = 0x10;
+const SID_NOTIFYJOIN = 0x22;
 const SID_FRIENDSLIST = 0x65;
 const SID_CHECKAD = 0x15;
 const SID_QUERYADURL = 0x41;
@@ -385,6 +387,25 @@ pub const AdInfo = struct {
     /// than 0x10, a new id, and BOTH strings non-empty before it fetches anything.
     body_len: usize = 0,
 };
+
+    /// SID_NOTIFYJOIN (0x22): tell bnetd we went off to play. Body is
+    /// { u32 product, u32 0x0e, cstr game name, cstr password } — the shape
+    /// NET_SID_CLIENT_Send_0x22_NotifyJoin @0x51b320 builds. No reply.
+    pub fn notifyJoin(self: *RealmClient, game_name: []const u8) !void {
+        const fd = self.bnet.?;
+        var body: [128]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(0x44325850); // D2XP
+        w.u32v(0x0e);
+        w.cstr(game_name);
+        w.cstr("");
+        try bncsSend(fd, SID_NOTIFYJOIN, w.slice());
+    }
+
+    /// SID_LEAVECHAT (0x10): leave the channel. No reply.
+    pub fn leaveChat(self: *RealmClient) !void {
+        try bncsSend(self.bnet.?, SID_LEAVECHAT, "");
+    }
 
     /// SID_FRIENDSLIST (0x65): u8 count, then per friend cstr name, u8 status,
     /// u8 location, u32 product, cstr location-string. Names are copied into `dst`.

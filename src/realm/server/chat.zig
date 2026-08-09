@@ -20,6 +20,11 @@ pub const Member = struct {
     name_len: u8 = 0,
     channel: [max_channel]u8 = [_]u8{0} ** max_channel,
     channel_len: u8 = 0,
+    /// The game they went off to play, if any. A player in a game is still connected to
+    /// bnetd — whispers must reach them — but they are no longer in the channel, so
+    /// channel talk must not. Set from SID_NOTIFYJOIN, cleared when they rejoin a channel.
+    game: [max_channel]u8 = [_]u8{0} ** max_channel,
+    game_len: u8 = 0,
     flags: u32 = 0, // SID_CHATEVENT user flags (operator/admin/...) for this user
     // The client's SID_ENTERCHAT statstring — for D2 it encodes the character
     // (name/class/level/gear) the channel user-list draws via
@@ -48,6 +53,9 @@ pub const Member = struct {
     }
     pub fn channelSlice(m: *const Member) []const u8 {
         return m.channel[0..m.channel_len];
+    }
+    pub fn gameSlice(m: *const Member) []const u8 {
+        return m.game[0..m.game_len];
     }
     pub fn statSlice(m: *const Member) []const u8 {
         return m.stat[0..m.stat_len];
@@ -189,6 +197,27 @@ pub fn setAway(fd: net.Socket, msg: []const u8) void {
     @memcpy(m.away[0..n], msg[0..n]);
     m.away_len = n;
 }
+/// Take this connection out of its channel while leaving it registered, so whispers and
+/// friend lookups still find it.
+pub fn clearChannel(fd: net.Socket) void {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByFdLocked(fd) orelse return;
+    m.channel_len = 0;
+}
+
+/// Record that this connection went into a game (SID_NOTIFYJOIN) and left the channel
+/// behind. Passing an empty name puts them back in the lobby.
+pub fn setGame(fd: net.Socket, game_name: []const u8) void {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByFdLocked(fd) orelse return;
+    const n: u8 = @intCast(@min(game_name.len, max_channel));
+    @memcpy(m.game[0..n], game_name[0..n]);
+    m.game_len = n;
+    if (n > 0) m.channel_len = 0; // out of the channel: channel talk must stop reaching them
+}
+
 /// Set/clear this connection's /dnd (Do-Not-Disturb) message.
 pub fn setDnd(fd: net.Socket, msg: []const u8) void {
     reg.lock.lock();
@@ -204,7 +233,7 @@ pub fn whereIs(name: []const u8, out: []u8) ?usize {
     reg.lock.lock();
     defer reg.lock.unlock();
     const m = findByNameLocked(name) orelse return null;
-    const ch = m.channelSlice();
+    const ch = if (m.game_len > 0) m.gameSlice() else m.channelSlice();
     const n = @min(ch.len, out.len);
     @memcpy(out[0..n], ch[0..n]);
     return n;
@@ -285,8 +314,15 @@ pub const Presence = struct {
     /// Channel they are sitting in, empty when they are not in one.
     channel: [max_channel]u8 = [_]u8{0} ** max_channel,
     channel_len: u8 = 0,
+    /// The game they went off to play, if any. A player in a game is still connected to
+    /// bnetd — whispers must reach them — but they are no longer in the channel, so
+    /// channel talk must not. Set from SID_NOTIFYJOIN, cleared when they rejoin a channel.
+    game: [max_channel]u8 = [_]u8{0} ** max_channel,
+    game_len: u8 = 0,
     away: bool = false,
     dnd: bool = false,
+    /// True when `channel` is actually a game name.
+    in_game: bool = false,
 
     pub fn channelSlice(p: *const Presence) []const u8 {
         return p.channel[0..p.channel_len];
@@ -297,8 +333,11 @@ pub fn presenceOf(name: []const u8) ?Presence {
     reg.lock.lock();
     defer reg.lock.unlock();
     const m = findByNameLocked(name) orelse return null;
-    var p = Presence{ .away = m.away_len > 0, .dnd = m.dnd_len > 0, .channel_len = m.channel_len };
-    @memcpy(p.channel[0..m.channel_len], m.channelSlice());
+    // A game beats a channel: it is where the player actually is.
+    const where = if (m.game_len > 0) m.gameSlice() else m.channelSlice();
+    var p = Presence{ .away = m.away_len > 0, .dnd = m.dnd_len > 0, .in_game = m.game_len > 0 };
+    p.channel_len = @intCast(where.len);
+    @memcpy(p.channel[0..where.len], where);
     return p;
 }
 

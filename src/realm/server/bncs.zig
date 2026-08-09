@@ -301,7 +301,8 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         // Client notifications with no BNCS reply — accept silently so they aren't
         // logged as "unhandled". LeaveChat (left a channel), NotifyJoin (entered a
         // game), CheckAd (banner-ad poll; we serve no ads).
-        SID_LEAVECHAT, SID_NOTIFYJOIN => {},
+        SID_LEAVECHAT => onLeaveChat(c, tag),
+        SID_NOTIFYJOIN => onNotifyJoin(c, tag, body),
         SID_CHECKAD => onCheckAd(c, tag),
         SID_STARTADVEX3 => onStartAdvex(c, tag, body),
         SID_NEWS_INFO => onNewsInfo(c, tag, body),
@@ -484,6 +485,34 @@ fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
     // (crash in D2WINMAIN_SetControlDisabled). Chat-flag enums live in protocol.zig.
 }
 
+// SID_LEAVECHAT (0x10): the client is leaving the channel. It used to be accepted and
+// ignored, which left the member sitting in the channel afterwards — still listed to
+// everyone else and still receiving talk they had walked away from.
+fn onLeaveChat(c: *Conn, tag: []const u8) void {
+    if (!c.in_channel) return;
+    broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
+    chat.setGame(c.fd, ""); // clears the game; the channel is cleared below
+    chat.clearChannel(c.fd);
+    c.in_channel = false;
+    log.line(tag, "{s} left chat", .{c.accountName()});
+}
+
+// SID_NOTIFYJOIN (0x22): { u32 product, u32 0x0e, cstr game name, cstr password } — the
+// client telling bnetd it has gone off to play (NET_SID_CLIENT_Send_0x22_NotifyJoin
+// @0x51b320). The connection stays up, so whispers should still find them, but they are
+// no longer in the channel and channel talk must stop reaching them. Ignoring this left a
+// player in a game listed in the lobby and reading it.
+fn onNotifyJoin(c: *Conn, tag: []const u8, body: []const u8) void {
+    var r = proto.Reader.init(body);
+    _ = r.getU32(); // product tag
+    _ = r.getU32(); // 0x0e
+    const game_name = r.getStr();
+    if (c.in_channel) broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
+    c.in_channel = false;
+    chat.setGame(c.fd, game_name);
+    log.line(tag, "{s} joined game '{s}'", .{ c.accountName(), game_name });
+}
+
 fn onGetChannelList(c: *Conn) void {
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_GETCHANNELLIST);
@@ -567,6 +596,7 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
 
     c.setChannel(channel);
     _ = chat.join(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
+    chat.setGame(c.fd, ""); // back in the lobby: no longer in a game
 
     // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
     // then list existing members, then announce the join to everyone else.
@@ -846,9 +876,15 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /whois <name>");
             return true;
         }
-        var chbuf: [chat.max_channel]u8 = undefined;
-        if (chat.whereIs(cmd.arg, &chbuf)) |n| {
-            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} is in channel {s}.", .{ cmd.arg, chbuf[0..n] }) catch return true);
+        if (chat.presenceOf(cmd.arg)) |pres| {
+            const where = pres.channelSlice();
+            const line = if (where.len == 0)
+                std.fmt.bufPrint(&rb, "{s} is logged on.", .{cmd.arg}) catch return true
+            else if (pres.in_game)
+                std.fmt.bufPrint(&rb, "{s} is in the game {s}.", .{ cmd.arg, where }) catch return true
+            else
+                std.fmt.bufPrint(&rb, "{s} is in channel {s}.", .{ cmd.arg, where }) catch return true;
+            sendEvent(c, EID_INFO, 0, acct, line);
         } else sendEvent(c, EID_ERROR, 0, acct, "That user is not logged on.");
         return true;
     }
@@ -941,6 +977,8 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: FriendCmd) void {
                     "online (do not disturb)"
                 else if (f.away)
                     "online (away)"
+                else if (f.location_len > 0 and f.in_game)
+                    std.fmt.bufPrint(&rb, "in the game {s}", .{f.locationSlice()}) catch "online"
                 else if (f.location_len > 0)
                     std.fmt.bufPrint(&rb, "online in {s}", .{f.locationSlice()}) catch "online"
                 else

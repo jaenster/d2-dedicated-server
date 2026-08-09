@@ -201,10 +201,12 @@ pub const FriendInfo = struct {
     name: [max_name]u8 = [_]u8{0} ** max_name,
     name_len: u8 = 0,
     online: bool = false,
-    /// Where they are — the channel they are sitting in. Empty when they are online but
-    /// not in a channel (in a game, or between screens).
+    /// Where they are: the channel they are sitting in, or the game they went off to
+    /// play. Empty when they are online but in neither.
     location: [32]u8 = [_]u8{0} ** 32,
     location_len: u8 = 0,
+    /// True when `location` names a game rather than a channel.
+    in_game: bool = false,
     away: bool = false,
     dnd: bool = false,
 
@@ -241,6 +243,7 @@ pub fn list(owner: []const u8, out: []FriendInfo) usize {
         const pres = chat.presenceOf(fi.nameSlice()) orelse continue;
         fi.away = pres.away;
         fi.dnd = pres.dnd;
+        fi.in_game = pres.in_game;
         const ch = pres.channelSlice();
         const cn: u8 = @intCast(@min(ch.len, fi.location.len));
         @memcpy(fi.location[0..cn], ch[0..cn]);

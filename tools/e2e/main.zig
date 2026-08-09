@@ -731,6 +731,74 @@ fn scFleetCapacity() Result {
 /// The slash commands the 1.14d client forwards. It intercepts a few locally (/fps,
 /// /players, /nopickup) but hands the rest to the realm verbatim, including whisper
 /// aliases realmd did not recognise and /help, which it cannot answer itself.
+/// Going into a game takes you out of the channel. Both signals the client sends for this
+/// — SID_NOTIFYJOIN and SID_LEAVECHAT — used to be accepted and ignored, which left a
+/// player who was off playing still listed in the lobby and still being sent its chat.
+fn scLeaveChannel() Result {
+    const name = "leave_channel";
+    const channel = "Diablo II";
+
+    var watcher = rc.RealmClient{};
+    defer watcher.close();
+    watcher.connectBnet() catch |e| return fail(name, "W {s}", .{@errorName(e)});
+    watcher.auth() catch |e| return fail(name, "W {s}", .{@errorName(e)});
+    watcher.login("LeaveWatch") catch |e| return fail(name, "W {s}", .{@errorName(e)});
+    watcher.enterChat() catch |e| return fail(name, "W {s}", .{@errorName(e)});
+    watcher.joinChannel(channel) catch |e| return fail(name, "W {s}", .{@errorName(e)});
+    watcher.setBnetTimeout(2000);
+
+    var player = rc.RealmClient{};
+    defer player.close();
+    player.connectBnet() catch |e| return fail(name, "P {s}", .{@errorName(e)});
+    player.auth() catch |e| return fail(name, "P {s}", .{@errorName(e)});
+    player.login("LeaveGoer") catch |e| return fail(name, "P {s}", .{@errorName(e)});
+    player.enterChat() catch |e| return fail(name, "P {s}", .{@errorName(e)});
+    player.joinChannel(channel) catch |e| return fail(name, "P {s}", .{@errorName(e)});
+    player.setBnetTimeout(2000);
+    _ = net.usleep(150_000);
+
+    // Off to play. The channel should be told they left.
+    player.notifyJoin("hunting") catch |e| return fail(name, "P {s}", .{@errorName(e)});
+    var announced = false;
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const ev = watcher.readChatEvent() catch break;
+        if (ev.eid != rc.EID_LEAVE) continue;
+        announced = std.mem.indexOf(u8, ev.username, "LeaveGoer") != null;
+        if (announced) break;
+    }
+    if (!announced) return fail(name, "the channel was never told LeaveGoer left for a game", .{});
+
+    // They are still logged on, and /whois should place them in the GAME, not a channel.
+    watcher.chatCommand("/whois LeaveGoer") catch |e| return fail(name, "W {s}", .{@errorName(e)});
+    var placed = false;
+    i = 0;
+    while (i < 12) : (i += 1) {
+        const ev = watcher.readChatEvent() catch break;
+        if (ev.eid != rc.EID_INFO) continue;
+        if (std.mem.indexOf(u8, ev.text, "in the game hunting") != null) {
+            placed = true;
+            break;
+        }
+        if (std.mem.indexOf(u8, ev.text, "channel") != null)
+            return fail(name, "/whois still puts a player in a game in a channel: '{s}'", .{ev.text});
+    }
+    if (!placed) return fail(name, "/whois did not place LeaveGoer in their game", .{});
+
+    // And channel talk must no longer reach them.
+    watcher.chatCommand("lobby noise") catch |e| return fail(name, "W {s}", .{@errorName(e)});
+    _ = net.usleep(200_000);
+    player.setBnetTimeout(400);
+    i = 0;
+    while (i < 4) : (i += 1) {
+        const ev = player.readChatEvent() catch break;
+        if (ev.eid == rc.EID_TALK and std.mem.indexOf(u8, ev.text, "lobby noise") != null)
+            return fail(name, "a player in a game still received channel chat", .{});
+    }
+
+    return .{ .name = name, .status = .pass, .msg = msg("NOTIFYJOIN removes them from the channel; /whois names the game; channel talk stops", .{}) };
+}
+
 fn scChatCommands() Result {
     const name = "chat_commands";
     const channel = "Diablo II";
@@ -1794,6 +1862,7 @@ pub fn main() !void {
         scLobbyChatAtoB(),
         scLobbyCharNames(),
         scChatCommands(),
+        scLeaveChannel(),
         scBannerAd(),
         scFriendsPersist(),
         scMultiInstance(),
