@@ -371,6 +371,83 @@ fn scCreateJoinGame() Result {
     return .{ .name = name, .status = .pass, .msg = msg("create+join ok create-token={d} join-token={d} gs_ip=127.0.0.1 (creates={d} joins={d})", .{ cg.token, jg.token, gs.creates, gs.joins }) };
 }
 
+/// The join screen's PLAYERS column, and the description beside it. realmd only ever sees
+/// joins pass through it, so a count it maintained alone could only ever climb; the number
+/// that matters is the one the hosting GS reports. Asserting a DROP is the whole point.
+fn scGamePopulation() Result {
+    const name = "game_population";
+    var gs = FakeGS{ .gsid = 0xF00D, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 4242 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("PopGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const cg = c.createGame("popgame", "come on in") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+
+    var rows: [8]rc.GameEntry = undefined;
+    var dst: [512]u8 = undefined;
+
+    // Find our game in the list. Other tests leave games behind in the same realmd, so
+    // match by name rather than assuming we're the only row.
+    const findRow = struct {
+        fn f(list: []const rc.GameEntry) ?rc.GameEntry {
+            for (list) |g| {
+                if (std.mem.eql(u8, g.name, "popgame")) return g;
+            }
+            return null;
+        }
+    }.f;
+
+    var n = c.gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const created = findRow(rows[0..n]) orelse return fail(name, "'popgame' missing from the list of {d}", .{n});
+    if (created.players != 1) return fail(name, "fresh game shows {d} players, want the creator's 1", .{created.players});
+    if (!std.mem.eql(u8, created.description, "come on in"))
+        return fail(name, "description='{s}' want 'come on in'", .{created.description});
+
+    // Four in the game now — the GS says so, and its word replaces realmd's guess.
+    gs.sendUpdateGameInfo(4242, 4, true) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitPlayers(&c, &rows, &dst, findRow, 4)) return fail(name, "count did not rise to 4", .{});
+
+    // Three of them leave. This is the direction realmd could never see on its own.
+    gs.sendUpdateGameInfo(4242, 1, false) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitPlayers(&c, &rows, &dst, findRow, 1)) return fail(name, "count did not fall back to 1", .{});
+
+    n = c.gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const final = findRow(rows[0..n]) orelse return fail(name, "'popgame' vanished from the list", .{});
+    if (!std.mem.eql(u8, final.description, "come on in"))
+        return fail(name, "description lost across updates: '{s}'", .{final.description});
+    return .{ .name = name, .status = .pass, .msg = msg("players 1 -> 4 -> 1 from the GS; description '{s}' survived", .{final.description}) };
+}
+
+/// Poll the game list until 'popgame' reports `want` players. UPDATEGAMEINFO is fire-and-
+/// forget over the gs-link, so there is no reply to wait on — only the effect to observe.
+fn awaitPlayers(
+    c: *rc.RealmClient,
+    rows: []rc.GameEntry,
+    dst: []u8,
+    findRow: *const fn ([]const rc.GameEntry) ?rc.GameEntry,
+    want: u8,
+) bool {
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 25) {
+        const n = c.gameList(rows, dst) catch return false;
+        if (findRow(rows[0..n])) |g| {
+            if (g.players == want) return true;
+        }
+        _ = net.usleep(25_000);
+    }
+    return false;
+}
+
 fn scFleetCapacity() Result {
     const name = "fleet_capacity";
     var gs_a = FakeGS{ .gsid = 0xAAA, .ip = .{ 127, 0, 0, 2 }, .maxgame = 1, .next_gameid = 100 };
@@ -1077,6 +1154,7 @@ pub fn main() !void {
         scMcpOn6112(),
         scCharListStatstring(),
         scCreateJoinGame(),
+        scGamePopulation(),
         scFleetCapacity(),
         scAdminApi(),
         scMultiGameOneGs(),

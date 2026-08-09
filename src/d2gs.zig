@@ -398,7 +398,11 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         // Tell realmd to drop a game from the join list when the engine destroys it
         // (otherwise dead games linger until their redis TTL → "game name and password
         // don't match" on join). srvtrace owns the game-destroy hook; d2cs sends CLOSEGAME.
-        @import("runtime/feature/srvtrace.zig").on_game_destroy = &d2cs.onGameDestroyed;
+        const srvtrace = @import("runtime/feature/srvtrace.zig");
+        srvtrace.on_game_destroy = &d2cs.onGameDestroyed;
+        // Same idea for population: realmd sees every join (they go through it) but never a
+        // leave, so its PLAYERS column only counts up. We hold the real number, so we send it.
+        srvtrace.on_players_changed = &d2cs.onPlayersChanged;
         d2cs.start(@ptrCast(&d2cs_host), d2cs_port, gs_public_ip, gs_public_port, gs_max_games, gsid);
     }
 

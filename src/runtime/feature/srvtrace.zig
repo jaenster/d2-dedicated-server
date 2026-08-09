@@ -165,6 +165,8 @@ fn putClient(e: *evlog.Event, pclient: usize) void {
 // off the join/destroy hooks and read their fields directly each heartbeat.
 // D2GameStrc offsets: nToken@0, szGameName@42, nClientsCount@140, dwSpawnedPlayers@144,
 // dwSpawnedMonsters@148, dwGameFrame@168.
+const GAME_NAME = 42;
+const GAME_CLIENTS = 140;
 
 /// Set once by DllMain (computeGsId) so the tick line carries the game-server id.
 pub var gsid: u32 = 0;
@@ -241,7 +243,19 @@ fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
     e.int("token", trunc32(token));
     putGame(&e, pgame);
     e.end();
-    if (on_game_destroy) |cb| cb(ascii(pgame + 42, 16));
+    if (on_game_destroy) |cb| cb(ascii(pgame + GAME_NAME, 16));
+}
+
+/// Optional observer fired when a game's population changes, with the game's name and
+/// the client count once the change has settled. The realm GS client subscribes so
+/// realmd's join list shows a live PLAYERS column — realmd on its own only ever sees
+/// joins go through it, never leaves, so without this the column only counts up.
+pub var on_players_changed: ?*const fn (name: []const u8, players: u32, joined: bool) void = null;
+
+fn notifyPlayers(pgame: usize, players: u32, joined: bool) void {
+    const cb = on_players_changed orelse return;
+    if (pgame == 0) return;
+    cb(ascii(pgame + GAME_NAME, 16), players, joined);
 }
 
 fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
@@ -250,6 +264,10 @@ fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
     putGame(&e, pgame);
     putClient(&e, pclient);
     e.end();
+    // These are entry detours, so the count is whatever the engine has already committed.
+    // CLIENT_AddToGame links the client and bumps nClientsCount before the join broadcast
+    // (Clients.cpp @0x539... `pGame->nClientsCount++`), so by here the joiner is counted.
+    notifyPlayers(pgame, readU32(pgame, GAME_CLIENTS), true);
 }
 
 fn onPlayerLeave(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
@@ -257,6 +275,12 @@ fn onPlayerLeave(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
     putGame(&e, pgame);
     putClient(&e, pclient);
     e.end();
+    // The mirror of the join case, and the reason this isn't symmetric: the leave broadcast
+    // has to walk a list the leaver is still on to tell everyone else about them, so the
+    // decrement happens after us (same caller, `pGame->nClientsCount--`). Subtract them here
+    // rather than reporting a count we know is one stale.
+    const now = readU32(pgame, GAME_CLIENTS);
+    notifyPlayers(pgame, if (now > 0) now - 1 else 0, false);
 }
 
 fn onDamage(attacker: usize, victim: usize, pdamage: usize) callconv(.c) void {

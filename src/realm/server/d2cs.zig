@@ -407,7 +407,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     // Expansion (LOD), softcore, non-ladder; difficulty from the client's request.
     // The registry picks the least-loaded GS with capacity and gives us its address.
-    log.line(tag, "create game '{s}' diff={d} (flags=0x{x})", .{ name, difficulty, create_flags });
+    log.line(tag, "create game '{s}' desc='{s}' diff={d} (flags=0x{x})", .{ name, desc, difficulty, create_flags });
     const routed = gslink.createGameRouted(name, pass, desc, 0, true, difficulty, false);
     if (routed == null) {
         log.line(tag, "create game '{s}' -> GS refused / all full", .{name});
@@ -418,7 +418,10 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     }
     const rr = routed.?;
-    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, pass); // 1 player: the creator
+    // 1 player: the creator. That seed and the join-time bump below are guesses that keep
+    // the list responsive before the game exists on the GS; once it does, the GS's own
+    // UPDATEGAMEINFO overwrites them with the count that also goes back down.
+    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, pass, desc);
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -489,9 +492,9 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         }
         log.line(tag, "join guild hall '{s}' as member {s}", .{ name, c.accountName() });
     }
-    // Best-effort bump of the join-screen player count (the GS owns the authoritative
-    // count; leaves aren't tracked here yet, so this can run high until the game closes).
-    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.pw());
+    // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
+    // both directions) as soon as the player is actually in the game.
+    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.pw(), g.desc());
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
@@ -538,14 +541,14 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     log.line(tag, "game list (reqid={d}) -> {d} game(s)", .{ reqid, n });
 
     for (games[0..n]) |g| {
-        var buf: [64]u8 = undefined;
+        var buf: [128]u8 = undefined; // 12B header + name + description, both bounded
         var w = startPacket(&buf, MCP_GAMELIST);
         w.putU16(reqid); // +1 echo request id
         w.putU32(g.gameid); // +3 gameid (low u16 = dedup key)
         w.putU8(@intCast(@min(g.players, 255))); // +7 player count (PLAYERS column)
         w.putU32(g.gameid); // +8 token (non -1/-2 -> treated as a real game entry)
         w.putStr(g.name_slice()); // +0xc game name (shown in the list)
-        w.putStr(""); // description
+        w.putStr(g.desc()); // description the creator typed
         finish(c, &w);
     }
     // End-of-list marker: token == -2 -> SetD2GSJoinResult(0x33) -> RefreshGameListDisplay().

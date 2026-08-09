@@ -125,14 +125,24 @@ pub const CloseGame = extern struct {
     gameid: u32,
 };
 
-/// UPDATEGAMEINFO (0x22). flag: 0=update, 1=enter, 2=leave; then charname cstr.
+/// UPDATEGAMEINFO (0x22). GS -> D2CS whenever a game's population changes, so the join
+/// screen's PLAYERS column tracks reality instead of the count realmd guessed at create
+/// time. `players` is the GS's own client count *after* the change — a level, not a delta,
+/// so a dropped message self-corrects on the next one and nothing can drift.
+///
+/// `flag` says which edge caused it (0=periodic update, 1=enter, 2=leave); realmd only
+/// logs it, since the count alone is what the list needs.
 pub const UpdateGameInfo = extern struct {
     h: Header,
     flag: u32,
     gameid: u32,
-    charlevel: u32,
-    charclass: u32,
+    players: u32,
 };
+
+/// UPDATEGAMEINFO flag values.
+pub const GAMEINFO_UPDATE: u32 = 0;
+pub const GAMEINFO_ENTER: u32 = 1;
+pub const GAMEINFO_LEAVE: u32 = 2;
 
 /// Read the i-th null-terminated string from a packet body, starting at `off`.
 /// Returns the slice (without the null) and advances `off` past the terminator.

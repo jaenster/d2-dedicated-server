@@ -129,9 +129,11 @@ fn createSchema(p: *pg.Pool) !void {
         \\  expires_at timestamptz
         \\)
     , .{});
-    // join password + player count (added separately so an existing table migrates in place).
+    // join password, player count + description (added separately so an existing table
+    // migrates in place).
     _ = try p.exec("alter table games add column if not exists password text not null default ''", .{});
     _ = try p.exec("alter table games add column if not exists players int not null default 0", .{});
+    _ = try p.exec("alter table games add column if not exists description text not null default ''", .{});
     _ = try p.exec("create index if not exists games_gameid_idx on games(gameid)", .{});
     _ = try p.exec("create index if not exists games_gsid_idx on games(gsid)", .{});
 }
@@ -271,31 +273,43 @@ fn sweepSessions(p: *pg.Pool) void {
 
 // ── games (ephemeral, TTL; gameid/gsid columns are indexed) ──────────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     const safe = sanitize(name, &nb) orelse return false;
     const p = ensurePool() orelse return false;
     const ip = ipToInt(gs_ip);
     if (ttl_s > 0) {
         _ = p.exec(
-            \\insert into games(name, gameid, ip, port, gsid, players, password, expires_at)
-            \\values ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))
+            \\insert into games(name, gameid, ip, port, gsid, players, password, description, expires_at)
+            \\values ($1, $2, $3, $4, $5, $6, $7, $8, now() + make_interval(secs => $9))
             \\on conflict (name) do update set
             \\  gameid = excluded.gameid, ip = excluded.ip, port = excluded.port,
             \\  gsid = excluded.gsid, players = excluded.players, password = excluded.password,
-            \\  expires_at = excluded.expires_at
-        , .{ safe, @as(i64, gameid), ip, @as(i32, gs_port), @as(i64, gsid), @as(i32, players), password, @as(f64, @floatFromInt(ttl_s)) }) catch return false;
+            \\  description = excluded.description, expires_at = excluded.expires_at
+        , .{ safe, @as(i64, gameid), ip, @as(i32, gs_port), @as(i64, gsid), @as(i32, players), password, description, @as(f64, @floatFromInt(ttl_s)) }) catch return false;
     } else {
         _ = p.exec(
-            \\insert into games(name, gameid, ip, port, gsid, players, password, expires_at)
-            \\values ($1, $2, $3, $4, $5, $6, $7, null)
+            \\insert into games(name, gameid, ip, port, gsid, players, password, description, expires_at)
+            \\values ($1, $2, $3, $4, $5, $6, $7, $8, null)
             \\on conflict (name) do update set
             \\  gameid = excluded.gameid, ip = excluded.ip, port = excluded.port,
             \\  gsid = excluded.gsid, players = excluded.players, password = excluded.password,
-            \\  expires_at = null
-        , .{ safe, @as(i64, gameid), ip, @as(i32, gs_port), @as(i64, gsid), @as(i32, players), password }) catch return false;
+            \\  description = excluded.description, expires_at = null
+        , .{ safe, @as(i64, gameid), ip, @as(i32, gs_port), @as(i64, gsid), @as(i32, players), password, description }) catch return false;
     }
     return true;
+}
+
+/// Overwrite a game's player count. A single targeted update: it deliberately does not
+/// touch expires_at, so a busy game's lease is governed by its registration, not its
+/// traffic.
+pub fn setGamePlayers(gameid: u32, players: u16) bool {
+    const p = ensurePool() orelse return false;
+    const res = p.exec(
+        "update games set players = $1 where gameid = $2 and (expires_at is null or expires_at > now())",
+        .{ @as(i32, players), @as(i64, gameid) },
+    ) catch return false;
+    return (res orelse 0) > 0;
 }
 
 pub fn findGame(name: []const u8) ?GameRec {
@@ -304,7 +318,7 @@ pub fn findGame(name: []const u8) ?GameRec {
     const p = ensurePool() orelse return null;
     sweepGames(p);
     var row = (p.row(
-        "select gameid, ip, port, gsid, password, players from games where name = $1 and (expires_at is null or expires_at > now())",
+        "select gameid, ip, port, gsid, password, players, description from games where name = $1 and (expires_at is null or expires_at > now())",
         .{safe},
     ) catch return null) orelse return null;
     defer row.deinit() catch {};
@@ -314,6 +328,7 @@ pub fn findGame(name: []const u8) ?GameRec {
     const gsid = row.get(i64, 3) catch return null;
     const password = row.get([]const u8, 4) catch "";
     const players = row.get(i32, 5) catch 0;
+    const description = row.get([]const u8, 6) catch "";
     var rec = GameRec{
         .gameid = @truncate(@as(u64, @bitCast(gameid))),
         .gs_ip = intToIp(ip),
@@ -322,6 +337,7 @@ pub fn findGame(name: []const u8) ?GameRec {
         .players = @truncate(@as(u32, @bitCast(players))),
     };
     rec.setPw(password);
+    rec.setDesc(description);
     return rec;
 }
 
@@ -329,7 +345,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
     const p = ensurePool() orelse return 0;
     sweepGames(p); // drop lapsed rows first so the listing matches findGame's view
     var result = p.query(
-        "select name, gameid, ip, port, gsid, players from games where expires_at is null or expires_at > now()",
+        "select name, gameid, ip, port, gsid, players, description from games where expires_at is null or expires_at > now()",
         .{},
     ) catch return 0;
     defer result.deinit();
@@ -342,6 +358,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
         const port = row.get(i32, 3) catch continue;
         const gsid = row.get(i64, 4) catch continue;
         const players = row.get(i32, 5) catch 0;
+        const description = row.get([]const u8, 6) catch "";
         var ng = types.NamedGame{
             .gameid = @truncate(@as(u64, @bitCast(gameid))),
             .gs_ip = intToIp(ip),
@@ -349,6 +366,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
             .gsid = @truncate(@as(u64, @bitCast(gsid))),
             .players = @truncate(@as(u32, @bitCast(players))),
         };
+        ng.setDesc(description);
         const ln: u8 = @intCast(@min(nm.len, ng.name.len));
         @memcpy(ng.name[0..ln], nm[0..ln]);
         ng.name_len = ln;

@@ -225,11 +225,21 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral) ────────────────────────────────────────────────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8, description: []const u8) bool {
     return switch (ephemeral) {
-        .fs => fs.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, game_ttl_s),
-        .redis => redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, game_ttl_s),
-        .pg => pg.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, game_ttl_s),
+        .fs => fs.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, description, game_ttl_s),
+        .redis => redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, description, game_ttl_s),
+        .pg => pg.registerGame(name, gameid, gs_ip, gs_port, gsid, players, password, description, game_ttl_s),
+    };
+}
+
+/// Overwrite a hosted game's player count (UPDATEGAMEINFO from the GS that hosts it).
+/// False if no live game carries that id.
+pub fn setGamePlayers(gameid: u32, players: u16) bool {
+    return switch (ephemeral) {
+        .fs => fs.setGamePlayers(gameid, players),
+        .redis => redis.setGamePlayers(gameid, players),
+        .pg => pg.setGamePlayers(gameid, players),
     };
 }
 

@@ -16,13 +16,19 @@ pub const GameRec = struct {
     gs_ip: [4]u8,
     gs_port: u16 = 4000,
     gsid: u32 = 0,
-    /// Player count shown in the join-screen list. Best-effort: realmd seeds it to 1 on
-    /// create and bumps it per join (the GS owns the authoritative count).
+    /// Player count shown in the join-screen list. realmd seeds it optimistically on
+    /// create/join; the hosting GS then overwrites it with its own client count, which
+    /// is the only number that also goes DOWN when someone leaves.
     players: u16 = 0,
     /// Game join password (empty = open game). Stored with the record so any realmd
     /// instance can validate a join. D2 passwords are short alphanumeric (no spaces).
     password: [16]u8 = [_]u8{0} ** 16,
     pw_len: u8 = 0,
+    /// The creator's game description, shown beside the name on the join screen. Sized to
+    /// the engine's own `szGameDescription[32]`. Unlike the password it may contain spaces,
+    /// so the flat-text backends store it last, as the remainder of the record.
+    description: [32]u8 = [_]u8{0} ** 32,
+    desc_len: u8 = 0,
 
     pub fn pw(g: *const GameRec) []const u8 {
         return g.password[0..g.pw_len];
@@ -31,6 +37,14 @@ pub const GameRec = struct {
         const n: u8 = @intCast(@min(s.len, g.password.len));
         @memcpy(g.password[0..n], s[0..n]);
         g.pw_len = n;
+    }
+    pub fn desc(g: *const GameRec) []const u8 {
+        return g.description[0..g.desc_len];
+    }
+    pub fn setDesc(g: *GameRec, s: []const u8) void {
+        const n: u8 = @intCast(@min(s.len, g.description.len));
+        @memcpy(g.description[0..n], s[0..n]);
+        g.desc_len = n;
     }
 };
 
@@ -63,4 +77,15 @@ pub const NamedGame = struct {
     gs_port: u16 = 4000,
     gsid: u32 = 0,
     players: u16 = 0,
+    description: [32]u8 = [_]u8{0} ** 32,
+    desc_len: u8 = 0,
+
+    pub fn desc(g: *const NamedGame) []const u8 {
+        return g.description[0..g.desc_len];
+    }
+    pub fn setDesc(g: *NamedGame, s: []const u8) void {
+        const n: u8 = @intCast(@min(s.len, g.description.len));
+        @memcpy(g.description[0..n], s[0..n]);
+        g.desc_len = n;
+    }
 };

@@ -346,15 +346,17 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral, PX TTL, reverse indexed by id and by gs) ───────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     const safe = sanitize(name, &nb) orelse return false;
 
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
-    var vb: [128]u8 = undefined;
-    // Fields: gameid ip port gsid players <password> (password last, may be empty).
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, password }) catch return false;
+    var vb: [256]u8 = undefined;
+    // Fields: gameid ip port gsid players <password> <description>. The password is a
+    // single token (may be empty); the description absorbs the rest, since it may
+    // contain spaces. Same encoding as the fs backend, so parseGame is shared in spirit.
+    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {s} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, password, description }) catch return false;
     var ik: [64]u8 = undefined;
     const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
     var gb: [64]u8 = undefined;
@@ -431,6 +433,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
         };
         const rec = parseGame(val) orelse continue;
         var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players };
+        ng.setDesc(rec.desc());
         const cl: u8 = @intCast(@min(gname.len, ng.name.len));
         @memcpy(ng.name[0..cl], gname[0..cl]);
         ng.name_len = cl;
@@ -476,7 +479,47 @@ fn parseGame(val: []const u8) ?GameRec {
     var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
     rec.players = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 0) else 0; // 5th
     if (it.next()) |p| rec.setPw(p); // 6th token = join password (may be empty)
+    rec.setDesc(it.rest()); // remainder = description (may contain spaces)
     return rec;
+}
+
+/// Overwrite a game's player count, found via the byid index. Rewrites the record with
+/// `SET ... KEEPTTL` so the game keeps the lease it already had — a join or a leave says
+/// nothing about how much longer the game should stay listed.
+pub fn setGamePlayers(gameid: u32, players: u16) bool {
+    var ik: [64]u8 = undefined;
+    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
+
+    conn_lock.lock();
+    defer conn_lock.unlock();
+    var r: Reader = undefined;
+    const idrep = command(&r, &.{ "GET", idkey }) orelse return false;
+    const name = switch (idrep) {
+        .bulk => |b| b orelse return false,
+        else => return false,
+    };
+    // Copy out of the reader buffer before issuing the next command overwrites it.
+    var ncopy: [64]u8 = undefined;
+    if (name.len == 0 or name.len > ncopy.len) return false;
+    @memcpy(ncopy[0..name.len], name);
+    var gk: [128]u8 = undefined;
+    const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{ncopy[0..name.len]}) catch return false;
+
+    const rep = command(&r, &.{ "GET", gamekey }) orelse return false;
+    const val = switch (rep) {
+        .bulk => |b| b orelse return false,
+        else => return false,
+    };
+    const rec = parseGame(val) orelse return false;
+    var vb: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {s} {s}", .{
+        rec.gameid,  rec.gs_ip[0], rec.gs_ip[1], rec.gs_ip[2], rec.gs_ip[3],
+        rec.gs_port, rec.gsid,     players,      rec.pw(),     rec.desc(),
+    }) catch return false;
+    return switch (command(&r, &.{ "SET", gamekey, body, "KEEPTTL" }) orelse return false) {
+        .status, .bulk, .int => true,
+        .array_len, .err => false,
+    };
 }
 
 /// Look up the game name for an engine gameid via the byid index, then delete the

@@ -30,6 +30,7 @@ const SID_AUTH_CHECK = 0x51;
 const MCP_STARTUP = 0x01;
 const MCP_CHARCREATE = 0x02;
 const MCP_CREATEGAME = 0x03;
+const MCP_GAMELIST = 0x05;
 const MCP_LADDERDATA = 0x11;
 const MCP_JOINGAME = 0x04;
 const MCP_CHARDELETE = 0x0a;
@@ -47,6 +48,7 @@ pub const GS_SETGSINFO = 0x12;
 pub const GS_ADDRINFO = 0x24;
 pub const GS_CREATEGAME = 0x20;
 pub const GS_JOINGAME = 0x21;
+pub const GS_UPDATEGAMEINFO = 0x22;
 
 pub const CLASS_NAMES = [_][]const u8{
     "Amazon", "Sorceress", "Necromancer", "Paladin",
@@ -137,6 +139,14 @@ pub const EID_LEAVE = 0x03;
 pub const EID_WHISPER = 0x04;
 pub const EID_TALK = 0x05;
 pub const EID_CHANNEL = 0x07;
+
+/// One row of the join-screen game list.
+pub const GameEntry = struct {
+    name: []const u8, // slice into the caller's dst buffer
+    description: []const u8, // ditto
+    gameid: u32 = 0,
+    players: u8 = 0,
+};
 
 pub const LadderEntry = struct {
     name: []const u8, // slice into the caller's dst buffer
@@ -449,6 +459,43 @@ pub const RealmClient = struct {
             off += 12 + entry_size;
         }
         return n;
+    }
+
+    /// MCP_GAMELIST (0x05): the join-screen list. The realm sends ONE packet PER GAME
+    /// and then a terminator whose token is -2, so we read until we see it. Per-game
+    /// body: [u16 reqid][u32 gameid][u8 players][u32 token][cstr name][cstr description].
+    /// Names/descriptions are copied into `dst`; returns how many games were listed.
+    pub fn gameList(self: *RealmClient, out: []GameEntry, dst: []u8) !usize {
+        const fd = self.d2cs.?;
+        var body: [8]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u16v(0); // reqid
+        w.u32v(0); // difficulty filter
+        w.u8v(0); // empty search cstr
+        try mcpSend(fd, MCP_GAMELIST, w.slice());
+
+        var n: usize = 0;
+        var di: usize = 0;
+        while (true) {
+            const r = try mcpRecv(fd, &self.rxbuf);
+            if (r.id != MCP_GAMELIST) return error.GameListBadId;
+            if (r.body.len < 11) return error.GameListShort;
+            if (net.rdU32(r.body, 7) == 0xFFFF_FFFE) return n; // -2 = end of list
+            const nm = std.mem.sliceTo(r.body[11..], 0);
+            const dsc = std.mem.sliceTo(r.body[11 + nm.len + 1 ..], 0);
+            if (n < out.len) {
+                @memcpy(dst[di .. di + nm.len], nm);
+                @memcpy(dst[di + nm.len .. di + nm.len + dsc.len], dsc);
+                out[n] = .{
+                    .name = dst[di .. di + nm.len],
+                    .description = dst[di + nm.len .. di + nm.len + dsc.len],
+                    .gameid = net.rdU32(r.body, 2),
+                    .players = r.body[6],
+                };
+                di += nm.len + dsc.len;
+                n += 1;
+            }
+        }
     }
 
     /// MCP_CHARCREATE (0x02) -> result (0 ok, 0x14 name taken, 0x15 invalid).

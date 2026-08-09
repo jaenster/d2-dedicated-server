@@ -73,6 +73,18 @@ pub const FakeGS = struct {
         }
     }
 
+    /// Report a game's population the way a real GS does on player enter/leave:
+    /// an absolute count, not a delta. `joined` only tags which edge caused it.
+    pub fn sendUpdateGameInfo(self: *FakeGS, gameid: u32, players: u32, joined: bool) !void {
+        const fd = self.sock orelse return error.NotConnected;
+        var b: [12]u8 = undefined;
+        var w = net.Writer.init(&b);
+        w.u32v(if (joined) 1 else 2);
+        w.u32v(gameid);
+        w.u32v(players);
+        try rc.ctlSend(fd, rc.GS_UPDATEGAMEINFO, w.slice());
+    }
+
     /// Spawn the background thread and wait up to wait_ms for registration.
     pub fn start(self: *FakeGS, wait_ms: u32) !void {
         self.thread = try std.Thread.spawn(.{}, run, .{self});

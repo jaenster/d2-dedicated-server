@@ -209,6 +209,17 @@ fn recordGame(name: []const u8, gameid: u32) void {
     games_tracked[idx].used = true;
 }
 
+/// Look up the gameid for `name`, leaving the entry in place. Null if it was never
+/// tracked — which is the normal case for a game this GS didn't create.
+fn peekGameId(name: []const u8) ?u32 {
+    games_lock.lock();
+    defer games_lock.unlock();
+    for (&games_tracked) |*g| {
+        if (g.used and std.mem.eql(u8, g.name[0..g.len], name)) return g.gameid;
+    }
+    return null;
+}
+
 /// Look up + forget the gameid for `name`. Null if it was never tracked.
 fn takeGameId(name: []const u8) ?u32 {
     games_lock.lock();
@@ -235,6 +246,25 @@ fn sendCloseGame(gameid: u32) void {
 /// Registered as `srvtrace.on_game_destroy` by the GS realm bootstrap.
 pub fn onGameDestroyed(name: []const u8) void {
     if (takeGameId(name)) |gid| sendCloseGame(gid);
+}
+
+fn sendUpdateGameInfo(gameid: u32, flag: u32, players: u32) void {
+    var r = std.mem.zeroes(p.UpdateGameInfo);
+    r.h = p.header(.updategameinfo, @sizeOf(p.UpdateGameInfo), nextSeq());
+    r.flag = flag;
+    r.gameid = gameid;
+    r.players = players;
+    _ = sendPacket(std.mem.asBytes(&r));
+}
+
+/// srvtrace player-count observer: report this GS's own client count for the game so
+/// realmd's join list stays honest. Fires on the engine tick thread, like CLOSEGAME.
+///
+/// A game we never tracked is one we didn't create, so we have no gameid to name it by
+/// and stay quiet rather than guess.
+pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool) void {
+    const gid = peekGameId(name) orelse return;
+    sendUpdateGameInfo(gid, if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE, players);
 }
 
 /// CREATEGAMEREQ: ladder/expansion/difficulty/hardcore byte flags, then

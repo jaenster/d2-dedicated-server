@@ -275,7 +275,20 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
             g.reply_gameid = if (body.len >= 8) std.mem.readInt(u32, body[4..8], .little) else 0;
             g.reply_done.store(true, .release);
         },
-        TYPE_UPDATEGAMEINFO => {}, // game population changes; ignore for now
+        TYPE_UPDATEGAMEINFO => {
+            // { flag:u32, gameid:u32, players:u32 } (see realm/protocol.zig). The GS is the
+            // only party that sees players leave, so its count replaces ours outright rather
+            // than adjusting it — an absolute value can't drift if a message is lost.
+            if (body.len >= 12) {
+                const flag = std.mem.readInt(u32, body[0..4], .little);
+                const gameid = std.mem.readInt(u32, body[4..8], .little);
+                const players = std.mem.readInt(u32, body[8..12], .little);
+                const known = state.global.setGamePlayers(gameid, @intCast(@min(players, 0xFFFF)));
+                log.line(tag, "GS UPDATEGAMEINFO gameid={d} players={d} flag={d}{s}", .{
+                    gameid, players, flag, if (known) "" else " (no such game)",
+                });
+            }
+        },
         TYPE_CLOSEGAME => {
             const gameid = if (body.len >= 8) std.mem.readInt(u32, body[4..8], .little) else 0;
             state.global.removeGameById(gameid);
