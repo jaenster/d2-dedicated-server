@@ -139,6 +139,9 @@ const Conn = struct {
     // on enter, replayed to other members in EID_SHOWUSER/EID_JOIN so chat shows chars.
     stat: [chat.max_stat]u8 = [_]u8{0} ** chat.max_stat,
     stat_len: u8 = 0,
+    // The `clan*charname` the client asked to be known as in SID_ENTERCHAT.
+    chat_name: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    chat_name_len: u8 = 0,
 
     fn setChannel(c: *Conn, name: []const u8) void {
         const n: u8 = @intCast(@min(name.len, chat.max_channel));
@@ -163,6 +166,17 @@ const Conn = struct {
         const n: u8 = @intCast(@min(s.len, chat.max_stat));
         @memcpy(c.stat[0..n], s[0..n]);
         c.stat_len = n;
+    }
+    fn setChatName(c: *Conn, s: []const u8) void {
+        const n: u8 = @intCast(@min(s.len, state.max_name));
+        @memcpy(c.chat_name[0..n], s[0..n]);
+        c.chat_name_len = n;
+    }
+    /// How this connection is named in chat events. The client hands us a `clan*charname`
+    /// in SID_ENTERCHAT and the channel list is drawn from the part after the '*', so
+    /// echoing it back is what makes characters (rather than account names) show up.
+    fn chatName(c: *Conn) []const u8 {
+        return if (c.chat_name_len > 0) c.chat_name[0..c.chat_name_len] else c.accountName();
     }
     fn statSlice(c: *Conn) []const u8 {
         return c.stat[0..c.stat_len];
@@ -243,7 +257,7 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     // If this connection was in a chat channel, leave it and tell the others.
     if (c.in_channel) {
         chat.leave(fd);
-        broadcastEvent(&c, EID_LEAVE, c.user_flags, c.accountName(), "");
+        broadcastEvent(&c, EID_LEAVE, c.user_flags, c.chatName(), "");
     }
     if (c.account_len > 0) friends.setOffline(c.accountName());
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
@@ -443,13 +457,17 @@ fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
     // (STRING) statstring (D2: the char the client is on). Capture the statstring so
     // we can replay it to other members when this user joins a channel.
     var r = proto.Reader.init(body);
-    _ = r.getStr();
+    // The requested username is NOT decoration: for D2 it arrives as `clan*charname`, and
+    // the channel list draws the part after the '*' as the character. Discarding it and
+    // substituting the account name is why the lobby showed accounts instead of characters.
+    const requested = r.getStr();
+    if (requested.len > 0) c.setChatName(requested);
     c.setStat(r.getStr());
     const acct = c.accountName();
-    log.line(tag, "enter chat as {s} (stat {d}B)", .{ acct, c.stat_len });
+    log.line(tag, "enter chat as {s} (chat name '{s}', stat {d}B)", .{ acct, c.chatName(), c.stat_len });
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_ENTERCHAT);
-    w.putStr(acct); // unique name
+    w.putStr(c.chatName()); // unique name — the identity the client adopts for itself
     w.putStr(c.statSlice()); // statstring (echo the client's own)
     w.putStr(acct); // account name
     finish(c, &w);
@@ -495,13 +513,16 @@ fn sendEvent(c: *Conn, eid: u32, flags: u32, username: []const u8, text: []const
     _ = net.writeAll(c.fd, bytes);
 }
 
-const BcastCtx = struct { eid: u32, flags: u32, username: []const u8, text: []const u8 };
+/// `username` is what goes on the wire (the `clan*charname` the channel list draws from);
+/// `account` is who the sender actually is. They are different strings and the squelch
+/// list is keyed on the account, so /ignore has to be checked against that one.
+const BcastCtx = struct { eid: u32, flags: u32, username: []const u8, account: []const u8, text: []const u8 };
 
 fn bcastCb(ctx: *const BcastCtx, m: *chat.Member) void {
     // Squelch: a recipient who /ignore'd the sender doesn't see their talk. Checked
     // on the Member directly — forEachInChannel already holds the registry lock, so
     // we must NOT call back into a lock-taking chat helper here (it would deadlock).
-    if (ctx.eid == EID_TALK and m.ignoresName(ctx.username)) return;
+    if (ctx.eid == EID_TALK and m.ignoresName(ctx.account)) return;
     var buf: [512]u8 = undefined;
     const bytes = buildChatEvent(&buf, ctx.eid, ctx.flags, ctx.username, ctx.text);
     chat.sendTo(m, bytes);
@@ -509,7 +530,7 @@ fn bcastCb(ctx: *const BcastCtx, m: *chat.Member) void {
 
 // Broadcast a CHATEVENT to every OTHER member in this connection's channel.
 fn broadcastEvent(c: *Conn, eid: u32, flags: u32, username: []const u8, text: []const u8) void {
-    const ctx = BcastCtx{ .eid = eid, .flags = flags, .username = username, .text = text };
+    const ctx = BcastCtx{ .eid = eid, .flags = flags, .username = username, .account = c.accountName(), .text = text };
     chat.forEachInChannel(c.channelName(), c.fd, &ctx, bcastCb);
 }
 
@@ -518,7 +539,7 @@ const ShowUserCtx = struct { c: *Conn };
 // On join, the joiner gets an EID_SHOWUSER for each existing member (with that
 // member's own flags, so ops/admins show with the right icon).
 fn showUserCb(ctx: *const ShowUserCtx, m: *chat.Member) void {
-    sendEvent(ctx.c, EID_SHOWUSER, m.flags, m.nameSlice(), m.statSlice());
+    sendEvent(ctx.c, EID_SHOWUSER, m.flags, m.displaySlice(), m.statSlice());
 }
 
 fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -537,14 +558,14 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     log.line(tag, "join channel '{s}' as {s} (flags=0x{x})", .{ channel, acct, flags });
 
     c.setChannel(channel);
-    _ = chat.join(c.fd, acct, channel, flags, c.statSlice());
+    _ = chat.join(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
 
     // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
     // then list existing members, then announce the join to everyone else.
     sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), channel, "");
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
-    broadcastEvent(c, EID_JOIN, flags, acct, c.statSlice());
+    broadcastEvent(c, EID_JOIN, flags, c.chatName(), c.statSlice());
 }
 
 fn guildErr(e: guilds.Error) []const u8 {
@@ -688,7 +709,7 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         }
         log.line(tag, "{s} whispers {s}: {s}", .{ acct, w.target, w.msg });
         var buf: [512]u8 = undefined;
-        const bytes = buildChatEvent(&buf, EID_WHISPER, c.user_flags, acct, w.msg);
+        const bytes = buildChatEvent(&buf, EID_WHISPER, c.user_flags, c.chatName(), w.msg);
         const res = chat.whisperEx(w.target, bytes); // delivers unless target is in DND
         if (!res.found) {
             sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
@@ -723,7 +744,9 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     // Broadcast to the OTHER members only (forEachInChannel excludes c.fd). The 1.14d
     // client already displays the sender's own line locally, so echoing it back here
     // makes every message the user types appear twice.
-    broadcastEvent(c, EID_TALK, c.user_flags, acct, text);
+    // Named the same way the channel list names them, or the client cannot match a
+    // line of chat to the row it came from.
+    broadcastEvent(c, EID_TALK, c.user_flags, c.chatName(), text);
 }
 
 const Whisper = struct { target: []const u8, msg: []const u8 };

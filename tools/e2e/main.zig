@@ -722,6 +722,73 @@ fn scFleetCapacity() Result {
     return .{ .name = name, .status = .pass, .msg = msg("spread a={d} b={d}, 3rd rejected (result={d})", .{ gs_a.creates, gs_b.creates, r3 }) };
 }
 
+/// The chat lobby has to name people by their CHARACTER. The 1.14d client splits a channel
+/// username on '*' and draws the part after it (COMCALLBACK_FormatChannelUserData @0x4471b0);
+/// realmd used to substitute the account name, which has no '*', so the list showed accounts
+/// and the client had no character to render at all.
+fn scLobbyCharNames() Result {
+    const name = "lobby_char_names";
+    const channel = "Diablo II";
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("CharAcctA") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    // What a real client asks to be known as: clan tag, '*', then the character.
+    a.enterChatAs("Clanny*Sorceress", "PX2D") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    if (!std.mem.eql(u8, a.uniqueName(), "Clanny*Sorceress"))
+        return fail(name, "ENTERCHAT unique name is '{s}', want the requested 'Clanny*Sorceress'", .{a.uniqueName()});
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+
+    var b = rc.RealmClient{};
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.login("CharAcctB") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChatAs("Clanny*Barbarian", "PX2D") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.setBnetTimeout(2000);
+    b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+
+    // B joined second, so B is shown the people already there. A must arrive as the
+    // character, not as CharAcctA.
+    var saw_a: bool = false;
+    var seen: [64]u8 = undefined;
+    var seen_len: usize = 0;
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const ev = b.readChatEvent() catch break;
+        if (ev.eid != rc.EID_SHOWUSER and ev.eid != rc.EID_JOIN) continue;
+        if (std.mem.eql(u8, ev.username, "Clanny*Sorceress")) {
+            saw_a = true;
+            break;
+        }
+        if (std.mem.indexOf(u8, ev.username, "CharAcctA") != null) {
+            const n = @min(ev.username.len, seen.len);
+            @memcpy(seen[0..n], ev.username[0..n]);
+            seen_len = n;
+            break;
+        }
+    }
+    if (!saw_a) {
+        if (seen_len > 0) return fail(name, "channel list named A '{s}' — the account, so the client has no character to draw", .{seen[0..seen_len]});
+        return fail(name, "never saw A in B's channel list", .{});
+    }
+
+    // And a line of chat has to carry the same identity, or the client cannot attribute it.
+    _ = net.usleep(100_000);
+    a.chatCommand("oi") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    i = 0;
+    while (i < 8) : (i += 1) {
+        const ev = b.readChatEvent() catch |e| return fail(name, "B no TALK ({s})", .{@errorName(e)});
+        if (ev.eid != rc.EID_TALK) continue;
+        if (!std.mem.eql(u8, ev.username, "Clanny*Sorceress"))
+            return fail(name, "TALK came from '{s}', want 'Clanny*Sorceress'", .{ev.username});
+        return .{ .name = name, .status = .pass, .msg = msg("channel list and chat both name A 'Clanny*Sorceress' (character, not CharAcctA)", .{}) };
+    }
+    return fail(name, "B never received A's TALK", .{});
+}
+
 fn scLobbyChatAtoB() Result {
     const name = "lobby_chat_a_to_b";
     const acct_a = "ChatAlice";
@@ -1415,6 +1482,7 @@ pub fn main() !void {
         scCharDelete(),
         scCharCopy(),
         scLobbyChatAtoB(),
+        scLobbyCharNames(),
         scMultiInstance(),
     };
 

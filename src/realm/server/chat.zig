@@ -26,6 +26,13 @@ pub const Member = struct {
     // COMCALLBACK_FormatChannelUserData. Replayed in EID_SHOWUSER/EID_JOIN.
     stat: [max_stat]u8 = [_]u8{0} ** max_stat,
     stat_len: u8 = 0,
+    // How this user is NAMED in chat events, as opposed to how they are looked up. The
+    // 1.14d client splits a channel username on '*' — the part after it is the character
+    // it draws, the part before is the clan (COMCALLBACK_FormatChannelUserData @0x4471b0).
+    // A bare account name has no '*', so the client shows the account where the character
+    // should be. `name` stays the account so whispers and /ignore keep working.
+    display: [max_name]u8 = [_]u8{0} ** max_name,
+    display_len: u8 = 0,
     // Social state, visible cross-connection (whisper auto-reply + message filtering).
     away: [max_status]u8 = [_]u8{0} ** max_status,
     away_len: u8 = 0, // 0 = not away
@@ -44,6 +51,11 @@ pub const Member = struct {
     }
     pub fn statSlice(m: *const Member) []const u8 {
         return m.stat[0..m.stat_len];
+    }
+    /// The name to put in chat events; falls back to the account when the client never
+    /// told us a character (a chat-only client, or one that entered before selecting one).
+    pub fn displaySlice(m: *const Member) []const u8 {
+        return if (m.display_len > 0) m.display[0..m.display_len] else m.nameSlice();
     }
     pub fn awaySlice(m: *const Member) []const u8 {
         return m.away[0..m.away_len];
@@ -82,7 +94,7 @@ var reg: Registry = .{};
 
 /// Claim (or reuse, by fd) a slot for this connection and set its name+channel.
 /// Returns the member, or null if the table is full.
-pub fn join(fd: net.Socket, name: []const u8, channel: []const u8, flags: u32, stat: []const u8) ?*Member {
+pub fn join(fd: net.Socket, name: []const u8, display: []const u8, channel: []const u8, flags: u32, stat: []const u8) ?*Member {
     reg.lock.lock();
     defer reg.lock.unlock();
     var slot: ?*Member = null;
@@ -105,6 +117,9 @@ pub fn join(fd: net.Socket, name: []const u8, channel: []const u8, flags: u32, s
     const sn: u8 = @intCast(@min(stat.len, max_stat));
     @memcpy(m.stat[0..sn], stat[0..sn]);
     m.stat_len = sn;
+    const dn: u8 = @intCast(@min(display.len, max_name));
+    @memcpy(m.display[0..dn], display[0..dn]);
+    m.display_len = dn;
     m.in_use = true;
     return m;
 }

@@ -213,6 +213,8 @@ pub const RealmClient = struct {
     lo: u32 = 0,
     hi: u32 = 0,
     rxbuf: [4096]u8 = undefined,
+    unique_name_buf: [64]u8 = undefined,
+    unique_name_len: usize = 0,
 
     pub fn sessionId(self: *RealmClient) u64 {
         return @as(u64, self.lo) | (@as(u64, self.hi) << 32);
@@ -326,14 +328,30 @@ pub const RealmClient = struct {
     /// SID_ENTERCHAT — announce ourselves into chat. Server replies with our
     /// unique/account name (consumed, not validated here).
     pub fn enterChat(self: *RealmClient) !void {
+        return self.enterChatAs(self.account, "");
+    }
+
+    /// SID_ENTERCHAT with an explicit requested username and statstring. A real D2 client
+    /// asks to be known as `clan*charname`; the reply's first string is the identity the
+    /// client then adopts, so this returns it for the caller to check.
+    pub fn enterChatAs(self: *RealmClient, username: []const u8, statstring: []const u8) !void {
         const fd = self.bnet.?;
-        var body: [64]u8 = undefined;
+        var body: [256]u8 = undefined;
         var w = net.Writer.init(&body);
-        w.cstr(self.account); // username
-        w.cstr(""); // statstring
+        w.cstr(username);
+        w.cstr(statstring);
         try bncsSend(fd, SID_ENTERCHAT, w.slice());
         const r = try bncsRecv(fd, &self.rxbuf);
         if (r.id != SID_ENTERCHAT) return error.EnterChatBadId;
+        const unique = std.mem.sliceTo(r.body, 0);
+        const n = @min(unique.len, self.unique_name_buf.len);
+        @memcpy(self.unique_name_buf[0..n], unique[0..n]);
+        self.unique_name_len = n;
+    }
+
+    /// The unique name SID_ENTERCHAT came back with (valid after enterChatAs).
+    pub fn uniqueName(self: *RealmClient) []const u8 {
+        return self.unique_name_buf[0..self.unique_name_len];
     }
 
     /// SID_JOINCHANNEL — body is u32 flags + cstr channel name.
