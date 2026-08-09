@@ -1096,7 +1096,9 @@ fn onReadUserData(c: *Conn, tag: []const u8, body: []const u8) void {
         if (i < nk) keys[i] = s;
     }
 
-    var buf: [2048]u8 = undefined;
+    // Four accounts x sixteen keys x a 256-byte value is the shape the request can ask
+    // for, and it does not fit in anything modest — size for it rather than truncate.
+    var buf: [4 * 16 * 258 + 32]u8 = undefined;
     var w = startPacket(&buf, SID_READUSERDATA);
     w.putU32(num_accounts);
     w.putU32(num_keys);
@@ -1346,11 +1348,29 @@ const PRODUCT_D2XP: u32 = @bitCast([4]u8{ 'D', '2', 'X', 'P' });
 const FRIEND_STATUS_DND: u8 = 0x01;
 const FRIEND_STATUS_AWAY: u8 = 0x02;
 
+/// Worst case on the wire: every friend at the longest name, in the longest-named channel.
+/// Sized rather than guessed, because guessing is how the previous 2048 ended up ~800 bytes
+/// short of what 50 friends can produce — and a short buffer here used to be a panic.
+const friends_reply_max = 8 + friends.max_friends * friends_entry_max;
+
+/// One entry at its longest: name + NUL, status, location byte, product, then the location
+/// string + NUL.
+const friends_entry_max = (friends.max_name + 1) + 1 + 1 + 4 + (chat.max_channel + 1);
+
+comptime {
+    // The reachable worst case is every friend online, in a maximum-length channel. It is
+    // ~2.8KB; this buffer was 2048, which the bounds-checked writer would now truncate
+    // rather than crash on — but a truncated friends list is still a broken reply, and the
+    // arithmetic is right here to be checked rather than eyeballed.
+    if (friends_reply_max < 5 + friends.max_friends * friends_entry_max)
+        @compileError("SID_FRIENDSLIST buffer is smaller than the list it must hold");
+}
+
 fn onFriendsList(c: *Conn, tag: []const u8) void {
     var infos: [friends.max_friends]friends.FriendInfo = undefined;
     const n = friends.list(c.accountName(), &infos);
     log.line(tag, "friends list for {s} -> {d} friend(s)", .{ c.accountName(), n });
-    var buf: [2048]u8 = undefined;
+    var buf: [friends_reply_max]u8 = undefined;
     var w = startPacket(&buf, SID_FRIENDSLIST);
     w.putU8(@intCast(n));
     for (infos[0..n]) |f| {

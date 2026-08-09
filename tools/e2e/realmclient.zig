@@ -438,9 +438,11 @@ pub const AdInfo = struct {
         // Chat events queue up on the same socket, so skip whatever is already in flight
         // rather than mistaking the first packet back for the reply.
         var r = try bncsRecv(fd, &self.rxbuf);
+        // Chat events queue ahead of the reply and there can be a lot of them — every
+        // /f add answers with one — so the skip allowance has to exceed the list itself.
         var tries: usize = 0;
         while (r.id != SID_FRIENDSLIST) : (tries += 1) {
-            if (tries >= 16) return error.FriendsListBadId;
+            if (tries >= 256) return error.FriendsListBadId;
             r = try bncsRecv(fd, &self.rxbuf);
         }
         if (r.body.len < 1) return error.FriendsListShort;

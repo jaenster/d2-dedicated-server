@@ -883,6 +883,72 @@ fn scGetFileTime() Result {
 /// Since the channel list started showing characters, the name a player can SEE is not the
 /// account. Everything that takes a name — whisper, /whois, /ignore — has to accept it, or
 /// the one name in front of them is the one name that does not work.
+/// Load: a full friends list, every entry online and in a channel. The reply is built into
+/// a fixed stack buffer, and this is the shape that overflows it — 50 entries at the
+/// longest name and channel is ~2.8KB, against the 2048 it used to be given. Before the
+/// bounds-checked writer that was an out-of-bounds slice, i.e. the server going down
+/// because somebody had too many friends.
+fn scFriendsListLoad() Result {
+    const name = "friends_list_load";
+    const acct = "LoadAcct";
+    const channel = "Diablo II";
+
+    var owner = rc.RealmClient{};
+    defer owner.close();
+    owner.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.enterChat() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.joinChannel(channel) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.setBnetTimeout(3000);
+
+    // Fill the list to its limit with the longest names the store will take.
+    const want = 50;
+    var added: usize = 0;
+    var i: usize = 0;
+    while (i < want) : (i += 1) {
+        var nb: [32]u8 = undefined;
+        const friend = std.fmt.bufPrint(&nb, "LoadFriend{d:0>2}xxxx", .{i}) catch return fail(name, "fmt", .{});
+        var cb: [64]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cb, "/f add {s}", .{friend}) catch return fail(name, "fmt", .{});
+        owner.chatCommand(cmd) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        added += 1;
+    }
+    _ = net.usleep(300_000);
+
+    // Bring a few of them online and into the channel, so their entries carry a location
+    // string too — the part that pushed the reply over the edge.
+    var online: [6]rc.RealmClient = undefined;
+    var opened: usize = 0;
+    defer for (online[0..opened]) |*oc| oc.close();
+    var k: usize = 0;
+    while (k < online.len) : (k += 1) {
+        var nb: [32]u8 = undefined;
+        const who = std.fmt.bufPrint(&nb, "LoadFriend{d:0>2}xxxx", .{k}) catch return fail(name, "fmt", .{});
+        online[k] = rc.RealmClient{};
+        opened = k + 1;
+        online[k].connectBnet() catch |e| return fail(name, "friend {s}", .{@errorName(e)});
+        online[k].auth() catch |e| return fail(name, "friend {s}", .{@errorName(e)});
+        online[k].login(who) catch |e| return fail(name, "friend {s}", .{@errorName(e)});
+        online[k].enterChat() catch |e| return fail(name, "friend {s}", .{@errorName(e)});
+        online[k].joinChannel(channel) catch |e| return fail(name, "friend {s}", .{@errorName(e)});
+    }
+    _ = net.usleep(300_000);
+
+    // The structured reply must come back whole, with every entry, and the server must
+    // still be alive afterwards.
+    var names: [64][]const u8 = undefined;
+    var dst: [4096]u8 = undefined;
+    const listed = owner.friendsList(&names, &dst) catch |e| return fail(name, "friendslist {s}", .{@errorName(e)});
+    if (listed != added) return fail(name, "listed {d} of {d} friends — the reply was truncated", .{ listed, added });
+
+    // Still serving: a second request on the same connection proves it did not fall over.
+    const again = owner.friendsList(&names, &dst) catch |e| return fail(name, "second friendslist {s}", .{@errorName(e)});
+    if (again != added) return fail(name, "second list returned {d}, want {d}", .{ again, added });
+
+    return .{ .name = name, .status = .pass, .msg = msg("{d} friends ({d} online in a channel) serialize whole, twice", .{ listed, opened }) };
+}
+
 fn scNameResolution() Result {
     const name = "name_resolution";
     const channel = "Diablo II";
@@ -2124,6 +2190,7 @@ pub fn main() !void {
         scLobbyChatAtoB(),
         scLobbyCharNames(),
         scChatCommands(),
+        scFriendsListLoad(),
         scNameResolution(),
         scLeaveChannel(),
         scCharFetchMeta(),
