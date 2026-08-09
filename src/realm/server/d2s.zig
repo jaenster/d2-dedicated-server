@@ -9,6 +9,11 @@
 //!   0x24  u8      status     (0x01 mandatory, 0x04 hardcore, 0x08 died, 0x20 expansion)
 const std = @import("std");
 
+/// Status-byte flags (offset 0x24). `expansion` is what a classic -> LOD upgrade sets.
+pub const status_hardcore: u8 = 0x04;
+pub const status_died: u8 = 0x08;
+pub const status_expansion: u8 = 0x20;
+
 pub const off_checksum = 0x0c;
 pub const off_name = 0x14;
 pub const off_status = 0x24;
@@ -97,6 +102,115 @@ pub fn status(data: []const u8) ?u8 {
 /// Overwrite the status flags byte. Does NOT fix the checksum.
 pub fn setStatus(data: []u8, v: u8) void {
     if (data.len > off_status) data[off_status] = v;
+}
+
+// ── attributes ("gf" section) ────────────────────────────────────────────────
+// Everything a played character actually IS lives past the header in a bit-packed list:
+// a 9-bit ItemStatCost id, then that stat's value at its own width, repeating until the
+// terminator id 0x1FF. The widths are ItemStatCost.txt's CSvBits column, so this table is
+// the game's own data rather than a guess — and the reason experience cannot simply be
+// read at a fixed offset the way level and class can.
+const stat_bits = [_]u8{
+    10, // 0  strength
+    10, // 1  energy
+    10, // 2  dexterity
+    10, // 3  vitality
+    10, // 4  statpts
+    8, // 5  newskills
+    21, // 6  hitpoints
+    21, // 7  maxhp
+    21, // 8  mana
+    21, // 9  maxmana
+    21, // 10 stamina
+    21, // 11 maxstamina
+    7, // 12 level
+    32, // 13 experience
+    25, // 14 gold
+    25, // 15 goldbank
+};
+
+pub const stat_level = 12;
+pub const stat_experience = 13;
+
+/// Terminator id that ends the attribute list.
+const stat_end = 0x1FF;
+
+/// LSB-first bit reader over the save's packed sections.
+const BitReader = struct {
+    data: []const u8,
+    pos: usize = 0, // in bits
+
+    fn read(r: *BitReader, n: u8) ?u32 {
+        if (n == 0 or n > 32) return null;
+        if (r.pos + n > r.data.len * 8) return null;
+        var v: u32 = 0;
+        var i: u8 = 0;
+        while (i < n) : (i += 1) {
+            const bit = (r.data[(r.pos + i) >> 3] >> @intCast((r.pos + i) & 7)) & 1;
+            v |= @as(u32, bit) << @intCast(i);
+        }
+        r.pos += n;
+        return v;
+    }
+};
+
+/// Read one attribute out of a played character's save. Null when the save has no
+/// attribute section (a freshly created character is only the header, and gets one the
+/// first time the game saves it) or the list ends without that stat.
+///
+/// Walking the list is the only way in: every entry's width depends on which stat it is,
+/// so a later stat cannot be located without decoding the ones before it.
+pub fn attribute(data: []const u8, stat_id: u16) ?u32 {
+    const marker = std.mem.indexOf(u8, data, "gf") orelse return null;
+    var r = BitReader{ .data = data[marker + 2 ..] };
+    while (true) {
+        const id = r.read(9) orelse return null;
+        if (id == stat_end) return null;
+        if (id >= stat_bits.len) return null; // unknown id: widths after it are unknowable
+        const v = r.read(stat_bits[id]) orelse return null;
+        if (id == stat_id) return v;
+    }
+}
+
+test "attribute walks the packed list and finds experience" {
+    // Build a "gf" section by hand: level(12)=87, experience(13)=1_500_000, then the
+    // terminator. Written LSB-first, the same way the game packs it.
+    var bits = std.ArrayList(u1){};
+    defer bits.deinit(std.testing.allocator);
+    const push = struct {
+        fn f(list: *std.ArrayList(u1), alloc: std.mem.Allocator, value: u32, n: u8) !void {
+            var i: u8 = 0;
+            while (i < n) : (i += 1) try list.append(alloc, @intCast((value >> @intCast(i)) & 1));
+        }
+    }.f;
+    try push(&bits, std.testing.allocator, stat_level, 9);
+    try push(&bits, std.testing.allocator, 87, stat_bits[stat_level]);
+    try push(&bits, std.testing.allocator, stat_experience, 9);
+    try push(&bits, std.testing.allocator, 1_500_000, stat_bits[stat_experience]);
+    try push(&bits, std.testing.allocator, stat_end, 9);
+
+    var save = std.ArrayList(u8){};
+    defer save.deinit(std.testing.allocator);
+    try save.appendSlice(std.testing.allocator, "HEADERgf");
+    var byte: u8 = 0;
+    for (bits.items, 0..) |b, i| {
+        byte |= @as(u8, b) << @intCast(i & 7);
+        if (i & 7 == 7) {
+            try save.append(std.testing.allocator, byte);
+            byte = 0;
+        }
+    }
+    if (bits.items.len & 7 != 0) try save.append(std.testing.allocator, byte);
+
+    try std.testing.expectEqual(@as(?u32, 87), attribute(save.items, stat_level));
+    try std.testing.expectEqual(@as(?u32, 1_500_000), attribute(save.items, stat_experience));
+    try std.testing.expectEqual(@as(?u32, null), attribute(save.items, 14)); // gold: not in the list
+}
+
+test "attribute returns null for a save with no attribute section" {
+    var save: [new_save_size]u8 = undefined;
+    try std.testing.expect(newSave(&save, "Freshie", 1, 0x20, 0x12345678));
+    try std.testing.expectEqual(@as(?u32, null), attribute(&save, stat_experience));
 }
 
 test "checksum matches a known-good real save round-trip" {

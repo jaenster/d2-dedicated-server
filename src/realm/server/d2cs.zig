@@ -760,13 +760,27 @@ fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
 // then count entries of [u32 expLo][u32 expHi][u32 charStats][entrySize-byte name]. charStats
 // = class(&0xf) | died<<4 | expansion<<5 | hardcore<<6 | progression<<8 | level<<16. Empty
 // realm -> the all-zero "empty ladder" form. count/entrySize are capped (<=256 / <=16) by the
-// client parser. Experience lives in the .d2s stat section (not the header) so we rank by level.
+// client parser.
+//
+// Experience is what a ladder is actually ordered by, and it does NOT live in the header —
+// it is an entry in the packed attribute list, which has to be walked to reach (see
+// d2s.attribute). Ranking on the header's level byte instead, as this did, ties every
+// character at the same level into an arbitrary order and puts a fresh level 90 above one
+// most of the way to 91.
 const ladder_max = 200;
 const ladder_entry_size: u32 = 16; // name field width
 
-const LadderEntry = struct { name: [16]u8 = .{0} ** 16, stats: u32 = 0 };
+const LadderEntry = struct {
+    name: [16]u8 = .{0} ** 16,
+    stats: u32 = 0,
+    experience: u32 = 0,
+};
 
-fn ladderLevelDesc(_: void, a: LadderEntry, b: LadderEntry) bool {
+/// Highest experience first, falling back to level for characters whose save has no
+/// attribute section yet — a character created but never played has no experience to
+/// compare, and should not outrank one that has some.
+fn ladderRankDesc(_: void, a: LadderEntry, b: LadderEntry) bool {
+    if (a.experience != b.experience) return a.experience > b.experience;
     return (a.stats >> 16) > (b.stats >> 16);
 }
 
@@ -781,7 +795,9 @@ fn collectLadder(out: *[ladder_max]LadderEntry) usize {
         const nc = store.listChars(acct, &names);
         for (names[0..nc]) |nm| {
             if (n >= ladder_max) return n;
-            var save: [256]u8 = undefined;
+            // Big enough to reach the attribute section of a played save; the header
+            // alone would give the level but never the experience.
+            var save: [8192]u8 = undefined;
             const sz = store.getCharD2s(acct, nm.slice(), &save);
             if (sz <= 0x2b) continue;
             const status = save[0x24];
@@ -793,7 +809,7 @@ fn collectLadder(out: *[ladder_max]LadderEntry) usize {
             stats |= (progression & 0x1f) << 8;
             stats |= @as(u32, save[0x2b]) << 16; // level
             const cn = nm.slice();
-            out[n] = .{ .stats = stats };
+            out[n] = .{ .stats = stats, .experience = d2s.attribute(save[0..sz], d2s.stat_experience) orelse 0 };
             @memcpy(out[n].name[0..@min(cn.len, 16)], cn[0..@min(cn.len, 16)]);
             n += 1;
         }
@@ -805,7 +821,7 @@ fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
     const mode: u8 = if (body.len > 0) body[0] else 0;
     var entries: [ladder_max]LadderEntry = undefined;
     const n = collectLadder(&entries);
-    std.sort.pdq(LadderEntry, entries[0..n], {}, ladderLevelDesc);
+    std.sort.pdq(LadderEntry, entries[0..n], {}, ladderRankDesc);
     log.line(tag, "ladder data request mode=0x{x} -> {d} entries", .{ mode, n });
 
     var buf: [8192]u8 = undefined;
@@ -823,25 +839,34 @@ fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putU32(@intCast(n)); // count
     w.putU32(ladder_entry_size); // per-entry name width
     for (entries[0..n]) |e| {
-        w.putU32(0); // experience low (not in the .d2s header)
-        w.putU32(0); // experience high
+        w.putU32(e.experience); // experience low
+        w.putU32(0); // experience high — D2 experience is a u32, so this is always 0
         w.putU32(e.stats);
         w.putBytes(&e.name);
     }
     finish(c, &w);
 }
 
-// MCP_CHARUPGRADE (0x18). Request: cstr charname (classic -> expansion conversion).
-// We run an expansion-only realm, so we accept it (Incoming0x18 reads result@u32 and
-// marks success). Mutating the .d2s expansion flag needs a checksum rewrite + a live
-// client to verify, so that part is deliberately deferred — the ack keeps the UI happy.
+// MCP_CHARUPGRADE (0x18). Request: cstr charname. This is the CharSel screen's
+// "convert to Lord of Destruction" (MAINMENU_UpgradeCharacterToExpansion @0x4349b0), and
+// the client's only test of the reply is result == 0 (Incoming0x18 @0x44ae40 stores the
+// u32 at +1). It used to be acked without touching anything, which meant the character
+// came back classic the next time it logged on and the screen kept offering the upgrade.
 fn onCharUpgrade(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const name = r.getStr();
-    log.line(tag, "char upgrade '{s}' (account={s}) -> ack (save unchanged)", .{ name, c.accountName() });
+    const outcome = store.upgradeCharToExpansion(c.accountName(), name);
+    log.line(tag, "char upgrade '{s}' (account={s}) -> {s}", .{ name, c.accountName(), @tagName(outcome) });
+
     var buf: [12]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARUPGRADE);
-    w.putU32(0); // result: success
+    // A character that was already expansion is not a failure — the conversion it asked
+    // for is a fact either way, and reporting non-zero would put an error on screen for a
+    // character that is exactly as the player wanted it.
+    w.putU32(switch (outcome) {
+        .upgraded, .already_expansion => 0,
+        .no_such_char, .failed => 1,
+    });
     finish(c, &w);
 }
 
@@ -854,10 +879,13 @@ fn onCancelCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     log.line(tag, "cancel game create (no-op)", .{});
 }
 
-// MCP_CHARRANK (0x16). Request: cstr charname, u32, u32. Cosmetic ranking lookup; the
-// client has no Incoming0x16, so there's no reply to send. Acknowledge in the log.
+// MCP_CHARRANK (0x16). Request: cstr charname, u32, u32. There is deliberately no reply:
+// the client's incoming dispatch table (Src::McpConnect::INCOMING @0x70ed00, bounds-checked
+// against 0x19) holds a null at index 0x16, so a 0x16 we sent back would be discarded before
+// any handler saw it. Logging it is the whole of the correct behaviour.
 fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
     _ = c;
-    _ = body;
-    log.line(tag, "char rank request (no ladder; no-op)", .{});
+    var r = proto.Reader.init(body);
+    const name = r.getStr();
+    log.line(tag, "char rank request '{s}' (client has no 0x16 handler; nothing to reply)", .{name});
 }

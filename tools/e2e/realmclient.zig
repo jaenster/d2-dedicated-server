@@ -36,6 +36,7 @@ const MCP_LADDERDATA = 0x11;
 const MCP_JOINGAME = 0x04;
 const MCP_CHARDELETE = 0x0a;
 const MCP_CHARLIST2 = 0x19;
+const MCP_CHARUPGRADE = 0x18;
 
 // d2dbs opcodes
 pub const DBS_SAVE = 0x30;
@@ -173,6 +174,7 @@ pub const LadderEntry = struct {
     name: []const u8, // slice into the caller's dst buffer
     level: u32 = 0,
     class_id: u8 = 0,
+    experience: u32 = 0,
 };
 
 pub const CharEntry = struct {
@@ -184,7 +186,8 @@ pub const CharEntry = struct {
 
 /// Decode a CHARLIST2 statstring. Layout (CharSel.cpp):
 ///   [0..2) 14-bit realm count; [13] class byte (class_id=byte-1);
-///   [25] level; [26..28) 14-bit flags (0x04 = expansion).
+///   [25] level; [26..28) 14-bit flags — the low byte mirrors the .d2s status byte
+///   (hardcore 0x04, died 0x08, expansion 0x20, ladder 0x40), progression above it.
 fn decodeStatstring(ss: []const u8, e: *CharEntry) void {
     if (ss.len > 13) e.class_id = @as(i32, ss[13]) - 1;
     if (ss.len > 25) e.level = ss[25];
@@ -472,10 +475,11 @@ pub const RealmClient = struct {
         var n: usize = 0;
         while (n < count and n < out.len) : (n += 1) {
             if (off + 12 + entry_size > data.len) break;
+            const experience = net.rdU32(data, off + 0);
             const stats = net.rdU32(data, off + 8);
             const nm = std.mem.sliceTo(data[off + 12 .. off + 12 + entry_size], 0);
             @memcpy(dst[di .. di + nm.len], nm);
-            out[n] = .{ .name = dst[di .. di + nm.len], .level = stats >> 16, .class_id = @intCast(stats & 0xf) };
+            out[n] = .{ .name = dst[di .. di + nm.len], .level = stats >> 16, .class_id = @intCast(stats & 0xf), .experience = experience };
             di += nm.len;
             off += 12 + entry_size;
         }
@@ -517,6 +521,19 @@ pub const RealmClient = struct {
                 n += 1;
             }
         }
+    }
+
+    /// MCP_CHARUPGRADE (0x18) -> result (0 = converted, non-zero = refused). Request body
+    /// is just the character name as a cstr (Send_0x18_CharUpgrade @0x44a810).
+    pub fn charUpgrade(self: *RealmClient, charname: []const u8) !u32 {
+        const fd = self.d2cs.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.cstr(charname);
+        try mcpSend(fd, MCP_CHARUPGRADE, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_CHARUPGRADE) return error.CharUpgradeBadId;
+        return net.rdU32(r.body, 0);
     }
 
     /// MCP_GAMEINFO (0x06): the detail panel. Mirrors NET_MCP_CLIENT_Incoming0x06 —

@@ -65,6 +65,41 @@ fn minimalD2s(buf: *[0x40]u8, name: []const u8, class_id: u8, level: u8) []const
     return buf[0..];
 }
 
+/// A save with a real attribute section: the header, then the "gf" marker and a packed
+/// list holding level and experience. Experience is not a header field — it is an entry in
+/// that list — so a fixture without one cannot exercise ranking by it.
+///
+/// Widths are ItemStatCost.txt's CSvBits: id is 9 bits, level 7, experience 32, and the
+/// list ends with id 0x1FF.
+fn d2sWithExperience(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, experience: u32) []const u8 {
+    @memset(buf, 0);
+    std.mem.writeInt(u32, buf[0..4], D2S_SIGNATURE, .little);
+    const n = @min(name.len, @as(usize, 15));
+    @memcpy(buf[0x14..][0..n], name[0..n]);
+    buf[0x24] = 0x20; // expansion
+    buf[0x28] = class_id;
+    buf[0x2b] = level;
+
+    buf[0x30] = 'g';
+    buf[0x31] = 'f';
+    var bit: usize = 0;
+    const put = struct {
+        fn f(b: []u8, at: *usize, value: u32, width: u8) void {
+            var i: u8 = 0;
+            while (i < width) : (i += 1) {
+                if ((value >> @intCast(i)) & 1 != 0) b[0x32 + (at.* >> 3)] |= @as(u8, 1) << @intCast(at.* & 7);
+                at.* += 1;
+            }
+        }
+    }.f;
+    put(buf, &bit, 12, 9); // stat id: level
+    put(buf, &bit, level, 7);
+    put(buf, &bit, 13, 9); // stat id: experience
+    put(buf, &bit, experience, 32);
+    put(buf, &bit, 0x1FF, 9); // terminator
+    return buf[0 .. 0x32 + (bit + 7) / 8];
+}
+
 // ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
@@ -258,6 +293,97 @@ fn scLadder() Result {
     if (king_level != 99) return fail(name, "LadderKing level={d} want 99", .{king_level});
     if (kr >= pr) return fail(name, "not ranked by level: King@{d} not before Pawn@{d}", .{ kr, pr });
     return .{ .name = name, .status = .pass, .msg = msg("ladder lists {d}; LadderKing(99)@{d} ranked above LadderPawn(1)@{d}", .{ cnt, kr, pr }) };
+}
+
+/// A ladder is ordered by experience, which is not in the save header — it lives in the
+/// packed attribute list. Two characters at the SAME level is the case that tells the two
+/// apart: ranking on the header's level byte can only tie them.
+fn scLadderExperience() Result {
+    const name = "ladder_experience";
+    const acct = "ExpAcct";
+    var buf: [0x80]u8 = undefined;
+    const ahead = rc.d2dbsSave(acct, "ExpAhead", d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (ahead != 0) return fail(name, "save ExpAhead result={d}", .{ahead});
+    const behind = rc.d2dbsSave(acct, "ExpBehind", d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (behind != 0) return fail(name, "save ExpBehind result={d}", .{behind});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var entries: [256]rc.LadderEntry = undefined;
+    var dst: [8192]u8 = undefined;
+    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var ahead_rank: ?usize = null;
+    var behind_rank: ?usize = null;
+    var ahead_exp: u32 = 0;
+    for (entries[0..cnt], 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, "ExpAhead")) {
+            ahead_rank = i;
+            ahead_exp = e.experience;
+        }
+        if (std.mem.eql(u8, e.name, "ExpBehind")) behind_rank = i;
+    }
+    const ar = ahead_rank orelse return fail(name, "ExpAhead not on ladder (cnt={d})", .{cnt});
+    const br = behind_rank orelse return fail(name, "ExpBehind not on ladder (cnt={d})", .{cnt});
+    if (ahead_exp != 1_900_000_000) return fail(name, "ExpAhead experience={d}, want 1900000000 (decoded from the attribute list)", .{ahead_exp});
+    if (ar >= br) return fail(name, "same level, more experience did not rank first: ExpAhead@{d} vs ExpBehind@{d}", .{ ar, br });
+    return .{ .name = name, .status = .pass, .msg = msg("equal level 90: exp {d} @{d} ranked above exp 1200000000 @{d}", .{ ahead_exp, ar, br }) };
+}
+
+/// CHARUPGRADE has to actually convert the save. It used to ack success and change
+/// nothing, so the character came back classic and the screen kept offering the upgrade.
+fn scCharUpgrade() Result {
+    const name = "char_upgrade";
+    const acct = "UpgradeAcct";
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    // A classic character: status carries no expansion bit, so the list reports flags 0.
+    const created = c.charCreate(4, 0, "Classicus") catch |e| return fail(name, "{s}", .{@errorName(e)}); // Barbarian
+    if (created != 0) return fail(name, "create result=0x{x}", .{created});
+
+    const before = charFlags(&c, "Classicus") orelse return fail(name, "'Classicus' missing from the list before upgrade", .{});
+    if (before & 0x20 != 0) return fail(name, "fixture is already expansion (flags=0x{x})", .{before});
+
+    const res = c.charUpgrade("Classicus") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res != 0) return fail(name, "upgrade result={d}, want 0", .{res});
+
+    const after = charFlags(&c, "Classicus") orelse return fail(name, "'Classicus' missing from the list after upgrade", .{});
+    if (after & 0x20 == 0) return fail(name, "still classic after upgrade (flags=0x{x}) — the save was not converted", .{after});
+
+    // Running it again must stay a success: the conversion it asked for is already true.
+    const again = c.charUpgrade("Classicus") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (again != 0) return fail(name, "re-upgrading an expansion character result={d}, want 0", .{again});
+
+    // A character that isn't there is a genuine failure.
+    const missing = c.charUpgrade("NotAChar") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (missing == 0) return fail(name, "upgrading a nonexistent character reported success", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("classic flags=0x{x} -> expansion flags=0x{x}; idempotent; missing char rejected", .{ before, after }) };
+}
+
+/// The statstring flags the char list reports for one character, or null if absent.
+/// The low byte mirrors the .d2s status byte, so 0x20 is the expansion bit.
+fn charFlags(c: *rc.RealmClient, want: []const u8) ?u16 {
+    var chars: [16]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const got = c.charList(&chars, &dst) catch return null;
+    for (chars[0..got.count]) |e| {
+        if (std.mem.eql(u8, e.name, want)) return e.flags;
+    }
+    return null;
 }
 
 fn scCharCreate() Result {
@@ -1284,6 +1410,8 @@ pub fn main() !void {
         scCharCreate(),
         scClassicChar(),
         scLadder(),
+        scLadderExperience(),
+        scCharUpgrade(),
         scCharDelete(),
         scCharCopy(),
         scLobbyChatAtoB(),

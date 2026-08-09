@@ -121,6 +121,29 @@ pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []co
     return saveCharD2s(dst_account, dst_char, buf[0..n]);
 }
 
+/// Result of a classic -> expansion conversion.
+pub const UpgradeResult = enum { upgraded, already_expansion, no_such_char, failed };
+
+/// Convert a character to Lord of Destruction by setting the expansion bit in its .d2s
+/// status byte and repairing the checksum. That bit is the whole conversion as far as a
+/// save file is concerned — everything else an expansion character gains, the game
+/// materializes on load, the same way a freshly created character grows from a bare
+/// 335-byte header on first play.
+///
+/// Already-expansion characters report that rather than failing: the client's only test
+/// is result == 0, so re-running it must not look like an error.
+pub fn upgradeCharToExpansion(account: []const u8, charname: []const u8) UpgradeResult {
+    var buf: [max_d2s]u8 = undefined;
+    const n = getCharD2s(account, charname, &buf);
+    if (n == 0) return .no_such_char;
+    if (n == buf.len) return .failed; // implausibly large, likely truncated
+    const st = d2s.status(buf[0..n]) orelse return .failed;
+    if (st & d2s.status_expansion != 0) return .already_expansion;
+    d2s.setStatus(buf[0..n], st | d2s.status_expansion);
+    d2s.fixChecksum(buf[0..n]);
+    return if (saveCharD2s(account, charname, buf[0..n])) .upgraded else .failed;
+}
+
 // ── accounts (durable) ───────────────────────────────────────────────────────
 
 /// Create an account. `pwhash` null = password-less. Returns false if it exists.
