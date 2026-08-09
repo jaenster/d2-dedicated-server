@@ -880,6 +880,89 @@ fn scGetFileTime() Result {
     return .{ .name = name, .status = .pass, .msg = msg("held file reports a real FILETIME ({d}); an absent one reports 0", .{held}) };
 }
 
+/// Since the channel list started showing characters, the name a player can SEE is not the
+/// account. Everything that takes a name — whisper, /whois, /ignore — has to accept it, or
+/// the one name in front of them is the one name that does not work.
+fn scNameResolution() Result {
+    const name = "name_resolution";
+    const channel = "Diablo II";
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("ResolveAcctA") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("Clan*Amazon", "PX2D") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.setBnetTimeout(2000);
+
+    var b = rc.RealmClient{};
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.login("ResolveAcctB") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChatAs("Clan*Necro", "PX2D") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.setBnetTimeout(2000);
+    _ = net.usleep(150_000);
+
+    // Whisper by the CHARACTER name — what B sees in the list — not the account.
+    b.chatCommand("/w Amazon seen you") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    var got = false;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const ev = a.readChatEvent() catch break;
+        if (ev.eid != rc.EID_WHISPER) continue;
+        got = std.mem.indexOf(u8, ev.text, "seen you") != null;
+        break;
+    }
+    if (!got) return fail(name, "a whisper to the character name never arrived", .{});
+
+    // And by the full chat identity.
+    b.chatCommand("/w Clan*Amazon and again") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    got = false;
+    i = 0;
+    while (i < 10) : (i += 1) {
+        const ev = a.readChatEvent() catch break;
+        if (ev.eid != rc.EID_WHISPER) continue;
+        got = std.mem.indexOf(u8, ev.text, "and again") != null;
+        break;
+    }
+    if (!got) return fail(name, "a whisper to the full clan*char identity never arrived", .{});
+
+    // /whois by character name has to find them too.
+    b.chatCommand("/whois Amazon") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    var found = false;
+    i = 0;
+    while (i < 10) : (i += 1) {
+        const ev = b.readChatEvent() catch break;
+        if (ev.eid == rc.EID_ERROR and std.mem.indexOf(u8, ev.text, "not logged on") != null)
+            return fail(name, "/whois by character name said the user is not logged on", .{});
+        if (ev.eid != rc.EID_INFO) continue;
+        if (std.mem.indexOf(u8, ev.text, channel) != null) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return fail(name, "/whois by character name did not locate them", .{});
+
+    // /ignore by character name must actually squelch: the stored key is the account, and
+    // typing the visible name used to store something the check never compared against.
+    b.chatCommand("/ignore Amazon") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    _ = net.usleep(150_000);
+    a.chatCommand("you should not see this") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    _ = net.usleep(250_000);
+    b.setBnetTimeout(400);
+    i = 0;
+    while (i < 6) : (i += 1) {
+        const ev = b.readChatEvent() catch break;
+        if (ev.eid == rc.EID_TALK and std.mem.indexOf(u8, ev.text, "should not see") != null)
+            return fail(name, "/ignore by character name did not squelch them", .{});
+    }
+
+    return .{ .name = name, .status = .pass, .msg = msg("whisper, /whois and /ignore all accept the character name the list shows", .{}) };
+}
+
 fn scLeaveChannel() Result {
     const name = "leave_channel";
     const channel = "Diablo II";
@@ -2040,6 +2123,7 @@ pub fn main() !void {
         scLobbyChatAtoB(),
         scLobbyCharNames(),
         scChatCommands(),
+        scNameResolution(),
         scLeaveChannel(),
         scCharFetchMeta(),
         scDifficultyGate(),

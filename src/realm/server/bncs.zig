@@ -854,18 +854,26 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
     var rb: [128]u8 = undefined;
     // /ignore <name> (alias /squelch) — stop seeing that user's talk and whispers.
     if (eqCmd(cmd.verb, "ignore") or eqCmd(cmd.verb, "squelch")) {
+        // Store the ACCOUNT, not what was typed: the broadcast path checks the sender's
+        // account, and a player types the character name the channel list shows them.
+        // Falls back to the literal text so squelching someone offline still records
+        // something rather than silently doing nothing.
+        var abuf: [chat.max_name]u8 = undefined;
+        const target = chat.resolveAccount(cmd.arg, &abuf) orelse cmd.arg;
         if (cmd.arg.len == 0) {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /ignore <name>");
-        } else if (chat.addIgnore(c.fd, cmd.arg)) {
+        } else if (chat.addIgnore(c.fd, target)) {
             sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} has been squelched.", .{cmd.arg}) catch return true);
         } else sendEvent(c, EID_ERROR, 0, acct, "Already squelched, or your ignore list is full.");
         return true;
     }
     // /unignore <name> (alias /unsquelch).
     if (eqCmd(cmd.verb, "unignore") or eqCmd(cmd.verb, "unsquelch")) {
+        var abuf2: [chat.max_name]u8 = undefined;
+        const untarget = chat.resolveAccount(cmd.arg, &abuf2) orelse cmd.arg;
         if (cmd.arg.len == 0) {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /unignore <name>");
-        } else if (chat.removeIgnore(c.fd, cmd.arg)) {
+        } else if (chat.removeIgnore(c.fd, untarget)) {
             sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} is no longer squelched.", .{cmd.arg}) catch return true);
         } else sendEvent(c, EID_ERROR, 0, acct, "That user was not squelched.");
         return true;

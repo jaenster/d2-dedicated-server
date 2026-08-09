@@ -175,9 +175,32 @@ pub fn forEachInChannel(
 
 // ── social helpers (caller must NOT hold reg.lock) ───────────────────────────
 
+/// The character part of a `clan*charname` chat identity, or the whole string when there
+/// is no '*'. This is the part the channel list draws, so it is the part a player sees and
+/// therefore the part they type.
+fn charPart(display: []const u8) []const u8 {
+    const star = std.mem.indexOfScalar(u8, display, '*') orelse return display;
+    return display[star + 1 ..];
+}
+
+/// Whether `name` refers to this member. A user is reachable by any of the names they are
+/// known by: the account (what scripts and the admin API use), the full chat identity, and
+/// the character alone — which is what the channel list shows, and so what someone typing
+/// a whisper will actually have in front of them. Matching only the account meant the one
+/// name a player could see was the one name that did not work.
+///
+/// Ambiguity resolves to the first match; two accounts playing identically-named characters
+/// is possible on a closed realm and there is no better answer than "whoever we find".
+fn matchesName(m: *const Member, name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(m.nameSlice(), name)) return true;
+    const disp = m.displaySlice();
+    if (std.ascii.eqlIgnoreCase(disp, name)) return true;
+    return std.ascii.eqlIgnoreCase(charPart(disp), name);
+}
+
 fn findByNameLocked(name: []const u8) ?*Member {
     for (&reg.members) |*m| {
-        if (m.in_use and std.ascii.eqlIgnoreCase(m.nameSlice(), name)) return m;
+        if (m.in_use and matchesName(m, name)) return m;
     }
     return null;
 }
@@ -339,6 +362,24 @@ pub fn presenceOf(name: []const u8) ?Presence {
     p.channel_len = @intCast(where.len);
     @memcpy(p.channel[0..where.len], where);
     return p;
+}
+
+/// Resolve any of a user's names to the ACCOUNT they are registered under, copied into
+/// `out`. Null when nobody online answers to that name.
+///
+/// The squelch list is keyed on the account because that is what the broadcast path has
+/// cheaply to hand, but a player types the name they can SEE — which since the channel
+/// list started showing characters is not the account. Resolving once, when the /ignore is
+/// added, keeps the key and the check in the same vocabulary without putting a three-way
+/// name comparison in the path every chat line takes.
+pub fn resolveAccount(name: []const u8, out: []u8) ?[]const u8 {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByNameLocked(name) orelse return null;
+    const acct = m.nameSlice();
+    const n = @min(acct.len, out.len);
+    @memcpy(out[0..n], acct[0..n]);
+    return out[0..n];
 }
 
 pub fn fdOf(name: []const u8) ?net.Socket {
