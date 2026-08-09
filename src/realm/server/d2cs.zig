@@ -515,6 +515,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // the list responsive before the game exists on the GS; once it does, the GS's own
     // UPDATEGAMEINFO overwrites them with the count that also goes back down.
     _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, pass, desc);
+    state.global.noteGameCreated(rr.gameid); // starts the clock the detail panel counts from
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -671,23 +672,72 @@ fn onCharDelete(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// MCP_GAMEINFO (0x06). Request: u16 reqid, cstr gamename. Populates the join-screen
-// detail panel. We mirror the verified 0x05 per-game layout but set the token to -1 so
-// the client cleanly shows "no detail" (Incoming0x06 maps -1 -> result 0x32 and returns
-// before parsing the server-name/player-list area). Join still works without it; the
-// full player-list layout is a live-client follow-up.
+// MCP_GAMEINFO (0x06). Request: u16 reqid, cstr gamename. Fills the join screen's detail
+// panel. Layout reversed from NET_MCP_CLIENT_Incoming0x06 @0x44aca0 together with its only
+// consumer, OOGMENU_DisplayGameDetails @0x443ba0 — the handler scatters the packet into
+// g_CharSelectBuffer and the display function reads it back, so the two together name every
+// field. Offsets below are from the id byte, as the client sees them:
+//
+//   +0x00  u8      id (0x06)
+//   +0x01  u16     reqid — MUST echo the request's, or the client drops the packet whole
+//   +0x03  i32     token: -1 => "no info", -2 => end-of-list, anything else => a real entry
+//   +0x07  u32     game uptime in seconds (rendered h:mm:ss)
+//   +0x0b  u8      the game's reference character level
+//   +0x0c  u8      allowed level difference; 0 means "no restriction" and shows one level
+//   +0x0d  u8      max players (shown only when 1..7)
+//   +0x0e  u8      player count — the bound on BOTH per-player loops below
+//   +0x0f  u8[16]  per-player class id
+//   +0x1f  u8[16]  per-player level
+//   +0x2f  cstr    game description
+//                  then `player count` consecutive cstrs: the player names
+//
+// The count at +0x0e is load-bearing twice over: at 0 the client stops right after the
+// description, and above 0 it reads exactly that many name strings — so the count and the
+// number of trailing strings have to agree or it walks off the end of the packet.
 fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
     const name = r.getStr();
-    const exists = state.global.findGame(name) != null;
-    log.line(tag, "game info '{s}' -> {s}", .{ name, if (exists) "exists (no detail)" else "not found" });
-    var buf: [32]u8 = undefined;
+
+    var buf: [512]u8 = undefined;
     var w = startPacket(&buf, MCP_GAMEINFO);
     w.putU16(reqid); // +1 reqid echo
-    w.putU32(0); // +3 unused
-    w.putU8(0); // +7 status
-    w.putU32(0xFFFF_FFFF); // +8 token = -1 -> "no info" (early return, no name parse)
+
+    const game = state.global.findGame(name) orelse {
+        log.line(tag, "game info '{s}' -> not found", .{name});
+        w.putU32(0xFFFF_FFFF); // +3 token = -1 -> "no info", client returns before parsing
+        w.zeros(8); // +7 uptime, +0xb..0xe levels/limits — unread on this path
+        finish(c, &w);
+        return;
+    };
+    const g = game;
+
+    var members: [state.max_members]state.Member = undefined;
+    const n = state.global.gameMembers(g.gameid, &members);
+    const created = state.global.gameCreated(g.gameid);
+    const uptime: u32 = if (created > 0) @intCast(@max(0, time(null) - created)) else 0;
+
+    w.putU32(g.gameid); // +3 token: a real entry (not -1/-2)
+    w.putU32(uptime); // +7 how long it has been up
+    // No level restrictions are enforced on this realm, so the reference level is the
+    // highest character present and the difference is 0 — which the client renders as a
+    // single level rather than a range. Inventing a range would gate joins we do allow.
+    var top_level: u8 = 0;
+    for (members[0..n]) |m| top_level = @max(top_level, m.level);
+    w.putU8(top_level); // +0xb reference level
+    w.putU8(0); // +0xc level difference: unrestricted
+    w.putU8(@intCast(max_players_per_game)); // +0xd max players
+    w.putU8(@intCast(n)); // +0xe player count — must match the strings below
+
+    var i: usize = 0;
+    while (i < 16) : (i += 1) w.putU8(if (i < n) members[i].class else 0); // +0x0f classes
+    i = 0;
+    while (i < 16) : (i += 1) w.putU8(if (i < n) members[i].level else 0); // +0x1f levels
+
+    w.putStr(g.desc()); // +0x2f description
+    for (members[0..n]) |m| w.putStr(m.name_slice()); // then exactly `n` names
+
+    log.line(tag, "game info '{s}' -> {d} player(s), up {d}s", .{ name, n, uptime });
     finish(c, &w);
 }
 

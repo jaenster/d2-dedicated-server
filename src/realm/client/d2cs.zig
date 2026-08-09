@@ -248,13 +248,22 @@ pub fn onGameDestroyed(name: []const u8) void {
     if (takeGameId(name)) |gid| sendCloseGame(gid);
 }
 
-fn sendUpdateGameInfo(gameid: u32, flag: u32, players: u32) void {
+fn sendUpdateGameInfo(gameid: u32, flag: u32, players: u32, char: []const u8, level: u32, class: u32) void {
+    var buf: [@sizeOf(p.UpdateGameInfo) + 24]u8 = undefined;
     var r = std.mem.zeroes(p.UpdateGameInfo);
-    r.h = p.header(.updategameinfo, @sizeOf(p.UpdateGameInfo), nextSeq());
     r.flag = flag;
     r.gameid = gameid;
     r.players = players;
-    _ = sendPacket(std.mem.asBytes(&r));
+    r.charlevel = level;
+    r.charclass = class;
+    @memcpy(buf[0..@sizeOf(p.UpdateGameInfo)], std.mem.asBytes(&r));
+    const n = @min(char.len, buf.len - @sizeOf(p.UpdateGameInfo) - 1);
+    @memcpy(buf[@sizeOf(p.UpdateGameInfo)..][0..n], char[0..n]);
+    buf[@sizeOf(p.UpdateGameInfo) + n] = 0; // cstr terminator
+    const total = @sizeOf(p.UpdateGameInfo) + n + 1;
+    const hdr = p.header(.updategameinfo, @intCast(total), nextSeq());
+    @memcpy(buf[0..@sizeOf(p.Header)], std.mem.asBytes(&hdr));
+    _ = sendPacket(buf[0..total]);
 }
 
 /// srvtrace player-count observer: report this GS's own client count for the game so
@@ -262,9 +271,9 @@ fn sendUpdateGameInfo(gameid: u32, flag: u32, players: u32) void {
 ///
 /// A game we never tracked is one we didn't create, so we have no gameid to name it by
 /// and stay quiet rather than guess.
-pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool) void {
+pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []const u8, level: u32, class: u32) void {
     const gid = peekGameId(name) orelse return;
-    sendUpdateGameInfo(gid, if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE, players);
+    sendUpdateGameInfo(gid, if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE, players, char, level, class);
 }
 
 /// CREATEGAMEREQ: ladder/expansion/difficulty/hardcore byte flags, then

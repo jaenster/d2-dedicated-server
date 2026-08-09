@@ -130,13 +130,18 @@ pub const CloseGame = extern struct {
 /// time. `players` is the GS's own client count *after* the change — a level, not a delta,
 /// so a dropped message self-corrects on the next one and nothing can drift.
 ///
-/// `flag` says which edge caused it (0=periodic update, 1=enter, 2=leave); realmd only
-/// logs it, since the count alone is what the list needs.
+/// `flag` says which edge caused it (0=periodic update, 1=enter, 2=leave). The character
+/// it happened to follows the struct as a C-string, with the level and class the join
+/// screen's detail panel lists them by — realmd has no other way to learn who is in a
+/// game, since it only ever sees the request to join, never the arrival.
 pub const UpdateGameInfo = extern struct {
     h: Header,
     flag: u32,
     gameid: u32,
     players: u32,
+    charlevel: u32,
+    charclass: u32,
+    // followed by: cstr charname
 };
 
 /// UPDATEGAMEINFO flag values.

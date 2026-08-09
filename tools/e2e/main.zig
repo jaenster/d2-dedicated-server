@@ -453,6 +453,69 @@ fn awaitPlayers(
 /// existing test could catch: a swap between two plausible-looking codes shows the player
 /// "Game name and password don't match" for a game that was never there, and an unlisted
 /// code renders nothing at all.
+/// The join screen's detail panel. It used to answer token -1 unconditionally, which is
+/// the client's "no info" branch — it returns before reading anything else, so the panel
+/// stayed blank for every game. Now it carries the real thing, which means the packet has
+/// to be laid out the way Incoming0x06 scatters it.
+fn scGameInfo() Result {
+    const name = "game_info_panel";
+    var gs = FakeGS{ .gsid = 0x1F0, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 909 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("InfoGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var dst: [512]u8 = undefined;
+
+    // A game nobody made must still answer, with the "no info" token rather than silence.
+    const none = c.gameInfo("ghostgame", &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (none.token != 0xFFFF_FFFF) return fail(name, "unknown game -> token 0x{x}, want 0xffffffff (no info)", .{none.token});
+
+    const cg = c.createGame("infogame", "detail me") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+
+    // Two characters arrive. Only the GS knows this happened, so only the GS can say so.
+    gs.sendPlayerUpdate(909, 1, true, "Zealot", 88, 3) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    gs.sendPlayerUpdate(909, 2, true, "Frostie", 42, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+
+    var d: rc.GameDetail = .{};
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 25) {
+        d = c.gameInfo("infogame", &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (d.players == 2) break;
+        _ = net.usleep(25_000);
+    }
+    if (d.players != 2) return fail(name, "panel shows {d} players, want 2", .{d.players});
+    if (!std.mem.eql(u8, d.description, "detail me")) return fail(name, "description='{s}' want 'detail me'", .{d.description});
+    if (!std.mem.eql(u8, d.names[0], "Zealot") or !std.mem.eql(u8, d.names[1], "Frostie"))
+        return fail(name, "names are '{s}'/'{s}', want Zealot/Frostie", .{ d.names[0], d.names[1] });
+    if (d.levels[0] != 88 or d.classes[0] != 3) return fail(name, "Zealot listed as level {d} class {d}, want 88/3", .{ d.levels[0], d.classes[0] });
+    if (d.levels[1] != 42 or d.classes[1] != 1) return fail(name, "Frostie listed as level {d} class {d}, want 42/1", .{ d.levels[1], d.classes[1] });
+    if (d.level != 88) return fail(name, "reference level {d}, want the highest present (88)", .{d.level});
+    if (d.max_players != 8) return fail(name, "max players {d}, want 8", .{d.max_players});
+
+    // One leaves: the roster has to compact, not leave a hole the panel would stop at.
+    gs.sendPlayerUpdate(909, 1, false, "Zealot", 88, 3) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    waited = 0;
+    while (waited < 2000) : (waited += 25) {
+        d = c.gameInfo("infogame", &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (d.players == 1) break;
+        _ = net.usleep(25_000);
+    }
+    if (d.players != 1) return fail(name, "after a leave the panel shows {d} players, want 1", .{d.players});
+    if (!std.mem.eql(u8, d.names[0], "Frostie")) return fail(name, "remaining player is '{s}', want Frostie", .{d.names[0]});
+
+    return .{ .name = name, .status = .pass, .msg = msg("unknown=no-info; 2 players named+levelled, leave compacted to Frostie; desc '{s}'", .{d.description}) };
+}
+
 fn scJoinErrors() Result {
     const name = "join_error_codes";
     var gs = FakeGS{ .gsid = 0xE770, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 777 };
@@ -1211,6 +1274,7 @@ pub fn main() !void {
         scCreateJoinGame(),
         scGamePopulation(),
         scJoinErrors(),
+        scGameInfo(),
         scFleetCapacity(),
         scAdminApi(),
         scMultiGameOneGs(),

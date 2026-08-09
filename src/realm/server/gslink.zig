@@ -33,6 +33,7 @@ const TYPE_ECHO = @intFromEnum(p.Type.echo);
 const TYPE_CREATEGAME = @intFromEnum(p.Type.creategame);
 const TYPE_JOINGAME = @intFromEnum(p.Type.joingame);
 const TYPE_UPDATEGAMEINFO = @intFromEnum(p.Type.updategameinfo);
+const TYPE_LEAVE_FLAG = p.GAMEINFO_LEAVE;
 const TYPE_CLOSEGAME = @intFromEnum(p.Type.closegame);
 const TYPE_ADDRINFO = @intFromEnum(p.Type.addrinfo);
 
@@ -279,13 +280,20 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
             // { flag:u32, gameid:u32, players:u32 } (see realm/protocol.zig). The GS is the
             // only party that sees players leave, so its count replaces ours outright rather
             // than adjusting it — an absolute value can't drift if a message is lost.
-            if (body.len >= 12) {
+            if (body.len >= 20) {
                 const flag = std.mem.readInt(u32, body[0..4], .little);
                 const gameid = std.mem.readInt(u32, body[4..8], .little);
                 const players = std.mem.readInt(u32, body[8..12], .little);
+                const level = std.mem.readInt(u32, body[12..16], .little);
+                const class = std.mem.readInt(u32, body[16..20], .little);
+                var off: usize = 20;
+                const char = p.readCStr(body, &off);
                 const known = state.global.setGamePlayers(gameid, @intCast(@min(players, 0xFFFF)));
-                log.line(tag, "GS UPDATEGAMEINFO gameid={d} players={d} flag={d}{s}", .{
-                    gameid, players, flag, if (known) "" else " (no such game)",
+                // The roster is what makes the join screen's detail panel able to name
+                // anyone; the count alone only fills the PLAYERS column.
+                state.global.setGameMember(gameid, flag != TYPE_LEAVE_FLAG, char, @intCast(@min(level, 255)), @intCast(@min(class, 255)));
+                log.line(tag, "GS UPDATEGAMEINFO gameid={d} players={d} flag={d} char='{s}' lvl={d} class={d}{s}", .{
+                    gameid, players, flag, char, level, class, if (known) "" else " (no such game)",
                 });
             }
         },

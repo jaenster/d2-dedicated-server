@@ -31,6 +31,7 @@ const MCP_STARTUP = 0x01;
 const MCP_CHARCREATE = 0x02;
 const MCP_CREATEGAME = 0x03;
 const MCP_GAMELIST = 0x05;
+const MCP_GAMEINFO = 0x06;
 const MCP_LADDERDATA = 0x11;
 const MCP_JOINGAME = 0x04;
 const MCP_CHARDELETE = 0x0a;
@@ -144,6 +145,21 @@ pub const EID_CHANNEL = 0x07;
 /// no-password wrappers can forward the password-carrying versions' return value.
 pub const CreateResult = struct { token: u16, result: u32 };
 pub const JoinResult = struct { token: u16, ip: [4]u8, result: u32 };
+
+/// The join screen's detail panel for one game (MCP_GAMEINFO).
+pub const GameDetail = struct {
+    token: u32 = 0,
+    uptime: u32 = 0,
+    level: u8 = 0,
+    level_diff: u8 = 0,
+    max_players: u8 = 0,
+    players: u8 = 0,
+    /// Parallel to `names`: class id and level of each listed player.
+    classes: [16]u8 = [_]u8{0} ** 16,
+    levels: [16]u8 = [_]u8{0} ** 16,
+    description: []const u8 = "",
+    names: [8][]const u8 = [_][]const u8{""} ** 8,
+};
 
 /// One row of the join-screen game list.
 pub const GameEntry = struct {
@@ -501,6 +517,50 @@ pub const RealmClient = struct {
                 n += 1;
             }
         }
+    }
+
+    /// MCP_GAMEINFO (0x06): the detail panel. Mirrors NET_MCP_CLIENT_Incoming0x06 —
+    /// reqid@1, token@3, uptime@7, level@0xb, diff@0xc, maxplayers@0xd, count@0xe,
+    /// class[16]@0xf, level[16]@0x1f, then the description cstr and `count` name cstrs.
+    pub fn gameInfo(self: *RealmClient, name: []const u8, dst: []u8) !GameDetail {
+        const fd = self.d2cs.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u16v(0); // reqid
+        w.cstr(name);
+        try mcpSend(fd, MCP_GAMEINFO, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_GAMEINFO) return error.GameInfoBadId;
+        if (r.body.len < 10) return error.GameInfoShort;
+
+        var d = GameDetail{ .token = net.rdU32(r.body, 2) };
+        if (d.token == 0xFFFF_FFFF or d.token == 0xFFFF_FFFE) return d; // "no info" / end
+        if (r.body.len < 0x2e) return error.GameInfoShort;
+        d.uptime = net.rdU32(r.body, 6);
+        d.level = r.body[10];
+        d.level_diff = r.body[11];
+        d.max_players = r.body[12];
+        d.players = r.body[13];
+        @memcpy(&d.classes, r.body[14..30]);
+        @memcpy(&d.levels, r.body[30..46]);
+
+        var off: usize = 46;
+        const desc = std.mem.sliceTo(r.body[off..], 0);
+        var di: usize = 0;
+        @memcpy(dst[di .. di + desc.len], desc);
+        d.description = dst[di .. di + desc.len];
+        di += desc.len;
+        off += desc.len + 1;
+        var i: usize = 0;
+        while (i < d.players and i < d.names.len) : (i += 1) {
+            if (off >= r.body.len) break;
+            const nm = std.mem.sliceTo(r.body[off..], 0);
+            @memcpy(dst[di .. di + nm.len], nm);
+            d.names[i] = dst[di .. di + nm.len];
+            di += nm.len;
+            off += nm.len + 1;
+        }
+        return d;
     }
 
     /// MCP_CHARCREATE (0x02) -> result (0 ok, 0x14 name taken, 0x15 invalid).

@@ -76,12 +76,21 @@ pub const FakeGS = struct {
     /// Report a game's population the way a real GS does on player enter/leave:
     /// an absolute count, not a delta. `joined` only tags which edge caused it.
     pub fn sendUpdateGameInfo(self: *FakeGS, gameid: u32, players: u32, joined: bool) !void {
+        try self.sendPlayerUpdate(gameid, players, joined, "", 0, 0);
+    }
+
+    /// The full form: the character the change happened to rides along, which is how
+    /// realmd learns who is in a game at all.
+    pub fn sendPlayerUpdate(self: *FakeGS, gameid: u32, players: u32, joined: bool, char: []const u8, level: u32, class: u32) !void {
         const fd = self.sock orelse return error.NotConnected;
-        var b: [12]u8 = undefined;
+        var b: [64]u8 = undefined;
         var w = net.Writer.init(&b);
         w.u32v(if (joined) 1 else 2);
         w.u32v(gameid);
         w.u32v(players);
+        w.u32v(level);
+        w.u32v(class);
+        w.cstr(char);
         try rc.ctlSend(fd, rc.GS_UPDATEGAMEINFO, w.slice());
     }
 

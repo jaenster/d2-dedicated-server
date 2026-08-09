@@ -250,12 +250,29 @@ fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
 /// the client count once the change has settled. The realm GS client subscribes so
 /// realmd's join list shows a live PLAYERS column — realmd on its own only ever sees
 /// joins go through it, never leaves, so without this the column only counts up.
-pub var on_players_changed: ?*const fn (name: []const u8, players: u32, joined: bool) void = null;
+/// The character it happened to comes along, because realmd's join-screen detail panel
+/// lists a game's players by name, level and class, and the GS is the only side that
+/// knows who is actually in there.
+pub var on_players_changed: ?*const fn (game: []const u8, players: u32, joined: bool, char: []const u8, level: u32, class: u32) void = null;
 
-fn notifyPlayers(pgame: usize, players: u32, joined: bool) void {
+/// Level and class of the character behind a D2ClientStrc, read off its player unit
+/// (pPlayer@0x174). Level is a stat rather than a struct field, so it goes through the
+/// engine's own accessor; class is the unit's txt-file index, which for a player IS the
+/// class id. Zeroes if the client has no unit yet — the panel simply shows less.
+fn clientLevelClass(pclient: usize) struct { level: u32, class: u32 } {
+    if (pclient == 0) return .{ .level = 0, .class = 0 };
+    const u = unit(readU32(pclient, CL_PLAYER)) orelse return .{ .level = 0, .class = 0 };
+    return .{ .level = fns.GetUnitStat.call(u, STAT_LEVEL, 0), .class = u.dwTxtFileNo };
+}
+
+/// ItemStatCost id of the `level` stat.
+const STAT_LEVEL: u32 = 12;
+
+fn notifyPlayers(pgame: usize, pclient: usize, players: u32, joined: bool) void {
     const cb = on_players_changed orelse return;
     if (pgame == 0) return;
-    cb(ascii(pgame + GAME_NAME, 16), players, joined);
+    const lc = clientLevelClass(pclient);
+    cb(ascii(pgame + GAME_NAME, 16), players, joined, ascii(pclient + CL_NAME, 16), lc.level, lc.class);
 }
 
 fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
@@ -267,7 +284,7 @@ fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
     // These are entry detours, so the count is whatever the engine has already committed.
     // CLIENT_AddToGame links the client and bumps nClientsCount before the join broadcast
     // (Clients.cpp @0x539... `pGame->nClientsCount++`), so by here the joiner is counted.
-    notifyPlayers(pgame, readU32(pgame, GAME_CLIENTS), true);
+    notifyPlayers(pgame, pclient, readU32(pgame, GAME_CLIENTS), true);
 }
 
 fn onPlayerLeave(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
@@ -280,7 +297,7 @@ fn onPlayerLeave(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
     // decrement happens after us (same caller, `pGame->nClientsCount--`). Subtract them here
     // rather than reporting a count we know is one stale.
     const now = readU32(pgame, GAME_CLIENTS);
-    notifyPlayers(pgame, if (now > 0) now - 1 else 0, false);
+    notifyPlayers(pgame, pclient, if (now > 0) now - 1 else 0, false);
 }
 
 fn onDamage(attacker: usize, victim: usize, pdamage: usize) callconv(.c) void {

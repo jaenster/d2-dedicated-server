@@ -13,6 +13,8 @@ const std = @import("std");
 const Spinlock = @import("realm_infra").lock.Spinlock;
 const store = @import("store.zig");
 
+extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds, for a game's elapsed-time line
+
 pub const max_name = 31;
 
 /// Multi-instance mode: sessions/games go to the shared Store (a shared volume)
@@ -33,6 +35,34 @@ pub const Session = struct {
     pub fn name(s: *const Session) []const u8 {
         return s.account[0..s.account_len];
     }
+};
+
+/// One character in a game, as the join screen's detail panel lists them. Filled from the
+/// hosting GS's UPDATEGAMEINFO — realmd sees a request to join, not an arrival, so this is
+/// the only honest source for who is actually in there.
+pub const Member = struct {
+    name: [16]u8 = [_]u8{0} ** 16,
+    name_len: u8 = 0,
+    level: u8 = 0,
+    class: u8 = 0,
+
+    pub fn name_slice(m: *const Member) []const u8 {
+        return m.name[0..m.name_len];
+    }
+};
+
+/// A D2 game holds eight.
+pub const max_members = 8;
+
+/// Who is in a game, and since when — the two things the join screen's detail panel needs
+/// that no store record carries. Keyed by engine gameid and kept per instance, so it works
+/// the same whether games live in memory or in a shared store.
+pub const Roster = struct {
+    gameid: u32 = 0,
+    created: i64 = 0,
+    members: [max_members]Member = [_]Member{.{}} ** max_members,
+    count: u8 = 0,
+    in_use: bool = false,
 };
 
 pub const Game = struct {
@@ -66,6 +96,7 @@ pub const State = struct {
     sessions: [1024]Session = [_]Session{.{}} ** 1024,
     next_id: u64 = 1,
     games: [512]Game = [_]Game{.{}} ** 512,
+    rosters: [256]Roster = [_]Roster{.{}} ** 256,
 
     /// Mint a session for `account`, returning its id (0 on failure).
     pub fn mintSession(st: *State, account: []const u8) u64 {
@@ -195,8 +226,97 @@ pub const State = struct {
         return false;
     }
 
+    /// Note that a game now exists, starting its clock. Called when realmd registers it.
+    pub fn noteGameCreated(st: *State, gameid: u32) void {
+        st.lock.lock();
+        defer st.lock.unlock();
+        const r = st.rosterSlot(gameid) orelse return;
+        r.* = .{ .gameid = gameid, .created = time(null), .in_use = true };
+    }
+
+    /// Forget a game's roster (CLOSEGAME / GS disconnect), freeing the slot.
+    pub fn forgetGameRoster(st: *State, gameid: u32) void {
+        st.lock.lock();
+        defer st.lock.unlock();
+        for (&st.rosters) |*r| {
+            if (r.in_use and r.gameid == gameid) r.* = .{};
+        }
+    }
+
+    /// The roster entry for `gameid`, reusing an existing one or claiming a free slot.
+    /// Null when the table is full. Caller holds the lock.
+    fn rosterSlot(st: *State, gameid: u32) ?*Roster {
+        var free: ?*Roster = null;
+        for (&st.rosters) |*r| {
+            if (r.in_use and r.gameid == gameid) return r;
+            if (free == null and !r.in_use) free = r;
+        }
+        return free;
+    }
+
+    /// Add or remove a character from a game's roster, from the hosting GS's
+    /// UPDATEGAMEINFO. Kept here rather than in the store because it changes on every
+    /// join and leave, and a store write per player movement is a lot of traffic for a
+    /// cosmetic panel — with the consequence, in multi-instance mode, that only the
+    /// instance holding that GS's link can list a game's players.
+    pub fn setGameMember(st: *State, gameid: u32, joined: bool, char: []const u8, level: u8, class: u8) void {
+        if (char.len == 0) return;
+        st.lock.lock();
+        defer st.lock.unlock();
+        const r = st.rosterSlot(gameid) orelse return;
+        if (!r.in_use) r.* = .{ .gameid = gameid, .created = time(null), .in_use = true };
+
+        var i: usize = 0;
+        while (i < r.count) : (i += 1) {
+            if (!std.ascii.eqlIgnoreCase(r.members[i].name_slice(), char)) continue;
+            if (joined) {
+                // Already listed — refresh it, since a level can change between joins.
+                r.members[i].level = level;
+                r.members[i].class = class;
+            } else {
+                // Compact rather than leave a hole: the panel walks the first `count`
+                // entries, and a gap would silently truncate the list at it.
+                r.members[i] = r.members[r.count - 1];
+                r.members[r.count - 1] = .{};
+                r.count -= 1;
+            }
+            return;
+        }
+        if (!joined or r.count >= max_members) return;
+        var m = Member{ .level = level, .class = class };
+        const n: u8 = @intCast(@min(char.len, m.name.len));
+        @memcpy(m.name[0..n], char[0..n]);
+        m.name_len = n;
+        r.members[r.count] = m;
+        r.count += 1;
+    }
+
+    /// Copy a game's roster out under the lock. Returns how many were filled.
+    pub fn gameMembers(st: *State, gameid: u32, out: []Member) usize {
+        st.lock.lock();
+        defer st.lock.unlock();
+        for (&st.rosters) |*r| {
+            if (!r.in_use or r.gameid != gameid) continue;
+            const n = @min(@as(usize, r.count), out.len);
+            @memcpy(out[0..n], r.members[0..n]);
+            return n;
+        }
+        return 0;
+    }
+
+    /// When a game was first seen here, or 0 if this instance never registered it.
+    pub fn gameCreated(st: *State, gameid: u32) i64 {
+        st.lock.lock();
+        defer st.lock.unlock();
+        for (&st.rosters) |*r| {
+            if (r.in_use and r.gameid == gameid) return r.created;
+        }
+        return 0;
+    }
+
     /// Remove a game by engine gameid (called on CLOSEGAME).
     pub fn removeGameById(st: *State, gameid: u32) void {
+        st.forgetGameRoster(gameid);
         if (shared) return store.removeGameById(gameid); // store's games-by-id reverse index
         st.lock.lock();
         defer st.lock.unlock();
