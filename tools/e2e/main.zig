@@ -1327,23 +1327,24 @@ fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
     // COPY the old values: getenv returns a pointer into the environ block, and the
     // setenv below overwrites that very entry, so keeping the pointer would restore
     // whatever happened to land there afterwards.
-    var saved: [16][128]u8 = undefined;
-    var had: [16]bool = undefined;
+    var saved: [24][512]u8 = undefined;
+    var had: [24]bool = undefined;
+    // Silently skipping either of these would put the environment back wrong, which is the
+    // exact failure this function exists to prevent — and it surfaces as a product bug in
+    // an unrelated scenario. A harness may shout.
+    if (envs.len > saved.len) std.debug.panic("spawnRealmd: {d} env vars, only {d} can be restored", .{ envs.len, saved.len });
     for (envs, 0..) |e, i| {
-        if (i >= saved.len) break;
         had[i] = false;
         if (getenv(e.name)) |old| {
             const v = std.mem.span(old);
-            if (v.len < saved[i].len) {
-                @memcpy(saved[i][0..v.len], v);
-                saved[i][v.len] = 0;
-                had[i] = true;
-            }
+            if (v.len >= saved[i].len) std.debug.panic("spawnRealmd: {s} is {d} bytes, too long to save/restore", .{ e.name, v.len });
+            @memcpy(saved[i][0..v.len], v);
+            saved[i][v.len] = 0;
+            had[i] = true;
         }
         _ = setenv(e.name, e.value, 1);
     }
     defer for (envs, 0..) |e, i| {
-        if (i >= saved.len) break;
         if (had[i]) {
             const restored: [*:0]const u8 = @ptrCast(&saved[i]);
             _ = setenv(e.name, restored, 1);
