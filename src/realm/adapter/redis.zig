@@ -360,17 +360,17 @@ pub fn expireSession(id: u64) void {
 
 // ── games (ephemeral, PX TTL, reverse indexed by id and by gs) ───────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     const safe = gameKey(name, &nb) orelse return false;
 
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
     var vb: [256]u8 = undefined;
-    // Fields: gameid ip port gsid players status <password> <description>. The password is a
+    // Fields: gameid ip port gsid players status difficulty <password> <description>. The password is a
     // single token (may be empty); the description absorbs the rest, since it may
     // contain spaces. Same encoding as the fs backend, so parseGame is shared in spirit.
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {s} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, status, password, description }) catch return false;
+    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, status, difficulty, password, description }) catch return false;
     var ik: [64]u8 = undefined;
     const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
     var gb: [64]u8 = undefined;
@@ -493,7 +493,8 @@ fn parseGame(val: []const u8) ?GameRec {
     var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
     rec.players = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 0) else 0; // 5th
     rec.status = if (it.next()) |t| (std.fmt.parseInt(u8, t, 10) catch 0) else 0; // 6th
-    if (it.next()) |p| rec.setPw(p); // 7th token = join password (may be empty)
+    rec.difficulty = if (it.next()) |t| (std.fmt.parseInt(u8, t, 10) catch 0) else 0; // 7th
+    if (it.next()) |p| rec.setPw(p); // 8th token = join password (may be empty)
     rec.setDesc(it.rest()); // remainder = description (may contain spaces)
     return rec;
 }
@@ -527,9 +528,10 @@ pub fn setGamePlayers(gameid: u32, players: u16) bool {
     };
     const rec = parseGame(val) orelse return false;
     var vb: [256]u8 = undefined;
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {s} {s}", .{
-        rec.gameid,  rec.gs_ip[0], rec.gs_ip[1], rec.gs_ip[2], rec.gs_ip[3], rec.gs_port,
-        rec.gsid,    players,      rec.status,   rec.pw(),     rec.desc(),
+    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{
+        rec.gameid, rec.gs_ip[0], rec.gs_ip[1],   rec.gs_ip[2], rec.gs_ip[3], rec.gs_port,
+        rec.gsid,   players,      rec.status,     rec.difficulty,
+        rec.pw(),   rec.desc(),
     }) catch return false;
     return switch (command(&r, &.{ "SET", gamekey, body, "KEEPTTL" }) orelse return false) {
         .status, .bulk, .int => true,

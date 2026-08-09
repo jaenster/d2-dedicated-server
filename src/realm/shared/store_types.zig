@@ -24,6 +24,9 @@ pub const GameRec = struct {
     /// ladder 0x40) — what KIND of game this is. A joining character has to match, and
     /// the client has a distinct error message for each way it can fail to.
     status: u8 = 0,
+    /// 0 Normal, 1 Nightmare, 2 Hell. A character has to have progressed far enough to be
+    /// allowed in, and the client has a specific message for each way that can fail.
+    difficulty: u8 = 0,
     /// Game join password (empty = open game). Stored with the record so any realmd
     /// instance can validate a join. D2 passwords are short alphanumeric (no spaces).
     password: [16]u8 = [_]u8{0} ** 16,

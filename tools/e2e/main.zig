@@ -66,6 +66,14 @@ fn minimalD2s(buf: *[0x40]u8, name: []const u8, class_id: u8, level: u8) []const
     return buf[0..];
 }
 
+/// A save whose header carries a progression byte (0x25) — how far the character has got,
+/// which is what the difficulty gates are checked against.
+fn d2sWithProgression(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, progression: u8) []const u8 {
+    const out = d2sWithExperience(buf, name, class_id, level, 1000);
+    buf[0x25] = progression;
+    return out;
+}
+
 /// A save with a real attribute section: the header, then the "gf" marker and a packed
 /// list holding level and experience. Experience is not a header field — it is an entry in
 /// that list — so a fixture without one cannot exercise ranking by it.
@@ -739,6 +747,79 @@ fn scFleetCapacity() Result {
 /// timestamp straight to its download layer, which compares it against what it has cached,
 /// so a zero means "older than anything you own" and nothing is fetched. realmd replied
 /// zero for everything — including files it was sitting on and would happily serve.
+/// Nightmare and Hell are earned. The thresholds are the client's own: CharSel @0x4349b0
+/// offers a difficulty at all only above progression 3 (classic) / 4 (expansion), and
+/// UIMENU_SelectDifficultySinglePlayerOrTcpip @0x439780 reveals Hell above 7 / 9.
+fn scDifficultyGate() Result {
+    const name = "difficulty_gate";
+    const acct = "DiffAcct";
+    var gs = FakeGS{ .gsid = 0xD1FF, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 900 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    // Three expansion characters either side of the two gates: 4 is one short of
+    // Nightmare, 5 clears it, 9 is one short of Hell, 10 clears it.
+    var buf: [0x80]u8 = undefined;
+    const chars = [_]struct { name: []const u8, prog: u8 }{
+        .{ .name = "DiffFresh", .prog = 4 },
+        .{ .name = "DiffNm", .prog = 5 },
+        .{ .name = "DiffNine", .prog = 9 },
+        .{ .name = "DiffHell", .prog = 10 },
+    };
+    for (chars) |ch| {
+        const blob = d2sWithProgression(&buf, ch.name, 1, 80, ch.prog);
+        const r = rc.d2dbsSave(acct, ch.name, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+        if (r != 0) return fail(name, "save {s} result={d}", .{ ch.name, r });
+    }
+
+    // The games themselves are made by a character that has cleared everything.
+    const maker = d2sWithProgression(&buf, "DiffMaker", 1, 99, 15);
+    _ = rc.d2dbsSave(acct, "DiffMaker", maker) catch |e| return fail(name, "save maker {s}", .{@errorName(e)});
+
+    var owner = rc.RealmClient{};
+    defer owner.close();
+    owner.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    owner.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((owner.startup() catch 1) != 0) return fail(name, "startup failed", .{});
+    if ((owner.charLogon("DiffMaker") catch 1) != 0) return fail(name, "charlogon DiffMaker failed", .{});
+
+    // Difficulty rides in bits 12-14 of the create flags.
+    const nm = owner.createGameDiff("nmgame", "d", 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (nm.result != 0) return fail(name, "create nightmare game result={d}", .{nm.result});
+    const hell = owner.createGameDiff("hellgame", "d", 2) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (hell.result != 0) return fail(name, "create hell game result={d}", .{hell.result});
+    const norm = owner.createGameDiff("normgame", "d", 0) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (norm.result != 0) return fail(name, "create normal game result={d}", .{norm.result});
+
+    const cases = [_]struct { char: []const u8, game: []const u8, want: u32, why: []const u8 }{
+        .{ .char = "DiffFresh", .game = "normgame", .want = 0, .why = "Normal is open to everyone" },
+        .{ .char = "DiffFresh", .game = "nmgame", .want = 0x73, .why = "progression 4 has not unlocked Nightmare" },
+        .{ .char = "DiffNm", .game = "nmgame", .want = 0, .why = "progression 5 has" },
+        .{ .char = "DiffNine", .game = "hellgame", .want = 0x74, .why = "progression 9 has not unlocked Hell" },
+        .{ .char = "DiffHell", .game = "hellgame", .want = 0, .why = "progression 10 has" },
+    };
+    for (cases) |cs| {
+        var c = rc.RealmClient{};
+        defer c.close();
+        c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if ((c.startup() catch 1) != 0) return fail(name, "startup failed", .{});
+        if ((c.charLogon(cs.char) catch 1) != 0) return fail(name, "charlogon {s} failed", .{cs.char});
+        const j = c.joinGame(cs.game) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (j.result != cs.want)
+            return fail(name, "{s} joining {s} -> 0x{x}, want 0x{x} ({s})", .{ cs.char, cs.game, j.result, cs.want, cs.why });
+    }
+
+    return .{ .name = name, .status = .pass, .msg = msg("Nightmare gated at progression 5, Hell at 10; Normal open (engine thresholds)", .{}) };
+}
+
 fn scGetFileTime() Result {
     const name = "get_file_time";
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
@@ -1931,6 +2012,7 @@ pub fn main() !void {
         scLobbyCharNames(),
         scChatCommands(),
         scLeaveChannel(),
+        scDifficultyGate(),
         scGetFileTime(),
         scBannerAd(),
         scFriendsPersist(),

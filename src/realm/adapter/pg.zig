@@ -135,6 +135,7 @@ fn createSchema(p: *pg.Pool) !void {
     _ = try p.exec("alter table games add column if not exists players int not null default 0", .{});
     _ = try p.exec("alter table games add column if not exists description text not null default ''", .{});
     _ = try p.exec("alter table games add column if not exists status int not null default 0", .{});
+    _ = try p.exec("alter table games add column if not exists difficulty int not null default 0", .{});
     _ = try p.exec("create index if not exists games_gameid_idx on games(gameid)", .{});
     _ = try p.exec("create index if not exists games_gsid_idx on games(gsid)", .{});
 }
@@ -288,31 +289,31 @@ fn sweepSessions(p: *pg.Pool) void {
 
 // ── games (ephemeral, TTL; gameid/gsid columns are indexed) ──────────────────
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     const safe = gameKey(name, &nb) orelse return false;
     const p = ensurePool() orelse return false;
     const ip = ipToInt(gs_ip);
     if (ttl_s > 0) {
         _ = p.exec(
-            \\insert into games(name, gameid, ip, port, gsid, players, status, password, description, expires_at)
-            \\values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + make_interval(secs => $10))
+            \\insert into games(name, gameid, ip, port, gsid, players, status, difficulty, password, description, expires_at)
+            \\values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now() + make_interval(secs => $11))
             \\on conflict (name) do update set
             \\  gameid = excluded.gameid, ip = excluded.ip, port = excluded.port,
             \\  gsid = excluded.gsid, players = excluded.players, status = excluded.status,
-            \\  password = excluded.password,
+            \\  difficulty = excluded.difficulty, password = excluded.password,
             \\  description = excluded.description, expires_at = excluded.expires_at
-        , .{ safe, @as(i64, gameid), ip, @as(i32, gs_port), @as(i64, gsid), @as(i32, players), @as(i32, status), password, description, @as(f64, @floatFromInt(ttl_s)) }) catch return false;
+        , .{ safe, @as(i64, gameid), ip, @as(i32, gs_port), @as(i64, gsid), @as(i32, players), @as(i32, status), @as(i32, difficulty), password, description, @as(f64, @floatFromInt(ttl_s)) }) catch return false;
     } else {
         _ = p.exec(
-            \\insert into games(name, gameid, ip, port, gsid, players, status, password, description, expires_at)
-            \\values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null)
+            \\insert into games(name, gameid, ip, port, gsid, players, status, difficulty, password, description, expires_at)
+            \\values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, null)
             \\on conflict (name) do update set
             \\  gameid = excluded.gameid, ip = excluded.ip, port = excluded.port,
             \\  gsid = excluded.gsid, players = excluded.players, status = excluded.status,
-            \\  password = excluded.password,
+            \\  difficulty = excluded.difficulty, password = excluded.password,
             \\  description = excluded.description, expires_at = null
-        , .{ safe, @as(i64, gameid), ip, @as(i32, gs_port), @as(i64, gsid), @as(i32, players), @as(i32, status), password, description }) catch return false;
+        , .{ safe, @as(i64, gameid), ip, @as(i32, gs_port), @as(i64, gsid), @as(i32, players), @as(i32, status), @as(i32, difficulty), password, description }) catch return false;
     }
     return true;
 }
@@ -335,7 +336,7 @@ pub fn findGame(name: []const u8) ?GameRec {
     const p = ensurePool() orelse return null;
     sweepGames(p);
     var row = (p.row(
-        "select gameid, ip, port, gsid, password, players, description, status from games where name = $1 and (expires_at is null or expires_at > now())",
+        "select gameid, ip, port, gsid, password, players, description, status, difficulty from games where name = $1 and (expires_at is null or expires_at > now())",
         .{safe},
     ) catch return null) orelse return null;
     defer row.deinit() catch {};
@@ -347,6 +348,7 @@ pub fn findGame(name: []const u8) ?GameRec {
     const players = row.get(i32, 5) catch 0;
     const description = row.get([]const u8, 6) catch "";
     const game_status = row.get(i32, 7) catch 0;
+    const game_difficulty = row.get(i32, 8) catch 0;
     var rec = GameRec{
         .gameid = @truncate(@as(u64, @bitCast(gameid))),
         .gs_ip = intToIp(ip),
@@ -357,6 +359,7 @@ pub fn findGame(name: []const u8) ?GameRec {
     rec.setPw(password);
     rec.setDesc(description);
     rec.status = @truncate(@as(u32, @bitCast(game_status)));
+    rec.difficulty = @truncate(@as(u32, @bitCast(game_difficulty)));
     return rec;
 }
 

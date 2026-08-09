@@ -50,6 +50,7 @@ const MCP_CHARCREATE = 0x02;
 const MCP_CREATEGAME = 0x03;
 const MCP_GAMELIST = 0x05;
 const MCP_GAMEINFO = 0x06;
+const MCP_CHARLOGON = 0x07;
 const MCP_LADDERDATA = 0x11;
 const MCP_JOINGAME = 0x04;
 const MCP_CHARDELETE = 0x0a;
@@ -769,12 +770,35 @@ pub const AdInfo = struct {
         return self.createGameWithPassword(name, desc, "");
     }
 
+    /// MCP_CHARLOGON (0x07): select the character this connection is playing. Reply is a
+    /// u32 result (0 = ok). Needed before anything that depends on WHICH character it is.
+    pub fn charLogon(self: *RealmClient, charname: []const u8) !u32 {
+        const fd = self.d2cs.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.cstr(charname);
+        try mcpSend(fd, MCP_CHARLOGON, w.slice());
+        const r = try mcpRecv(fd, &self.rxbuf);
+        if (r.id != MCP_CHARLOGON) return error.CharLogonBadId;
+        return net.rdU32(r.body, 0);
+    }
+
+    /// Create a game at a specific difficulty. It rides in bits 12-14 of the create flags
+    /// (Normal 0, Nightmare 0x1000, Hell 0x2000).
+    pub fn createGameDiff(self: *RealmClient, name: []const u8, desc: []const u8, difficulty: u2) !CreateResult {
+        return self.createGameFull(name, desc, "", @as(u32, difficulty) << 12);
+    }
+
     pub fn createGameWithPassword(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8) !CreateResult {
+        return self.createGameFull(name, desc, password, 0);
+    }
+
+    fn createGameFull(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8, flags: u32) !CreateResult {
         const fd = self.d2cs.?;
         var body: [128]u8 = undefined;
         var w = net.Writer.init(&body);
         w.u16v(7);
-        w.u32v(0);
+        w.u32v(flags);
         w.u8v(1);
         w.u8v(0);
         w.u8v(8); // max_players

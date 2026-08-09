@@ -62,7 +62,9 @@ const JOIN_FULL: u32 = 0x2b; // str 0x1429 "Game is Full."
 const JOIN_HARDCORE_MIX: u32 = 0x71; // str 0x1426 hardcore and normal may not share a game
 const JOIN_CLASSIC_INTO_EXPANSION: u32 = 0x78; // str 0x2775 classic char, expansion game
 const JOIN_EXPANSION_INTO_CLASSIC: u32 = 0x79; // str 0x2776 expansion char, classic game
-const JOIN_LADDER_MISMATCH: u32 = 0x7d; // str 0x2ab1/0x2ab2 (client picks by its own ladder flag)
+const JOIN_LADDER_MISMATCH: u32 = 0x7d; 
+const JOIN_NEED_NIGHTMARE: u32 = 0x73; // str 0x14f4/0x5522 "must kill Diablo/Baal to play Nightmare"
+const JOIN_NEED_HELL: u32 = 0x74; // str 0x14f3/0x5521 "...in Nightmare difficulty to play Hell" // str 0x2ab1/0x2ab2 (client picks by its own ladder flag)
 
 /// Character status bits as they sit in the .d2s header at 0x24 — the same bits the
 /// CharSel statstring and MCP_CHARCREATE speak in. A game stores the creator's, so a
@@ -71,6 +73,36 @@ const STATUS_HARDCORE: u8 = 0x04;
 const STATUS_EXPANSION: u8 = 0x20;
 const STATUS_LADDER: u8 = 0x40;
 const STATUS_JOIN_MASK: u8 = STATUS_HARDCORE | STATUS_EXPANSION | STATUS_LADDER;
+
+/// How far a character has to have got to be let into a harder game.
+///
+/// These are the client's OWN thresholds, not a guess. CharSel @0x4349b0 decides whether to
+/// offer a difficulty at all with `progression > 3` for classic and `> 4` for expansion, and
+/// UIMENU_SelectDifficultySinglePlayerOrTcpip @0x439780 reveals the Hell button on
+/// `progression > 7` / `> 9`. Progression is the .d2s byte at 0x25 — the same value the
+/// CharSel statstring carries in bits 8..12 of the character flags.
+///
+/// Expansion needs one more step than classic at each gate because its acts are counted too.
+const progression_nightmare_classic: u8 = 4;
+const progression_nightmare_expansion: u8 = 5;
+const progression_hell_classic: u8 = 8;
+const progression_hell_expansion: u8 = 10;
+
+/// The reason `progression` cannot enter a game of `difficulty`, or null if it can.
+/// Normal is always open — everyone starts there.
+fn difficultyError(difficulty: u8, progression: u8, expansion: bool) ?u32 {
+    return switch (difficulty) {
+        0 => null,
+        1 => if (progression < (if (expansion) progression_nightmare_expansion else progression_nightmare_classic))
+            JOIN_NEED_NIGHTMARE
+        else
+            null,
+        else => if (progression < (if (expansion) progression_hell_expansion else progression_hell_classic))
+            JOIN_NEED_HELL
+        else
+            null,
+    };
+}
 
 /// A D2 game holds eight players; past that the engine's CreateClient refuses outright
 /// (`pGame->nClientsCount < 8`, D2Game/Game/Clients.cpp CreateClient @0x539a30). Turning
@@ -418,6 +450,15 @@ fn charStatus(c: *DConn) u8 {
     return save[0x24] & STATUS_JOIN_MASK;
 }
 
+/// The logged-on character's progression (.d2s 0x25) — how far through the game it has got.
+/// Zero when the save can't be read, which gates it to Normal; that is the safe direction.
+fn charProgression(c: *DConn) u8 {
+    var save: [64]u8 = undefined;
+    const n = store.getCharD2s(c.accountName(), c.charName(), &save);
+    if (n <= 0x25) return 0;
+    return save[0x25] & 0x1f;
+}
+
 /// Reply to a failed JOINGAME. All five fields still have to be on the wire: the client's
 /// Incoming0x04 @0x44ac20 reads them unconditionally, and only consults `result` once it
 /// has seen the IP is zero — a short packet is not a rejection, it's a desync.
@@ -502,6 +543,12 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const expansion = (status & STATUS_EXPANSION) != 0;
     const hardcore = (status & STATUS_HARDCORE) != 0;
     const ladder: u8 = if ((status & STATUS_LADDER) != 0) 1 else 0;
+    // NOT gated here, deliberately. The CREATEGAME reply has three codes — invalid name,
+    // name taken, server down — and none of them means "you have not unlocked that
+    // difficulty", so refusing here could only report a reason that isn't the reason. The
+    // client sends JOINGAME immediately after a successful create, and that path has both
+    // the same check and a code that says the true thing (0x73 / 0x74), so an ineligible
+    // character is still turned away — with the right message, one packet later.
     log.line(tag, "create game '{s}' desc='{s}' diff={d} status=0x{x:0>2} (flags=0x{x})", .{ name, desc, difficulty, status, create_flags });
     const routed = gslink.createGameRouted(name, pass, desc, ladder, expansion, difficulty, hardcore);
     if (routed == null) {
@@ -514,7 +561,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // 1 player: the creator. That seed and the join-time bump below are guesses that keep
     // the list responsive before the game exists on the GS; once it does, the GS's own
     // UPDATEGAMEINFO overwrites them with the count that also goes back down.
-    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, pass, desc);
+    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc);
     state.global.noteGameCreated(rr.gameid); // starts the clock the detail panel counts from
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
@@ -575,6 +622,13 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "join game '{s}' (account={s}) -> status mismatch game=0x{x:0>2} char=0x{x:0>2} -> 0x{x}", .{ name, c.accountName(), g.status, joiner, why });
         return rejectJoin(c, &w, why);
     }
+    // Nightmare and Hell are earned. The client hides difficulties a character has not
+    // unlocked, so anything asking for one here has either been modified or is stale —
+    // either way it gets the specific message rather than a confusing generic failure.
+    if (difficultyError(g.difficulty, charProgression(c), (joiner & STATUS_EXPANSION) != 0)) |why| {
+        log.line(tag, "join game '{s}' (account={s}) -> difficulty {d} not unlocked (progression {d}) -> 0x{x}", .{ name, c.accountName(), g.difficulty, charProgression(c), why });
+        return rejectJoin(c, &w, why);
+    }
     // The engine's CreateClient hard-refuses a ninth client, so a join that would exceed
     // the cap is rejected while the client can still be told why. This is only trustworthy
     // because the count now comes back down when players leave.
@@ -584,7 +638,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
     // both directions) as soon as the player is actually in the game.
-    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.pw(), g.desc());
+    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc());
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
