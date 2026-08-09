@@ -6,6 +6,7 @@
         // of anything libd2 already models — the .d2s header helpers here were a duplicate
         // of d2-formats down to the byte offsets.
         .d2_formats = .{ .path = "../libd2/packages/formats" },
+        .d2_util = .{ .path = "../libd2/packages/util" },
         .pg = .{
             .url = "git+https://github.com/karlseguin/pg.zig#4215baf19f7f61a94aab9f6c5893ea12aa9bce96",
             .hash = "pg-0.0.0-Wp_7gYr_BgC1O2IRXa8tdwXhOZJLLSAl7F_ut1N07zF7",

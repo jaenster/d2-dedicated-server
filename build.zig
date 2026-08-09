@@ -89,6 +89,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("d2-formats");
 
+    // d2-util (libd2) — the D2GS wire Huffman codec and its packet framing. Also
+    // dependency-free, and the reason this repo no longer carries its own copy.
+    const d2_util = b.dependency("d2_util", .{
+        .target = realmd_target,
+        .optimize = optimize,
+    }).module("d2-util");
+
     // realm_adapter — the concrete persistence backends (fs/redis/pg) behind the store
     // facade, imported by realmd. Includes the Postgres client, so the pg dependency lives
     // here (lazy, only fetched when a step builds realmd). The qqserver does NOT use this:
@@ -156,11 +163,12 @@ pub fn build(b: *std.Build) void {
     // from Game.exe's static table — verified against a real captured GS frame).
     const huffman_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/e2e/huffman.zig"),
+            .root_source_file = b.path("tools/e2e/huffman_vectors.zig"),
             .target = realmd_target,
             .optimize = optimize,
         }),
     });
+    huffman_tests.root_module.addImport("d2_util", d2_util);
     test_step.dependOn(&b.addRunArtifact(huffman_tests).step);
 
     // BNCS auth crypto unit tests (all self-contained, std-only): the standard-SHA-1
