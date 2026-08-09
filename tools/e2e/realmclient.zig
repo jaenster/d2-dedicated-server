@@ -140,6 +140,11 @@ pub const EID_WHISPER = 0x04;
 pub const EID_TALK = 0x05;
 pub const EID_CHANNEL = 0x07;
 
+/// Reply to MCP_CREATEGAME / MCP_JOINGAME. Named rather than anonymous so the
+/// no-password wrappers can forward the password-carrying versions' return value.
+pub const CreateResult = struct { token: u16, result: u32 };
+pub const JoinResult = struct { token: u16, ip: [4]u8, result: u32 };
+
 /// One row of the join-screen game list.
 pub const GameEntry = struct {
     name: []const u8, // slice into the caller's dst buffer
@@ -514,7 +519,11 @@ pub const RealmClient = struct {
     }
 
     /// MCP_CREATEGAME -> (token, result).
-    pub fn createGame(self: *RealmClient, name: []const u8, desc: []const u8) !struct { token: u16, result: u32 } {
+    pub fn createGame(self: *RealmClient, name: []const u8, desc: []const u8) !CreateResult {
+        return self.createGameWithPassword(name, desc, "");
+    }
+
+    pub fn createGameWithPassword(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8) !CreateResult {
         const fd = self.d2cs.?;
         var body: [128]u8 = undefined;
         var w = net.Writer.init(&body);
@@ -524,7 +533,7 @@ pub const RealmClient = struct {
         w.u8v(0);
         w.u8v(8); // max_players
         w.cstr(name);
-        w.cstr(""); // password
+        w.cstr(password);
         w.cstr(desc);
         try mcpSend(fd, MCP_CREATEGAME, w.slice());
         const r = try mcpRecv(fd, &self.rxbuf);
@@ -536,13 +545,17 @@ pub const RealmClient = struct {
     }
 
     /// MCP_JOINGAME -> (token, gs_ip octets, result).
-    pub fn joinGame(self: *RealmClient, name: []const u8) !struct { token: u16, ip: [4]u8, result: u32 } {
+    pub fn joinGame(self: *RealmClient, name: []const u8) !JoinResult {
+        return self.joinGameWithPassword(name, "");
+    }
+
+    pub fn joinGameWithPassword(self: *RealmClient, name: []const u8, password: []const u8) !JoinResult {
         const fd = self.d2cs.?;
         var body: [128]u8 = undefined;
         var w = net.Writer.init(&body);
         w.u16v(8);
         w.cstr(name);
-        w.cstr(""); // password
+        w.cstr(password);
         try mcpSend(fd, MCP_JOINGAME, w.slice());
         const r = try mcpRecv(fd, &self.rxbuf);
         if (r.id != MCP_JOINGAME) return error.JoinGameBadId;

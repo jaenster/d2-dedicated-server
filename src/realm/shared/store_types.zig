@@ -20,6 +20,10 @@ pub const GameRec = struct {
     /// create/join; the hosting GS then overwrites it with its own client count, which
     /// is the only number that also goes DOWN when someone leaves.
     players: u16 = 0,
+    /// The creator's character status bits (.d2s 0x24: hardcore 0x04, expansion 0x20,
+    /// ladder 0x40) — what KIND of game this is. A joining character has to match, and
+    /// the client has a distinct error message for each way it can fail to.
+    status: u8 = 0,
     /// Game join password (empty = open game). Stored with the record so any realmd
     /// instance can validate a join. D2 passwords are short alphanumeric (no spaces).
     password: [16]u8 = [_]u8{0} ** 16,

@@ -37,6 +37,46 @@ const MCP_CHARRANK = 0x16;
 const MCP_CHARUPGRADE = 0x18;
 const MCP_CHARLIST2 = 0x19;
 
+// MCP result codes, taken from the client's own switch statements in
+// OOG_PollJoinCreatePump @0x441770 (D2Client/OOGUtilities.cpp), with the string-table id
+// each one resolves to.
+//
+// The important part is what the client does with a code that ISN'T here: the switch
+// falls to `default:`, which returns without showing a popup or changing state — the
+// player is left staring at a frozen join screen. An unlisted code is worse than a wrong
+// one, so every failure path below must pick from this list.
+//
+// CREATEGAME (0x03) replies:
+const CREATE_OK: u32 = 0x00;
+const CREATE_INVALID_NAME: u32 = 0x1e; // str 0x1411 "Invalid Game Name"
+const CREATE_NAME_TAKEN: u32 = 0x1f; // str 0x1412 "A Game Already Exists With That Name"
+const CREATE_SERVER_DOWN: u32 = 0x20; // str 0x1413 "Server Down"
+
+// JOINGAME (0x04) replies. NOTE the first two — they are not in the order you would
+// guess from the numbers, and realmd had them the wrong way round: 0x29 is the PASSWORD
+// failure and 0x2a is the MISSING-GAME failure.
+const JOIN_OK: u32 = 0x00;
+const JOIN_BAD_PASSWORD: u32 = 0x29; // str 0x1428 "Game name and password don't match."
+const JOIN_NO_SUCH_GAME: u32 = 0x2a; // str 0x1427 "Game does not exist."
+const JOIN_FULL: u32 = 0x2b; // str 0x1429 "Game is Full."
+const JOIN_HARDCORE_MIX: u32 = 0x71; // str 0x1426 hardcore and normal may not share a game
+const JOIN_CLASSIC_INTO_EXPANSION: u32 = 0x78; // str 0x2775 classic char, expansion game
+const JOIN_EXPANSION_INTO_CLASSIC: u32 = 0x79; // str 0x2776 expansion char, classic game
+const JOIN_LADDER_MISMATCH: u32 = 0x7d; // str 0x2ab1/0x2ab2 (client picks by its own ladder flag)
+
+/// Character status bits as they sit in the .d2s header at 0x24 — the same bits the
+/// CharSel statstring and MCP_CHARCREATE speak in. A game stores the creator's, so a
+/// joiner can be checked against it.
+const STATUS_HARDCORE: u8 = 0x04;
+const STATUS_EXPANSION: u8 = 0x20;
+const STATUS_LADDER: u8 = 0x40;
+const STATUS_JOIN_MASK: u8 = STATUS_HARDCORE | STATUS_EXPANSION | STATUS_LADDER;
+
+/// A D2 game holds eight players; past that the engine's CreateClient refuses outright
+/// (`pGame->nClientsCount < 8`, D2Game/Game/Clients.cpp CreateClient @0x539a30). Turning
+/// a join away here means a clear "Game is Full." instead of a silent failure at the GS.
+const max_players_per_game: u16 = 8;
+
 // Set from main() (mirrors gslink.gs_ip_override). When `game_ip` is set, JOINGAME
 // advertises the qqserver's public IP to the client instead of the GS's own IP; the
 // real GS address is recorded as a route for the qqserver to splice to. `route_ttl_s`
@@ -368,6 +408,47 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+/// The logged-on character's status bits, read from its .d2s header at 0x24. This is what
+/// decides which KIND of game the account may create or join. Defaults to expansion when
+/// the save can't be read, matching the rest of the closed-realm assumptions here.
+fn charStatus(c: *DConn) u8 {
+    var save: [64]u8 = undefined;
+    const n = store.getCharD2s(c.accountName(), c.charName(), &save);
+    if (n <= 0x24) return STATUS_EXPANSION;
+    return save[0x24] & STATUS_JOIN_MASK;
+}
+
+/// Reply to a failed JOINGAME. All five fields still have to be on the wire: the client's
+/// Incoming0x04 @0x44ac20 reads them unconditionally, and only consults `result` once it
+/// has seen the IP is zero — a short packet is not a rejection, it's a desync.
+fn rejectJoin(c: *DConn, w: *proto.Writer, result: u32) void {
+    w.putU16(0); // token
+    w.putU16(0); // unknown
+    w.putU32(0); // d2gs IP — zero is what sends the client down the error branch
+    w.putU32(0); // game hash
+    w.putU32(result);
+    finish(c, w);
+}
+
+/// Whether `joiner` may enter a game created by a character with `game` status, and which
+/// of the client's messages says why not. Each mismatch has its own string, so answering
+/// with a generic failure would be throwing away an explanation the client already has.
+fn joinStatusError(game: u8, joiner: u8) ?u32 {
+    if ((game & STATUS_EXPANSION) != (joiner & STATUS_EXPANSION)) {
+        return if ((joiner & STATUS_EXPANSION) == 0) JOIN_CLASSIC_INTO_EXPANSION else JOIN_EXPANSION_INTO_CLASSIC;
+    }
+    if ((game & STATUS_HARDCORE) != (joiner & STATUS_HARDCORE)) return JOIN_HARDCORE_MIX;
+    if ((game & STATUS_LADDER) != (joiner & STATUS_LADDER)) return JOIN_LADDER_MISMATCH;
+    return null;
+}
+
+/// A game name the realm will accept. The client offers "Invalid Game Name" as a distinct
+/// error, so an empty or oversized name should get it rather than being pushed to a GS
+/// that will refuse it for reasons we'd then have to describe as "Server Down".
+fn validGameName(name: []const u8) bool {
+    return name.len > 0 and name.len <= 15;
+}
+
 fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
@@ -386,42 +467,54 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     var w = startPacket(&buf, MCP_CREATEGAME);
     w.putU16(reqid);
 
+    const fail = struct {
+        fn f(cc: *DConn, ww: *proto.Writer, result: u32) void {
+            ww.putU16(0); // token
+            ww.putU16(0); // unknown
+            ww.putU32(result);
+            finish(cc, ww);
+        }
+    }.f;
+
+    if (!validGameName(name)) {
+        log.line(tag, "create game '{s}' -> invalid name", .{name});
+        return fail(c, &w, CREATE_INVALID_NAME);
+    }
     if (!gslink.ready()) {
+        // "Server Down" is the honest one and, more to the point, the only one in the
+        // client's switch that fits. The 0x06 that used to go out here isn't a case at
+        // all, so the client fell to `default:` and left the player on a dead screen.
         log.line(tag, "create game '{s}' -> NO GS available", .{name});
-        w.putU16(0); // token
-        w.putU16(0); // unknown
-        w.putU32(0x06); // result: server down / unavailable
-        finish(c, &w);
-        return;
+        return fail(c, &w, CREATE_SERVER_DOWN);
     }
     // A name already in the realm registry is a DIFFERENT failure than "no GS took it":
     // the client shows "a game with that name already exists" and offers to join instead.
     // Asking the GS first would just get a refusal we'd report as the generic 0x1e.
     if (state.global.findGame(name) != null) {
         log.line(tag, "create game '{s}' -> name already exists", .{name});
-        w.putU16(0);
-        w.putU16(0);
-        w.putU32(0x1f); // result: a game with that name already exists
-        finish(c, &w);
-        return;
+        return fail(c, &w, CREATE_NAME_TAKEN);
     }
-    // Expansion (LOD), softcore, non-ladder; difficulty from the client's request.
-    // The registry picks the least-loaded GS with capacity and gives us its address.
-    log.line(tag, "create game '{s}' desc='{s}' diff={d} (flags=0x{x})", .{ name, desc, difficulty, create_flags });
-    const routed = gslink.createGameRouted(name, pass, desc, 0, true, difficulty, false);
+    // The game inherits the CREATOR's character flags — a hardcore ladder character makes
+    // a hardcore ladder game. They used to be hardcoded to expansion/softcore/non-ladder,
+    // which made every game look joinable to everyone and pushed the mismatch down to the
+    // GS, where it surfaces as a disconnect rather than a sentence.
+    const status = charStatus(c);
+    const expansion = (status & STATUS_EXPANSION) != 0;
+    const hardcore = (status & STATUS_HARDCORE) != 0;
+    const ladder: u8 = if ((status & STATUS_LADDER) != 0) 1 else 0;
+    log.line(tag, "create game '{s}' desc='{s}' diff={d} status=0x{x:0>2} (flags=0x{x})", .{ name, desc, difficulty, status, create_flags });
+    const routed = gslink.createGameRouted(name, pass, desc, ladder, expansion, difficulty, hardcore);
     if (routed == null) {
+        // Nothing to do with the name — every GS is full or refused. Same message the
+        // client shows when the fleet is unreachable, because that is what happened.
         log.line(tag, "create game '{s}' -> GS refused / all full", .{name});
-        w.putU16(0);
-        w.putU16(0);
-        w.putU32(0x1e); // result: a game with that name failed
-        finish(c, &w);
-        return;
+        return fail(c, &w, CREATE_SERVER_DOWN);
     }
     const rr = routed.?;
     // 1 player: the creator. That seed and the join-time bump below are guesses that keep
     // the list responsive before the game exists on the GS; once it does, the GS's own
     // UPDATEGAMEINFO overwrites them with the count that also goes back down.
-    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, pass, desc);
+    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, pass, desc);
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -453,48 +546,44 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const game = state.global.findGame(name);
     if (game == null) {
         log.line(tag, "join game '{s}' -> not found", .{name});
-        w.putU16(0); // token
-        w.putU16(0); // unknown
-        w.putU32(0); // d2gs IP
-        w.putU32(0); // game hash
-        w.putU32(0x29); // result: game does not exist
-        finish(c, &w);
-        return;
+        return rejectJoin(c, &w, JOIN_NO_SUCH_GAME);
     }
     const g = game.?;
     // Reject a wrong password for a passworded game (open games have pw_len == 0).
-    // 0x2a = "incorrect password" (verify the exact client string in a live test).
     if (g.pw_len > 0 and !std.mem.eql(u8, g.pw(), join_pass)) {
         log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD", .{ name, c.accountName() });
-        w.putU16(0); // token
-        w.putU16(0); // unknown
-        w.putU32(0); // d2gs IP
-        w.putU32(0); // game hash
-        w.putU32(0x2a); // result: incorrect password
-        finish(c, &w);
-        return;
+        return rejectJoin(c, &w, JOIN_BAD_PASSWORD);
     }
     // Guild Hall game type (cut feature): a game named exactly after a guild IS that
     // guild's private hall. Only members on the approved list may enter — the wiki's
     // "the Battle.net server will check if your character is on the approved list".
-    // Non-members get 0x29 (game does not exist) so the hall stays hidden from outsiders.
+    // Non-members are told the game does not exist, so the hall stays hidden.
     if (guilds.load(name)) |gh| {
         var ghc = gh;
         if (ghc.findMember(c.accountName()) == null) {
             log.line(tag, "join guild hall '{s}' (account={s}) -> NOT A MEMBER, hidden", .{ name, c.accountName() });
-            w.putU16(0); // token
-            w.putU16(0); // unknown
-            w.putU32(0); // d2gs IP
-            w.putU32(0); // game hash
-            w.putU32(0x29); // result: game does not exist
-            finish(c, &w);
-            return;
+            return rejectJoin(c, &w, JOIN_NO_SUCH_GAME);
         }
         log.line(tag, "join guild hall '{s}' as member {s}", .{ name, c.accountName() });
     }
+    // A character that doesn't belong in this game is turned away HERE, with the specific
+    // reason, rather than at the GS — which has no way to say anything back to a client
+    // still sitting on the join screen.
+    const joiner = charStatus(c);
+    if (joinStatusError(g.status, joiner)) |why| {
+        log.line(tag, "join game '{s}' (account={s}) -> status mismatch game=0x{x:0>2} char=0x{x:0>2} -> 0x{x}", .{ name, c.accountName(), g.status, joiner, why });
+        return rejectJoin(c, &w, why);
+    }
+    // The engine's CreateClient hard-refuses a ninth client, so a join that would exceed
+    // the cap is rejected while the client can still be told why. This is only trustworthy
+    // because the count now comes back down when players leave.
+    if (g.players >= max_players_per_game) {
+        log.line(tag, "join game '{s}' (account={s}) -> FULL ({d} players)", .{ name, c.accountName(), g.players });
+        return rejectJoin(c, &w, JOIN_FULL);
+    }
     // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
     // both directions) as soon as the player is actually in the game.
-    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.pw(), g.desc());
+    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.pw(), g.desc());
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
@@ -514,7 +603,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putU16(0); // unknown
     w.putBytes(&advertised_ip); // d2gs / qqserver IP (in_addr, network order)
     w.putU32(0); // game hash
-    w.putU32(0); // result: success
+    w.putU32(JOIN_OK); // result: success
     finish(c, &w);
 }
 

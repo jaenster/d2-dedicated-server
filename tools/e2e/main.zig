@@ -448,6 +448,61 @@ fn awaitPlayers(
     return false;
 }
 
+/// Every rejection the join screen can render, checked against the code the 1.14d client
+/// actually switches on (OOG_PollJoinCreatePump @0x441770). These were wrong in a way no
+/// existing test could catch: a swap between two plausible-looking codes shows the player
+/// "Game name and password don't match" for a game that was never there, and an unlisted
+/// code renders nothing at all.
+fn scJoinErrors() Result {
+    const name = "join_error_codes";
+    var gs = FakeGS{ .gsid = 0xE770, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 777 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("ErrGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    // A game nobody made: "Game does not exist." (0x2a), NOT the password message.
+    const missing = c.joinGame("nosuchgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (missing.result != 0x2a) return fail(name, "join of a missing game -> 0x{x}, want 0x2a (game does not exist)", .{missing.result});
+
+    // A real game with a password: the wrong one is 0x29, and it must not be confusable
+    // with the code above — that swap is the bug this test exists for.
+    const cg = c.createGameWithPassword("pwgame", "d", "letmein") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    const wrong = c.joinGameWithPassword("pwgame", "nope") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (wrong.result != 0x29) return fail(name, "wrong password -> 0x{x}, want 0x29 (name and password don't match)", .{wrong.result});
+    const right = c.joinGameWithPassword("pwgame", "letmein") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (right.result != 0) return fail(name, "correct password -> 0x{x}, want 0", .{right.result});
+
+    // An empty name is its own error, and reaches the client as "Invalid Game Name".
+    const unnamed = c.createGame("", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (unnamed.result != 0x1e) return fail(name, "empty game name -> 0x{x}, want 0x1e (invalid game name)", .{unnamed.result});
+
+    // Eight is the engine's own ceiling (CreateClient refuses a ninth). Report a full game
+    // from the GS and the ninth join is turned away with "Game is Full." rather than being
+    // sent to a server that will drop it.
+    gs.sendUpdateGameInfo(777, 8, true) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var full_result: u32 = 0;
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 25) {
+        const j = c.joinGameWithPassword("pwgame", "letmein") catch |e| return fail(name, "{s}", .{@errorName(e)});
+        full_result = j.result;
+        if (full_result == 0x2b) break;
+        _ = net.usleep(25_000);
+    }
+    if (full_result != 0x2b) return fail(name, "join of a full game -> 0x{x}, want 0x2b (game is full)", .{full_result});
+
+    return .{ .name = name, .status = .pass, .msg = msg("missing=0x2a wrong-pw=0x29 ok=0 unnamed=0x1e full=0x2b", .{}) };
+}
+
 fn scFleetCapacity() Result {
     const name = "fleet_capacity";
     var gs_a = FakeGS{ .gsid = 0xAAA, .ip = .{ 127, 0, 0, 2 }, .maxgame = 1, .next_gameid = 100 };
@@ -1155,6 +1210,7 @@ pub fn main() !void {
         scCharListStatstring(),
         scCreateJoinGame(),
         scGamePopulation(),
+        scJoinErrors(),
         scFleetCapacity(),
         scAdminApi(),
         scMultiGameOneGs(),
