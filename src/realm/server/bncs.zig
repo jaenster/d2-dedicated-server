@@ -893,8 +893,23 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: FriendCmd) void {
             var infos: [friends.max_friends]friends.FriendInfo = undefined;
             const n = friends.list(acct, &infos);
             if (n == 0) sendEvent(c, EID_INFO, 0, "", "Your friends list is empty.");
-            for (infos[0..n]) |f| sendEvent(c, EID_INFO, 0, f.nameSlice(), if (f.online) "online" else "offline");
-            onFriendsList(c, tag); // also push the structured list so the UI panel updates
+            // Chat text is the ONLY way a 1.14d client can be shown this — see the note on
+            // onFriendsList. So say where each friend actually is, not just whether they
+            // are on: "online in Diablo II", "away", and so on.
+            for (infos[0..n]) |f| {
+                var rb: [96]u8 = undefined;
+                const where: []const u8 = if (!f.online)
+                    "offline"
+                else if (f.dnd)
+                    "online (do not disturb)"
+                else if (f.away)
+                    "online (away)"
+                else if (f.location_len > 0)
+                    std.fmt.bufPrint(&rb, "online in {s}", .{f.locationSlice()}) catch "online"
+                else
+                    "online";
+                sendEvent(c, EID_INFO, 0, f.nameSlice(), where);
+            }
         },
     }
 }
@@ -1222,8 +1237,18 @@ fn onAuthAccountLogon(c: *Conn, tag: []const u8) void {
 // Product code for an online friend (D2XP), little-endian 4 chars as the client expects.
 const PRODUCT_D2XP: u32 = @bitCast([4]u8{ 'D', '2', 'X', 'P' });
 
-// SID_FRIENDSLIST (0x65): reply with this account's friends. Per entry:
-// cstr name, u8 status flags, u8 location (0=offline,1=online), u32 product, cstr loc-string.
+// SID_FRIENDSLIST (0x65): this account's friends. Per entry: cstr name, u8 status flags,
+// u8 location (0=offline, 1=online), u32 product, cstr location string.
+//
+// A 1.14d client CANNOT RECEIVE THIS. Its incoming dispatch
+// (NET_SID_CLIENT_IncomingPacketHandler @0x521b00) drops anything with an id >= 0x5e
+// before looking at the table, and 0x65 is past that — so nothing we put here reaches the
+// game's UI. The friends feature reaches a real player only as chat text, which is what
+// handleFriendCmd sends. This is kept because it is correct, cheap, and the clientless
+// tooling and other Battle.net clients do speak it; it is not the D2 path.
+const FRIEND_STATUS_DND: u8 = 0x01;
+const FRIEND_STATUS_AWAY: u8 = 0x02;
+
 fn onFriendsList(c: *Conn, tag: []const u8) void {
     var infos: [friends.max_friends]friends.FriendInfo = undefined;
     const n = friends.list(c.accountName(), &infos);
@@ -1232,11 +1257,14 @@ fn onFriendsList(c: *Conn, tag: []const u8) void {
     var w = startPacket(&buf, SID_FRIENDSLIST);
     w.putU8(@intCast(n));
     for (infos[0..n]) |f| {
+        var flags: u8 = 0;
+        if (f.dnd) flags |= FRIEND_STATUS_DND;
+        if (f.away) flags |= FRIEND_STATUS_AWAY;
         w.putStr(f.nameSlice());
-        w.putU8(0); // status flags (mutual/DND/away) — none yet
+        w.putU8(flags);
         w.putU8(if (f.online) @as(u8, 1) else 0); // location
         w.putU32(if (f.online) PRODUCT_D2XP else 0);
-        w.putStr(""); // location string (channel/game name)
+        w.putStr(f.locationSlice()); // the channel they are in, empty if none
     }
     finish(c, &w);
 }

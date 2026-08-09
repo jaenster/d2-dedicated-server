@@ -279,6 +279,29 @@ pub fn whisperEx(name: []const u8, bytes: []const u8) WhisperResult {
 
 /// The fd of an online member by name (for ops /kick), or null. The caller acts on
 /// the socket (e.g. send a kick event then close it).
+/// Where a user is and how available they are, for the friends list. Null if they are
+/// not in chat (offline, or in a game rather than the lobby).
+pub const Presence = struct {
+    /// Channel they are sitting in, empty when they are not in one.
+    channel: [max_channel]u8 = [_]u8{0} ** max_channel,
+    channel_len: u8 = 0,
+    away: bool = false,
+    dnd: bool = false,
+
+    pub fn channelSlice(p: *const Presence) []const u8 {
+        return p.channel[0..p.channel_len];
+    }
+};
+
+pub fn presenceOf(name: []const u8) ?Presence {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByNameLocked(name) orelse return null;
+    var p = Presence{ .away = m.away_len > 0, .dnd = m.dnd_len > 0, .channel_len = m.channel_len };
+    @memcpy(p.channel[0..m.channel_len], m.channelSlice());
+    return p;
+}
+
 pub fn fdOf(name: []const u8) ?net.Socket {
     reg.lock.lock();
     defer reg.lock.unlock();

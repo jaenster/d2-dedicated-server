@@ -16,6 +16,7 @@
 const std = @import("std");
 const Spinlock = @import("realm_infra").lock.Spinlock;
 const store = @import("store.zig");
+const chat = @import("chat.zig");
 
 extern "c" fn system(cmd: [*:0]const u8) c_int;
 
@@ -200,24 +201,50 @@ pub const FriendInfo = struct {
     name: [max_name]u8 = [_]u8{0} ** max_name,
     name_len: u8 = 0,
     online: bool = false,
+    /// Where they are — the channel they are sitting in. Empty when they are online but
+    /// not in a channel (in a game, or between screens).
+    location: [32]u8 = [_]u8{0} ** 32,
+    location_len: u8 = 0,
+    away: bool = false,
+    dnd: bool = false,
+
     pub fn nameSlice(f: *const FriendInfo) []const u8 {
         return f.name[0..f.name_len];
     }
+    pub fn locationSlice(f: *const FriendInfo) []const u8 {
+        return f.location[0..f.location_len];
+    }
 };
 
-/// Snapshot `owner`'s friends (with online status) into `out`. Returns the count.
+/// Snapshot `owner`'s friends into `out`, with where each one is. Returns the count.
+///
+/// Two passes on purpose: the names come out under the friends lock, then presence is
+/// resolved with that lock RELEASED, because it lives in the chat registry behind a
+/// different lock. Holding both at once would work today and be a deadlock the first time
+/// anything took them in the other order.
 pub fn list(owner: []const u8, out: []FriendInfo) usize {
-    lock.lock();
-    defer lock.unlock();
-    ensureLoadedLocked(owner);
     var n: usize = 0;
-    for (&pairs) |*p| {
-        if (n >= out.len) break;
-        if (!p.in_use or !eqi(p.ownerSlice(), owner)) continue;
-        var fi = FriendInfo{ .name_len = p.friend_len, .online = isOnlineLocked(p.friendSlice()) };
-        @memcpy(fi.name[0..p.friend_len], p.friendSlice());
-        out[n] = fi;
-        n += 1;
+    {
+        lock.lock();
+        defer lock.unlock();
+        ensureLoadedLocked(owner);
+        for (&pairs) |*p| {
+            if (n >= out.len) break;
+            if (!p.in_use or !eqi(p.ownerSlice(), owner)) continue;
+            var fi = FriendInfo{ .name_len = p.friend_len, .online = isOnlineLocked(p.friendSlice()) };
+            @memcpy(fi.name[0..p.friend_len], p.friendSlice());
+            out[n] = fi;
+            n += 1;
+        }
+    }
+    for (out[0..n]) |*fi| {
+        const pres = chat.presenceOf(fi.nameSlice()) orelse continue;
+        fi.away = pres.away;
+        fi.dnd = pres.dnd;
+        const ch = pres.channelSlice();
+        const cn: u8 = @intCast(@min(ch.len, fi.location.len));
+        @memcpy(fi.location[0..cn], ch[0..cn]);
+        fi.location_len = cn;
     }
     return n;
 }

@@ -1260,7 +1260,35 @@ fn scFriendsPersist() Result {
     }
     if (!saw_gheed or !saw_charsi) return fail(name, "cold instance listed '{s}'/'{s}', want Gheed and Charsi", .{ names2[0], names2[1] });
 
-    return .{ .name = name, .status = .pass, .msg = msg("2 friends written by one instance, read back by another that never saw them", .{}) };
+    // A friend who is actually in a channel should be reported as being there. This is the
+    // only part of the friends feature a real 1.14d client can see, since it arrives as
+    // chat text — the structured 0x65 reply is dropped by the client outright.
+    var pal = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21113 };
+    defer pal.close();
+    pal.connectBnet() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
+    pal.auth() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
+    pal.login("Gheed") catch |e| return fail(name, "pal {s}", .{@errorName(e)});
+    pal.enterChat() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
+    pal.joinChannel("Diablo II") catch |e| return fail(name, "pal {s}", .{@errorName(e)});
+    _ = net.usleep(150_000);
+
+    c.chatCommand("/f list") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var located = false;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const ev = c.readChatEvent() catch break;
+        // Gheed also generates a channel-JOIN on this connection; only the INFO lines are
+        // the /f list reply.
+        if (ev.eid != rc.EID_INFO or !std.mem.eql(u8, ev.username, "Gheed")) continue;
+        if (std.mem.indexOf(u8, ev.text, "Diablo II") != null) {
+            located = true;
+            break;
+        }
+        return fail(name, "/f list says Gheed is '{s}' — should name the channel they are in", .{ev.text});
+    }
+    if (!located) return fail(name, "/f list never reported where Gheed is", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("2 friends survive a cold instance; /f list places Gheed in his channel", .{}) };
 }
 
 // Two realmd instances (A, B) sharing one data dir (REALMD_SHARED) keep sessions
