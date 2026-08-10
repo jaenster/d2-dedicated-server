@@ -171,6 +171,19 @@ pub fn build(b: *std.Build) void {
     huffman_tests.root_module.addImport("d2_util", d2_util);
     test_step.dependOn(&b.addRunArtifact(huffman_tests).step);
 
+    // qqserver unit tests — the game-traffic gateway's pure wire logic (the 0xAF greeting
+    // strip qq applies to the GS→client splice). Rooted at the qq binary with its infra import.
+    const qq_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/realm/qqserver/main.zig"),
+            .target = realmd_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    qq_tests.root_module.addImport("realm_infra", realm_infra);
+    test_step.dependOn(&b.addRunArtifact(qq_tests).step);
+
     // BNCS auth crypto unit tests (all self-contained, std-only): the standard-SHA-1
     // CheckRevision core, the broken-SHA-1 OLS password hash, and the CD-key decode —
     // each carries vectors verified against a real 1.14d client. No real keys committed.

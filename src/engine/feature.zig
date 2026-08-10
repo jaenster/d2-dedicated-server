@@ -60,6 +60,12 @@ const Feature = struct {
     name: []const u8,
     flag: ?[]const u8 = null,
     default: bool = true,
+    /// Server-only: detours server-side engine functions / reads server unit
+    /// structs. The same d2gs.dll is injected into the real CLIENT (for the realm
+    /// gateway + checkrev bypass); installing these there fires the hooks on
+    /// client-side state and null-derefs (e.g. srvtrace's skill decoder on the
+    /// Enchant precast). installAll() skips these unless we booted as the GS.
+    server_only: bool = false,
 };
 
 /// The one table: every feature, its name, and how it toggles. Edit here to add,
@@ -75,10 +81,9 @@ const registry = [_]Feature{
     .{ .mod = @import("../runtime/feature/checkrev_patch.zig"), .name = "checkrev", .flag = "bypass-checkrev", .default = false },
     .{ .mod = @import("../runtime/feature/nocompress.zig"), .name = "nocompress", .flag = "no-compress", .default = false },
     .{ .mod = @import("../runtime/feature/clientdiag.zig"), .name = "clientdiag", .flag = "clientdiag", .default = false },
-    .{ .mod = @import("../runtime/feature/srvdiag.zig"), .name = "srvdiag" },
-    .{ .mod = @import("../runtime/feature/srvtrace.zig"), .name = "srvtrace" },
-    .{ .mod = @import("../runtime/feature/cainfix.zig"), .name = "cainfix" },
-    .{ .mod = @import("../runtime/feature/actpreload.zig"), .name = "actpreload" },
+    .{ .mod = @import("../runtime/feature/srvdiag.zig"), .name = "srvdiag", .server_only = true },
+    .{ .mod = @import("../runtime/feature/srvtrace.zig"), .name = "srvtrace", .server_only = true },
+    .{ .mod = @import("../runtime/feature/cainfix.zig"), .name = "cainfix", .server_only = true },
     // Off by default: the CompileTxt detour destabilizes engine bootstrap (flaky crash
     // during data load) — opt in with --ladder-items only once the detour is fixed.
     .{ .mod = @import("../runtime/feature/ladderitems.zig"), .name = "ladderitems", .flag = "ladder-items", .default = false },
@@ -89,10 +94,6 @@ const registry = [_]Feature{
     .{ .mod = @import("../runtime/feature/omnivision.zig"), .name = "omnivision", .flag = "omnivision", .default = false },
     .{ .mod = @import("../runtime/feature/mapunits.zig"), .name = "mapunits", .flag = "mapunits", .default = false },
     .{ .mod = @import("../runtime/feature/mapreveal.zig"), .name = "mapreveal", .flag = "mapreveal", .default = false },
-    // Debug: draw our clean-room collision diff vs the engine as colored automap dots (SEED 1 only).
-    .{ .mod = @import("../runtime/feature/colloverlay.zig"), .name = "colloverlay", .flag = "colloverlay", .default = false },
-    // Cut Guild Halls: the client-side Steeg Stone panel (ported from GuildStone.cpp).
-    .{ .mod = @import("../runtime/feature/guild_panel.zig"), .name = "guild_panel", .flag = "guild-panel", .default = false },
 };
 
 fn initEnabled() [registry.len]bool {
@@ -129,9 +130,15 @@ pub fn applyFlags(comptime hasFlag: anytype) void {
 // ── lifecycle dispatch ───────────────────────────────────────────────────────
 
 /// Run each enabled feature's install() (byte-patches / setup). Call once at
-/// process attach, after flags have set the enable bits.
-pub fn installAll() void {
+/// process attach, after flags have set the enable bits. `server` is true only
+/// when this process booted as the dedicated GS (--d2gs-boot); when false (the
+/// DLL is riding along in the real client for the realm gateway) the server_only
+/// features are skipped — their detours would fire on client-side state and crash.
+pub fn installAll(server: bool) void {
     inline for (registry, 0..) |f, i| {
+        // In client mode, fully disable server_only features so not just install()
+        // but every later dispatch (fanGameFrame/postInitAll/…) skips them too.
+        if (f.server_only and !server) enabled[i] = false;
         if (@hasDecl(f.mod, "install") and enabled[i]) f.mod.install();
     }
 }

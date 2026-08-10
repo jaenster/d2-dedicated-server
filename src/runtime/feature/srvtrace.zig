@@ -795,6 +795,184 @@ fn emitLevel(pLevel: usize) void {
     e.endRaw(); // raw sink: these lines can be 100s of KB; must not be wrapped/capped
 }
 
+// ── DRLG per-tile GRID CELL dump (CollMap fidelity diff) ─────────────────────
+// For levels 57 (Act2 tomb) and 80 (Act3 Kurast) we emit, per preset room, the
+// engine's actual DRLG grid cell values so a clean-room port's CollMap can be
+// diffed cell-for-cell. CollMap bits derive from these grid cells via FillTileData:
+//   CollMap 0x01 WALL    <- nFlags 0x40 <- grid cell bit 17 (0x00020000)
+//   CollMap 0x04 MISSILE <- nFlags 0x80 <- grid cell bit 16 (0x00010000)
+//   CollMap 0x10 ALT     <- nFlags 0x02 <- grid cell bit 28 (0x10000000)
+// We only emit cells with any of those bits set (mask below) to keep lines sane.
+//
+// Grid access (GetGridFlags 0x67c570): value = pCellsFlags[nX + pCellsRowOffsets[nY]].
+// D2DrlgGridStrc (20B): pCellsFlags@0x00(int*), pCellsRowOffsets@0x04(int*),
+//   nWidth@0x08, nHeight@0x0C, bIsSubGrid@0x10.
+// pRoomExData is D2DrlgPresetRoomStrc (room+0x20 when nPresetType==2):
+//   nLevelPrest@0x00, nPickedFile@0x04, pMap@0x08, nFlags@0x0C,
+//   pWallGrid[4]@0x10, pOrientationGrid[4]@0x60, pFloorGrid[2]@0xB0, pCellGrid@0xD8.
+// We read grid[0] of wall/orient/floor.
+const GRID_INTEREST_MASK: u32 = 0x10030000; // bit28 | bit17 | bit16
+const GRID_DIM_CAP: i32 = 512;
+const PRDATA_WALLGRID0: usize = 0x10;
+const PRDATA_ORIENTGRID0: usize = 0x60;
+const PRDATA_FLOORGRID0: usize = 0xB0;
+
+/// DRLGPRESET_InitGridsFromDS1File(pRoomEx) @0x6667d0 — fills a preset room's wall/
+/// orientation/floor/cell grids from its picked DS1 file layers, then moves the DS1's
+/// preset units into the room. The engine only calls this at ROOM ACTIVATION (via
+/// InitRoomEx→InitGridCells), never during DRLG layout, so at our post-generation hook
+/// the grids' pCellsFlags are still NULL. We invoke it ourselves to materialise the
+/// grids for capture. It derives everything from pRoomEx (pLevel->pDrlg->pMemoryPool,
+/// pRoomExData->pMap->pDrlgFile) — a standard __fastcall (pRoomEx in ECX, RET 0). The
+/// grid flag values are DS1-derived (deterministic, no RNG), so they don't depend on
+/// the room seed. The trailing AddAndSetPresetUnits only relinks per-room preset-unit
+/// lists (no pRoom deref, no alloc), so it is safe here.
+fn initGridsFromDS1File(pRoomEx: usize) void {
+    var buf = [2]u32{ @truncate(pRoomEx), 0x6667d0 };
+    asm volatile (
+        \\movl (%[buf]), %%ecx
+        \\call *4(%[buf])
+        :
+        : [buf] "r" (&buf),
+        : .{ .eax = true, .ecx = true, .edx = true, .memory = true, .cc = true });
+}
+
+/// GetGridFlags(pGrid, tx, ty) replica: pCellsFlags[tx + pCellsRowOffsets[ty]].
+fn gridCell(pGrid: usize, tx: i32, ty: i32) u32 {
+    const pFlags = readU32(pGrid, 0x00);
+    const pRowOff = readU32(pGrid, 0x04);
+    if (pFlags == 0 or pRowOff == 0) return 0;
+    const rowOff = @as(i32, @bitCast(readU32(pRowOff, @as(usize, @intCast(ty)) * 4)));
+    const idx = tx + rowOff;
+    if (idx < 0) return 0;
+    return readU32(pFlags, @as(usize, @intCast(idx)) * 4);
+}
+
+/// Emit interesting cells of one grid layer into an already-open "cells" array.
+/// For the orientation grid (is_orient) the wall orientation lives in bits 8-11, so
+/// we emit any cell where (g>>8)&0xf != 0 (unmasked); for wall/floor we emit cells
+/// carrying a collision/alt bit (GRID_INTEREST_MASK: bit28|bit17|bit16).
+fn emitGridLayer(e: *evlog.EventN(131072), pGrid: usize, layer: u8, is_orient: bool, first: *bool) void {
+    if (pGrid == 0) return;
+    var w = @as(i32, @bitCast(readU32(pGrid, 0x08))); // nWidth
+    var h = @as(i32, @bitCast(readU32(pGrid, 0x0C))); // nHeight
+    if (w <= 0 or h <= 0) return;
+    if (w > GRID_DIM_CAP) w = GRID_DIM_CAP;
+    if (h > GRID_DIM_CAP) h = GRID_DIM_CAP;
+    var ty: i32 = 0;
+    while (ty < h and !e.full) : (ty += 1) {
+        var tx: i32 = 0;
+        while (tx < w and !e.full) : (tx += 1) {
+            const g = gridCell(pGrid, tx, ty);
+            // Orientation grid: emit any non-empty cell (the wall orientation value);
+            // wall/floor grids: emit cells carrying a collision/alt bit.
+            const keep = if (is_orient) g != 0 else g & GRID_INTEREST_MASK != 0;
+            if (!keep) continue;
+            if (!first.*) e.comma();
+            first.* = false;
+            e.objOpen();
+            e.intFirst("tx", tx);
+            e.int("ty", ty);
+            e.hex("g", g);
+            e.int("l", layer); // 0=wall 1=orient 2=floor
+            e.objClose();
+        }
+    }
+}
+
+/// For levels 57 & 80, emit one `grid` JSON line per preset room with the engine's
+/// actual DRLG grid cell values (interesting cells only). Called from onDrlgLevel
+/// after emitLevel. Own frame so the big buffer is short-lived.
+fn emitGridForLevel(pLevel: usize) void {
+    const levelId = @as(i32, @bitCast(readU32(pLevel, 0x1D0)));
+    if (levelId != 57 and levelId != 80) return;
+    var room: usize = readU32(pLevel, 0x10); // pRoomExFirst
+    var guard: usize = 0;
+    while (room != 0 and guard < DRLG_ROOM_CAP) : (guard += 1) {
+        const nextRoom = readU32(room, 0x24); // pRoomExNext (read before dump)
+        const presetType = s32(readU32(room, 0x48));
+        const pData = readU32(room, 0x20);
+        if (presetType == 2 and pData != 0) {
+            // Grids are populated only at room ACTIVATION (InitRoomEx→InitGridCells),
+            // not during DRLG layout — so at this hook a not-yet-activated room's
+            // pCellsFlags is NULL. Capture EVERY preset room: if the wall grid is
+            // already inited (activated room), read it AS-IS; otherwise force-init it
+            // from the DS1 file so it isn't a false zero. Force-init needs only that
+            // pMap->pDrlgFile is loaded (the fields InitGridsFromDS1File dereferences);
+            // bInited isn't required (it's set at activation, after the DS1 loads).
+            const wallInited = readU32(pData + PRDATA_WALLGRID0, 0x00) != 0;
+            const pMap = readU32(pData, 0x08); // D2DrlgMapStrc*
+            const pDrlgFile = if (pMap != 0) readU32(pMap, 0x0C) else 0; // pMap->pDrlgFile
+            const pLevel2 = readU32(room, 0x58);
+            const pDrlg2 = if (pLevel2 != 0) readU32(pLevel2, 0x1B4) else 0;
+            const pPool = if (pDrlg2 != 0) readU32(pDrlg2, 0x478) else 0;
+            if (!wallInited and pMap != 0 and pDrlgFile != 0 and pPool != 0) initGridsFromDS1File(room);
+
+            var e = evlog.EventN(131072).begin("grid");
+            e.int("lvl", levelId);
+            e.int("rpx", @as(i32, @bitCast(readU32(room, 0x34)))); // WorldPosition.x
+            e.int("rpy", @as(i32, @bitCast(readU32(room, 0x38)))); // WorldPosition.y
+            e.int("w", @as(i32, @bitCast(readU32(room, 0x3C)))); // WorldSize.x
+            e.int("h", @as(i32, @bitCast(readU32(room, 0x40)))); // WorldSize.y
+            e.int("def", s32(readU32(pData, 0x00))); // nLevelPrest
+            e.int("pickedFile", s32(readU32(pData, 0x04)));
+            e.boolean("inited", wallInited); // grids were already engine-inited (activated room)
+            e.arrayField("cells");
+            var first = true;
+            emitGridLayer(&e, pData + PRDATA_WALLGRID0, 0, false, &first);
+            emitGridLayer(&e, pData + PRDATA_ORIENTGRID0, 1, true, &first);
+            emitGridLayer(&e, pData + PRDATA_FLOORGRID0, 2, false, &first);
+            e.arrayEnd();
+            e.endRaw();
+        }
+        room = nextRoom;
+    }
+}
+
+// ── Resolved-tile capture (DT1 variant chosen per cell) ──────────────────────
+// The CollMap residual is not grid values (the port decodes bits 17/16/28 faithfully)
+// but DT1 TILE RESOLUTION: DRLGROOMTILE_GetTileLibraryEntry 0x66d820 may pick a
+// different DT1 tile variant (by rarity/seed order) → a different 25-byte subtile
+// collision block → missing/extra 0x01. To confirm, we observe the engine's actual
+// resolved tile per cell by hooking DRLGROOMTILE_FillTileData 0x66dde0 (called by the
+// tile-build in canonical cell order with the room's own seed). Args at entry (EBP
+// frame, __fastcall): ECX=pRoomEx, [esp+4]=nPosX, [esp+8]=nPosY, [esp+0xC]=nGridFlags,
+// [esp+0x10]=pTileLibEntry. Gated to levels 57 & 80. This fires only when a room is
+// ACTIVATED, so the capture warps the player through L57/L80 (see warpAndDumpColl).
+//
+// D2TileLibraryEntryStrc (Ghidra 62fbfe69, /Diablo2/GFX): nDirection@0x00,
+// nFlags(short)@0x06, nOrientation@0x14, nIndex@0x18 (main/roomType), nSubIndex@0x1C,
+// nFrame_Rarity@0x20, dwBlockOffset_pBlock@0x2C, pParent(DT1 record)@0x38,
+// dwBlockDataOffset@0x48 (archive byte offset of the block data — a STABLE
+// discriminator of WHICH dt1 tile block was selected).
+// FillTileData is hooked via the proven generic hook table (see `hooks`), capturing
+// nPosX/nPosY (stack args) + pTileLibEntry. It fires for EVERY activated room, so we
+// gate emission to a target level set by warpAndDumpColl just before it warps the
+// player into L57/L80. -1 = capture off (all other room activations ignored cheaply).
+var tile_gate_level: i32 = -1;
+
+/// Handler for the FillTileData generic hook. a1=nPosX, a2=nPosY, a3=pTileLibEntry
+/// (see the hooks-table entry). Emits the engine's resolved DT1 tile identity for
+/// the cell when capture is armed (tile_gate_level >= 0).
+fn onTile(wx: usize, wy: usize, pLib: usize) callconv(.c) void {
+    const lvl = tile_gate_level;
+    if (lvl < 0 or pLib == 0) return;
+    var e = evlog.EventN(512).begin("tile");
+    e.int("lvl", lvl);
+    e.int("wx", @as(i32, @bitCast(@as(u32, @truncate(wx)))));
+    e.int("wy", @as(i32, @bitCast(@as(u32, @truncate(wy)))));
+    e.int("dir", s32(readU32(pLib, 0x00))); // nDirection
+    e.int("orient", s32(readU32(pLib, 0x14))); // nOrientation
+    e.int("main", s32(readU32(pLib, 0x18))); // nIndex (main/roomType)
+    e.int("sub", s32(readU32(pLib, 0x1C))); // nSubIndex
+    e.int("rarity", s32(readU32(pLib, 0x20))); // nFrame_Rarity
+    e.int("lflags", @as(i64, @intCast(readU32(pLib, 0x04) >> 16))); // nFlags (short @0x06)
+    e.hex("parent", readU32(pLib, 0x38)); // pParent (source DT1 record)
+    e.hex("blockOff", readU32(pLib, 0x48)); // dwBlockDataOffset (stable dt1 block discriminator)
+    e.hex("pBlock", readU32(pLib, 0x2C)); // dwBlockOffset_pBlock
+    e.endRaw();
+}
+
 /// Dump-all state. `dumpall_done` ensures the forced pass runs once per process;
 /// `in_dumpall` guards against the forced InitLevel calls re-triggering the pass
 /// (their generated levels still dump normally via emitLevel).
@@ -1172,8 +1350,27 @@ fn maybeDumpColl() void {
             d.* = pg;
             break;
         };
-        dumpActColl(pg, player);
+        dumpActColl(pg, player); // the act the player started in
+        // Resolved-tile + CollMap capture for the tomb (57) and Kurast (80): warp the
+        // player into each level so its rooms activate (lazy-loads the act's DRLG,
+        // AddRoomData → InitRoomEx → tile-build → FillTileData hook fires). Warp is a
+        // server-side relocation (same routine arena.zig uses) → headless-safe.
+        warpAndDumpColl(pg, player, 80);
+        warpAndDumpColl(pg, player, 57);
     }
+}
+
+/// Warp the player into `levelId` then dump that act's CollMap. Warping lazy-loads
+/// the destination act and activates rooms, which drives the FillTileData hook
+/// (resolved-tile records) for the target level as a side effect.
+fn warpAndDumpColl(pGame: usize, player: *t.UnitAny, levelId: u32) void {
+    // Arm resolved-tile capture for this level: the warp's room activation drives the
+    // FillTileData hook, and dumpActColl's AddRoomData activates the level's remaining
+    // rooms — both emit `tile` records while the gate is set.
+    tile_gate_level = @intCast(levelId);
+    fns.WarpUnitToLevel.call(.{ @as(?*anyopaque, @ptrFromInt(pGame)), player, levelId, 0 });
+    dumpActColl(pGame, player);
+    tile_gate_level = -1;
 }
 
 /// True once `D2GS_DRLG_DUMPALL` is set to a non-empty value (checked once).
@@ -1216,6 +1413,7 @@ fn onDrlgLevel(pLevel: usize, _: usize, _: usize) callconv(.c) void {
     if (pLevel == 0) return;
     if (!drlgCaptureOn()) return; // never dump/mutate on a normal live game
     emitLevel(pLevel); // own frame — buffer freed before any dump-all recursion
+    emitGridForLevel(pLevel); // per-tile grid cells for L57/L80 (CollMap diff)
 
     if (!dumpall_done and !in_dumpall and dumpAllEnabled()) {
         // Trigger on the first generated level (the town, generated during act init).
@@ -1395,6 +1593,12 @@ const hooks = [_]Hook{
     // every path AFTER rooms are linked; pLevel in EDX. Prologue = CMP [EDX+8],0 (4)
     // + JZ rel8 (2) = 6; the JZ at +4 is relocated by the trampoline (.rel8 = {4}). --
     .{ .addr = 0x642390, .prologue = 6, .label = "drlg_level", .handler = &onDrlgLevel, .a1 = .edx, .rel8 = &.{4} },
+
+    // -- resolved-tile capture: DRLGROOMTILE_FillTileData(pRoomEx=ECX, pTileData=EDX,
+    // [esp+4]=nPosX, [esp+8]=nPosY, [esp+0xC]=nGridFlags, [esp+0x10]=pTileLibEntry).
+    // We capture nPosX/nPosY + pTileLibEntry (level gated in-handler via tile_gate_level).
+    // Prologue = PUSH EBP; MOV EBP,ESP; MOV EAX,[EBP+0x14] = 6 bytes, no rel8. --
+    .{ .addr = 0x66dde0, .prologue = 6, .label = "tile", .handler = &onTile, .a1 = .{ .stack = 4 }, .a2 = .{ .stack = 8 }, .a3 = .{ .stack = 0x10 } },
 };
 
 pub fn install() void {

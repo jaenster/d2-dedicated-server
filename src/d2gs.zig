@@ -286,10 +286,12 @@ fn parseEndpoints() void {
             d2dbs_port = 6114;
             d2dbs_enabled = true;
         }
-        // Topology: qqserver owns the client-facing :4000 and splices game traffic to
-        // this GS's real QServer, which we relocate to :4100 (gsport patch below reads
-        // gs_public_port). The GS self-reports :4100 via ADDRINFO; realmd records that as
-        // the per-game route in redis so qqserver knows the backend. Overridable by --gs-addr.
+        // Topology. qqserver always owns the client-facing :4000 (the port the client
+        // hardcodes) and splices game traffic to this GS's real QServer, which we relocate
+        // to :4100. qq swallows the GS's duplicate 0xAF00 greeting so the S->C stream matches
+        // a --no-compress client; binding the engine directly on :4000 would hand the client
+        // the engine's raw 0xAF01 and desync a compression-aware client. The GS self-reports
+        // :4100 via ADDRINFO; realmd records that as the per-game route so qq knows the backend.
         if (parseDottedQuad(rhost)) |oct| gs_public_ip = oct;
         gs_public_port = 4100;
     }
@@ -445,6 +447,10 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
         if (hasFlag("d2gs")) {
             log.print("d2gs: DLL_PROCESS_ATTACH (--d2gs)");
             log.hex("d2gs: Game.exe base=0x", @intFromPtr(GetModuleHandleA(null)));
+            // Are we the dedicated GS process? --realm implies it (realm mode is meaningless
+            // without a running server), so callers pass just `--realm` instead of pairing it
+            // with --d2gs-boot. This one decision also gates the server_only features below.
+            const is_server = hasFlag("d2gs-boot") or hasFlag("realm");
             // Feature registry (engine/feature.zig): map command-line flags onto
             // per-feature enable bits, then install every enabled feature. Covers
             // the attach-time patches that used to be a manual sequence here —
@@ -452,8 +458,8 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
             // checkrev (--bypass-checkrev), nocompress (--no-compress) and clientdiag
             // are gated by their flags. The single config table is in feature.zig.
             feature.applyFlags(hasFlag);
-            feature.installAll();
-            if (hasFlag("mapunits") or hasFlag("mapreveal") or hasFlag("guild-panel") or hasFlag("colloverlay")) drawing.install();
+            feature.installAll(is_server);
+            if (hasFlag("mapunits") or hasFlag("mapreveal")) drawing.install();
             if (hasFlag("screenshot")) screenshot.install();
             if (hasFlag("dump-cdkeys")) cdkeydump.install(); // log decoded CD keys for verification
             if (hasFlag("suppress-halts")) halt_hook.enableSuppress(); // sub-mode, not a toggle
@@ -543,16 +549,16 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
                 // Drive the real client through the menus into a game with a
                 // character and verify it loads (no server bootstrap).
                 autoenter.install();
-            } else if (hasFlag("d2gs-boot")) {
+            } else if (is_server) {
                 use_realm = hasFlag("realm");
                 // Realm mode is pointless without game creation: a realmd CREATEGAME
                 // must reach command.createGame and joins must be ACKed. --realm implies it.
                 command.allow_create = hasFlag("create-games") or use_realm;
                 parseEndpoints();
-                log.print("d2gs: --d2gs-boot set, spawning server thread");
+                log.print("d2gs: server boot (--d2gs-boot/--realm), spawning server thread");
                 _ = CreateThread(null, 0, serverThread, null, 0, null);
             } else {
-                log.print("d2gs: injection OK (no --d2gs-boot, engine untouched)");
+                log.print("d2gs: injection OK (no server-boot flag, engine untouched)");
             }
         }
     }

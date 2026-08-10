@@ -1960,6 +1960,10 @@ const EchoServer = struct {
     thread: ?std.Thread = null,
     got: [256]u8 = undefined,
     got_len: usize = 0,
+    // When set, each accepted conn opens with a 2-byte 0xAF00 greeting BEFORE it starts
+    // echoing — mimicking the real 1.14d engine's leading connection-established frame that
+    // qqserver must strip (stripGsGreeting). Lets a scenario prove the strip end-to-end.
+    send_greeting: bool = false,
 
     fn start(self: *EchoServer) !void {
         const fd = socket(posix.AF.INET, posix.SOCK.STREAM, 0);
@@ -1997,6 +2001,10 @@ const EchoServer = struct {
 
     fn echoConn(self: *EchoServer, cfd: c_int) void {
         defer _ = cclose(cfd);
+        if (self.send_greeting) {
+            const greeting = [2]u8{ 0xAF, 0x00 }; // the leading frame qq must strip
+            _ = c_write(cfd, &greeting, greeting.len);
+        }
         var buf: [256]u8 = undefined;
         while (true) {
             const n = c_read(cfd, &buf, buf.len);
@@ -2074,7 +2082,10 @@ fn scQqserverTokenTranslate() Result {
     const QQ_PORT: u16 = 14000;
     const GS_GAMEID: u32 = 3;
 
-    var echo = EchoServer{};
+    // Greeting ON: the echo backend opens with 0xAF00 (like the real engine), so this
+    // scenario also proves qqserver STRIPS the GS greeting — if it didn't, the client's
+    // first post-handshake byte would be 0xAF, not the echoed 0x68 packet (assert below).
+    var echo = EchoServer{ .send_greeting = true };
     echo.start() catch |e| return fail(name, "echo start {s}", .{@errorName(e)});
     defer echo.stop();
 
@@ -2126,9 +2137,12 @@ fn scQqserverTokenTranslate() Result {
 
     net.writeAll(fd, &logon) catch |e| return fail(name, "send {s}", .{@errorName(e)});
 
-    // The qqserver replays the (rewritten) packet to the echo backend, which echoes it.
+    // The qqserver replays the (rewritten) packet to the echo backend, which echoes it —
+    // AFTER opening with a 0xAF00 greeting that qq must strip. So the first byte we read here
+    // is the echoed 0x68 packet; a 0xAF would mean the GS-greeting strip failed to remove it.
     var back: [logon.len]u8 = undefined;
     net.readFull(fd, &back) catch |e| return fail(name, "no echo back through qq ({s})", .{@errorName(e)});
+    if (back[0] == 0xaf) return fail(name, "GS greeting NOT stripped — client got 0xAF as first game byte", .{});
 
     // Backend must have seen the rewritten packet: id 0x68, token now == GS gameid 3, tail intact.
     var waited: u32 = 0;

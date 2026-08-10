@@ -39,6 +39,45 @@ const TOKEN_OFFSET: usize = 5;
 const GAMELOGON_ID: u8 = 0x68;
 const MIN_LOGON_BYTES: usize = TOKEN_OFFSET + 2;
 
+/// How many leading bytes of a GS→client buffer are the engine's 0xAF greeting frame that qq
+/// must strip (see stripGsGreeting). Returns 0 when `buf` does not begin with a COMPLETE 0xAF
+/// frame — not 0xAF, too short to read the flag byte, or a declared frame longer than what's
+/// buffered — so the caller forwards those bytes verbatim rather than eating payload. The 0xAF
+/// frame is 2 bytes for 0xAF00, else byte[1]+1 (mirrors the client's packet demux @0x52a8d0).
+fn greetingStripLen(buf: []const u8) u32 {
+    if (buf.len < 2 or buf[0] != 0xAF) return 0;
+    const af_len: u32 = if (buf[1] == 0) 2 else @as(u32, buf[1]) + 1;
+    return if (af_len <= buf.len) af_len else 0;
+}
+
+test "greetingStripLen: 0xAF00 greeting" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 2), greetingStripLen(&.{ 0xAF, 0x00 })); // exact 2-byte greeting
+    try t.expectEqual(@as(u32, 2), greetingStripLen(&.{ 0xAF, 0x00, 0x01, 0x02 })); // greeting + payload
+}
+
+test "greetingStripLen: 0xAF with non-zero flag uses byte[1]+1 length" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 2), greetingStripLen(&.{ 0xAF, 0x01, 0x99 })); // 0xAF01 = 2 bytes
+    try t.expectEqual(@as(u32, 6), greetingStripLen(&.{ 0xAF, 0x05, 1, 2, 3, 4, 5, 6 })); // len byte[1]+1=6
+}
+
+test "greetingStripLen: does not strip when frame is incomplete or absent" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{0xAF})); // 1 byte: can't read the flag
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{ 0xAF, 0x05, 1, 2 })); // declares 6, only 4 buffered
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{ 0x6B, 0x00 })); // not a 0xAF frame (ENTERGAME)
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{})); // empty
+    try t.expectEqual(@as(u32, 0), greetingStripLen(&.{ 0x01, 0xAF })); // 0xAF not first
+}
+
+test "greetingStripLen: strips exactly the greeting, leaving the payload intact" {
+    const t = std.testing;
+    const buf = [_]u8{ 0xAF, 0x00, 0x02, 0xDE, 0xAD }; // greeting then a 3-byte world packet
+    const n = greetingStripLen(&buf);
+    try t.expectEqualSlices(u8, &.{ 0x02, 0xDE, 0xAD }, buf[n..]);
+}
+
 // Redis token-route value is a packed 10 bytes: ip[4] ++ port(u16 LE) ++ gameid(u32 LE),
 // written by realmd's redis adapter. Key: "realmd:troute:<token-hex, no pad>".
 const ROUTE_BYTES: usize = 10;
@@ -237,13 +276,7 @@ const Conn = struct {
     gs_eof: bool = false,
     c2g_bytes: u64 = 0, // total bytes spliced client->GS (diagnostics)
     g2c_bytes: u64 = 0, // total bytes spliced GS->client
-    // qq already ran the client<->qq compression negotiate by sending its own 0xAF00 before
-    // it knew the backend. The REAL 1.14d engine ALSO sends a 0xAF NEGOTIATE_COMPRESSION as
-    // its first game-port byte(s); forwarding that verbatim double-negotiates and the client
-    // rejects the join (the ~49-byte reject). So we SWALLOW exactly one leading 0xAF frame
-    // from the GS before splicing. False until we've inspected the GS's first bytes. (Our
-    // standalone GS never sends a leading 0xAF, so the peek-and-drop is a no-op there.)
-    gs_af_checked: bool = false,
+    gs_greeted: bool = false, // stripped the GS's one leading 0xAF00 greeting yet?
 };
 
 const RedisState = enum { disconnected, connecting, ready };
@@ -714,12 +747,13 @@ const Gateway = struct {
     fn serviceOpen(g: *Gateway, c: *Conn, gs_side: bool, re: i16) void {
         if (gs_side) {
             if (re & posix.POLL.OUT != 0) g.flush(c.gs, &c.c2g, &c.c2g_off, &c.c2g_len, &c.gs_eof);
+            // First GS read carries the leading 0xAF greeting that qq must strip (see
+            // stripGsGreeting); every read after that is a verbatim splice.
             if (re & posix.POLL.IN != 0) {
-                if (!c.gs_af_checked and c.g2c < 0) {
-                    g.pumpGsFirst(c);
-                } else {
-                    g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes);
-                }
+                if (c.gs_greeted)
+                    g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes)
+                else
+                    g.stripGsGreeting(c);
             }
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.gs_eof = true;
         } else {
@@ -765,12 +799,15 @@ const Gateway = struct {
         len.* = un;
     }
 
-    /// First GS->client read: strip a leading 0xAF NEGOTIATE_COMPRESSION frame (the real
-    /// 1.14d engine sends one; our standalone GS does not) so it isn't double-forwarded to a
-    /// client that already negotiated with qq's own 0xAF00. The 0xAF frame is 2 bytes when
-    /// byte[1]==0, else byte[1]+1 bytes (matches the client's packet demux). Forward whatever
-    /// follows the stripped frame normally; if nothing followed yet, wait for the next read.
-    fn pumpGsFirst(g: *Gateway, c: *Conn) void {
+    /// Pre-splice phase: the real 1.14d engine opens the game stream with one leading 0xAF
+    /// greeting (nocompress forces 0xAF00). qq already sent the client its OWN 0xAF00 to prompt
+    /// GAMELOGON, so the GS's copy MUST be dropped — forwarding it leaves the client reading a
+    /// stray 0xAF as a bogus opcode, desyncing before ENTERGAME (the classic ~49-byte stall).
+    /// We strip ONE validated 0xAF frame (see greetingStripLen) on the first GS read, forward
+    /// whatever follows, then hand the session to pump(). If the first byte is NOT 0xAF,
+    /// something upstream is wrong: forward as-is and log — never silently eat payload.
+    /// (Assumes the 2-byte greeting arrives in one read, which it does on the loopback splice.)
+    fn stripGsGreeting(g: *Gateway, c: *Conn) void {
         const bi = g.poolAcquire() orelse return;
         const got = read(c.gs, &g.pool[bi], BUF_SZ);
         if (got == 0) {
@@ -780,22 +817,16 @@ const Gateway = struct {
         }
         if (got < 0) {
             g.poolRelease(bi);
-            if (lastErrno() == EAGAIN) return;
-            c.gs_eof = true;
+            if (lastErrno() != EAGAIN) c.gs_eof = true;
             return;
         }
-        c.gs_af_checked = true; // only inspect the very first GS bytes once
+        c.gs_greeted = true; // only the first GS read carries the greeting
         const un: u32 = @intCast(got);
-        var start: u32 = 0;
-        if (un >= 2 and g.pool[bi][0] == 0xAF) {
-            const af_len: u32 = if (g.pool[bi][1] == 0) 2 else @as(u32, g.pool[bi][1]) + 1;
-            if (af_len <= un) {
-                if (trace) log.line("qq", "swallowed engine's leading 0xAF negotiate ({d}B) — not forwarding", .{af_len});
-                start = af_len;
-            }
-        }
+        const start = greetingStripLen(g.pool[bi][0..un]);
+        if (start == 0 and g.pool[bi][0] != 0xAF)
+            log.line("qq", "GS's first byte is 0x{x:0>2}, not a 0xAF greeting — forwarding as-is", .{g.pool[bi][0]});
         const payload = g.pool[bi][start..un];
-        if (payload.len == 0) { // nothing but the negotiate — done, splice the rest later
+        if (payload.len == 0) { // greeting only; splice the rest on the next read
             g.poolRelease(bi);
             return;
         }
@@ -811,8 +842,8 @@ const Gateway = struct {
             c.cli_eof = true;
             return;
         }
-        // Partial write: park the unsent remainder of the payload for a later POLLOUT. Shift
-        // it to the buffer start so the existing flush(off..len) logic sends exactly it.
+        // Partial write: park the unsent remainder for a later POLLOUT, shifted to buffer start
+        // so the existing flush(off..len) logic sends exactly it.
         const sent: u32 = if (w > 0) @intCast(w) else 0;
         const rem = payload[sent..];
         std.mem.copyForwards(u8, g.pool[bi][0..rem.len], rem);
@@ -878,6 +909,34 @@ fn parseReply(buf: []const u8) ?ParsedReply {
         },
         else => return .{ .consumed = crlf + 2, .found = false }, // -err / +ok / :int → no route
     }
+}
+
+test "parseReply: complete 10-byte route decodes ip/port/gameid" {
+    const t = std.testing;
+    // ip 127.0.0.1, port 4100 (LE 04 10), gameid 10 (LE 0A 00 00 00)
+    const reply = "$10\r\n" ++ [_]u8{ 127, 0, 0, 1, 0x04, 0x10, 0x0A, 0, 0, 0 } ++ "\r\n";
+    const pr = parseReply(reply) orelse return error.ExpectedReply;
+    try t.expect(pr.found);
+    try t.expectEqual(reply.len, pr.consumed);
+    try t.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &pr.ip);
+    try t.expectEqual(@as(u16, 4100), pr.port);
+    try t.expectEqual(@as(u32, 10), pr.gameid);
+}
+
+test "parseReply: nil / error / short-bulk are 'no route' (found=false)" {
+    const t = std.testing;
+    const nil = parseReply("$-1\r\n") orelse return error.ExpectedReply;
+    try t.expect(!nil.found);
+    try t.expectEqual(@as(usize, 5), nil.consumed);
+    try t.expect(!(parseReply("-ERR nope\r\n").?.found)); // redis error reply
+    try t.expect(!(parseReply("$4\r\nabcd\r\n").?.found)); // bulk shorter than a route
+}
+
+test "parseReply: returns null until a full reply has arrived" {
+    const t = std.testing;
+    try t.expectEqual(@as(?ParsedReply, null), parseReply("")); // empty
+    try t.expectEqual(@as(?ParsedReply, null), parseReply("$10")); // no CRLF yet
+    try t.expectEqual(@as(?ParsedReply, null), parseReply("$10\r\n" ++ [_]u8{ 1, 2, 3 })); // payload partial
 }
 
 pub fn main() !void {
