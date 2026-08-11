@@ -251,8 +251,9 @@ wine Game.exe -w -nosound --headless --loaddll Z:\...\d2gs.dll \
 wine Game.exe -w -skiptobnet --loaddll Z:\...\d2gs.dll --d2gs --bypass-checkrev
 ```
 
-`./run.sh` builds the DLLs and assembles a wine test dir for the injection-only case. The full
-create+join flow has an end-to-end test: [`tools/realmd-test/e2e-game.sh`](tools/realmd-test/e2e-game.sh)
+`zig build` produces the DLLs; assembling a wine test dir around them is up to your own launcher
+(the ones in this tree hardcode local paths and stay gitignored). The full create+join flow has an
+end-to-end test: [`tools/realmd-test/e2e-game.sh`](tools/realmd-test/e2e-game.sh)
 (boots realmd + GS, drives two clients to create + join, asserts both characters loaded; needs wine
 + a real 1.14d install via `E2E_GAME_SRC`).
 

@@ -52,3 +52,10 @@ probegame/
 
 # run-stack.sh runtime logs
 .stack/
+
+# local launchers: they hardcode this machine's wine prefixes and install dirs
+/run.sh
+/run-*.sh
+
+# a data dir named "=<port>" means something leaked an env assignment into a path
+/=*
