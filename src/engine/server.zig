@@ -11,6 +11,9 @@
 
 const std = @import("std");
 const feature = @import("feature.zig");
+const memstat = @import("../runtime/memstat.zig");
+const poolstat = @import("../runtime/poolstat.zig");
+const log = @import("../log.zig");
 
 extern "kernel32" fn GetModuleHandleA(name: ?[*:0]const u8) callconv(.winapi) ?*anyopaque;
 
@@ -198,6 +201,16 @@ pub fn QSERVER_PutNewGameOnTokenList(game_server_id: u32, token: u16) void {
     stdcall(0x0052c110, fn (u32, u16) callconv(StdcallConv) void)(game_server_id, token); // VERIFIED 0052c110
 }
 
+/// Disconnect whichever client currently holds `name` in the global by-name client table,
+/// saving its character on the way out (SERVER_DisconnectClient cleans up with bSavePlayer=1)
+/// and closing its connection. Returns false when no client held the name. Retail ships this
+/// uncalled — a dedicated server needs it to release the seat a character still holds after
+/// the game it left. bool QSERVER_DisconnectClientByName(char* szClientName, uint32_t nReason)
+pub fn QSERVER_DisconnectClientByName(name: [*:0]const u8, reason: u32) bool {
+    const f = stdcall(0x005302d0, fn (usize, u32) callconv(StdcallConv) u32); // VERIFIED 005302d0 (ret 0x8)
+    return f(@intFromPtr(name), reason) != 0;
+}
+
 /// Initialize the gQServerGameState struct (its game hashtable + crit-sections
 /// at +0x50). Operates on the static global directly. void QSERVER_InitializeServerState()
 pub fn QSERVER_InitializeServerState() void {
@@ -251,6 +264,11 @@ fn gptr(comptime abs_addr: usize, comptime T: type) *T {
 /// SetupAsBnetServer to enable realm mode. `realm` may be null to run open (no
 /// D2CS) — then BattleNetServerService stays null and the realm path no-ops.
 pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
+    // Working set per boot step, so "what should we strip" is answered with the bill rather
+    // than a guess. Prints "<step> 0x<KB resident> 0x<KB this step added>".
+    log.hex("mem: at DLL attach — wine + image (KB):", memstat.at_attach / 1024);
+    memstat.phase("mem: engine startup before us (KB, +KB):");
+    log.hex2("pools: at DLL attach — in-use / handed-out:", poolstat.at_attach_in_use, poolstat.at_attach_handed);
     if (realm) |t| SetupAsBnetServer(t);
     QSERVER_CreateAndInit(.server, .bnet); // allocs pQServer, opens :4000 listener
     NET_SetPlayersCount(8);
@@ -258,6 +276,7 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     QSERVER_SetGlobalInstance(@ptrFromInt(at(globals.gQServerGameState)), 1); // cookie≠0 → no halt
     gptr(globals.gbQServerRunning, u32).* = 1;
     QSERVER_InitializeServerState();
+    memstat.phase("mem: after QSERVER init (KB, +KB):");
     // Game-data tables load AFTER server-state init. Loading them BEFORE the whole server
     // bootstrap (the retail app-mode order) corrupts pool state and breaks the network join
     // path (tables load into a NULL pool because the 52-entry LoadDataForGame init never ran).
@@ -265,7 +284,10 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     // build (SUNITPROXY_InitAllNpcItemTables) ran with MonStats unloaded and bailed, leaving
     // vendors empty. Re-run it here, now that the data is loaded, to populate the vendor tables.
     TXT_InitTxtFiles(0, 0, 1);
+    memstat.phase("mem: after TXT_InitTxtFiles (KB, +KB):");
     SUNITPROXY_InitAllNpcItemTables();
+    memstat.phase("mem: after NPC vendor tables (KB, +KB):");
+    memstat.graphicsCacheCensus();
 }
 
 /// One tick of the server: drain inbound packets, advance all games, then flush

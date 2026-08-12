@@ -97,6 +97,20 @@ pub fn guildForChar(charname: []const u8) ?[]const u8 {
     return null;
 }
 
+/// True when the realm issued a join for this character that is still inside
+/// `TOKEN_TTL_MS`. This is what authorizes releasing the seat that character still
+/// holds from an earlier game: only realmd writes these entries, so a client can't
+/// name someone else's character to have them thrown out of the game they are in.
+pub fn hasFreshJoin(charname: []const u8) bool {
+    const now = GetTickCount();
+    for (&entries) |*slot| {
+        if (!slot.ready.load(.acquire)) continue;
+        if (!eqlIgnoreCase(slot.char[0..slot.char_len], charname)) continue;
+        if ((now -% slot.tick_ms) < TOKEN_TTL_MS) return true; // u32 wrap, as validate()
+    }
+    return false;
+}
+
 /// Resolve the account for a join token. Returns null if unknown.
 pub fn accountForToken(token: u32) ?[]const u8 {
     for (&entries) |*slot| {
