@@ -13,6 +13,7 @@ const p = @import("realm_shared").protocol;
 const server = @import("../../engine/server.zig");
 const command = @import("../../engine/command.zig");
 const joinctx = @import("joinctx.zig");
+const poolstat = @import("../../runtime/poolstat.zig");
 const log = @import("../../log.zig");
 
 // ── winsock (Game.exe already loaded ws2_32 + WSAStartup; we reuse it) ────────
@@ -257,7 +258,11 @@ fn sendUpdateGameInfo(gameid: u32, flag: u32, players: u32, char: []const u8, le
     r.charlevel = level;
     r.charclass = class;
     @memcpy(buf[0..@sizeOf(p.UpdateGameInfo)], std.mem.asBytes(&r));
-    const n = @min(char.len, buf.len - @sizeOf(p.UpdateGameInfo) - 1);
+    // `n` is spelled usize on purpose. @min against a comptime bound gives the result the
+    // smallest type that holds it — here u5 — and then `@sizeOf(UpdateGameInfo) + n` is u5
+    // arithmetic that overflows at 32, so every character whose name is 4 or more letters
+    // long panicked this thread on the way into a game.
+    const n: usize = @min(char.len, buf.len - @sizeOf(p.UpdateGameInfo) - 1);
     @memcpy(buf[@sizeOf(p.UpdateGameInfo)..][0..n], char[0..n]);
     buf[@sizeOf(p.UpdateGameInfo) + n] = 0; // cstr terminator
     const total = @sizeOf(p.UpdateGameInfo) + n + 1;
@@ -287,6 +292,28 @@ fn handleCreateGame(body: []const u8) void {
     const name = p.readCStr(body, &off);
     const pass = p.readCStr(body, &off);
     const desc = p.readCStr(body, &off);
+
+    // Never hand the engine a name it is already hosting. Its own de-duplicator
+    // (SetGameName @0x52f940) formats the name pointer into a stack buffer with
+    // `sprintf(buf + len, "~%d", (int)szGameName)` and blows the stack cookie —
+    // the whole process dies with 0xC0000409, taking every other game with it.
+    // On a real realm D2CS guarantees uniqueness so the path is never walked; here
+    // two clients racing to create the same name reach it every time.
+    if (peekGameId(name) != null) {
+        log.print("d2cs: CREATEGAME refused — already hosting that name");
+        sendCreateGameReply(p.CREATE_NAME_TAKEN, 0);
+        return;
+    }
+
+    // The engine keeps ONE memory-pool manager per game and there are eight in total, one of
+    // which is the global system's — so seven games, and asking for the eighth does not fail,
+    // it raises 0xe0000001 and kills the process along with every game already on it. Refusing
+    // here turns a server death into the client being told the server is full.
+    if (poolstat.freeManagers() == 0) {
+        log.print("d2cs: CREATEGAME refused — no memory-pool manager free (this GS is at its game limit)");
+        sendCreateGameReply(p.CREATE_SERVER_FULL, 0);
+        return;
+    }
 
     const ladder = body[0];
     const expansion = body[1] != 0;

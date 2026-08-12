@@ -102,12 +102,25 @@ pub const AddrInfo = extern struct {
     port: u16, // host-order port the client dials (the GS game port, e.g. 4000)
 };
 
-/// CREATEGAMEREPLY (0x20). result: 0=ok, 1=fail.
+/// CREATEGAMEREPLY (0x20). result: see CREATE_* below.
 pub const CreateGameReply = extern struct {
     h: Header,
     result: u32,
     gameid: u32,
 };
+
+/// CREATEGAMEREPLY result codes. `NAME_TAKEN` is told apart from the generic failure
+/// because it is the one the player can act on — D2CS turns it into "a game with that
+/// name already exists" and offers to join instead, where a generic failure only says
+/// the realm is down. The GS is the last word on it: two realmd instances can both
+/// believe a name is free, and only the GS that would host it knows for certain.
+pub const CREATE_OK: u32 = 0;
+pub const CREATE_FAILED: u32 = 1;
+pub const CREATE_NAME_TAKEN: u32 = 2;
+/// This GS cannot host another game right now (its engine is at the memory-pool manager
+/// limit). Distinct from CREATE_FAILED on purpose: "full" is a routing fact — realmd can
+/// place the game on a different GS — whereas a generic failure is final for the request.
+pub const CREATE_SERVER_FULL: u32 = 3;
 
 /// JOINGAMEREPLY (0x21). result: 0=ok, 1=fail, 2=full.
 pub const JoinGameReply = extern struct {

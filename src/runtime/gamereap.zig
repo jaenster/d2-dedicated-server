@@ -23,6 +23,20 @@ pub fn apply(idle_ms: u32) void {
     }
 }
 
+/// Overridable, because this window is the real throttle on game THROUGHPUT, not the 8-manager
+/// ceiling: a finished game keeps its pool manager for this long, so a server churning games
+/// faster than the window runs out of managers while nothing is actually being played. Measured
+/// at 5000 ms: 3 games created every ~4 s saturates the table and one client per round is turned
+/// away. The trade is the other direction — too short and a player who drops for a moment loses
+/// the game rather than getting back into it.
 pub fn applyDefault() void {
     apply(default_idle_ms);
+}
+
+/// `ms` from --reap-ms / D2GS_REAP_MS, else the default. Clamped to something sane: zero would
+/// destroy a game the instant its last player left (including mid-rejoin), and a huge value
+/// reintroduces the manager exhaustion this patch exists to avoid.
+pub fn applyConfigured(ms: u32) void {
+    const clamped = @min(@max(ms, 250), 300_000);
+    apply(clamped);
 }

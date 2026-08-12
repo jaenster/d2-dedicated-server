@@ -51,6 +51,12 @@ const CREATE_OK: u32 = 0x00;
 const CREATE_INVALID_NAME: u32 = 0x1e; // str 0x1411 "Invalid Game Name"
 const CREATE_NAME_TAKEN: u32 = 0x1f; // str 0x1412 "A Game Already Exists With That Name"
 const CREATE_SERVER_DOWN: u32 = 0x20; // str 0x1413 "Server Down"
+// There is NO "servers are full" code on the create path: JoinOrCreateGame @0x441500 bounds the
+// switch at 0x20 and sends everything else to str 0x1415 "Error Creating Game" (0x2b "Game is
+// Full" exists only on the JOIN path, and means that one game is full — not this). So a full
+// fleet gets the default bucket on purpose: "Error Creating Game" is vague but TRUE, whereas
+// "Server Down" would be a plain lie about servers that are up and busy.
+const CREATE_ERROR_GENERIC: u32 = 0x21; // > 0x20 -> str 0x1415 "Error Creating Game"
 
 // JOINGAME (0x04) replies. NOTE the first two — they are not in the order you would
 // guess from the numbers, and realmd had them the wrong way round: 0x29 is the PASSWORD
@@ -558,9 +564,24 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     log.line(tag, "create game '{s}' desc='{s}' diff={d} status=0x{x:0>2} (flags=0x{x})", .{ name, desc, difficulty, status, create_flags });
     const routed = gslink.createGameRouted(name, pass, desc, ladder, expansion, difficulty, hardcore);
     if (routed == null) {
-        // Nothing to do with the name — every GS is full or refused. Same message the
-        // client shows when the fleet is unreachable, because that is what happened.
-        log.line(tag, "create game '{s}' -> GS refused / all full", .{name});
+        // The findGame() check above is not a guarantee: two clients can both pass it
+        // before either has registered anything, and only the GS that would host the
+        // game knows the name is spoken for. When it says so, say so — the player gets
+        // "that name already exists" and the offer to join, instead of being told the
+        // realm is down while it plainly is not.
+        if (gslink.last_create_failure == .name_taken) {
+            log.line(tag, "create game '{s}' -> name already exists (GS refused; lost the race)", .{name});
+            return fail(c, &w, CREATE_NAME_TAKEN);
+        }
+        // Nothing to do with the name. Say WHICH of the two it was: a fleet with no room
+        // left is an operational signal (add GS capacity), a refusal is a fault. The client
+        // gets the same code either way — "server down" is the only one of its three that
+        // fits "no server took your game" — but the log should not blur them.
+        if (gslink.last_create_failure == .all_full) {
+            log.line(tag, "create game '{s}' -> every GS is at its game limit (fleet is full)", .{name});
+            return fail(c, &w, CREATE_ERROR_GENERIC);
+        }
+        log.line(tag, "create game '{s}' -> GS refused", .{name});
         return fail(c, &w, CREATE_SERVER_DOWN);
     }
     const rr = routed.?;

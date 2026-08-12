@@ -194,9 +194,17 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
         return;
     };
     defer {
+        const was_registered = g.registered.load(.acquire);
         registry.release(g);
-        state.global.expireGamesByGs(g.gsid);
-        log.line(tag, "GS gsid=0x{x} disconnected; its games expired", .{g.gsid});
+        // Only a connection that got as far as ADDRINFO owns any games. Anything else is
+        // a port probe — `nc -z`, a k8s readiness check, run-stack's own await — and it
+        // arrives with gsid still 0. Expiring "gsid 0's games" on its way out is at best
+        // a line of noise per probe and at worst reaps real records that happen to carry
+        // no gs id yet.
+        if (was_registered) {
+            state.global.expireGamesByGs(g.gsid);
+            log.line(tag, "GS gsid=0x{x} disconnected; its games expired", .{g.gsid});
+        }
     }
 
     g.fd = fd;
@@ -315,7 +323,11 @@ fn writeHeader(buf: []u8, size: u16, typ: u16, seq: u32) void {
 
 // ── request/response (called from client/MCP threads) ────────────────────────
 
-const Result = struct { ok: bool, gameid: u32 };
+const Result = struct { ok: bool, gameid: u32, result: u32 = 1 };
+
+/// p.CREATE_NAME_TAKEN, spelled locally because this reply is shared by CREATE and JOIN.
+const proto_create_name_taken: u32 = p.CREATE_NAME_TAKEN;
+const proto_create_server_full: u32 = p.CREATE_SERVER_FULL;
 
 fn awaitReply(g: *Gs) Result {
     // Poll the reply flag the control thread sets. Game create/join is rare and
@@ -323,14 +335,21 @@ fn awaitReply(g: *Gs) Result {
     var spins: usize = 0;
     while (spins < 5000) : (spins += 1) { // ~5s at 1ms
         if (g.reply_done.load(.acquire)) {
-            return .{ .ok = g.reply_result == 0, .gameid = g.reply_gameid };
+            return .{ .ok = g.reply_result == 0, .gameid = g.reply_gameid, .result = g.reply_result };
         }
         _ = usleep(1000); // 1ms
     }
-    return .{ .ok = false, .gameid = 0 };
+    return .{ .ok = false, .gameid = 0, .result = 1 };
 }
 
 pub const CreateResult = struct { gsid: u32, gameid: u32, ip: [4]u8, port: u16 };
+
+/// Why createGameRouted came back empty. The caller has three different things to say
+/// to the player and only this tells them apart: a name someone else already has is
+/// not the same news as a realm with no servers in it.
+pub const CreateFailure = enum { no_gs, name_taken, refused, all_full };
+/// Set by createGameRouted when it returns null. Read it immediately.
+pub var last_create_failure: CreateFailure = .no_gs;
 
 /// Route a game create to the least-loaded GS with capacity. Returns the chosen
 /// GS's id + the engine gameid + the address clients dial, or null if no GS could
@@ -340,6 +359,7 @@ pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, la
     // the registry for a moment before its handler deregisters it. If the send fails,
     // that GS is dead — unregister it (so we don't pick it again) and try the next.
     var attempts: usize = 0;
+    last_create_failure = .no_gs;
     while (attempts < max_gs) : (attempts += 1) {
         const g = registry.pickForCreate() orelse return null;
         g.req_lock.lock();
@@ -363,7 +383,26 @@ pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, la
         }
         const r = awaitReply(g);
         g.req_lock.unlock();
-        if (!r.ok or r.gameid == 0) return null; // the GS actively refused — a real no
+        if (!r.ok or r.gameid == 0) {
+            // A name this GS already hosts is final, and trying the next GS would only
+            // scatter same-named games across the fleet.
+            if (r.result == proto_create_name_taken) {
+                last_create_failure = .name_taken;
+                return null;
+            }
+            // "I am full" is a fact about that GS, not about the request. Its engine caps
+            // concurrent games, and it can hit that cap before our own live count says so
+            // (a finished game holds its slot through the reap window). Park this GS at its
+            // advertised capacity so pickForCreate stops choosing it, and try the next one —
+            // otherwise a single full GS fails creates while the rest of the fleet is idle.
+            if (r.result == proto_create_server_full) {
+                last_create_failure = .all_full;
+                if (g.maxgame != 0) g.live_games.store(g.maxgame, .release);
+                continue;
+            }
+            last_create_failure = .refused;
+            return null;
+        }
         _ = g.live_games.fetchAdd(1, .monotonic);
         return .{ .gsid = g.gsid, .gameid = r.gameid, .ip = g.ip(), .port = g.port };
     }
