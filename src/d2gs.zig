@@ -27,6 +27,8 @@ const gamereap = @import("runtime/gamereap.zig");
 const roominit = @import("runtime/roominit.zig");
 const gameloop = @import("runtime/gameloop.zig");
 const joindiag = @import("runtime/joindiag.zig");
+const rejoin = @import("runtime/rejoin.zig");
+const poolstat = @import("runtime/poolstat.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
 const realmgw = @import("runtime/realmgw.zig");
 const d2bsload = @import("runtime/d2bsload.zig"); // deferred D2BS.dll injection (post game-window)
@@ -37,6 +39,15 @@ const screenshot = @import("test/screenshot.zig");
 const log = @import("log.zig");
 const obs = @import("realm/shared/obs.zig");
 const cdkeydump = @import("runtime/cdkeydump.zig");
+const crash = @import("runtime/crash.zig");
+const memstat = @import("runtime/memstat.zig");
+const framepace = @import("runtime/framepace.zig");
+const tickstat = @import("runtime/tickstat.zig");
+
+/// A safety-check failure anywhere in this DLL logs where it happened and kills the
+/// process, instead of quietly killing one thread and leaving a server that answers
+/// health checks but can no longer let anybody in. See runtime/crash.zig.
+pub const panic = std.debug.FullPanic(crash.onPanic);
 
 var use_realm: bool = false;
 var d2cs_host: [64]u8 = undefined; // null-terminated IPv4
@@ -52,7 +63,11 @@ var fetch_enabled: bool = false;
 // this GS's stable fleet id. Set from --gs-addr/--max-games (or env) in parseEndpoints.
 var gs_public_ip: [4]u8 = .{ 0, 0, 0, 0 };
 var gs_public_port: u16 = 4000;
-var gs_max_games: u32 = 100;
+// Seven, because that is what the engine can actually host: Fog hands out eight memory-pool
+// managers, one game takes one, and the Global Pool System permanently holds the first. This
+// number is advertised to realmd and realmd honours it when placing games, so a wrong one
+// here is how a busy realm kills a GS. --max-games still overrides it.
+var gs_max_games: u32 = 7;
 var gsid: u32 = 0;
 
 const BOOL = win.BOOL; // enum(c_int){ FALSE, TRUE } in zig 0.16
@@ -367,7 +382,15 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     gsport.apply(gs_public_port);
     // Reap empty games after a few seconds (default 5min) so abandoned games don't leak
     // FOG pool managers (only 8 exist) and crash the GS with 0xe0000001 after ~8 creates.
-    gamereap.applyDefault();
+    {
+        // The empty-game reap window doubles as this GS's throughput limiter (a finished game
+        // holds its pool manager until it fires), so make it tunable rather than a constant.
+        var tmp: [16]u8 = undefined;
+        if (flagToken("reap-ms", &tmp) orelse envToken("D2GS_REAP_MS", &tmp)) |n| {
+            const v = std.fmt.parseInt(u32, tmp[0..n], 10) catch 0;
+            if (v > 0) gamereap.applyConfigured(v) else gamereap.applyDefault();
+        } else gamereap.applyDefault();
+    }
     // Per-game server hook surface: hook RoomInit to fan out roomInit() with a real
     // per-game GameCtx (the game's own FOG pool). Opt-in via a consumer flag so the
     // default server path stays byte-identical.
@@ -380,6 +403,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     if (use_realm) {
         if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         joindiag.install(); // log nReason when the engine refuses a join
+        rejoin.install(); // let a character re-enter without waiting for its old seat to clear
         if (hasFlag("pkttrace")) pkttrace.install(); // verbose :4000 packet trace
         realm.init(); // populate the callback table before SetupAsBnetServer
         log.print("d2gs: bootstrap (realm mode, IsBattleNetServer=1)");
@@ -425,25 +449,47 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // mode has no d2cs control path (clients connect to QServer to host), so it can't
     // be gated safely — keep full ticking there. A rare safety tick guards against a
     // count that's ever wrong: the GS steps slowly rather than freezing.
+    // Idle pacing: retail's own loop (QSERVER_CooperativeThreadMain) sleeps 10 ms when nothing
+    // is running, so a client arriving at an empty GS is noticed promptly. The safety tick then
+    // lands at ~1 Hz, which is only there to accept and reap, not to simulate.
+    const IDLE_SLEEP_MS: u32 = 10;
+    const IDLE_TICKS_PER_SAFETY: u64 = 100;
     var idle_ticks: u64 = 0;
     while (true) {
         command.pump(); // run queued engine commands (create game, …) on this thread
         if (use_realm) realm.pumpDelivery(); // deliver fetched char outside the join stack
         const busy = if (use_realm) d2cs.liveGames() > 0 else true;
         if (busy) {
+            // Timed: one thread steps every game, and 25 fps means a 40 ms budget for all of
+            // them together, so this is what really caps games per process.
+            tickstat.begin();
             server.tick();
+            tickstat.end(if (use_realm) d2cs.liveGames() else 1);
         } else {
             idle_ticks +%= 1;
-            if (idle_ticks % 100 == 0) server.tick(); // ~1 Hz safety tick (accept + reap)
+            if (idle_ticks % IDLE_TICKS_PER_SAFETY == 0) server.tick(); // ~1 Hz safety tick (accept + reap)
         }
         health.tick(); // heartbeat for the health endpoint (liveness = this advancing)
-        Sleep(10); // ~100 Hz; D2 logic runs at 25 fps, tune later
+        poolstat.report(); // says who holds the 8 pool managers, but only when that changes
+        // With games live, wait for the frame the engine is actually going to run: both
+        // TickAllGames and DispatchAndCleanup self-gate on their own 40 ms accumulators, so
+        // polling faster only burns wakeups — it cannot make the simulation advance sooner.
+        // Idle, keep retail's 10 ms so a joining client is picked up promptly.
+        if (busy) framepace.sleepToNextFrame(IDLE_SLEEP_MS) else Sleep(IDLE_SLEEP_MS);
     }
 }
 
 pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(.winapi) BOOL {
     if (reason == 1) { // DLL_PROCESS_ATTACH
         _ = DisableThreadLibraryCalls(hModule);
+        // Before anything that can panic: a panic without the image base logs raw
+        // addresses, and ASLR makes those unsymbolizable after the fact.
+        crash.install(@intFromPtr(hModule));
+        // Wine plus the loaded Game.exe image, before the engine initialises anything of its
+        // own. Recorded rather than logged: the log is not wired up this early.
+        memstat.markAttach();
+        poolstat.markAttach(); // is the pool table still empty this early? decides if it can be moved
+        memstat.diag_enabled = hasFlag("memdiag"); // heap/region/tick diagnostics: opt-in, they are costly
         if (hasFlag("d2gs")) {
             log.print("d2gs: DLL_PROCESS_ATTACH (--d2gs)");
             log.hex("d2gs: Game.exe base=0x", @intFromPtr(GetModuleHandleA(null)));
