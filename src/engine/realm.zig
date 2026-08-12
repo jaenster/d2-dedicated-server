@@ -55,7 +55,6 @@ pub fn setDatabaseSource(host: [*:0]const u8, port: u16) void {
     log.print("realm: d2dbs char source set");
 }
 
-var save_buf: [16384]u8 = undefined;
 var load_filetime: [2]u32 = .{ 0, 0 }; // a zeroed FILETIME (load-time placeholder)
 var load_filetimes: [2]u32 = undefined; // { &load_filetime, unk0x194 }
 
@@ -65,13 +64,37 @@ var load_filetimes: [2]u32 = undefined; // { &load_filetime, unk0x194 }
 // ClientSetDwSaveTo1 and leaves the join half-set-up. So the callback fetches the
 // save and queues it here, and the tick loop (pumpDelivery) delivers it once the
 // engine's join call stack has fully unwound.
+//
+// There is one of these PER JOIN IN FLIGHT, and each carries its own save bytes.
+// A single shared slot looks sufficient — a join is over in milliseconds — but two
+// clients entering between one tick and the next is not rare, it is what happens
+// every time two people click the same game. The second fetch then overwrote both
+// the slot and the buffer, the first client's delivery never happened, and the
+// engine refused it with 0xe (loader reported success, no player unit) — the
+// character simply never arrived. Whoever fetched first lost.
 const Pending = struct {
+    busy: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     client_id: u32 = 0,
     container: ?*anyopaque = null,
     len: u32 = 0, // 0 = fetch failed (refuse the join)
+    save: [16384]u8 = undefined,
 };
-var pending: Pending = .{};
+// Eight: a full game's worth of players can arrive together, and a slot is held only
+// for the fetch plus the tick that drains it.
+var pending: [8]Pending = blk: {
+    var e: [8]Pending = undefined;
+    for (&e) |*slot| slot.* = .{};
+    break :blk e;
+};
+
+/// Take an unused delivery slot, or null if every join in flight already holds one.
+fn claimPending() ?*Pending {
+    for (&pending) |*slot| {
+        if (slot.busy.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) return slot;
+    }
+    return null;
+}
 
 // ── fpGetDatabaseCharacter (slot 0x08) ───────────────────────────────────────
 // Called when a client joins (NET_D2GS_SERVER_SrvJoinGame): the GS asks the realm
@@ -107,37 +130,48 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
     const container_slot: *const usize = @ptrFromInt(ecx -% 8);
     const container: ?*anyopaque = @ptrFromInt(container_slot.*);
 
+    const slot = claimPending() orelse {
+        // Refusing is the honest outcome and the client is told; silently returning
+        // would leave it sitting at a loading screen until it timed out.
+        log.print("realm:   no free delivery slot — too many joins at once, refusing");
+        return 0;
+    };
+
     var save_len: usize = 0;
     if (dbs_ready and d2dbs.connectTo(dbs_host, dbs_port)) {
         var sp = obs.enter("char_fetch"); // timed span over the d2dbs round-trip
         defer sp.exit();
-        save_len = d2dbs.fetchCharSave(acct_name, char_name, &save_buf);
+        save_len = d2dbs.fetchCharSave(acct_name, char_name, &slot.save);
         d2dbs.disconnect();
     }
-
 
     // Queue the delivery for the tick loop; do NOT call OnDatabaseCharacterReceived
     // synchronously here (see Pending).
     load_filetimes = .{ @truncate(@intFromPtr(&load_filetime)), 0 };
-    pending.client_id = @intCast(client_id);
-    pending.container = container;
-    pending.len = if (save_len > 0 and save_len <= 0xFFFF) @intCast(save_len) else 0;
-    pending.ready.store(true, .release);
+    slot.client_id = @intCast(client_id);
+    slot.container = container;
+    slot.len = if (save_len > 0 and save_len <= 0xFFFF) @intCast(save_len) else 0;
+    slot.ready.store(true, .release);
     log.hex("realm:   save fetched, queued for delivery bytes=0x", save_len);
     return 0;
 }
 
-/// Deliver a queued character save to the engine, OUTSIDE the join call stack.
-/// Call once per server tick. len==0 means the fetch failed → refuse the join.
+/// Deliver every queued character save to the engine, OUTSIDE the join call stack.
+/// Call once per server tick. len==0 means the fetch failed → refuse that join.
+/// Drains ALL ready slots: leaving one for the next tick is how a client ends up
+/// waiting on a character that was fetched and then never handed over.
 pub fn pumpDelivery() void {
-    if (!pending.ready.swap(false, .acquire)) return;
-    if (pending.len == 0) {
-        log.print("realm:   char fetch FAILED — refusing join");
-        _ = OnDatabaseCharacterReceived(pending.client_id, &save_buf, 0, 0, 1, 0, &load_filetimes, pending.container);
-        return;
+    for (&pending) |*slot| {
+        if (!slot.ready.swap(false, .acquire)) continue;
+        defer slot.busy.store(false, .release);
+        if (slot.len == 0) {
+            log.print("realm:   char fetch FAILED — refusing join");
+            _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, 0, 0, 1, 0, &load_filetimes, slot.container);
+            continue;
+        }
+        _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, slot.len, slot.len, 0, 0, &load_filetimes, slot.container);
+        log.print("realm:   char delivered (SendStateCommand 2)");
     }
-    _ = OnDatabaseCharacterReceived(pending.client_id, &save_buf, pending.len, pending.len, 0, 0, &load_filetimes, pending.container);
-    log.print("realm:   char delivered (SendStateCommand 2)");
 }
 
 pub const getDatabaseCharShim = fastcall.Callback2(2, getDatabaseCharImpl).shim;
