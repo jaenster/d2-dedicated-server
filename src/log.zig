@@ -49,6 +49,7 @@ pub fn initObs() void {
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const FILE_SHARE_READ: u32 = 1;
+const FILE_SHARE_WRITE: u32 = 2;
 const OPEN_ALWAYS: u32 = 4;
 const FILE_APPEND_DATA: u32 = 4;
 const INVALID_HANDLE: ?win.HANDLE = @ptrFromInt(std.math.maxInt(usize));
@@ -79,9 +80,43 @@ pub fn initConsole() void {
 }
 
 fn writeAll(h: win.HANDLE, msg: []const u8) void {
+    // Message and newline in ONE WriteFile. Under wine every call crosses to wineserver, so a
+    // second one to write a single byte doubles the cost of logging a line.
     var w: u32 = 0;
+    var buf: [1024]u8 = undefined;
+    if (msg.len + 1 <= buf.len) {
+        @memcpy(buf[0..msg.len], msg);
+        buf[msg.len] = '\n';
+        _ = WriteFile(h, &buf, @intCast(msg.len + 1), &w, null);
+        return;
+    }
     _ = WriteFile(h, msg.ptr, @intCast(msg.len), &w, null);
     _ = WriteFile(h, "\n", 1, &w, null);
+}
+
+/// The append handle for d2gs_log.txt, opened once. 0 = not yet opened, 1 = opening failed.
+///
+/// This used to CreateFileA + CloseHandle around every line, which under wine is an open, a
+/// stat and a close per log line, each a wineserver round trip -- together about a tenth of the
+/// game server's CPU. FILE_SHARE_WRITE matters now that the handle is held: a second GS on the
+/// same directory could not open the file at all otherwise. FILE_APPEND_DATA keeps concurrent
+/// appends atomic, so a shared handle needs no lock of its own.
+var log_handle = std.atomic.Value(usize).init(0);
+
+fn logFile() ?win.HANDLE {
+    switch (log_handle.load(.acquire)) {
+        0 => {},
+        1 => return null,
+        else => |v| return @ptrFromInt(v),
+    }
+    const h = CreateFileA("d2gs_log.txt", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, null, OPEN_ALWAYS, 0, null);
+    const v: usize = if (h) |hh| (if (hh == INVALID_HANDLE) 1 else @intFromPtr(hh)) else 1;
+    // Two threads racing here both open; the loser closes its own and uses the winner's.
+    if (log_handle.cmpxchgStrong(0, v, .acq_rel, .acquire)) |won| {
+        if (v > 1) _ = CloseHandle(@ptrFromInt(v));
+        return if (won <= 1) null else @ptrFromInt(won);
+    }
+    return if (v <= 1) null else @ptrFromInt(v);
 }
 
 /// Write one line to both sinks: stdout (so `wine Game.exe` logs like a normal CLI
@@ -90,10 +125,7 @@ fn emit(line: []const u8) void {
     if (GetStdHandle(STD_OUTPUT_HANDLE)) |out| {
         if (out != INVALID_HANDLE) writeAll(out, line);
     }
-    const h = CreateFileA("d2gs_log.txt", FILE_APPEND_DATA, FILE_SHARE_READ, null, OPEN_ALWAYS, 0, null) orelse return;
-    if (h == INVALID_HANDLE) return;
-    defer _ = CloseHandle(h);
-    writeAll(h, line);
+    if (logFile()) |h| writeAll(h, line);
 }
 
 /// Raw, uncapped passthrough to both sinks — NO structured `{"ts","msg":...}` wrapper
