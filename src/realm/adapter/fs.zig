@@ -12,7 +12,7 @@
 //! and serialise fs ops behind one spinlock — these are infrequent and it keeps the
 //! shared Io single-op-at-a-time, which is simplest and safe.
 const std = @import("std");
-const Spinlock = @import("realm_infra").lock.Spinlock;
+const Lock = @import("realm_infra").lock.Lock;
 const types = @import("realm_infra").types;
 
 const Dir = std.Io.Dir;
@@ -25,7 +25,7 @@ extern "c" fn time(t: ?*c_long) c_long;
 
 var data_dir: []const u8 = "realmd-data";
 var io: std.Io = undefined;
-var fs_lock: Spinlock = .{};
+var fs_lock: Lock = .{};
 var write_ctr = std.atomic.Value(u32).init(0);
 
 pub fn init(io_: std.Io, dir: []const u8) void {

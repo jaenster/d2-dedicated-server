@@ -5,7 +5,7 @@
 //! slow/blocked peer can't tear a packet sent by another thread.
 const std = @import("std");
 const net = @import("realm_infra").net;
-const Spinlock = @import("realm_infra").lock.Spinlock;
+const Lock = @import("realm_infra").lock.Lock;
 
 pub const max_name = 16;
 pub const max_channel = 32;
@@ -46,7 +46,7 @@ pub const Member = struct {
     ignores: [max_ignores][max_name]u8 = [_][max_name]u8{[_]u8{0} ** max_name} ** max_ignores,
     ignore_lens: [max_ignores]u8 = [_]u8{0} ** max_ignores,
     ignore_count: u8 = 0,
-    send_lock: Spinlock = .{},
+    send_lock: Lock = .{},
 
     pub fn nameSlice(m: *const Member) []const u8 {
         return m.name[0..m.name_len];
@@ -94,7 +94,7 @@ pub fn countInChannel(channel: []const u8, exclude_fd: net.Socket) usize {
 }
 
 const Registry = struct {
-    lock: Spinlock = .{},
+    lock: Lock = .{},
     members: [1024]Member = [_]Member{.{}} ** 1024,
 };
 

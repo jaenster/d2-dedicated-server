@@ -14,7 +14,7 @@
 //! The in-memory pair table stays as the working set so reads don't hit the store, and is
 //! seeded lazily the first time an account's list is touched after a restart.
 const std = @import("std");
-const Spinlock = @import("realm_infra").lock.Spinlock;
+const Lock = @import("realm_infra").lock.Lock;
 const store = @import("store.zig");
 const chat = @import("chat.zig");
 
@@ -50,7 +50,7 @@ const Presence = struct {
     in_use: bool = false,
 };
 
-var lock: Spinlock = .{};
+var lock: Lock = .{};
 var pairs: [4096]Pair = [_]Pair{.{}} ** 4096;
 var online: [1024]Presence = [_]Presence{.{}} ** 1024;
 

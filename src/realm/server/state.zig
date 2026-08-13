@@ -10,7 +10,7 @@
 //! by d2cs at MCP_STARTUP. Because we own both ends, the realm handoff carries a
 //! plain session id in the MCP chunk — no pvpgn-style shared-secret crypto.
 const std = @import("std");
-const Spinlock = @import("realm_infra").lock.Spinlock;
+const Lock = @import("realm_infra").lock.Lock;
 const store = @import("store.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds, for a game's elapsed-time line
@@ -93,7 +93,7 @@ pub const Game = struct {
 };
 
 pub const State = struct {
-    lock: Spinlock = .{},
+    lock: Lock = .{},
     sessions: [1024]Session = [_]Session{.{}} ** 1024,
     next_id: u64 = 1,
     games: [512]Game = [_]Game{.{}} ** 512,

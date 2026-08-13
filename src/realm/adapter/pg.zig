@@ -19,7 +19,7 @@
 //! IO from realmd's thread-per-peer workers.
 const std = @import("std");
 const pg = @import("pg");
-const Spinlock = @import("realm_infra").lock.Spinlock;
+const Lock = @import("realm_infra").lock.Lock;
 const types = @import("realm_infra").types;
 const fs = @import("fs.zig");
 
@@ -62,7 +62,7 @@ pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
 var dsn: []const u8 = "";
 var pool: ?*pg.Pool = null;
 var schema_ready: bool = false;
-var init_lock: Spinlock = .{};
+var init_lock: Lock = .{};
 // Owned by this module; the pool keeps a pointer to its `io()`.
 var threaded: std.Io.Threaded = undefined;
 var threaded_set: bool = false;
