@@ -1,6 +1,8 @@
 .{
     .name = .d2gs,
-    .version = "0.16.0",
+    // The project's own version, which is what a consumer of this manifest reads — not the Zig
+    // version it happens to be built with. Kept in step with the release tags.
+    .version = "0.2.0",
     .dependencies = .{
         .pg = .{
             .url = "git+https://github.com/karlseguin/pg.zig#4215baf19f7f61a94aab9f6c5893ea12aa9bce96",
@@ -12,8 +14,8 @@
         // of d2-formats down to the byte offsets.
         //
         // Pinned by URL, not to a sibling checkout. The images are built from this repo alone —
-        // the Dockerfile copies build.zig, build.zig.zon and src/ and nothing else — so a
-        // `../libd2` path dependency resolved on a developer's machine and nowhere else, and
+        // the Dockerfile copies build.zig, build.zig.zon, apps/ and packages/ and nothing else —
+        // so a `../libd2` path dependency resolved on a developer's machine and nowhere else, and
         // every image build since the path landed failed on it. A pin also makes the version a
         // deliberate commit here rather than whatever happens to be checked out next door.
         .libd2 = .{

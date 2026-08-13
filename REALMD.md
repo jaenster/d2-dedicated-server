@@ -1,6 +1,6 @@
 # realmd: a Zig Battle.net / Diablo II realm server
 
-`src/realm/server/` is a clean-room replacement for **PvPGN** (bnetd + d2cs + d2dbs), written in
+`apps/realmd/` is a clean-room replacement for **PvPGN** (bnetd + d2cs + d2dbs), written in
 Zig as a single binary. It is the realm the unmodified 1.14d client logs into, and it dispatches
 games to our injected game server (`d2gs.dll` in `Game.exe`) over the same control protocol the GS
 already speaks.

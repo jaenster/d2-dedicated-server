@@ -1,11 +1,16 @@
 const std = @import("std");
 
-// Builds two DLLs (both x86-windows, run under wine on Linux):
-//   dbghelp.dll — injection foothold. Game.exe loads dbghelp for its crash
-//                 handler; our proxy forwards the real exports and LoadLibrary's
-//                 the DLLs passed via `-loaddll <winpath>`.
-//   d2gs.dll    — the payload that drives 1.14d's built-in QServer/D2Game engine
-//                 as a headless dedicated game server.
+// The repo is laid out as apps/ + packages/:
+//
+//   apps/d2gs      -> dbghelp.dll + d2gs.dll, the injected pair (x86-windows, run under wine)
+//   apps/realmd    -> realmd, the realm server (bnetd + d2cs + d2dbs in one binary)
+//   apps/qqserver  -> qqserver, the stateless ingress for game traffic
+//   packages/*     -> what more than one of those needs, each one its own module
+//   tools/*        -> everything that is built to be run by hand, not deployed
+//
+// The two DLLs are one app: dbghelp is the foothold (Game.exe loads it for its crash handler,
+// and it LoadLibrary's whatever `-loaddll <winpath>` names), d2gs is the payload that drives
+// 1.14d's built-in QServer/D2Game engine as a headless dedicated server. They ship together.
 pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86,
@@ -14,71 +19,34 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    // realm_shared — the shared realm package (wire protocol + enums) imported by BOTH
-    // the GS-side client (in d2gs.dll) and the realm server (realmd), so the two ends
-    // agree on the wire by construction. Target-less: it compiles in each importer's context.
-    const realm_shared = b.createModule(.{
-        .root_source_file = b.path("src/realm/shared/shared.zig"),
+    // The native host target, for everything that is not injected into Game.exe.
+    // Cross-compile for deploy with `-Dtarget=x86_64-linux-musl` for static Linux binaries.
+    const host = b.standardTargetOptions(.{});
+
+    // ── packages ─────────────────────────────────────────────────────────────────
+    //
+    // Target-less modules: each compiles in its importer's context, which is what lets
+    // realm_proto and obs go into BOTH the x86-windows DLL and the native binaries.
+
+    // The realmd <-> d2gs wire contract (protocol + the shared guild model), imported by both
+    // ends of the realm link so the two agree on the wire by construction.
+    const realm_proto = b.addModule("realm_proto", .{
+        .root_source_file = b.path("packages/realm-proto/realm_proto.zig"),
     });
 
-    // realm_infra — shared host-side infrastructure (net/log/config/lock/store types) for
-    // the NATIVE binaries (realmd + qqserver). Deliberately NOT given to the x86-windows
-    // DLL, so libc-socket / POSIX code never enters that build.
-    const realm_infra = b.createModule(.{
-        .root_source_file = b.path("src/realm/shared/infra.zig"),
+    // Per-thread trace/span context. Shared by the DLL and the host binaries because a trace
+    // that stops at the process boundary is not a trace — the id a client's join is stamped
+    // with in realmd is the id the game server logs it under.
+    const obs = b.addModule("obs", .{
+        .root_source_file = b.path("packages/obs/obs.zig"),
     });
 
-
-    const dbghelp = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "dbghelp",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/dbghelp.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    // Host-side infrastructure (net/log/config/lock/store types) for the NATIVE binaries.
+    // Deliberately NOT given to the DLL, so libc-socket / POSIX code never enters that build.
+    const realm_infra = b.addModule("realm_infra", .{
+        .root_source_file = b.path("packages/realm-infra/realm_infra.zig"),
     });
-    b.installArtifact(dbghelp);
-
-    const d2gs = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "d2gs",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/d2gs.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    d2gs.root_module.addImport("realm_shared", realm_shared);
-    b.installArtifact(d2gs);
-
-    // ver-IX86-1.dll — the CheckRevision module packed into the version-check MPQ
-    // realmd serves over BNFTP. Same x86-windows target as the other DLLs.
-    const checkrev = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "ver-IX86-1",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/checkrev/checkrev.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    // Module-definition file: export `CheckRevision` UNDECORATED (ordinal 1) so the
-    // client's GetProcAddress("CheckRevision") resolves it (stdcall would otherwise
-    // mangle it to CheckRevision@28).
-    checkrev.root_module.addObjectFile(b.path("src/checkrev/checkrev.def"));
-    b.installArtifact(checkrev);
-
-    // `zig build dlls` — install ONLY the injected DLLs (no realmd, no pg fetch).
-    // Used by the game-server container image, which needs the DLLs but not realmd.
-    const dlls_step = b.step("dlls", "Build only the injected DLLs (dbghelp + d2gs)");
-    dlls_step.dependOn(&b.addInstallArtifact(dbghelp, .{}).step);
-    dlls_step.dependOn(&b.addInstallArtifact(d2gs, .{}).step);
-
-    // realmd — the realm server (bnetd+d2cs+d2dbs in one binary). Native host
-    // target by default (dev on macOS/Linux); cross-compile for deploy with
-    // `-Dtarget=x86_64-linux-musl` for a static Linux binary.
-    const realmd_target = b.standardTargetOptions(.{});
+    realm_infra.addImport("obs", obs);
 
     // One dependency on the libd2 monorepo, whose root re-exports every package's module.
     //
@@ -87,37 +55,77 @@ pub fn build(b: *std.Build) void {
     // the fresh-character writer are all already modelled there and two implementations of a byte
     // format is one more than can stay correct. d2-util is the D2GS wire Huffman codec and its
     // packet framing, for the same reason.
-    const libd2 = b.dependency("libd2", .{
-        .target = realmd_target,
-        .optimize = optimize,
-    });
+    const libd2 = b.dependency("libd2", .{ .target = host, .optimize = optimize });
     const d2_formats = libd2.module("d2-formats");
     const d2_util = libd2.module("d2-util");
 
-    // realm_adapter — the concrete persistence backends (fs/redis/pg) behind the store
-    // facade, imported by realmd. Includes the Postgres client, so the pg dependency lives
-    // here (lazy, only fetched when a step builds realmd). The qqserver does NOT use this:
-    // it talks to redis directly with its own async client, so it never pulls pg.
-    const realm_adapter = b.createModule(.{
-        .root_source_file = b.path("src/realm/adapter/adapters.zig"),
+    // The three BNCS logon primitives (broken-SHA-1 password hash, version check, CD-key
+    // decode). std-only, so the version-check DLL can import the same code realmd verifies with.
+    const bncs_auth = b.addModule("bncs_auth", .{
+        .root_source_file = b.path("packages/bncs-auth/bncs_auth.zig"),
     });
-    realm_adapter.addImport("realm_infra", realm_infra);
-    if (b.lazyDependency("pg", .{ .target = realmd_target, .optimize = optimize })) |pg_dep| {
-        realm_adapter.addImport("pg", pg_dep.module("pg"));
+
+    // The concrete persistence backends (fs/redis/pg) behind the store facade, imported by
+    // realmd. Includes the Postgres client, so the pg dependency lives here (lazy, only fetched
+    // when a step builds realmd). The qqserver does NOT use this: it talks to redis directly
+    // with its own async client, so it never pulls pg.
+    const realm_store = b.addModule("realm_store", .{
+        .root_source_file = b.path("packages/realm-store/realm_store.zig"),
+    });
+    realm_store.addImport("realm_infra", realm_infra);
+    if (b.lazyDependency("pg", .{ .target = host, .optimize = optimize })) |pg_dep| {
+        realm_store.addImport("pg", pg_dep.module("pg"));
     }
+
+    // ── apps/d2gs ────────────────────────────────────────────────────────────────
+
+    const dbghelp = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "dbghelp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/d2gs/dbghelp.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    dbghelp.root_module.addImport("realm_proto", realm_proto);
+    dbghelp.root_module.addImport("obs", obs);
+    b.installArtifact(dbghelp);
+
+    const d2gs = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "d2gs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/d2gs/d2gs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    d2gs.root_module.addImport("realm_proto", realm_proto);
+    d2gs.root_module.addImport("obs", obs);
+    b.installArtifact(d2gs);
+
+    // `zig build dlls` — install ONLY the injected DLLs (no realmd, no pg fetch).
+    // Used by the game-server container image, which needs the DLLs but not realmd.
+    const dlls_step = b.step("dlls", "Build only the injected DLLs (dbghelp + d2gs)");
+    dlls_step.dependOn(&b.addInstallArtifact(dbghelp, .{}).step);
+    dlls_step.dependOn(&b.addInstallArtifact(d2gs, .{}).step);
+
+    // ── apps/realmd ──────────────────────────────────────────────────────────────
 
     const realmd = b.addExecutable(.{
         .name = "realmd",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/realm/server/main.zig"),
-            .target = realmd_target,
+            .root_source_file = b.path("apps/realmd/main.zig"),
+            .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    realmd.root_module.addImport("realm_shared", realm_shared);
+    realmd.root_module.addImport("realm_proto", realm_proto);
     realmd.root_module.addImport("realm_infra", realm_infra);
-    realmd.root_module.addImport("realm_adapter", realm_adapter);
+    realmd.root_module.addImport("realm_store", realm_store);
+    realmd.root_module.addImport("bncs_auth", bncs_auth);
     realmd.root_module.addImport("d2_formats", d2_formats);
 
     // Web UI: -Dwebui=true builds webui/ (Vite + React → one self-contained
@@ -128,7 +136,7 @@ pub fn build(b: *std.Build) void {
         const cmd = b.addSystemCommand(&.{ "sh", "-c", "set -e; npm --prefix \"$1\" ci && npm --prefix \"$1\" run build && cp \"$1/dist/index.html\" \"$2\"", "realmd-webui", b.pathFromRoot("webui") });
         cmd.has_side_effects = true; // npm/vite do their own incremental builds
         break :blk cmd.addOutputFileArg("index.html");
-    } else b.path("src/realm/server/webui_stub.html");
+    } else b.path("apps/realmd/webui_stub.html");
     realmd.root_module.addAnonymousImport("webui_blob", .{ .root_source_file = webui_blob });
 
     b.installArtifact(realmd);
@@ -138,100 +146,17 @@ pub fn build(b: *std.Build) void {
     const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
     realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
 
-    // `zig build test` — realm-server unit tests. Rooted at the guild service so it
-    // pulls the store facade + realm modules; runs every `test` block reachable from
-    // there (guild model/service serialization, store helpers, …).
-    const realm_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/realm/server/realm_tests.zig"),
-            .target = realmd_target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    realm_tests.root_module.addImport("realm_shared", realm_shared);
-    realm_tests.root_module.addImport("realm_infra", realm_infra);
-    realm_tests.root_module.addImport("realm_adapter", realm_adapter);
-    realm_tests.root_module.addImport("d2_formats", d2_formats);
-    const run_realm_tests = b.addRunArtifact(realm_tests);
-    const test_step = b.step("test", "Run realm-server unit tests");
-    test_step.dependOn(&run_realm_tests.step);
-
-    // Zig collects `test` blocks only from files in a test artifact's ROOT module, so the
-    // tests in realm_infra and realm_adapter are invisible to realm_tests above no matter
-    // what it imports — they need an artifact rooted at their own barrel. Without these two,
-    // the lock, the logger and the RESP codec compile in every binary and are tested in none.
-    inline for (.{
-        .{ "src/realm/shared/infra.zig", false },
-        .{ "src/realm/adapter/adapters.zig", true },
-    }) |spec| {
-        const mod_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(spec[0]),
-                .target = realmd_target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
-        });
-        mod_tests.root_module.addImport("realm_infra", realm_infra);
-        if (spec[1]) {
-            if (b.lazyDependency("pg", .{ .target = realmd_target, .optimize = optimize })) |pg_dep| {
-                mod_tests.root_module.addImport("pg", pg_dep.module("pg"));
-            }
-        }
-        test_step.dependOn(&b.addRunArtifact(mod_tests).step);
-    }
-
-    // D2GS Huffman codec unit tests (the clientless game-protocol decoder, reconstructed
-    // from Game.exe's static table — verified against a real captured GS frame).
-    const huffman_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/e2e/huffman_vectors.zig"),
-            .target = realmd_target,
-            .optimize = optimize,
-        }),
-    });
-    huffman_tests.root_module.addImport("d2_util", d2_util);
-    test_step.dependOn(&b.addRunArtifact(huffman_tests).step);
-
-    // qqserver unit tests — the game-traffic gateway's pure wire logic (the 0xAF greeting
-    // strip qq applies to the GS→client splice). Rooted at the qq binary with its infra import.
-    const qq_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/realm/qqserver/main.zig"),
-            .target = realmd_target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    qq_tests.root_module.addImport("realm_infra", realm_infra);
-    test_step.dependOn(&b.addRunArtifact(qq_tests).step);
-
-    // BNCS auth crypto unit tests (all self-contained, std-only): the standard-SHA-1
-    // CheckRevision core, the broken-SHA-1 OLS password hash, and the CD-key decode —
-    // each carries vectors verified against a real 1.14d client. No real keys committed.
-    inline for (.{
-        "src/checkrev/checkrev_core.zig",
-        "src/realm/server/xsha1.zig",
-        "src/realm/shared/cdkey.zig",
-    }) |src| {
-        const t = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path(src),
-            .target = realmd_target,
-            .optimize = optimize,
-        }) });
-        test_step.dependOn(&b.addRunArtifact(t).step);
-    }
-
-    // qqserver — the cloud-native game-traffic gateway: a token-translating, fully
-    // non-blocking poll() splice proxy fronting the GS fleet. ZERO heap, bare libc sockets,
-    // and its OWN async redis client (route lookups over a non-blocking redis connection in
-    // the same poll loop) — so it imports neither the adapter modules nor the pg dependency.
+    // ── apps/qqserver ────────────────────────────────────────────────────────────
+    //
+    // The cloud-native game-traffic gateway: a token-translating, fully non-blocking poll()
+    // splice proxy fronting the GS fleet. ZERO heap, bare libc sockets, and its OWN async redis
+    // client (route lookups over a non-blocking redis connection in the same poll loop) — so it
+    // imports neither the store package nor the pg dependency.
     const qqserver = b.addExecutable(.{
         .name = "qqserver",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/realm/qqserver/main.zig"),
-            .target = realmd_target,
+            .root_source_file = b.path("apps/qqserver/main.zig"),
+            .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
@@ -243,6 +168,99 @@ pub fn build(b: *std.Build) void {
     const qqserver_step = b.step("qqserver", "Build the qqserver game-traffic gateway");
     qqserver_step.dependOn(&b.addInstallArtifact(qqserver, .{}).step);
 
+    // ── tests ────────────────────────────────────────────────────────────────────
+    //
+    // Zig collects `test` blocks only from files in a test artifact's ROOT module, so a package
+    // is tested only by an artifact rooted at its own barrel — importing it from somewhere else
+    // runs none of its tests. Hence one artifact per package rather than one big root.
+    const test_step = b.step("test", "Run the unit tests");
+
+    const realm_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/realmd/realm_tests.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    realm_tests.root_module.addImport("realm_proto", realm_proto);
+    realm_tests.root_module.addImport("realm_infra", realm_infra);
+    realm_tests.root_module.addImport("realm_store", realm_store);
+    realm_tests.root_module.addImport("bncs_auth", bncs_auth);
+    realm_tests.root_module.addImport("d2_formats", d2_formats);
+    test_step.dependOn(&b.addRunArtifact(realm_tests).step);
+
+    // qqserver's pure wire logic (the 0xAF greeting strip it applies to the GS→client splice),
+    // rooted at the binary itself with its infra import.
+    const qq_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/qqserver/main.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    qq_tests.root_module.addImport("realm_infra", realm_infra);
+    test_step.dependOn(&b.addRunArtifact(qq_tests).step);
+
+    // The packages: realm_infra's lock/logger/config, realm_store's RESP codec and fs backend,
+    // and the BNCS auth vectors (each verified against a real 1.14d client; no real keys here).
+    inline for (.{
+        .{ "packages/realm-infra/realm_infra.zig", true, false },
+        .{ "packages/realm-store/realm_store.zig", true, true },
+        .{ "packages/bncs-auth/bncs_auth.zig", false, false },
+        .{ "packages/realm-proto/realm_proto.zig", false, false },
+    }) |spec| {
+        const mod_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(spec[0]),
+                .target = host,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        mod_tests.root_module.addImport("obs", obs);
+        if (spec[1]) mod_tests.root_module.addImport("realm_infra", realm_infra);
+        if (spec[2]) {
+            if (b.lazyDependency("pg", .{ .target = host, .optimize = optimize })) |pg_dep| {
+                mod_tests.root_module.addImport("pg", pg_dep.module("pg"));
+            }
+        }
+        test_step.dependOn(&b.addRunArtifact(mod_tests).step);
+    }
+
+    // D2GS Huffman codec unit tests (the clientless game-protocol decoder, reconstructed
+    // from Game.exe's static table — verified against a real captured GS frame).
+    const huffman_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/e2e/huffman_vectors.zig"),
+            .target = host,
+            .optimize = optimize,
+        }),
+    });
+    huffman_tests.root_module.addImport("d2_util", d2_util);
+    test_step.dependOn(&b.addRunArtifact(huffman_tests).step);
+
+    // ── tools ────────────────────────────────────────────────────────────────────
+
+    // ver-IX86-1.dll — the CheckRevision module packed into the version-check MPQ realmd serves
+    // over BNFTP. Built for the client's target (x86-windows), not this host's.
+    const checkrev = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "ver-IX86-1",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/ver-ix86/checkrev.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    checkrev.root_module.addImport("bncs_auth", bncs_auth);
+    // Module-definition file: export `CheckRevision` UNDECORATED (ordinal 1) so the
+    // client's GetProcAddress("CheckRevision") resolves it (stdcall would otherwise
+    // mangle it to CheckRevision@28).
+    checkrev.root_module.addObjectFile(b.path("tools/ver-ix86/checkrev.def"));
+    b.installArtifact(checkrev);
+
     // e2e — clientless wire-protocol test harness (pure Zig, no wine/Game.exe).
     // Builds realmd first, then `zig build e2e` builds AND runs the harness; it
     // auto-starts its own realmd child (REALMD_BIN, health 18080) and runs the
@@ -251,11 +269,12 @@ pub fn build(b: *std.Build) void {
         .name = "e2e",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/e2e/main.zig"),
-            .target = realmd_target,
+            .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
+    e2e.root_module.addImport("bncs_auth", bncs_auth);
     const run_e2e = b.addRunArtifact(e2e);
     run_e2e.step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
     run_e2e.step.dependOn(&b.addInstallArtifact(qqserver, .{}).step); // qqserver_routing spawns it
@@ -266,11 +285,13 @@ pub fn build(b: *std.Build) void {
     // Used to verify the empty-game reaper fix (the GS shouldn't OOM past ~8 games).
     const gamestress_mod = b.createModule(.{
         .root_source_file = b.path("tools/gamestress/main.zig"),
-        .target = realmd_target,
+        .target = host,
         .optimize = optimize,
         .link_libc = true,
     });
-    gamestress_mod.addAnonymousImport("realmclient", .{ .root_source_file = b.path("tools/e2e/realmclient.zig") });
+    const realmclient = b.createModule(.{ .root_source_file = b.path("tools/e2e/realmclient.zig") });
+    realmclient.addImport("bncs_auth", bncs_auth);
+    gamestress_mod.addImport("realmclient", realmclient);
     const gamestress = b.addExecutable(.{ .name = "gamestress", .root_module = gamestress_mod });
     const run_gamestress = b.addRunArtifact(gamestress);
     b.step("gamestress", "Create N games against a running realm (reaper stress test)").dependOn(&run_gamestress.step);
@@ -281,7 +302,7 @@ pub fn build(b: *std.Build) void {
         .name = "bnftp-probe",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/bnftp-probe/main.zig"),
-            .target = realmd_target,
+            .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
@@ -292,26 +313,18 @@ pub fn build(b: *std.Build) void {
     b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
 
     // checkrev-probe — clientless BNCS *version-check* client (selector 0x01): runs
-    // SID_AUTH_INFO -> compute response (shared checkrev_core) -> SID_AUTH_CHECK
+    // SID_AUTH_INFO -> compute response (the same bncs_auth the DLL uses) -> SID_AUTH_CHECK
     // against a real bnet and prints the result code. Separate from BNFTP.
     const crprobe = b.addExecutable(.{
         .name = "checkrev-probe",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/checkrev-probe/main.zig"),
-            .target = realmd_target,
+            .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    crprobe.root_module.addAnonymousImport("checkrev_core", .{
-        .root_source_file = b.path("src/checkrev/checkrev_core.zig"),
-    });
-    crprobe.root_module.addAnonymousImport("cdkey", .{
-        .root_source_file = b.path("src/realm/shared/cdkey.zig"),
-    });
-    crprobe.root_module.addAnonymousImport("xsha1", .{
-        .root_source_file = b.path("src/realm/server/xsha1.zig"),
-    });
+    crprobe.root_module.addImport("bncs_auth", bncs_auth);
     b.installArtifact(crprobe);
     const run_crprobe = b.addRunArtifact(crprobe);
     if (b.args) |args| run_crprobe.addArgs(args);

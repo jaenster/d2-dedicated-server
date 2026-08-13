@@ -8,7 +8,7 @@
 //!      version-check MPQ (filename + filetime) the server wants. Hexdump it.
 //!   2. Open a fresh 0x02 connection → BNFTP-request that filename. Hexdump the
 //!      raw reply and save the file bytes so we can diff the header layout (and
-//!      the MPQ contents) against our own src/realm/server/bnftp.zig.
+//!      the MPQ contents) against our own apps/realmd/bnftp.zig.
 //!
 //! Egress can go through a SOCKS5 proxy (`--socks5 host:port`) so the probe
 //! reaches the target from a chosen IP — e.g. an `ssh -D 1080 hetzner` dynamic

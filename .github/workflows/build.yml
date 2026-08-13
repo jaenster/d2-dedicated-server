@@ -21,7 +21,8 @@ on:
     branches: [main]
     tags: ["v*"]
     paths:
-      - src/**
+      - apps/**
+      - packages/**
       - webui/**
       - deploy/Dockerfile
       - deploy/gs-entrypoint.sh

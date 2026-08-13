@@ -1,4 +1,4 @@
-// Typed client over realmd's /admin/* JSON API (see src/realm/server/admin.zig).
+// Typed client over realmd's /admin/* JSON API (see apps/realmd/admin.zig).
 // Auth is cookie-based: POST /admin/login sets an HMAC-signed session cookie; every
 // request rides on it (credentials: same-origin). When realmd is behind an SSO
 // forward-auth proxy, /admin/me is already authenticated upstream and no login form

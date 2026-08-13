@@ -1,7 +1,7 @@
 # realmd web UI
 
 A small Vite + React admin UI for the `realmd` realm server. It's a thin frontend
-over the existing `/admin/*` JSON API (`src/realm/server/admin.zig`) — it adds **no**
+over the existing `/admin/*` JSON API (`apps/realmd/admin.zig`) — it adds **no**
 new server endpoints.
 
 ![Login](img/login.png)

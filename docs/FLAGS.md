@@ -1,0 +1,59 @@
+# Flags
+
+Passed to `Game.exe`, read by our DLLs. Several have an environment-variable equivalent, which
+is what the container images and the Helm chart use.
+
+## Boot / connection
+
+| flag | effect |
+|-|-|
+| `--loaddll <path>` | (proxy) LoadLibrary an injected DLL; repeatable |
+| `--d2gs` | attach + log; install crash/halt/multi-instance guards |
+| `--d2gs-boot` | run the engine bootstrap + tick loop (the dedicated server) |
+| `--realm` | bootstrap in realm mode (register the realm callback table) |
+| `--create-games` | load data tables so the engine can create games |
+| `--realmd <host>` | connect to one realm server, deriving gs-link (`:6115`) + d2dbs (`:6114`); DNS ok. Env: `REALMD_HOST` |
+| `--d2cs <ip:port>` | connect to realmd's gs-link for create/join dispatch (overrides `--realmd`) |
+| `--d2dbs <ip:port>` | fetch character saves from realmd's d2dbs (overrides `--realmd`) |
+| `--gs-addr <ip:port>` | public address clients dial for this GS's games (self-reported to realmd). Env: `D2GS_GS_ADDR` |
+| `--max-games <n>` | capacity this GS advertises to realmd. Env: `D2GS_MAX_GAMES` |
+| `--reap-ms <n>` | how long an empty game is kept before it is destroyed (default 5000). Also this server's throughput ceiling -- see [How many games per server](PERFORMANCE.md#how-many-games-per-server). Env: `D2GS_REAP_MS` |
+| `--realm-gw <ip>` | (client) point the game's bnet gateway list at your realm instead of Blizzard's |
+
+## Feature toggles
+
+Off by default unless noted. See [`docs/MODDING.md`](MODDING.md).
+
+| flag | effect |
+|-|-|
+| `--headless` | apply survival/no-display patches (run with no GUI) |
+| `--bypass-checkrev` | (client) skip the bnet version check |
+| `--no-compress` | disable packet compression (debugging) |
+| `--expmod` | server: XP scaling |
+| `--ubers` | server: Pandemonium / Uber Tristram event |
+| `--arena` | server: PvP arena rounds |
+| `--ladder-items` | server: ladder-only item content (opt-in; bootstrap-flaky) |
+| `--guild-panel` | client: Steeg Stone guild panel |
+| `--omnivision` / `--mapunits` / `--mapreveal` | client: maphack (see-through, monster/item dots, auto-reveal) |
+
+## Client driving / debug
+
+| flag | effect |
+|-|-|
+| `--auto-login <acct:pass>` | (client) drive login -> char select -> create a game |
+| `--auto-join <acct:pass:game>` | (client) drive login -> char select -> join a game |
+| `--bot <name>` | run an in-game bot (`apps/d2gs/bot/`) |
+| `--screenshot` | (client) take a screenshot every 3s (headed debugging) |
+| `--pkttrace` | log every `:4000` client/GS packet id (verbose) |
+| `--suppress-halts` | swallow engine asserts instead of exiting (debugging) |
+| `--eipprof` | sample every thread's program counter from inside the process and report the hot engine addresses. No host profiler can see them: the 32-bit guest runs translated under wine, so a host sampler only ever sees the translator. Not for a live realm |
+| `--memdiag` | report the engine's working set per bootstrap step |
+| `--test-enter` | drive the server into a game on its own, with no client (DRLG capture) |
+| `--fetch-char <acct:char>` / `--create-char` | exercise the d2dbs character fetch / creation paths |
+| `--d2bs` | inject D2BS after the game window exists (kolbot on a stock client) |
+| `--dump-cdkeys` | print the decoded classic/expansion CD-key globals |
+
+## realmd configuration
+
+`realmd` is configured by environment only (`REALMD_*`) -- see
+[`REALMD.md`](../REALMD.md#configuration-env-only).

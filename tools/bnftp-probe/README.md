@@ -4,7 +4,7 @@ A clientless **BNFTP discovery client** — points at a real Battle.net server a
 dumps what it serves. BNFTP (protocol selector `0x02`) is *unauthenticated*: no
 CD-key, no SRP, no login. So with two CD-key-free steps we can pull a real
 server's version-check MPQ and compare its wire format against our own
-`src/realm/server/bnftp.zig`.
+`apps/realmd/bnftp.zig`.
 
 What it does:
 

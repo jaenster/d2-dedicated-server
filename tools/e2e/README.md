@@ -15,7 +15,7 @@ TCP — **no wine, no `Game.exe`**. Scenarios are assertion-rich and named.
   registers over the gs-link (AUTHREPLY + SETGSINFO + ADDRINFO) and answers
   CREATEGAME/JOINGAME with a configurable gameid; tracks `creates` / `joins`.
 - `net.zig` — libc TCP client + little-endian framing helpers (mirrors
-  `src/realm/server/net.zig`; the 0.16 `std.posix` socket wrappers were removed).
+  `apps/realmd/net.zig`; the 0.16 `std.posix` socket wrappers were removed).
 - `main.zig` — `minimalD2s` craft, the named scenarios, and the runner: optionally
   auto-starts its own `realmd` child, prints a summary, exits non-zero on failure.
 

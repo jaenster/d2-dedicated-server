@@ -76,7 +76,7 @@ that pops 0x1c, returns nonzero, and fills the out-param pointers.
 Method to get the rest: targeted capstone disasm of each call site (linear sweep
 of .text desyncs  -  disassemble per known caller function instead).
 
-### Shim generator  -  `src/runtime/fastcall.zig`
+### Shim generator  -  `apps/d2gs/runtime/fastcall.zig`
 `fastcall.Callback2(n_stack, impl)` generates a `callconv(.naked)` shim that
 adapts the engine's fastcall ABI (ECX, EDX + n_stack stack args) to a plain cdecl
 handler `fn (ecx, edx, s1..sN) callconv(.c) T`, with correct `add esp,(N+2)*4` +
@@ -96,4 +96,4 @@ Remaining refinement, not blockers:
 - Tighten `fpFindPlayerToken` validation against D2CS (currently accepts the engine's
   token-table lookup).
 - The `0xFF` control subtypes + the realmd<->GS framing are decoded enough for create/join;
-  see `src/realm/shared/` for the wire contract both ends import.
+  see `packages/realm-proto/` for the wire contract both ends import.

@@ -317,7 +317,7 @@ model {
       description 'Headless Game.exe + d2gs.dll under wine+Xvfb. Connects out to gslink (:6115), ADDRINFO self-reports <ip>:4000 + gsid + maxgame; serves game traffic on :4000. On k8s it is INTERNAL (registers its status.podIP:4000, no hostPort) with an in-process health endpoint on :8086 for the k8s probes.'
     }
 
-    // qqserver — a SEPARATE binary (src/realm/server/qqserver.zig): the cloud-native
+    // qqserver — a SEPARATE binary (apps/qqserver/main.zig): the cloud-native
     // game-traffic gateway. A QServer-of-QServers — one public :4000 that splices each
     // client connection through to the owning GS, so GS pods stay internal.
     qqserver = process 'qqserver (game gateway)' {

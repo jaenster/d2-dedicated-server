@@ -1,5 +1,5 @@
 //! Minimal libc TCP client + framing helpers for the clientless E2E harness.
-//! Mirrors src/realm/server/net.zig: the 0.16 std.posix socket wrappers were
+//! Mirrors packages/realm-infra/net.zig: the 0.16 std.posix socket wrappers were
 //! removed, so we call libc directly. No std.Thread.sleep / std.time on 0.16
 //! either — sleeps go through usleep.
 const std = @import("std");

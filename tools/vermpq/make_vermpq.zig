@@ -4,7 +4,7 @@
 //! Adds the (Authenticode-signed) CheckRevision DLL into a fresh MPQ under the
 //! name the client extracts (<mpq-basename>.dll), then applies the Blizzard WEAK
 //! signature (StormLib has the factored key built in) so the client's
-//! SFILE_VerifyFileSignature accepts it. See ../../src/realmd/assets/README.md.
+//! SFILE_VerifyFileSignature accepts it. See ../../apps/realmd/assets/README.md.
 //!
 //! Links StormLib (a C library); built by build.sh via `zig build-exe`.
 const std = @import("std");

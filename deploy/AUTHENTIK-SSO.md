@@ -1,7 +1,7 @@
 # Web UI behind Authentik SSO (nginx-ingress forward-auth)
 
 The realmd admin web UI is served on the **health/admin port (8080)** alongside the
-`/admin/*` JSON API. realmd authenticates it two ways (see `src/realm/server/admin.zig`):
+`/admin/*` JSON API. realmd authenticates it two ways (see `apps/realmd/admin.zig`):
 
 - **Account login** — a realm account listed in `REALMD_ADMINS`, by password. Always on.
 - **SSO forward-auth** — when `REALMD_TRUSTED_AUTH_HEADER` is set, realmd trusts that

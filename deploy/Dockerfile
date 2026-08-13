@@ -21,7 +21,8 @@ RUN curl -sSL https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG
       | tar -xJ -C /opt && ln -s /opt/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 WORKDIR /src
 COPY build.zig build.zig.zon ./
-COPY src ./src
+COPY apps ./apps
+COPY packages ./packages
 
 # ── build: realmd (static musl) ──────────────────────────────────────────────────
 # Node builds the admin web UI (webui/ → one self-contained index.html), which the
