@@ -130,6 +130,12 @@ fn nextToken() u32 {
 const Conn = struct {
     fd: net.Socket,
     server_token: u32,
+    // Outbound packets accumulate here and go out in one write; most requests answer with
+    // several (a channel join sends the join, the user list and the MOTD). Flushed before we
+    // block on read so the client never waits on bytes we hold, and by a `defer` on the
+    // handler so no exit path can strand them.
+    out: [8192]u8 = undefined,
+    out_len: usize = 0,
     client_token: u32 = 0,
     account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     account_len: u8 = 0,
@@ -192,14 +198,36 @@ fn startPacket(buf: []u8, id: u8) proto.Writer {
     w.putU16(0); // length placeholder, back-patched in finish()
     return w;
 }
+/// Push `bytes` into the connection's outbound buffer, flushing first if they will not fit.
+/// A single packet larger than the whole buffer goes straight out on its own.
+fn queue(c: *Conn, bytes: []const u8) void {
+    if (bytes.len > c.out.len) {
+        flushOut(c);
+        _ = net.writeAll(c.fd, bytes);
+        return;
+    }
+    if (c.out_len + bytes.len > c.out.len) flushOut(c);
+    @memcpy(c.out[c.out_len..][0..bytes.len], bytes);
+    c.out_len += bytes.len;
+}
+
+/// Write everything queued. Cheap to call when nothing is pending.
+fn flushOut(c: *Conn) void {
+    if (c.out_len == 0) return;
+    const n = c.out_len;
+    c.out_len = 0; // cleared first: a failed write must not leave bytes to be re-sent
+    _ = net.writeAll(c.fd, c.out[0..n]);
+}
+
 fn finish(c: *Conn, w: *proto.Writer) void {
     w.patchU16(2, @intCast(w.pos));
-    _ = net.writeAll(c.fd, w.slice());
+    queue(c, w.slice());
 }
 
 pub fn handle(fd: net.Socket, tag: []const u8) void {
     _ = obs.startTrace(); // one trace per client connection — every line on this thread carries it
     var c = Conn{ .fd = fd, .server_token = nextToken() };
+    defer flushOut(&c); // no exit path may strand queued packets
     log.line(tag, "client connected", .{});
 
     var acc: [16384]u8 = undefined;
@@ -207,6 +235,9 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     var got_proto = false;
 
     while (true) {
+        // Answers go out before we wait for the next request; the client must never be
+        // blocked on bytes sitting in our buffer.
+        flushOut(&c);
         const n = net.readSome(fd, acc[len..]);
         if (n == 0) break;
         len += n;
@@ -557,7 +588,7 @@ fn buildChatEvent(buf: []u8, eid: u32, flags: u32, username: []const u8, text: [
 fn sendEvent(c: *Conn, eid: u32, flags: u32, username: []const u8, text: []const u8) void {
     var buf: [512]u8 = undefined;
     const bytes = buildChatEvent(&buf, eid, flags, username, text);
-    _ = net.writeAll(c.fd, bytes);
+    queue(c, bytes);
 }
 
 /// `username` is what goes on the wire (the `clan*charname` the channel list draws from);
@@ -1008,7 +1039,7 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: FriendCmd) void {
 }
 
 fn onQueryRealms(c: *Conn, tag: []const u8) void {
-    log.line(tag, "query realms -> {s}", .{realm_name});
+    if (trace_packets) log.line(tag, "query realms -> {s}", .{realm_name});
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_QUERYREALMS2);
     w.putU32(0); // unknown
@@ -1026,7 +1057,9 @@ fn onLogonRealm(c: *Conn, tag: []const u8, body: []const u8) void {
     const title = r.getStr();
 
     const acct = c.accountName();
-    log.line(tag, "realm logon: parsed token=0x{x} title='{s}' acct='{s}' (minting session)", .{ c.client_token, title, acct });
+    // Field-level detail for protocol work; the line below reports the same logon with the
+    // session id.
+    if (trace_packets) log.line(tag, "realm logon: parsed token=0x{x} title='{s}' acct='{s}' (minting session)", .{ c.client_token, title, acct });
     const sid = state.global.mintSession(acct);
     const cookie = nextToken();
     log.line(tag, "realm logon account={s} realm={s} session={d}", .{ acct, title, sid });
@@ -1232,7 +1265,7 @@ fn adId() u32 {
 
 fn onCheckAd(c: *Conn, tag: []const u8) void {
     if (ad_file.len == 0 or ad_url.len == 0) {
-        log.line(tag, "checkad -> no ad configured (set REALMD_AD_FILE + REALMD_AD_URL)", .{});
+        // Silent: every client asks on every login, and main() already reports a configured ad.
         return; // no reply at all: the client just keeps whatever it has
     }
     var buf: [512]u8 = undefined;

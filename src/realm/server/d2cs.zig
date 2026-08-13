@@ -136,6 +136,11 @@ fn mintToken() u16 {
 
 const DConn = struct {
     fd: net.Socket,
+    // Outbound packets accumulate here and leave in one write: the game list sends one packet
+    // PER GAME plus a terminator, so browsing a busy realm cost a syscall per listed game.
+    // Flushed before we block on read, and by a `defer` so no exit path can strand them.
+    out: [16384]u8 = undefined,
+    out_len: usize = 0,
     session: u64 = 0,
     account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     account_len: u8 = 0,
@@ -166,9 +171,30 @@ fn startPacket(buf: []u8, id: u8) proto.Writer {
     w.putU8(id);
     return w;
 }
+/// Push `bytes` into the connection's outbound buffer, flushing first if they will not fit.
+/// A packet larger than the whole buffer goes straight out on its own.
+fn queue(c: *DConn, bytes: []const u8) void {
+    if (bytes.len > c.out.len) {
+        flushOut(c);
+        _ = net.writeAll(c.fd, bytes);
+        return;
+    }
+    if (c.out_len + bytes.len > c.out.len) flushOut(c);
+    @memcpy(c.out[c.out_len..][0..bytes.len], bytes);
+    c.out_len += bytes.len;
+}
+
+/// Write everything queued. Cheap to call when nothing is pending.
+fn flushOut(c: *DConn) void {
+    if (c.out_len == 0) return;
+    const n = c.out_len;
+    c.out_len = 0; // cleared first: a failed write must not leave bytes to be re-sent
+    _ = net.writeAll(c.fd, c.out[0..n]);
+}
+
 fn finish(c: *DConn, w: *proto.Writer) void {
     w.patchU16(0, @intCast(w.pos));
-    _ = net.writeAll(c.fd, w.slice());
+    queue(c, w.slice());
 }
 
 /// Standalone listener entry (the dedicated d2cs port): the leading 0x01 protocol
@@ -186,6 +212,7 @@ pub fn handleFrom(fd: net.Socket, tag: []const u8, initial: []const u8) void {
 
 fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: bool) void {
     var c = DConn{ .fd = fd };
+    defer flushOut(&c); // no exit path may strand queued packets
     log.line(tag, "client connected", .{});
 
     var acc: [16384]u8 = undefined;
@@ -225,6 +252,8 @@ fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: b
             log.line(tag, "oversized packet, dropping connection", .{});
             return;
         }
+        // Everything answered so far goes out before we wait for the next request.
+        flushOut(&c);
         const n = net.readSome(fd, acc[len..]);
         if (n == 0) break;
         len += n;
@@ -588,7 +617,14 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // 1 player: the creator. That seed and the join-time bump below are guesses that keep
     // the list responsive before the game exists on the GS; once it does, the GS's own
     // UPDATEGAMEINFO overwrites them with the count that also goes back down.
-    _ = state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc);
+    // Without the record the game exists on the GS but nowhere the realm can find it, and the
+    // client's very next packet is a JOINGAME for this name — which would come back "game does
+    // not exist" right after we reported success. Fail the create instead; the GS reaps the
+    // orphaned empty game on its own idle timer.
+    if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc)) {
+        log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it", .{ name, rr.gameid });
+        return fail(c, &w, CREATE_ERROR_GENERIC);
+    }
     state.global.noteGameCreated(rr.gameid); // starts the clock the detail panel counts from
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
