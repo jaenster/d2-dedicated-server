@@ -363,7 +363,15 @@ const Gateway = struct {
 
     fn closeConn(g: *Gateway, c: *Conn) void {
         if (c.c2g_bytes != 0 or c.g2c_bytes != 0 or c.gs >= 0)
-            log.line("qq", "conn closed: client->GS={d}B GS->client={d}B (cli_eof={} gs_eof={})", .{ c.c2g_bytes, c.g2c_bytes, c.cli_eof, c.gs_eof });
+            // `greeted` is what makes a failed join readable. A join that dies leaves zero bytes
+            // going back to the client whether the GS never accepted the connection, accepted it
+            // and died, or greeted us and then refused the GAMELOGON in silence — three different
+            // faults in three different processes that print the same line without it. The engine
+            // greets unprompted the moment it accepts, so seeing the greeting places the failure
+            // after the accept and nowhere else.
+            log.line("qq", "conn closed: client->GS={d}B GS->client={d}B (cli_eof={} gs_eof={} greeted={})", .{
+                c.c2g_bytes, c.g2c_bytes, c.cli_eof, c.gs_eof, c.gs_greeted,
+            });
         if (c.cli >= 0) _ = close(c.cli);
         if (c.gs >= 0) _ = close(c.gs);
         if (c.c2g >= 0) g.poolRelease(@intCast(c.c2g));
@@ -732,12 +740,18 @@ const Gateway = struct {
     }
 
     fn serviceConnecting(g: *Gateway, c: *Conn, re: i16) void {
+        // Say so. A game server that will not take the connection is the one failure the client
+        // cannot see any other way — it is answered by nothing at all, exactly like a game that
+        // was never created, and blaming it on the realm costs an afternoon.
         if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
+            log.line("qq", "the GS refused the connection (errno {d}) — the client is dropped", .{connectResult(c.gs)});
             g.closeConn(c);
             return;
         }
         if (re & posix.POLL.OUT == 0) return;
-        if (connectResult(c.gs) != 0) {
+        const err = connectResult(c.gs);
+        if (err != 0) {
+            log.line("qq", "could not connect to the GS: errno {d} — the client is dropped", .{err});
             g.closeConn(c);
             return;
         }

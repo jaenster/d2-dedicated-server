@@ -59,7 +59,82 @@ fn b4Intercept() callconv(.naked) void {
     );
 }
 
+// ── which gate of IsValidChecks refused a GAMELOGON ──────────────────────────
+//
+// The 0xB4 hook above only sees refusals that got as far as SrvJoinAct. Everything
+// NET_D2GS_SERVER_IsValidChecks @0x52c690 turns away never reaches it: each of its checks
+// branches to one shared reject label that returns zero through GuardStack, so the client is
+// simply never answered. Eight checks share that label, which makes "the join was refused"
+// the only fact available and none of them tell you which one it was.
+//
+// So intercept the four that are calls (the other four are inline compares on the character's
+// class, language and name, which are the same on every attempt by the same client) and say
+// which one said no. Each intercept runs the engine's own check and reports only when it fails,
+// so an accepted join costs one jump.
+const NAME_LEN_CALLSITE: usize = 0x0052c6d5; // ECX=szCharName, EDX=16 -> length is within bounds
+const STRING_LENGTH_CHECK: usize = 0x0053efc0;
+const NAME_BY_ID_CALLSITE: usize = 0x0052c6fe; // ECX=nClientId -> the connection has a name
+const GET_PLAYER_NAME_BY_CLIENT_ID: usize = 0x00538b70;
+const TOKEN_VALID_CALLSITE: usize = 0x0052c717; // ECX=nGameToken -> this server has that game
+const SERVER_IS_TOKEN_VALID: usize = 0x0052c060;
+const NAME_CHARS_CALLSITE: usize = 0x0052c72d; // EDX=szCharName, EDI=16 -> no forbidden characters
+const CHECK_FORBIDDEN_CHARS: usize = 0x0052c5b0;
+
+fn refusedName(name_ptr: usize) callconv(.c) void {
+    log.cstr("realm: JOIN REFUSED by IsValidChecks — name length: ", name_ptr);
+}
+
+fn refusedNoNameForClient(client_id: usize) callconv(.c) void {
+    log.hex("realm: JOIN REFUSED by IsValidChecks — no name for clientId=0x", client_id);
+}
+
+fn refusedToken(token: usize) callconv(.c) void {
+    log.hex("realm: JOIN REFUSED by IsValidChecks — this server has no game token=0x", token);
+}
+
+fn refusedChars(name_ptr: usize) callconv(.c) void {
+    log.cstr("realm: JOIN REFUSED by IsValidChecks — forbidden characters in ", name_ptr);
+}
+
+/// Build an intercept for one gate: call the engine's check unchanged, and on a zero result hand
+/// `reg` to `report` before returning that same zero. EAX is the check's own return, so it is
+/// saved across the report; ECX and EDX are dead at all four call sites and EBX/ESI/EDI/EBP are
+/// preserved by the reporting function's own calling convention.
+fn gate(comptime orig: usize, comptime report: anytype, comptime reg: []const u8) fn () callconv(.naked) void {
+    return struct {
+        fn shim() callconv(.naked) void {
+            asm volatile ("mov %[o], %%eax\n call *%%eax\n test %%eax, %%eax\n jnz 1f\n push %%eax\n push " ++ reg ++ "\n call %[r:P]\n add $4, %%esp\n pop %%eax\n 1:\n ret"
+                :
+                : [o] "i" (orig),
+                  [r] "X" (report),
+            );
+        }
+    }.shim;
+}
+
+const nameLenGate = gate(STRING_LENGTH_CHECK, &refusedName, "%%esi");
+const nameByIdGate = gate(GET_PLAYER_NAME_BY_CLIENT_ID, &refusedNoNameForClient, "%%edi");
+const tokenGate = gate(SERVER_IS_TOKEN_VALID, &refusedToken, "%%ebx");
+const nameCharsGate = gate(CHECK_FORBIDDEN_CHARS, &refusedChars, "%%esi");
+
+fn hookGates() void {
+    var ok = true;
+    inline for (.{
+        .{ NAME_LEN_CALLSITE, &nameLenGate },
+        .{ NAME_BY_ID_CALLSITE, &nameByIdGate },
+        .{ TOKEN_VALID_CALLSITE, &tokenGate },
+        .{ NAME_CHARS_CALLSITE, &nameCharsGate },
+    }) |g| {
+        if (!patch.MemoryPatch(g[0]).call(@intFromPtr(g[1])).commit()) ok = false;
+    }
+    log.print(if (ok)
+        "joindiag: IsValidChecks gates hooked (a silent refusal now names its check)"
+    else
+        "joindiag: FAILED to hook the IsValidChecks gates — refusals stay silent");
+}
+
 pub fn install() void {
+    hookGates();
     if (patch.MemoryPatch(B4_CALLSITE).call(@intFromPtr(&b4Intercept)).commit()) {
         log.print("joindiag: ConnectionRefused hook installed (logs nReason)");
     } else {
