@@ -602,13 +602,15 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
             log.line(tag, "create game '{s}' -> name already exists (GS refused; lost the race)", .{name});
             return fail(c, &w, CREATE_NAME_TAKEN);
         }
-        // Nothing to do with the name. Say WHICH of the two it was: a fleet with no room
-        // left is an operational signal (add GS capacity), a refusal is a fault. The client
-        // gets the same code either way — "server down" is the only one of its three that
-        // fits "no server took your game" — but the log should not blur them.
+        // Nothing to do with the name. Say WHICH of the two it was in the LOG: a fleet with no
+        // room left is an operational signal (add GS capacity), a refusal is a fault. The client
+        // gets the same code either way — "server down" is the only one of its three that fits
+        // "no server took your game", and a fleet that is merely busy is not an error to report
+        // as one. The distinction that matters to a player is none; the one that matters to
+        // whoever runs the realm is in the line above.
         if (gslink.last_create_failure == .all_full) {
             log.line(tag, "create game '{s}' -> every GS is at its game limit (fleet is full)", .{name});
-            return fail(c, &w, CREATE_ERROR_GENERIC);
+            return fail(c, &w, CREATE_SERVER_DOWN);
         }
         log.line(tag, "create game '{s}' -> GS refused", .{name});
         return fail(c, &w, CREATE_SERVER_DOWN);
