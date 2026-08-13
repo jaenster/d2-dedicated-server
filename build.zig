@@ -53,17 +53,18 @@ pub fn build(b: *std.Build) void {
     // d2-formats is the clean-room 1.14d file formats — the realm's .d2s handling comes from
     // there rather than a second copy in this repo, because the header layout, the checksum and
     // the fresh-character writer are all already modelled there and two implementations of a byte
-    // format is one more than can stay correct. d2-util is the D2GS wire Huffman codec and its
-    // packet framing, for the same reason.
+    // format is one more than can stay correct.
     const libd2 = b.dependency("libd2", .{ .target = host, .optimize = optimize });
     const d2_formats = libd2.module("d2-formats");
-    const d2_util = libd2.module("d2-util");
 
-    // The three BNCS logon primitives (broken-SHA-1 password hash, version check, CD-key
-    // decode). std-only, so the version-check DLL can import the same code realmd verifies with.
-    const bncs_auth = b.addModule("bncs_auth", .{
-        .root_source_file = b.path("packages/bncs-auth/bncs_auth.zig"),
-    });
+    // d2-bnet is the Battle.net protocol: the broken-SHA-1 password hash, the version
+    // check, the CD-key decode, and the chat/realm message vocabulary they travel in. It lives
+    // there and not here because a realm server is not its only consumer — the clientless
+    // harnesses need the same hashes, and so does the version-check DLL below, which is why the
+    // module is taken twice: libd2's packages bind their target, and that DLL is not this host.
+    const d2_bnet = libd2.module("d2-bnet");
+    const libd2_win = b.dependency("libd2", .{ .target = target, .optimize = optimize });
+    const d2_bnet_win = libd2_win.module("d2-bnet");
 
     // The concrete persistence backends (fs/redis/pg) behind the store facade, imported by
     // realmd. Includes the Postgres client, so the pg dependency lives here (lazy, only fetched
@@ -125,7 +126,7 @@ pub fn build(b: *std.Build) void {
     realmd.root_module.addImport("realm_proto", realm_proto);
     realmd.root_module.addImport("realm_infra", realm_infra);
     realmd.root_module.addImport("realm_store", realm_store);
-    realmd.root_module.addImport("bncs_auth", bncs_auth);
+    realmd.root_module.addImport("d2_bnet", d2_bnet);
     realmd.root_module.addImport("d2_formats", d2_formats);
 
     // Web UI: -Dwebui=true builds webui/ (Vite + React → one self-contained
@@ -186,7 +187,7 @@ pub fn build(b: *std.Build) void {
     realm_tests.root_module.addImport("realm_proto", realm_proto);
     realm_tests.root_module.addImport("realm_infra", realm_infra);
     realm_tests.root_module.addImport("realm_store", realm_store);
-    realm_tests.root_module.addImport("bncs_auth", bncs_auth);
+    realm_tests.root_module.addImport("d2_bnet", d2_bnet);
     realm_tests.root_module.addImport("d2_formats", d2_formats);
     test_step.dependOn(&b.addRunArtifact(realm_tests).step);
 
@@ -204,11 +205,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(qq_tests).step);
 
     // The packages: realm_infra's lock/logger/config, realm_store's RESP codec and fs backend,
-    // and the BNCS auth vectors (each verified against a real 1.14d client; no real keys here).
+    // and realm_proto's wire types.
     inline for (.{
         .{ "packages/realm-infra/realm_infra.zig", true, false },
         .{ "packages/realm-store/realm_store.zig", true, true },
-        .{ "packages/bncs-auth/bncs_auth.zig", false, false },
         .{ "packages/realm-proto/realm_proto.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
@@ -229,18 +229,6 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     }
 
-    // D2GS Huffman codec unit tests (the clientless game-protocol decoder, reconstructed
-    // from Game.exe's static table — verified against a real captured GS frame).
-    const huffman_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/e2e/huffman_vectors.zig"),
-            .target = host,
-            .optimize = optimize,
-        }),
-    });
-    huffman_tests.root_module.addImport("d2_util", d2_util);
-    test_step.dependOn(&b.addRunArtifact(huffman_tests).step);
-
     // ── tools ────────────────────────────────────────────────────────────────────
 
     // ver-IX86-1.dll — the CheckRevision module packed into the version-check MPQ realmd serves
@@ -254,7 +242,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    checkrev.root_module.addImport("bncs_auth", bncs_auth);
+    checkrev.root_module.addImport("d2_bnet", d2_bnet_win);
     // Module-definition file: export `CheckRevision` UNDECORATED (ordinal 1) so the
     // client's GetProcAddress("CheckRevision") resolves it (stdcall would otherwise
     // mangle it to CheckRevision@28).
@@ -274,7 +262,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    e2e.root_module.addImport("bncs_auth", bncs_auth);
+    e2e.root_module.addImport("d2_bnet", d2_bnet);
     const run_e2e = b.addRunArtifact(e2e);
     run_e2e.step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
     run_e2e.step.dependOn(&b.addInstallArtifact(qqserver, .{}).step); // qqserver_routing spawns it
@@ -290,7 +278,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const realmclient = b.createModule(.{ .root_source_file = b.path("tools/e2e/realmclient.zig") });
-    realmclient.addImport("bncs_auth", bncs_auth);
+    realmclient.addImport("d2_bnet", d2_bnet);
     gamestress_mod.addImport("realmclient", realmclient);
     const gamestress = b.addExecutable(.{ .name = "gamestress", .root_module = gamestress_mod });
     const run_gamestress = b.addRunArtifact(gamestress);
@@ -313,7 +301,7 @@ pub fn build(b: *std.Build) void {
     b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
 
     // checkrev-probe — clientless BNCS *version-check* client (selector 0x01): runs
-    // SID_AUTH_INFO -> compute response (the same bncs_auth the DLL uses) -> SID_AUTH_CHECK
+    // SID_AUTH_INFO -> compute response (the same d2-bnet the DLL uses) -> SID_AUTH_CHECK
     // against a real bnet and prints the result code. Separate from BNFTP.
     const crprobe = b.addExecutable(.{
         .name = "checkrev-probe",
@@ -324,7 +312,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    crprobe.root_module.addImport("bncs_auth", bncs_auth);
+    crprobe.root_module.addImport("d2_bnet", d2_bnet);
     b.installArtifact(crprobe);
     const run_crprobe = b.addRunArtifact(crprobe);
     if (b.args) |args| run_crprobe.addArgs(args);

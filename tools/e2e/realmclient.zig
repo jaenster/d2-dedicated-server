@@ -3,7 +3,7 @@
 //! tools/e2e/realmclient.py; the Python encodes the exact wire formats.
 const std = @import("std");
 const net = @import("net.zig");
-const xsha1 = @import("bncs_auth").xsha1;
+const xsha1 = @import("d2_bnet").xsha1;
 const Socket = net.Socket;
 
 // Ports the harness's own realmd listens on. Overridable as a block via E2E_PORT_BASE

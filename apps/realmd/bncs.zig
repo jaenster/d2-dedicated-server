@@ -17,7 +17,7 @@ const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
 const obs = @import("realm_infra").obs;
 const proto = @import("proto.zig");
-const protocol = @import("bncs_protocol.zig");
+const protocol = @import("d2_bnet").protocol;
 const state = @import("state.zig");
 const bnftp = @import("bnftp.zig");
 const d2cs = @import("d2cs.zig");
@@ -28,7 +28,7 @@ const guilds = @import("guilds.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds, for the banner-ad FILETIME
 const guild = @import("realm_proto").guild;
-const xsha1 = @import("bncs_auth").xsha1;
+const xsha1 = @import("d2_bnet").xsha1;
 
 // Set by main() before serving.
 pub var realm_name: []const u8 = "TypeGuru";

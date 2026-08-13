@@ -19,8 +19,8 @@
         // every image build since the path landed failed on it. A pin also makes the version a
         // deliberate commit here rather than whatever happens to be checked out next door.
         .libd2 = .{
-            .url = "git+https://github.com/jaenster/libd2#e6cdc4927c6180be8dd309b0423b470f64f1fc6c",
-            .hash = "libd2-0.1.0-wboU7csTggEHHS42lawMTtPHOLOI4c9C7AaLwze6BZKc",
+            .url = "git+https://github.com/jaenster/libd2#9b612b71e7186210b5f361b6afeb27eeb6b38b5f",
+            .hash = "libd2-0.1.0-wboU7dFjogEKIOJ29IX3haYNLU76kxH2MVNMlaRgp9Bw",
         },
     },
     .paths = .{""},

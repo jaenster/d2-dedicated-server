@@ -22,7 +22,7 @@
 //! file version (VERSION.dll) and the signature gate (WinVerifyTrust).
 const std = @import("std");
 const win = std.os.windows;
-const core = @import("bncs_auth").checkrev;
+const core = @import("d2_bnet").checkrev;
 
 extern "kernel32" fn GetModuleFileNameW(m: ?win.HMODULE, buf: [*]u16, n: u32) callconv(.winapi) u32;
 extern "version" fn GetFileVersionInfoSizeW(f: [*:0]const u16, h: ?*u32) callconv(.winapi) u32;
