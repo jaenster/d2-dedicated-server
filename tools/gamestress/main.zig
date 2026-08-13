@@ -13,6 +13,13 @@ pub fn main() !void {
     const acct: []const u8 = if (getenv("GS_ACCT")) |a| std.mem.span(a) else "StressGuy";
     const hold: c_uint = if (getenv("GS_HOLD_MS")) |h| (std.fmt.parseInt(c_uint, std.mem.span(h), 10) catch 0) else 0;
 
+    // Same escape hatch the e2e harness has: without it this connects to whatever is on 6112,
+    // which on a dev box is usually someone's live realm rather than the one under test.
+    if (getenv("E2E_PORT_BASE")) |b| {
+        const base = std.fmt.parseInt(u16, std.mem.span(b), 10) catch 0;
+        if (base != 0) rc.setPortBase(base);
+    }
+
     var c = rc.RealmClient{};
     defer c.close();
     try c.connectBnet();
@@ -36,7 +43,11 @@ pub fn main() !void {
     const jg = try c.joinGame("smoke");
     std.debug.print("join   'smoke' -> token={d} result={d} gs={d}.{d}.{d}.{d}\n", .{ jg.token, jg.result, jg.ip[0], jg.ip[1], jg.ip[2], jg.ip[3] });
 
-    const n: usize = 5;
+    // GS_GAMES / GS_DELAY_MS: five creates 1.5s apart keeps the 5s reaper in the loop, which is
+    // the reaper regression. Testing the pool ceiling wants the opposite — more games than the
+    // engine's seven, created faster than any reap window — so both are tunable.
+    const n: usize = if (getenv("GS_GAMES")) |g| (std.fmt.parseInt(usize, std.mem.span(g), 10) catch 5) else 5;
+    const delay_ms: c_uint = if (getenv("GS_DELAY_MS")) |d| (std.fmt.parseInt(c_uint, std.mem.span(d), 10) catch 1500) else 1500;
     var ok: usize = 0;
     var fail: usize = 0;
     var i: usize = 0;
@@ -50,7 +61,7 @@ pub fn main() !void {
             std.debug.print("[{d}/{d}] create {s} -> ERROR {s}\n", .{ i + 1, n, name, @errorName(e) });
             fail += 1;
         }
-        _ = usleep(1_500_000); // 1.5s between creates so the 5s reaper keeps up
+        _ = usleep(delay_ms * 1000);
     }
     std.debug.print("\nstress done: {d} created ok, {d} failed (of {d})\n", .{ ok, fail, n });
 }

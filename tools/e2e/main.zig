@@ -10,7 +10,7 @@ const FakeGS = @import("fakegs.zig").FakeGS;
 // libc process control. The 0.16 std.process.spawn API requires an Io instance
 // + Environ.Map; we call fork/execve/kill/waitpid directly instead — same
 // "talk to libc, skip the churny std wrappers" approach net.zig takes for
-// sockets. getenv mirrors src/realm/server/config.zig.
+// sockets. getenv mirrors packages/realm-infra/config.zig.
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn fork() c_int;
 extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
@@ -1570,7 +1570,12 @@ fn maybeStartRealmd() !?c_int {
     }
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
-    const health = envOr("REALMD_HEALTH_PORT", "18080");
+    // The child has to be told the SAME health port the scenarios above will ask on. That is
+    // HEALTH_PORT, which E2E_PORT_BASE has already moved — so defaulting this to a literal 18080
+    // meant the base override started a child that tried to bind whatever else owned 18080,
+    // failed, and left every scenario reporting ConnectFailed as though the server were broken.
+    var health_buf: [8]u8 = undefined;
+    const health = envOr("REALMD_HEALTH_PORT", std.fmt.bufPrintZ(&health_buf, "{d}", .{HEALTH_PORT}) catch "18080");
     // Fresh data dir each run — accounts/chars/games persist otherwise and break
     // isolation (e.g. a re-created account would already exist on the 2nd run).
     var rmbuf: [512]u8 = undefined;
