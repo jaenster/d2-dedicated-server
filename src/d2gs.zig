@@ -130,16 +130,25 @@ fn fnv1a(s: []const u8) u32 {
     return h;
 }
 
-/// A stable per-GS id for the fleet: hash of the pod/host name (unique per k8s pod),
-/// falling back to the public ip:port if the name is unavailable.
+/// A stable per-GS id for the fleet: hash of the pod/host name together with the game port
+/// this GS owns.
+///
+/// Must be stable across restarts (realmd indexes live games by gsid) AND distinct per GS.
+/// The host name alone is only the first: two GS processes on one machine hash identically and
+/// realmd's registry is keyed by gsid, so the second to register silently replaces the first.
+/// The port is what separates them and is equally stable.
 fn computeGsId() u32 {
-    var buf: [256]u8 = undefined;
-    var sz: DWORD = @intCast(buf.len);
-    if (GetComputerNameA(&buf, &sz).toBool() and sz > 0) return fnv1a(buf[0..sz]);
-    var fb: [6]u8 = undefined;
-    fb[0..4].* = gs_public_ip;
-    std.mem.writeInt(u16, fb[4..6], gs_public_port, .little);
-    return fnv1a(&fb);
+    var buf: [264]u8 = undefined;
+    var sz: DWORD = 256;
+    var n: usize = 0;
+    if (GetComputerNameA(&buf, &sz).toBool() and sz > 0) {
+        n = sz;
+    } else {
+        buf[0..4].* = gs_public_ip; // no host name to be had — the address identifies us instead
+        n = 4;
+    }
+    std.mem.writeInt(u16, buf[n..][0..2], gs_public_port, .little);
+    return fnv1a(buf[0 .. n + 2]);
 }
 
 /// Matches `--flag` anywhere in the command line (token-aware).
@@ -369,6 +378,9 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // Let the host reach a stable post-init state. TODO: replace this fixed
     // delay with a hook on the engine's init-complete point (VERIFY.md #4).
     log.print("d2gs: server thread up; waiting for engine init...");
+    // This thread runs the engine tick, so its EIP is where the server's time goes. Opt-in:
+    // sampling suspends the tick thread.
+    if (hasFlag("eipprof")) eipprof.installHere();
     health.start(); // HTTP health endpoint up now — answers 503 until the tick loop beats
     Sleep(3000);
 
