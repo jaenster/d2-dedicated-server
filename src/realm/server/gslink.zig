@@ -19,7 +19,7 @@ const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
 const obs = @import("realm_infra").obs;
 const state = @import("state.zig");
-const Spinlock = @import("realm_infra").lock.Spinlock;
+const Lock = @import("realm_infra").lock.Lock;
 const p = @import("realm_shared").protocol;
 
 extern "c" fn usleep(usec: c_uint) c_int;
@@ -57,8 +57,8 @@ const Gs = struct {
     in_use: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // slot claimed
     registered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // ADDRINFO seen → can host
 
-    send_lock: Spinlock = .{}, // serialise writes to this GS fd
-    req_lock: Spinlock = .{}, // one create/join in flight to this GS
+    send_lock: Lock = .{}, // serialise writes to this GS fd
+    req_lock: Lock = .{}, // one create/join in flight to this GS
     reply_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reply_result: u32 = 1,
     reply_gameid: u32 = 0,
@@ -74,7 +74,7 @@ const Gs = struct {
 
 const GsRegistry = struct {
     entries: [max_gs]Gs = [_]Gs{.{}} ** max_gs,
-    lock: Spinlock = .{},
+    lock: Lock = .{},
 
     /// Claim a free slot for a new connection (fields reset by the caller).
     fn alloc(self: *GsRegistry) ?*Gs {
@@ -329,15 +329,22 @@ const Result = struct { ok: bool, gameid: u32, result: u32 = 1 };
 const proto_create_name_taken: u32 = p.CREATE_NAME_TAKEN;
 const proto_create_server_full: u32 = p.CREATE_SERVER_FULL;
 
+const REPLY_TIMEOUT_US: u64 = 5_000_000;
+
 fn awaitReply(g: *Gs) Result {
-    // Poll the reply flag the control thread sets. Game create/join is rare and
-    // latency-tolerant, so a short polling wait beats wrestling with condvars.
-    var spins: usize = 0;
-    while (spins < 5000) : (spins += 1) { // ~5s at 1ms
+    // Poll the reply flag the control thread sets — 0.16 has no condvar outside Io, and a
+    // create/join is rare enough that polling is fine. The interval matters: this runs while
+    // holding req_lock, and a flat 1 ms woke the thread 5000 times for a GS that never
+    // answered. Poll tightly at first (a healthy GS answers in ms) then back off.
+    var waited_us: u64 = 0;
+    var nap: c_uint = 200;
+    while (waited_us < REPLY_TIMEOUT_US) {
         if (g.reply_done.load(.acquire)) {
             return .{ .ok = g.reply_result == 0, .gameid = g.reply_gameid, .result = g.reply_result };
         }
-        _ = usleep(1000); // 1ms
+        _ = usleep(nap);
+        waited_us += nap;
+        if (nap < 10_000) nap *= 2;
     }
     return .{ .ok = false, .gameid = 0, .result = 1 };
 }
