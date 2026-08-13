@@ -28,6 +28,7 @@ const roominit = @import("runtime/roominit.zig");
 const gameloop = @import("runtime/gameloop.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const rejoin = @import("runtime/rejoin.zig");
+const eipprof = @import("runtime/eipprof.zig");
 const poolstat = @import("runtime/poolstat.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
 const realmgw = @import("runtime/realmgw.zig");
