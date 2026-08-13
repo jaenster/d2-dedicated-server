@@ -13,8 +13,8 @@ server replaces **PvPGN**, so the **unmodified retail client** logs in and plays
 with no client mods.
 
 > **Status: a real 1.14d client logs into the realm, creates/joins a game on the headless
-> server, and the character spawns in-world -- including two clients in the same game
-> (multiplayer).** See [Status](#status).
+> server, and the character spawns in-world -- including a full eight-player party, and
+> characters leaving one game and entering the next all evening.** See [Status](#status).
 
 Built for **containers and Kubernetes**. The Windows `Game.exe` runs under wine with no GUI or
 display; the realm and gateway are few-MB static binaries that contain no game files. State
@@ -201,10 +201,19 @@ empty game is destroyed after an idle window (`--reap-ms`, default 5s), so a ser
 *throughput* ceiling of roughly `7 / window` new games per second.
 
 That ceiling is per process, so **capacity scales by adding game servers, not by tuning one**.
-Measured with a load that creates three games per round, back to back: one server manages 2 of 8
-rounds before it starts refusing; two servers manage 8 of 8, with the games split 13/12 by
-realmd's least-loaded routing. Refusals are clean -- realmd parks a full server and tries the
-next, and the client is told the realm is busy rather than being dropped.
+Measured with eight characters running games back to back -- half of them re-entering one shared
+game, half churning their own -- one server places 22 of 32 games per round and a second takes it
+to 29. Every refusal is clean and says the same thing: realmd parks a full server, tries the next,
+and tells the client the realm is busy rather than dropping it.
+
+**There is no per-address limit at the game port.** The engine has one -- eight concurrent
+connections from an address, then a ban past twenty in fifteen seconds -- and it is right for a
+server players dial directly and wrong for this one, because every client arrives through
+qqserver and the engine sees a single peer address for the whole realm. Stock, that caps the
+server at eight connections and then bans its own gateway; worse, it refuses by accepting the
+connection and closing it without a byte, so the client waits at a loading screen with nothing to
+read. The dedicated bootstrap turns it off. Per-address abuse control belongs at the gateway,
+which is the only peer that can still tell clients apart.
 
 ## Build
 
@@ -212,6 +221,10 @@ next, and the client is told the realm is busy rather than being dropped.
 zig build     # -> zig-out/bin/{dbghelp.dll, d2gs.dll, ver-IX86-1.dll}  (x86-windows)
               #    + zig-out/bin/{realmd, qqserver}  (native host binaries)
 ```
+
+Nothing to check out beside it: the clean-room 1.14d core ([libd2](https://github.com/jaenster/libd2))
+is pinned by URL in `build.zig.zon`, so a bare clone of this repo builds, and which version it was
+built against is a commit here rather than whatever happens to be on your disk.
 
 ## Deploy
 
@@ -419,6 +432,8 @@ Passed to `Game.exe`, read by our DLLs.
 | `--d2dbs <ip:port>` | fetch character saves from realmd's d2dbs (overrides `--realmd`) |
 | `--gs-addr <ip:port>` | public address clients dial for this GS's games (self-reported to realmd). Env: `D2GS_GS_ADDR` |
 | `--max-games <n>` | capacity this GS advertises to realmd. Env: `D2GS_MAX_GAMES` |
+| `--reap-ms <n>` | how long an empty game is kept before it is destroyed (default 5000). Also this server's throughput ceiling -- see [How many games per server](#how-many-games-per-server). Env: `D2GS_REAP_MS` |
+| `--realm-gw <ip>` | (client) point the game's bnet gateway list at your realm instead of Blizzard's |
 
 **Feature toggles** (off by default unless noted):
 
@@ -444,6 +459,12 @@ Passed to `Game.exe`, read by our DLLs.
 | `--screenshot` | (client) take a screenshot every 3s (headed debugging) |
 | `--pkttrace` | log every `:4000` client/GS packet id (verbose) |
 | `--suppress-halts` | swallow engine asserts instead of exiting (debugging) |
+| `--eipprof` | sample every thread's program counter from inside the process and report the hot engine addresses. No host profiler can see them: the 32-bit guest runs translated under wine, so a host sampler only ever sees the translator. Not for a live realm |
+| `--memdiag` | report the engine's working set per bootstrap step |
+| `--test-enter` | drive the server into a game on its own, with no client (DRLG capture) |
+| `--fetch-char <acct:char>` / `--create-char` | exercise the d2dbs character fetch / creation paths |
+| `--d2bs` | inject D2BS after the game window exists (kolbot on a stock client) |
+| `--dump-cdkeys` | print the decoded classic/expansion CD-key globals |
 
 ## Layout
 
@@ -491,11 +512,27 @@ Other docs: [`REALM.md`](REALM.md), [`REALMD.md`](REALMD.md), [`VERIFY.md`](VERI
 - Create + join a game dispatched to the headless GS.
 - **Character spawns in-world** (loaded from d2dbs, full life/mana, playable).
 - **Multiplayer**: two real clients in one game, visible to each other.
+- **A full party**: eight characters entering one game together, repeatedly, in lockstep. A ninth
+  is turned away with the engine's own answer rather than silence.
 - **A fleet**: two game servers registered to one realm, games routed to the least loaded, each
-  client spliced to the server that owns its game. 24 games back to back, no failures.
+  client spliced to the server that owns its game.
+- **The whole game lifecycle, not just the first game.** One realm login, a character creating a
+  game, playing, leaving, and making or re-entering the next -- which is what a client actually
+  does all evening, and what a test that spawns a process per game cannot reach. 450 games across
+  25 rounds with three characters, clean, with resident memory and descriptor count flat.
+- **A second login cannot take a live session's place.** The character is refused and the session
+  already in the world keeps playing; a character whose client died re-enters immediately.
 
 **Rough edges / next:**
 
+- **The realm-side character lock is not implemented.** The engine's callback table has
+  `fpUnlockDatabaseCharacter` and `fpRelockDatabaseCharacter`; Blizzard's realm held a character
+  while it was in a game and refused the second join upstream. Ours issues the join, and the game
+  server then refuses it -- correctly, but through a path that answers nothing, so a double login
+  sits at the loading screen until the client gives up instead of being told. Refusing from
+  realmd's own roster is the wrong fix: that roster is fed by the game server, and one stale entry
+  would lock a player out of their own character.
+- Password-protected games are untested end to end.
 - Verbose join diagnostics compiled in by default; `pkttrace` gated.
 - Two headed clients in one wineprefix can trip the bnet gateway-list parser on the second client's
   startup (intermittent); the e2e test retries.
@@ -503,6 +540,8 @@ Other docs: [`REALM.md`](REALM.md), [`REALMD.md`](REALMD.md), [`VERIFY.md`](VERI
   countdown starts immediately. At the 5s default the client always wins that race, but it is why
   the window cannot simply be shortened to buy throughput -- the countdown needs to start at the
   first join, not at creation.
+- Least-loaded routing breaks ties toward the first registered server, so with equal load one
+  server takes the work until its count rises.
 - Replace the fixed init delay with a proper engine-init hook.
 
 ## License & legal
