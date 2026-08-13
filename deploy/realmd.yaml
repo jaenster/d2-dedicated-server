@@ -110,7 +110,15 @@ metadata:
   name: realmd
   namespace: realmd
 spec:
-  replicas: 2
+  # ONE replica, and not for capacity reasons. Sessions and games live in the shared store,
+  # so any pod can serve login and the game list — but the GS fleet does NOT: a game server
+  # holds its gs-link control connection to exactly one pod, and create/join is a synchronous
+  # request over that socket. A join that lands on a pod which does not hold the owning GS's
+  # connection still succeeds at the realm, then fails quietly on the GS: notifyJoin's result
+  # is discarded, so joinctx is never populated and the character is fetched — and saved —
+  # under the wrong account. HA needs the GS dialling every pod, or dispatch relayed through
+  # the store. Until then this is one pod (see deploy/chart/values.yaml, which already says so).
+  replicas: 1
   selector:
     matchLabels: { app: realmd }
   template:

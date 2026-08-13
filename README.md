@@ -49,9 +49,13 @@ uses (never the client): a **gs-link** (port 6115) the fleet registers over and 
 create/join to a server, and **d2dbs** (port 6114) the server fetches/saves character bytes from.
 
 Persistence dispatches to `fs` (default, zero deps), `redis` (ephemeral sessions/games), or `pg`
-(durable chars), so realmd is **stateless and horizontally scalable** -- all state lives in the
-backing services. Health/readiness and the admin UI are on `:8080`; SIGTERM drains cleanly.
-See [`src/realm/server/README.md`](src/realm/server/README.md).
+(durable chars), so realmd keeps **no durable state of its own** -- sessions and games live in the
+backing services and any instance can resolve either. One thing is not shared, and it is the one
+that decides replica count: a game server holds its gs-link control connection to exactly **one**
+realmd, and create/join is a synchronous request over that socket. So **run realmd as a single
+replica** today; the chart does, and says why. Multi-instance HA needs the fleet dialling every
+pod, or dispatch relayed through the store. Health/readiness and the admin UI are on `:8080`;
+SIGTERM drains cleanly. See [`src/realm/server/README.md`](src/realm/server/README.md).
 
 ### d2gs: the headless game server (injected into Game.exe)
 
@@ -60,7 +64,7 @@ See [`src/realm/server/README.md`](src/realm/server/README.md).
 
 - **Survival + optimization patches** -- byte-patches that let the Windows engine run with no
   display (stub the renderers/media loaders, hide the window) and frame-pace its idle loop so the
-  server sits near-zero CPU (see [Resource footprint](#resource-footprint-idle)). It also drives
+  server sits near-zero CPU (see [Resource footprint](#resource-footprint)). It also drives
   the engine's own server tick: drain inbound packets, tick all games, flush queued outbound.
 - **A built-in mod framework** -- a registry of pure feature modules that hook the engine (exp
   scaling, ubers, an arena mode, client-side maphack, ...), each toggled on its own. Adding a
@@ -71,21 +75,38 @@ On a join the server does not read a shared disk -- it **fetches the character o
 from realmd's d2dbs, which serves it from whichever store backend is configured (redis / pg / fs).
 See [`src/engine/README.md`](src/engine/README.md) and [`src/runtime/README.md`](src/runtime/README.md).
 
-### qqserver: the game-traffic gateway (one IP for the whole fleet)
+### qqserver: the ingress for game traffic (one address for the whole fleet)
 
-`src/realm/qqserver/` builds the `qqserver` binary, a **pure-Zig**, stateless game-traffic
-gateway. It gives the entire game-server fleet a **single public game port (`:4000`)**.
+`src/realm/qqserver/` builds the `qqserver` binary: a **pure-Zig, stateless ingress** for game
+traffic. It is an ingress controller for the D2 game protocol -- one public address in front, the
+whole game-server fleet behind it, routed per connection.
 
-When a client joins, realmd hands it a short-lived **join token** and writes the route for that
-token (`token -> GS pod + real game id`) into the shared store (redis). The client connects to
-`qqserver:4000` carrying the token. The gateway reads it, looks up the route, and **splices** the
-connection straight through to the owning game server's internal `:4000`.
+It exists because the client gives you nothing to route on. The realm can tell it *which host* to
+dial, but the game port is fixed at `:4000`, so without a gateway every game server needs its own
+client-routable address and the fleet can never outgrow the IPs you own.
 
-Because tokens are realm-globally unique, **any** gateway pod behind **any** public IP can resolve
-**any** token -- so it needs no session affinity and holds no state of its own. This is what lets
-the game servers live on internal pod IPs (or the same host on other ports) while clients only ever
-see one address. (In the lightweight single-binary path, realmd can do this splice in-process and
-you don't run a separate qqserver at all.)
+An HTTP ingress reads the `Host` header to choose a backend. qqserver does the same job one layer
+down, on the game's own protocol:
+
+1. realmd mints a realm-globally-unique **token** per create/join and records
+   `token -> {gs address, real engine game id}` in redis.
+2. The client dials `qqserver:4000` and sends `GAMELOGON` (`0x68`), which carries that token.
+3. qqserver reads it, looks up the route, **rewrites the token in the packet** to the game id the
+   backend engine actually knows, dials that GS, replays the rewritten packet, and **splices**.
+
+That is the entire extent of the protocol it understands: one field in the first packet, plus the
+engine's `0xAF` greeting frame, which it strips. Everything after is opaque bytes in both
+directions -- so gameplay changes cannot break it, and it never needs to keep up with the engine.
+
+Because the token is realm-global, **any** gateway pod resolves **any** token: no session
+affinity, no shared state of its own, no warm-up. NAT-proof too -- two clients behind one public
+IP never collide, because the route key is the token, not the source address.
+
+The implementation matches the job: **one thread, one `poll()` loop, zero heap, no globals**, all
+state in a single value on `main()`'s stack. Even the redis lookup is non-blocking and pipelined on
+a persistent connection in the same poll set, so one connection waiting on its route never stalls
+the others. Idle it sits in `poll(-1)` at 0% CPU. (In the lightweight single-binary path, realmd
+can splice in-process and you don't run qqserver at all.)
 
 ### Plus: the shared realm contract
 
@@ -102,7 +123,7 @@ protocol that both the realm and the game server import, so they agree on the wi
        +----------------------+        +----------------------+
        |  realmd              |        |  qqserver            |
        |  :6112  login, realm |        |  :4000  public game  |
-       |  :8080  health / UI  |        |         gateway      |
+       |  :8080  health / UI  |        |         ingress      |
        +----------+-----------+        +-----------+----------+
             ^   ^      writes token route (redis)  |
   internal: |   +----------------------------------+
@@ -145,7 +166,7 @@ the owning GS:
 
 ![Kubernetes topology](docs/architecture/img/k8s_deploy.png)
 
-## Resource footprint (idle)
+## Resource footprint
 
 The 1.14d engine's main loop busy-spins by default; d2gs frame-paces it, so an **idle game server
 sits near-zero**. Measured on a real Hetzner k3s node with no players online:
@@ -153,11 +174,37 @@ sits near-zero**. Measured on a real Hetzner k3s node with no players online:
 | service | CPU | memory | image |
 |-|-|-|-|
 | `realmd` (login + realm + d2dbs + gs-link) | ~1m | ~6 MiB | scratch, static musl |
-| `qqserver` (game-traffic gateway) | **~0m** | **~1 MiB** | scratch, static musl |
+| `qqserver` (game-traffic ingress) | **~0m** | **~1 MiB** | scratch, static musl |
 | `d2gs` (wine, headless `Game.exe`) | ~15m | ~300 MiB | debian + wine32 |
 
-The pure-Zig services are effectively free; the game server's footprint is just wine plus the
-loaded engine. Postgres/Redis are optional -- `fs` persistence drops them entirely.
+The pure-Zig services stay effectively free under load, not just at idle. Driving 120 games
+through a two-server fleet, both sitting at ~4 MiB resident:
+
+- **realmd: ~1.8 ms of CPU per game** -- one client's whole session, login through create and join.
+- **qqserver: ~0.6 ms of CPU per connection.** Per *connection*, not per game: its cost is the
+  route lookup and the splice setup, so a game that four players join costs four times a solo one.
+  Byte copying did not register at this scale (620 KB across 119 connections, 99% of it the
+  GS→client world-state push).
+
+Measured on an M3 Max running native arm64 debug builds, so treat them as a shape rather than a
+budget -- expect more per unit on an x86 vCPU, less from the ReleaseSafe builds the images use.
+The `~1m` in the table above is the number to size against: real x86, real cluster. The game
+server's footprint is wine plus the loaded engine, and a game costs about **2.5 MiB** on top.
+Postgres/Redis are optional -- `fs` persistence drops them entirely.
+
+### How many games per server
+
+**Seven concurrent games per `Game.exe`, and that is a hard engine limit.** Fog's allocator has a
+fixed table of 8 pool managers (`Fog/Memory.cpp` raises `0xe0000001` on the 9th) and one is held
+permanently by the global pool system. A game holds its manager until it is destroyed, and an
+empty game is destroyed after an idle window (`--reap-ms`, default 5s), so a server also has a
+*throughput* ceiling of roughly `7 / window` new games per second.
+
+That ceiling is per process, so **capacity scales by adding game servers, not by tuning one**.
+Measured with a load that creates three games per round, back to back: one server manages 2 of 8
+rounds before it starts refusing; two servers manage 8 of 8, with the games split 13/12 by
+realmd's least-loaded routing. Refusals are clean -- realmd parks a full server and tries the
+next, and the client is told the realm is busy rather than being dropped.
 
 ## Build
 
@@ -410,7 +457,7 @@ src/
     client/      GS-side clients of the realm (gs-link/d2dbs, join context)
     server/      realmd binary: login + realm + d2dbs + gs-link, pluggable store
                  (fs/redis/pg), health, graceful shutdown                       [README]
-    qqserver/    qqserver binary: stateless token-translating game gateway
+    qqserver/    qqserver binary: stateless token-translating game ingress
     adapter/     store backends (fs/redis/pg) behind the persistence facade
   engine/        bindings into Game.exe's own engine + realm callback table     [README]
     feature.zig  the mod framework registry (one table of features + toggles)
@@ -444,14 +491,19 @@ Other docs: [`REALM.md`](REALM.md), [`REALMD.md`](REALMD.md), [`VERIFY.md`](VERI
 - Create + join a game dispatched to the headless GS.
 - **Character spawns in-world** (loaded from d2dbs, full life/mana, playable).
 - **Multiplayer**: two real clients in one game, visible to each other.
+- **A fleet**: two game servers registered to one realm, games routed to the least loaded, each
+  client spliced to the server that owns its game. 24 games back to back, no failures.
 
 **Rough edges / next:**
 
 - Verbose join diagnostics compiled in by default; `pkttrace` gated.
 - Two headed clients in one wineprefix can trip the bnet gateway-list parser on the second client's
   startup (intermittent); the e2e test retries.
-- Harden across restarts + many concurrent games; replace the fixed init delay with a proper
-  engine-init hook.
+- A brand-new game has no players, so it is indistinguishable from an abandoned one and the reap
+  countdown starts immediately. At the 5s default the client always wins that race, but it is why
+  the window cannot simply be shortened to buy throughput -- the countdown needs to start at the
+  first join, not at creation.
+- Replace the fixed init delay with a proper engine-init hook.
 
 ## License & legal
 

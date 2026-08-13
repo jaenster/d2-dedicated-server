@@ -47,8 +47,8 @@ GS StatefulSet with `hostPort 4000`):
 - `gslink.zig` — d2cs↔d2gs control channel: AUTHREQ/REPLY, SETGSINFO, CREATEGAME/JOINGAME dispatch (sends account+char so the GS can fetch the save).
 - `state.zig` — in-memory sessions/games, instance-hashed ids for multi-instance.
 - `store.zig` — durable Store seam: `chars/<account>/<char>.d2s` + small session/game records. File-backed today; the seam keeps multi-instance to a shared dir (e.g. a RWX PVC) with no extra service.
-- `lock.zig` — spinlock (zig 0.16 dropped `Thread.Mutex`).
-- `log.zig` — line logger.
+- `lock.zig` — the lock everything here uses (zig 0.16 dropped `Thread.Mutex`). Spins briefly, then yields, then sleeps: several of its callers hold it across IO.
+- `log.zig` — line logger; one line costs one `write`.
 - `assets/` — `bnserver-D2DV.ini` (gateway/version config), the factored Blizzard weak-signature key, README.
 
 ## Protocol notes
