@@ -132,6 +132,16 @@ fn disconnectClient(game: usize, client: usize, reason: u32) void {
     f(game, client, reason);
 }
 
+/// uint QSERVER_GetClientGameToken(uint nClientId) — __stdcall, `ret 4`. Looks the client up in
+/// the QServer's CONNECTION table and returns its server token, or zero when there is no
+/// connection. That is the whole question this file turns on: a seat whose connection is gone is
+/// a leftover, and a seat whose connection is still there is somebody playing.
+fn connectionToken(client_no: u32) u32 {
+    const f: *const fn (u32) callconv(std.builtin.CallingConvention{ .x86_stdcall = .{} }) u32 =
+        @ptrFromInt(0x0052b610);
+    return f(client_no);
+}
+
 const Seat = struct { client_no: u32, game: usize };
 
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -185,6 +195,14 @@ fn releaseStaleSeat(name_ptr: usize) callconv(.c) u32 {
     }
     const seat = findSeat(char_name) orelse return 0;
     if (seat.game == 0) return 0;
+    // Only a seat nobody is sitting in may be released. A character whose QServer connection is
+    // still there is being PLAYED, and taking its seat would throw a live session out of its game
+    // so a second login of the same character could take its place — which is not a rejoin, it is
+    // one player evicting themselves. Refuse instead and let the first session keep playing.
+    if (connectionToken(seat.client_no) != 0) {
+        log.cstr("rejoin: refusing a second login — a live connection is playing ", name_ptr);
+        return 0;
+    }
     const token = @as(*const u32, @ptrFromInt(seat.game + GAME_TOKEN)).*;
     const game = findAndLockGame(token);
     if (game == 0) {
