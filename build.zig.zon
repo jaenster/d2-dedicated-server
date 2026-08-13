@@ -2,15 +2,23 @@
     .name = .d2gs,
     .version = "0.16.0",
     .dependencies = .{
-        // The clean-room 1.14d core. d2gs consumes libd2 rather than carrying its own copy
-        // of anything libd2 already models — the .d2s header helpers here were a duplicate
-        // of d2-formats down to the byte offsets.
-        .d2_formats = .{ .path = "../libd2/packages/formats" },
-        .d2_util = .{ .path = "../libd2/packages/util" },
         .pg = .{
             .url = "git+https://github.com/karlseguin/pg.zig#4215baf19f7f61a94aab9f6c5893ea12aa9bce96",
             .hash = "pg-0.0.0-Wp_7gYr_BgC1O2IRXa8tdwXhOZJLLSAl7F_ut1N07zF7",
             .lazy = true,
+        },
+        // The clean-room 1.14d core. d2gs consumes libd2 rather than carrying its own copy
+        // of anything libd2 already models — the .d2s header helpers here were a duplicate
+        // of d2-formats down to the byte offsets.
+        //
+        // Pinned by URL, not to a sibling checkout. The images are built from this repo alone —
+        // the Dockerfile copies build.zig, build.zig.zon and src/ and nothing else — so a
+        // `../libd2` path dependency resolved on a developer's machine and nowhere else, and
+        // every image build since the path landed failed on it. A pin also makes the version a
+        // deliberate commit here rather than whatever happens to be checked out next door.
+        .libd2 = .{
+            .url = "git+https://github.com/jaenster/libd2#e6cdc4927c6180be8dd309b0423b470f64f1fc6c",
+            .hash = "libd2-0.1.0-wboU7csTggEHHS42lawMTtPHOLOI4c9C7AaLwze6BZKc",
         },
     },
     .paths = .{""},

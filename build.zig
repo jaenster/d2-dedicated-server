@@ -80,21 +80,19 @@ pub fn build(b: *std.Build) void {
     // `-Dtarget=x86_64-linux-musl` for a static Linux binary.
     const realmd_target = b.standardTargetOptions(.{});
 
-    // d2-formats (libd2) — the clean-room 1.14d file formats. The realm's .d2s handling
-    // comes from here rather than from a second copy living in this repo: the header
-    // layout, the checksum and the fresh-character writer are all already modelled there,
-    // and two implementations of a byte format is one more than can stay correct.
-    const d2_formats = b.dependency("d2_formats", .{
+    // One dependency on the libd2 monorepo, whose root re-exports every package's module.
+    //
+    // d2-formats is the clean-room 1.14d file formats — the realm's .d2s handling comes from
+    // there rather than a second copy in this repo, because the header layout, the checksum and
+    // the fresh-character writer are all already modelled there and two implementations of a byte
+    // format is one more than can stay correct. d2-util is the D2GS wire Huffman codec and its
+    // packet framing, for the same reason.
+    const libd2 = b.dependency("libd2", .{
         .target = realmd_target,
         .optimize = optimize,
-    }).module("d2-formats");
-
-    // d2-util (libd2) — the D2GS wire Huffman codec and its packet framing. Also
-    // dependency-free, and the reason this repo no longer carries its own copy.
-    const d2_util = b.dependency("d2_util", .{
-        .target = realmd_target,
-        .optimize = optimize,
-    }).module("d2-util");
+    });
+    const d2_formats = libd2.module("d2-formats");
+    const d2_util = libd2.module("d2-util");
 
     // realm_adapter — the concrete persistence backends (fs/redis/pg) behind the store
     // facade, imported by realmd. Includes the Postgres client, so the pg dependency lives
