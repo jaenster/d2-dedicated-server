@@ -313,20 +313,23 @@ fn findPlayerTokenImpl(
     log.hex("realm:   s6=0x", s6);
     log.hex("realm:   s7=0x", s7);
 
-    // Token validation ported from D2Server.dll 1.00 PlayerToken_ValidateAndConsume:
-    // the realm (realmd/d2cs) issued this join token via joinctx.remember; the GS
-    // validates it here — known + unconsumed + within the 120s TTL — and consumes it
-    // once so it can't be replayed. Default is OBSERVE-ONLY: the legacy path accepted
-    // every join, and s1==issued-token isn't yet confirmed in a live join, so we only
-    // log the verdict. Flip `enforce_token` true once a live join shows "token VALID"
-    // to close the accept-all gap (then unknown/stale/replayed tokens are rejected).
-    const enforce_token = false;
-    const token = @as(u32, @truncate(s1));
-    const token_valid = joinctx.validate(token);
-    log.print(if (token_valid) "realm:   token VALID (known, fresh)" else "realm:   token UNKNOWN/STALE/USED");
-    if (enforce_token) {
-        if (!token_valid) return 0; // reject: unknown, replayed, or expired token
-        joinctx.consume(token);
+    // Join validation ported from D2Server.dll 1.00 PlayerToken_ValidateAndConsume: realmd
+    // authorized this join via joinctx.remember; the GS checks it here — known + unconsumed +
+    // within the 120s TTL — and consumes it once so it can't be replayed.
+    //
+    // s1 is the ENGINE GAMEID, not realmd's join token: qqserver rewrites the token in the
+    // client's GAMELOGON to the gameid before the GS sees the packet. Matching it against
+    // stored realm tokens compares two different namespaces, hence validateGame.
+    //
+    // OBSERVE-ONLY: the legacy path accepted every join. Flip `enforce_join` once a run of
+    // live joins reports VALID.
+    const enforce_join = false;
+    const gameid = @as(u32, @truncate(s1));
+    const join_valid = joinctx.validateGame(gameid);
+    log.print(if (join_valid) "realm:   join VALID (realm-issued, fresh)" else "realm:   join UNKNOWN/STALE/USED");
+    if (enforce_join) {
+        if (!join_valid) return 0; // reject: unknown, replayed, or expired authorization
+        joinctx.consumeGame(gameid);
     }
     return 1; // accept — join proceeds to char load
 }

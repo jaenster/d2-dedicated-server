@@ -72,14 +72,19 @@ pub var gsid: u32 = 0;
 var sock: SOCKET = INVALID_SOCKET;
 var seqno: u32 = 0;
 
-// A tiny atomic spinlock (std.Thread.Mutex isn't built for the GS DLL target). The
-// guarded sections are tiny and contention is near-zero (game create/destroy are rare).
-const SpinLock = struct {
+// A tiny atomic lock (std.Thread.Mutex isn't built for the GS DLL target). Contention is
+// near-zero, but one guarded section is a blocking send(): on socket back-pressure a pure
+// spinner burns a core, and one of the two threads taking it is the engine tick thread, which
+// owes every live game a frame every 40 ms. So spin only briefly, then yield.
+const Lock = struct {
     held: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    fn lock(self: *SpinLock) void {
-        while (self.held.swap(true, .acquire)) {}
+    fn lock(self: *Lock) void {
+        var spins: u32 = 0;
+        while (self.held.swap(true, .acquire)) : (spins += 1) {
+            if (spins < 64) std.atomic.spinLoopHint() else Sleep(if (spins < 128) 0 else 1);
+        }
     }
-    fn unlock(self: *SpinLock) void {
+    fn unlock(self: *Lock) void {
         self.held.store(false, .release);
     }
 };
@@ -87,7 +92,7 @@ const SpinLock = struct {
 // Replies are sent from the gslink control thread, but CLOSEGAME is sent from the
 // engine tick thread (srvtrace's game-destroy hook). Serialize so two senders can't
 // interleave bytes on the shared socket.
-var send_lock: SpinLock = .{};
+var send_lock: Lock = .{};
 
 fn sendPacket(bytes: []const u8) bool {
     send_lock.lock();
@@ -176,7 +181,7 @@ fn sendJoinGameReply(result: u32, gameid: u32) void {
 // to drop. Without this, dead games linger in realmd's join list until their redis
 // TTL (~hours) and clients joining one get "game name and password don't match".
 const GameSlot = struct { name: [16]u8 = undefined, len: u8 = 0, gameid: u32 = 0, used: bool = false };
-var games_lock: SpinLock = .{};
+var games_lock: Lock = .{};
 var games_tracked = [_]GameSlot{.{}} ** 256;
 
 // Count of games that exist on this GS, from CREATE (recordGame, before the first
@@ -356,7 +361,7 @@ fn handleJoinGame(body: []const u8) void {
     // engine token table here — just remember who is joining so we can resolve
     // the account (and guild) when the engine asks us for the character save.
     if (charname.len > 0 and account.len > 0) {
-        joinctx.remember(token, charname, account, guild_tag);
+        joinctx.remember(token, gameid, charname, account, guild_tag);
         if (guild_tag.len > 0) log.print("d2cs: JOINGAME cached char/account/guild for fetch") else log.print("d2cs: JOINGAME cached char/account for fetch");
     }
     sendJoinGameReply(if (command.allow_create) 0 else 1, gameid);

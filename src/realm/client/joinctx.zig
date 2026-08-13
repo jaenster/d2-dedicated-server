@@ -20,6 +20,11 @@ const Entry = struct {
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     consumed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     token: u32 = 0,
+    /// The engine gameid realmd authorized this join for. Kept BESIDE the token because the
+    /// two are different namespaces and only the gameid reaches the engine: qqserver rewrites
+    /// the client's realm token to it before the GS sees the packet, so fpFindPlayerToken is
+    /// handed a gameid. See validateGame.
+    gameid: u32 = 0,
     tick_ms: u32 = 0,
     char: [16]u8 = undefined,
     char_len: usize = 0,
@@ -52,8 +57,8 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// Record realmd's account/char/token (+ guild tag) for an imminent join (last-wins ring).
-pub fn remember(token: u32, charname: []const u8, account: []const u8, guild_tag: []const u8) void {
+/// Record realmd's account/char/token/gameid (+ guild tag) for an imminent join (last-wins ring).
+pub fn remember(token: u32, gameid: u32, charname: []const u8, account: []const u8, guild_tag: []const u8) void {
     const slot = &entries[next % entries.len];
     next +%= 1;
     slot.ready.store(false, .release);
@@ -67,6 +72,7 @@ pub fn remember(token: u32, charname: []const u8, account: []const u8, guild_tag
     @memcpy(slot.guild[0..gn], guild_tag[0..gn]);
     slot.guild_len = gn;
     slot.token = token;
+    slot.gameid = gameid;
     slot.tick_ms = GetTickCount();
     slot.consumed.store(false, .release);
     slot.ready.store(true, .release);
@@ -120,28 +126,33 @@ pub fn accountForToken(token: u32) ?[]const u8 {
     return null;
 }
 
-/// Non-consuming join-token validity check. Ported from D2Server.dll 1.00
-/// `PlayerToken_ValidateAndConsume` (minus the consume): the token must be one the
-/// realm issued (via `remember`), not already used, and within `TOKEN_TTL_MS`.
-/// The GS calls this from fpFindPlayerToken to reject unknown/replayed/stale tokens.
-pub fn validate(token: u32) bool {
+/// Non-consuming validity check for what the ENGINE presents at join time. Ported from
+/// D2Server.dll 1.00 `PlayerToken_ValidateAndConsume` (minus the consume): the join must be
+/// one the realm issued (via `remember`), not already used, and within `TOKEN_TTL_MS`.
+///
+/// Matches on the GAMEID, not the realm token. Three ids ride this path: realmd's realm-global
+/// join token, the engine gameid (`GAME_CreateBattleNetGame`'s out-param, the 1024-slot
+/// nToken), and qqserver REWRITES the token in the client's GAMELOGON to that gameid before
+/// the GS sees it. Matching a gameid against stored realm tokens compares two namespaces that
+/// only agree when two small counters happen to collide.
+pub fn validateGame(gameid: u32) bool {
     const now = GetTickCount();
     for (&entries) |*slot| {
         if (!slot.ready.load(.acquire)) continue;
         if (slot.consumed.load(.acquire)) continue;
-        if (slot.token != token) continue;
+        if (slot.gameid != gameid) continue;
         return (now -% slot.tick_ms) < TOKEN_TTL_MS; // u32 wrap, matches D2Server
     }
     return false;
 }
 
-/// Consume-once: mark the token's slot used so the same token can't be replayed to
-/// join twice (D2Server unlinked the token node on validate). Call after a
-/// successful `validate` when token enforcement is enabled.
-pub fn consume(token: u32) void {
+/// Consume-once: mark the join's slot used so the same authorization can't be replayed
+/// (D2Server unlinked the token node on validate). Call after a successful `validateGame`
+/// when token enforcement is enabled.
+pub fn consumeGame(gameid: u32) void {
     for (&entries) |*slot| {
         if (!slot.ready.load(.acquire)) continue;
-        if (slot.token == token) {
+        if (slot.gameid == gameid) {
             slot.consumed.store(true, .release);
             return;
         }
