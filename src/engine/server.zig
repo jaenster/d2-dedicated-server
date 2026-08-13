@@ -58,10 +58,19 @@ pub fn QSERVER_CreateAndInit(conn: ConnectionType, game: GameType) void {
     stdcall(0x0052b7a0, fn (u32, u32) callconv(StdcallConv) void)(@intFromEnum(conn), @intFromEnum(game)); // VERIFIED
 }
 
-/// Max players the QServer accepts.  void NET_SetPlayersCount(int)
-pub fn NET_SetPlayersCount(n: u32) void {
-    stdcall(0x0052b250, fn (u32) callconv(StdcallConv) void)(n); // VERIFIED
+/// void NET_SetPlayersCount(int) — despite the name, the one thing this sets is
+/// D2QServerStrc.nPerIpConnectionLimit, which QServerNT's accept path spends three ways:
+/// `IsPerIpLimitReached` refuses the (n+1)th concurrent connection from one address,
+/// `CheckIpConnectionRate` fails past `n * 2 + 3` attempts from it inside 15 seconds, and failing
+/// that calls `BanIpAddress`. A NEGATIVE value turns off all three (`IsPerIpLimitReached` returns
+/// false on `< 0`, `CheckIpConnectionRate` only runs its window on `> 0`), which is why the
+/// argument is signed here.
+pub fn NET_SetPlayersCount(n: i32) void {
+    stdcall(0x0052b250, fn (i32) callconv(StdcallConv) void)(n); // VERIFIED
 }
+
+/// Per-address limits belong at the gateway, not here — see NET_SetPlayersCount.
+pub const PER_IP_UNLIMITED: i32 = -1;
 
 /// Toggle the QServer anti-hack throttle.  void NET_HACK_SetUseQServerHack(int)
 pub fn NET_HACK_SetUseQServerHack(on: u32) void {
@@ -271,7 +280,13 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     log.hex2("pools: at DLL attach — in-use / handed-out:", poolstat.at_attach_in_use, poolstat.at_attach_handed);
     if (realm) |t| SetupAsBnetServer(t);
     QSERVER_CreateAndInit(.server, .bnet); // allocs pQServer, opens :4000 listener
-    NET_SetPlayersCount(8);
+    // Every client reaches this GS through qqserver, so the engine sees ONE peer address for the
+    // whole realm. Stock 8 therefore caps the entire server at eight concurrent connections and
+    // bans its own gateway at twenty joins per fifteen seconds — and it refuses by closing the
+    // socket straight after accepting it, with nothing written, so a client is left holding an
+    // established connection that answers nothing. Indistinguishable from a game that was never
+    // created, which is what made it expensive to find.
+    NET_SetPlayersCount(PER_IP_UNLIMITED);
     NET_HACK_SetUseQServerHack(0);
     QSERVER_SetGlobalInstance(@ptrFromInt(at(globals.gQServerGameState)), 1); // cookie≠0 → no halt
     gptr(globals.gbQServerRunning, u32).* = 1;
