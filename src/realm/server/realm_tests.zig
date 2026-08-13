@@ -9,6 +9,7 @@ test {
     _ = @import("friends.zig");
     _ = @import("d2s.zig");
     _ = @import("proto.zig");
+    _ = @import("gslink.zig");
     // Shared infrastructure every listener sits on.
     _ = @import("realm_infra").lock;
     _ = @import("realm_infra").log;

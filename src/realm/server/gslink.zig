@@ -53,6 +53,11 @@ const Gs = struct {
     port: u16 = 4000, // game port clients dial
     maxgame: u32 = 0, // advertised capacity (0 = unknown → unlimited)
     live_games: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// This GS answered a create with "server full". Our own count cannot see that: a finished
+    /// game holds its engine slot through the reap window, so the GS runs out while we still
+    /// think it has room. Cleared the moment any game on it closes, which is exactly when room
+    /// reappears — the GS is the one that knows, and CLOSEGAME is it saying so.
+    full: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     in_use: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // slot claimed
     registered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // ADDRINFO seen → can host
@@ -105,6 +110,7 @@ const GsRegistry = struct {
         var best_load: u32 = std.math.maxInt(u32);
         for (&self.entries) |*g| {
             if (!g.in_use.load(.acquire) or !g.registered.load(.acquire)) continue;
+            if (g.full.load(.acquire)) continue; // said so itself; waiting on a close
             const load = g.live_games.load(.acquire);
             if (g.maxgame != 0 and load >= g.maxgame) continue; // full
             if (load < best_load) {
@@ -214,6 +220,7 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     g.port = 4000;
     g.maxgame = 0;
     g.live_games.store(0, .release);
+    g.full.store(false, .release);
     g.seqno.store(0, .release);
     g.reply_done.store(false, .release);
     log.line(tag, "GS connected from {d}.{d}.{d}.{d}; sending AUTHREQ", .{ g.peer_ip[0], g.peer_ip[1], g.peer_ip[2], g.peer_ip[3] });
@@ -309,6 +316,7 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
             const gameid = if (body.len >= 8) std.mem.readInt(u32, body[4..8], .little) else 0;
             state.global.removeGameById(gameid);
             if (g.live_games.load(.acquire) > 0) _ = g.live_games.fetchSub(1, .monotonic);
+            g.full.store(false, .release); // a slot came free — this GS can host again
             log.line(tag, "GS CLOSEGAME gameid={d}", .{gameid});
         },
         else => log.line(tag, "GS unhandled control type 0x{x:0>2}", .{typ}),
@@ -397,14 +405,15 @@ pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, la
                 last_create_failure = .name_taken;
                 return null;
             }
-            // "I am full" is a fact about that GS, not about the request. Its engine caps
-            // concurrent games, and it can hit that cap before our own live count says so
-            // (a finished game holds its slot through the reap window). Park this GS at its
-            // advertised capacity so pickForCreate stops choosing it, and try the next one —
-            // otherwise a single full GS fails creates while the rest of the fleet is idle.
+            // "I am full" is a fact about that GS, not about the request, so try the next one
+            // rather than failing while the rest of the fleet is idle. Flag it instead of forcing
+            // the live count to capacity: that count is what CLOSEGAME walks back down, and
+            // overwriting it means every close spends itself undoing a number we made up before
+            // the GS is picked again — one that reported full while hosting three games stayed
+            // unpickable for four closes it would never receive.
             if (r.result == proto_create_server_full) {
                 last_create_failure = .all_full;
-                if (g.maxgame != 0) g.live_games.store(g.maxgame, .release);
+                g.full.store(true, .release);
                 continue;
             }
             last_create_failure = .refused;
@@ -441,4 +450,42 @@ fn putCStr(buf: []u8, pos: usize, s: []const u8) usize {
     @memcpy(buf[pos..][0..s.len], s);
     buf[pos + s.len] = 0;
     return pos + s.len + 1;
+}
+
+test "a GS that reported full is pickable again after one close, not after enough closes" {
+    var reg: GsRegistry = .{};
+    const g = reg.alloc().?;
+    g.gsid = 7;
+    g.maxgame = 7;
+    g.registered.store(true, .release);
+    // Three games live, and the engine still refuses a fourth: its finished games hold their
+    // slots through the reap window, which our count cannot see.
+    g.live_games.store(3, .release);
+    try std.testing.expect(reg.pickForCreate() != null);
+
+    g.full.store(true, .release);
+    try std.testing.expect(reg.pickForCreate() == null);
+
+    // One close is one free slot. Forcing live_games to maxgame instead would need four.
+    g.full.store(false, .release);
+    _ = g.live_games.fetchSub(1, .monotonic);
+    try std.testing.expect(reg.pickForCreate() != null);
+    try std.testing.expectEqual(@as(u32, 2), g.live_games.load(.acquire));
+}
+
+test "a GS at its advertised capacity is skipped, and a second GS takes the create" {
+    var reg: GsRegistry = .{};
+    const a = reg.alloc().?;
+    a.gsid = 1;
+    a.maxgame = 7;
+    a.live_games.store(7, .release);
+    a.registered.store(true, .release);
+    try std.testing.expect(reg.pickForCreate() == null);
+
+    const b = reg.alloc().?;
+    b.gsid = 2;
+    b.maxgame = 7;
+    b.live_games.store(2, .release);
+    b.registered.store(true, .release);
+    try std.testing.expectEqual(@as(u32, 2), reg.pickForCreate().?.gsid);
 }
