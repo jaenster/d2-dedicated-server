@@ -159,6 +159,31 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run realm-server unit tests");
     test_step.dependOn(&run_realm_tests.step);
 
+    // Zig collects `test` blocks only from files in a test artifact's ROOT module, so the
+    // tests in realm_infra and realm_adapter are invisible to realm_tests above no matter
+    // what it imports — they need an artifact rooted at their own barrel. Without these two,
+    // the lock, the logger and the RESP codec compile in every binary and are tested in none.
+    inline for (.{
+        .{ "src/realm/shared/infra.zig", false },
+        .{ "src/realm/adapter/adapters.zig", true },
+    }) |spec| {
+        const mod_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(spec[0]),
+                .target = realmd_target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        mod_tests.root_module.addImport("realm_infra", realm_infra);
+        if (spec[1]) {
+            if (b.lazyDependency("pg", .{ .target = realmd_target, .optimize = optimize })) |pg_dep| {
+                mod_tests.root_module.addImport("pg", pg_dep.module("pg"));
+            }
+        }
+        test_step.dependOn(&b.addRunArtifact(mod_tests).step);
+    }
+
     // D2GS Huffman codec unit tests (the clientless game-protocol decoder, reconstructed
     // from Game.exe's static table — verified against a real captured GS frame).
     const huffman_tests = b.addTest(.{

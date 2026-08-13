@@ -6,3 +6,10 @@
 pub const fs = @import("fs.zig");
 pub const redis = @import("redis.zig");
 pub const pg = @import("pg.zig");
+
+// As in infra.zig: naming the backends is what gets their `test` blocks compiled in.
+test {
+    _ = fs;
+    _ = redis;
+    _ = pg;
+}

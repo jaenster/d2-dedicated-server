@@ -8,3 +8,14 @@ pub const obs = @import("obs.zig"); // per-thread trace/span context (log.zig st
 pub const config = @import("config.zig");
 pub const lock = @import("lock.zig");
 pub const types = @import("store_types.zig");
+
+// A re-export alone does not get a file analysed; naming each one here is what puts the infra
+// unit tests into `zig build test`.
+test {
+    _ = net;
+    _ = log;
+    _ = obs;
+    _ = config;
+    _ = lock;
+    _ = types;
+}
