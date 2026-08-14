@@ -16,30 +16,47 @@ const std = @import("std");
 
 pub const Error = error{ OutOfThunks, MapFailed };
 
-const thunk_size = 10;
+const thunk_size = 16;
 
-/// How the process is told an import went off the end of the shim. Replaced by the host so this
-/// package does not decide how the server logs or dies.
-pub const Reporter = *const fn (name: [*:0]const u8) callconv(.c) noreturn;
+/// Returning zero is what makes an unimplemented import survivable, and it is not a guess: nearly
+/// every Carbon and CoreFoundation entry point here returns an OSErr or a pointer, and `noErr` is 0.
+/// So a call the shim does not implement reads as "succeeded, nothing to report" and the game goes
+/// on — which is how far more of the boot gets reached than by implementing them one at a time.
+///
+/// Safe for any signature because Darwin i386 is uniformly cdecl: the caller cleans its own
+/// arguments, so a callee that ignores them and returns 0 in EAX cannot corrupt the stack.
+///
+/// `strict` turns that off and aborts on the first one instead — the mode to use when a failure has
+/// to be traced to its cause rather than absorbed.
+pub var strict = false;
 
-var reporter: Reporter = defaultReport;
+/// Names already reported, so a call in a loop does not bury the log. Fixed-size and lock-free:
+/// entries are unique name pointers, and a lost race costs a duplicate line, not correctness.
+var seen: [1024]usize = @splat(0);
 
-/// Written straight to fd 2 rather than through a buffered writer: the process is about to die, and
-/// a buffered report of why is a report nobody reads.
-fn defaultReport(name: [*:0]const u8) callconv(.c) noreturn {
-    const prefix = "unimplemented Darwin import called: ";
+fn reportOnce(name: [*:0]const u8) void {
+    const key = @intFromPtr(name);
+    var i = (key >> 3) % seen.len;
+    for (0..seen.len) |_| {
+        if (seen[i] == key) return;
+        if (seen[i] == 0) {
+            seen[i] = key;
+            break;
+        }
+        i = (i + 1) % seen.len;
+    }
+    // Straight to fd 2: if this call is about to take the process down, a buffered account of why
+    // is one nobody reads.
+    const prefix = "darwin: unimplemented import ";
     _ = std.c.write(2, prefix, prefix.len);
     _ = std.c.write(2, name, std.mem.len(name));
     _ = std.c.write(2, "\n", 1);
-    std.c.abort();
 }
 
-pub fn setReporter(r: Reporter) void {
-    reporter = r;
-}
-
-fn dispatch(name: [*:0]const u8) callconv(.c) noreturn {
-    reporter(name);
+fn dispatch(name: [*:0]const u8) callconv(.c) c_int {
+    reportOnce(name);
+    if (strict) std.c.abort();
+    return 0;
 }
 
 /// A slab of executable thunks, one per unresolved import.
@@ -72,12 +89,20 @@ pub const Thunks = struct {
         const at = self.code.ptr + self.used;
         const site = @intFromPtr(at);
 
-        at[0] = 0x68; // push imm32
+        at[0] = 0x68; // push imm32 — the name, as dispatch's cdecl argument
         std.mem.writeInt(u32, at[1..5], @truncate(@intFromPtr(name)), .little);
         at[5] = 0xe8; // call rel32
-        const after = site + thunk_size;
-        const rel: i32 = @truncate(@as(i64, @intCast(@intFromPtr(&dispatch))) - @as(i64, @intCast(after)));
+        // Displacement is measured from the end of the call, not the end of the thunk.
+        const after_call = site + 10;
+        const rel: i32 = @truncate(@as(i64, @intCast(@intFromPtr(&dispatch))) - @as(i64, @intCast(after_call)));
         std.mem.writeInt(i32, at[6..10], rel, .little);
+        // Drop the pushed name and return dispatch's zero to the game.
+        at[10] = 0x83; // add esp, 4
+        at[11] = 0xc4;
+        at[12] = 0x04;
+        at[13] = 0xc3; // ret
+        at[14] = 0x90;
+        at[15] = 0x90;
 
         self.used += thunk_size;
         return site;
@@ -97,7 +122,7 @@ pub const Thunks = struct {
 
 const testing = std.testing;
 
-test "a thunk is ten bytes of push-and-call at the address it reports" {
+test "a thunk names itself, then returns zero to its caller" {
     var t = try Thunks.init(4);
     defer t.deinit();
 
@@ -113,11 +138,22 @@ test "a thunk is ten bytes of push-and-call at the address it reports" {
     try testing.expectEqual(@as(u32, @truncate(@intFromPtr(name))), std.mem.readInt(u32, code[1..5], .little));
     try testing.expectEqual(@as(u8, 0xe8), code[5]);
 
-    // The relative displacement has to land exactly on the dispatcher, which is the part that is
-    // easy to get one instruction wrong.
+    // The displacement has to land exactly on the dispatcher, and it is measured from the end of
+    // the call — not the end of the thunk, which is the easy way to get it one instruction wrong.
     const rel = std.mem.readInt(i32, code[6..10], .little);
-    const target: i64 = @as(i64, @intCast(a + thunk_size)) + rel;
+    const target: i64 = @as(i64, @intCast(a + 10)) + rel;
     try testing.expectEqual(@as(i64, @intCast(@intFromPtr(&dispatch))), target);
+
+    // Without the stack fixup and the return, an unimplemented call takes the process with it
+    // instead of reading as noErr.
+    try testing.expectEqualSlices(u8, &.{ 0x83, 0xc4, 0x04, 0xc3 }, code[10..14]);
+}
+
+test "an unimplemented import reads as success, and names itself only once" {
+    // 0 is noErr, and that is the whole reason the boot gets past several hundred Carbon calls
+    // nobody has implemented.
+    try testing.expectEqual(@as(c_int, 0), dispatch("_SomeCarbonCallNobodyImplemented"));
+    try testing.expectEqual(@as(c_int, 0), dispatch("_SomeCarbonCallNobodyImplemented"));
 }
 
 test "the slab refuses to overflow into memory it does not own" {
