@@ -17,6 +17,8 @@ pub const pthread = @import("pthread.zig");
 pub const mach = @import("mach.zig");
 pub const cxx = @import("cxx.zig");
 pub const carbon = @import("carbon.zig");
+pub const files = @import("files.zig");
+pub const memory = @import("memory.zig");
 pub const compat = @import("compat.zig");
 
 /// `_close$UNIX2003` -> `close`, `_stat$INODE64` -> `stat`, `_realpath$DARWIN_EXTSN` -> `realpath`.
@@ -87,6 +89,14 @@ pub const Resolver = struct {
             return addr;
         }
         if (carbon.address(norm)) |addr| {
+            self.libc_hits += 1;
+            return addr;
+        }
+        if (files.address(norm)) |addr| {
+            self.libc_hits += 1;
+            return addr;
+        }
+        if (memory.address(norm)) |addr| {
             self.libc_hits += 1;
             return addr;
         }

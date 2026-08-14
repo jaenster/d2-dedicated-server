@@ -54,6 +54,9 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
     }
+    // Before the segments get their real protections, while __TEXT is still writable.
+    if (fits_32bit) applyPatches(&loaded);
+
     // Sealing is what makes the thunks executable, so it has to follow every bind, not precede it.
     try resolver.seal();
     try macho.load.protect(&loaded);
@@ -123,6 +126,47 @@ pub fn main(init: std.process.Init) !void {
 
 /// `PreInitApplication`, the first thing the image's own entry point calls.
 const pre_init_application: u32 = 0x0019d582;
+
+/// `geD2DefaultApplicationMode` — where the command-line parser starts before any token matches.
+const default_app_mode: u32 = 0x005c8a30;
+
+/// APPMODE_server. The six names at 0x3e0e9c are 1 client, 2 server, 3 multiplayer, 4 launcher,
+/// 5 expand.
+const appmode_server: u32 = 2;
+
+/// The two gates between a loaded image and a running game. Both are conditional jumps taken on a
+/// condition a headless Linux process cannot satisfy, and both are answered the same way the
+/// Windows build's engine patches are: by writing over the branch.
+fn applyPatches(loaded: *const macho.load.Loaded) void {
+    const patches = [_]struct { at: u32, bytes: []const u8, why: []const u8 }{
+        // Renderer init cannot succeed without a window, and its failure otherwise skips the whole
+        // game. `JZ` -> nothing.
+        .{ .at = 0x0019b1b0, .bytes = &.{ 0x90, 0x90 }, .why = "call ApplicationMain even if renderer init fails" },
+        // PreInitApplication is main, and the game runs inside a SetEvent() gate standing in for
+        // Win32 single-instance detection. Ungated, pre-init merely completes and returns.
+        .{ .at = 0x0019da54, .bytes = &.{ 0x90, 0x90 }, .why = "enter the game regardless of SetEvent" },
+        // Renderer::Windowed::Initialize, whose result the patch above already discards. Enumerating
+        // display modes on a machine with no display is not something to make succeed — it is
+        // something not to call. `mov al, 1; ret`, and the server mode never touches the display
+        // again.
+        .{ .at = 0x0019cc81, .bytes = &.{ 0xb0, 0x01, 0xc3 }, .why = "skip renderer init entirely (headless)" },
+        // Two UI calls ApplicationMain makes before it reaches the per-mode dispatch, even in server
+        // mode: the menu bar, and the display-mode enumeration behind CGDisplayCopyAllDisplayModes.
+        // Neither has anything to enumerate here and the second dereferences what it gets back.
+        .{ .at = 0x0019ce5a, .bytes = &.{0xc3}, .why = "no menu bar to enable" },
+        .{ .at = 0x002b4e7e, .bytes = &.{0xc3}, .why = "no display to pre-setup" },
+    };
+    for (patches) |p| {
+        const at: [*]u8 = @ptrFromInt(loaded.at(p.at));
+        @memcpy(at[0..p.bytes.len], p.bytes);
+        note("d2gs-native: patch 0x{x} {s}\n", .{ p.at, p.why });
+    }
+
+    // Belt and braces with the command line: the parser starts from this and only moves if a token
+    // matches, so setting it means a parse that finds nothing still lands on the server.
+    const mode: *u32 = @ptrFromInt(loaded.at(default_app_mode));
+    mode.* = appmode_server;
+}
 
 /// `StormMac::MAC_GetCommandLine`'s cache: an 0x800 byte buffer it fills once from
 /// `[[NSProcessInfo processInfo] arguments]`, guarded by "is the first byte still zero".

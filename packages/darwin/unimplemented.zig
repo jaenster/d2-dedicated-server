@@ -2,13 +2,15 @@
 //!
 //! There are 626 of them and most will never be called: a headless server never opens a window,
 //! never draws a menu, never plays a sound. Writing 626 stubs to find out which ones matter is the
-//! wrong way round — instead every unresolved name gets ten bytes of generated code that names
-//! itself when the game calls it, and the game tells us what it actually needs.
+//! wrong way round — instead every unresolved name gets sixteen bytes of generated code that names
+//! itself and returns zero, so the game both tells us what it needs and carries on without it.
 //!
 //!     push <name>          ; cdecl argument
-//!     call report          ; never returns
+//!     call dispatch        ; reports once, returns 0
+//!     add  esp, 4
+//!     ret
 //!
-//! Emitting code rather than sharing one stub is what preserves the name. A single shared trap
+//! Emitting code rather than sharing one stub is what preserves the name. A single shared stub
 //! would report only that something unimplemented was called, which is the one detail already
 //! known.
 
@@ -30,6 +32,9 @@ const thunk_size = 16;
 /// to be traced to its cause rather than absorbed.
 pub var strict = false;
 
+/// Where the one-line reports go. Stderr by default; negative silences them.
+pub var report_fd: c_int = 2;
+
 /// Names already reported, so a call in a loop does not bury the log. Fixed-size and lock-free:
 /// entries are unique name pointers, and a lost race costs a duplicate line, not correctness.
 var seen: [1024]usize = @splat(0);
@@ -45,12 +50,14 @@ fn reportOnce(name: [*:0]const u8) void {
         }
         i = (i + 1) % seen.len;
     }
-    // Straight to fd 2: if this call is about to take the process down, a buffered account of why
-    // is one nobody reads.
+    // A raw descriptor, not a buffered writer: if this call is about to take the process down, a
+    // buffered account of why is one nobody reads. The host can point it somewhere else, and a
+    // negative value silences it.
+    if (report_fd < 0) return;
     const prefix = "darwin: unimplemented import ";
-    _ = std.c.write(2, prefix, prefix.len);
-    _ = std.c.write(2, name, std.mem.len(name));
-    _ = std.c.write(2, "\n", 1);
+    _ = std.c.write(report_fd, prefix, prefix.len);
+    _ = std.c.write(report_fd, name, std.mem.len(name));
+    _ = std.c.write(report_fd, "\n", 1);
 }
 
 fn dispatch(name: [*:0]const u8) callconv(.c) c_int {
@@ -150,6 +157,8 @@ test "a thunk names itself, then returns zero to its caller" {
 }
 
 test "an unimplemented import reads as success, and names itself only once" {
+    report_fd = -1; // the build runner owns this process's stderr while tests run
+    defer report_fd = 2;
     // 0 is noErr, and that is the whole reason the boot gets past several hundred Carbon calls
     // nobody has implemented.
     try testing.expectEqual(@as(c_int, 0), dispatch("_SomeCarbonCallNobodyImplemented"));
