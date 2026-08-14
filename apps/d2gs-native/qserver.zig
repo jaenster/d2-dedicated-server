@@ -39,6 +39,14 @@ const addr = struct {
     const qserver_state_cookie: u32 = 0x005c1670;
     /// One byte, not the Windows build's dword.
     const gbQServerRunning: u32 = 0x00441cf1;
+
+    /// D2BattleNetEventCallbackTable* (win: BattleNetServerService 0x00883d50). Read at
+    /// 0x001a78bc by the GAMELOGON handler; the Mac image has no writer for it at all, so it
+    /// is permanently null and every join takes the no-realm branch.
+    const battle_net_server_service: u32 = 0x005c8a50;
+    /// uint32[0x401] token -> game-server id (win: DATA_LastGameServer). Indexed by the u16
+    /// game token at 0x001abd1f; zero or -1 means "no such game".
+    const token_table: u32 = 0x0053756c;
 };
 
 /// CONNECTIONTYPE_SERVER — the dedicated path, the same 0 the host branch passes.
@@ -81,6 +89,16 @@ fn bootstrap() void {
     running().* = 1;
     call(addr.qserver_initialize_server_state, fn () callconv(.c) void)();
     note("d2gs-native: QSERVER running={d} on :4000\n", .{running().*});
+    reportJoinPreconditions();
+}
+
+/// The two things the GAMELOGON handler consults before it will let anyone in, printed once so a
+/// refusal can be read off the log instead of guessed at. With no realm callback table the engine
+/// only serves game token 1, and only while that token holds a live game.
+fn reportJoinPreconditions() void {
+    const bnet: *const u32 = @ptrFromInt(image.at(addr.battle_net_server_service));
+    const tokens: [*]const u32 = @ptrFromInt(image.at(addr.token_table));
+    note("d2gs-native: BattleNetServerService={x} token[1]={x}\n", .{ bnet.*, tokens[1] });
 }
 
 /// One server heartbeat, as `QSERVER_CooperativeThreadMain` runs it: drain the sockets, advance

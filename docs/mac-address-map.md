@@ -133,7 +133,7 @@ is a byte offset inside the function, not its entry.
 
 |purpose|windows addr|windows name|mac addr|how confirmed|
 |-|-|-|-|-|
-|SERVER_IS_TOKEN_VALID|`0x0052c060`|`D2Game::Game::Server::SERVER_IsTokenValid`|--|not found -- no function of this name in the Mac DB|
+|SERVER_IS_TOKEN_VALID|`0x0052c060`|`D2Game::Game::Server::SERVER_IsTokenValid`|`0x001abcff`|CONFIRMED -- same shape (lock, `DATA_LastGameServer[nToken]`, reject 0 and -1). Carried a duplicate, wrong `ProcessClientMessage_GameSetup` name; renamed|
 |CHECK_FORBIDDEN_CHARS|`0x0052c5b0`|`D2Game::Game::Server::STRING_CheckIfPlayerNameDoNotContainForbidenChars`|--|not found -- no function of this name in the Mac DB|
 |b4Intercept()|`0x0052c690`|`D2Game::Game::Server::NET_D2GS_SERVER_IsValidChecks`|`0x001acd78`|TU=Game.cpp (D2Game), size 285/443|
 |NAME_LEN_CALLSITE|`0x0052c6d5`|`D2Game::Game::Server::NET_D2GS_SERVER_IsValidChecks` (IN+45)|`0x001acd78`|TU=Game.cpp (D2Game), size 285/443|
@@ -146,6 +146,43 @@ is a byte offset inside the function, not its entry.
 |SEND_0XB4|`0x0053b260`|`D2Game::Game::Server::ServerCmd::NET_D2GS_SERVER_Send_0xB4_ConnectionRefused`|`0x002de167`?|UNCONFIRMED -- name-only, immediately before the D2Net Server.cpp anchor|
 |STRING_LENGTH_CHECK|`0x0053efc0`|`D2Game::Game::SCmd::STRING_CheckIfStringLengthDoNotExceedSize`|`0x001b03b8`?|UNCONFIRMED -- name-only, at the Level.cpp/SCmd.cpp boundary|
 |JOINACT_CALLSITE|`0x0053f2dc`|`D2Game::Game::CCmd::NET_D2GS_SERVER_ProcessClientMessage_GameSetup` (IN+1dc)|--|REFUTED -- DB says `0x00213930`, inside the PlrTrade.cpp/a1q1.cpp neighbourhood|
+
+### the GAMELOGON refusal (`b4 06 00 00 00`)
+
+Reason 6 is not a character-load failure. Windows `NET_D2GS_SERVER_ProcessClientMessage_GameSetup`
+`0x0053f100` case 1 calls `IsTokenFirstGame` `0x0053eff0` **only when `BattleNetServerService` is
+null**, and every 6 that function returns means "this server has no game on that token":
+
+- `CMP dword[EBP+8],1` at `0x0053eff9` -> the packet's u16 game token must be 1
+- `SERVER_IsTokenValid(1)` -> `DATA_LastGameServer[1]` must be a live game
+- `QSERVER_FindAndLockGame` must return it; then the char name must be non-empty, under 16, and not
+  already seated in that game
+
+The Mac build inlines the whole thing into the `0x68` case of `NET_D2GS_SERVER_ProcessClientMessage_GameSetup`
+`0x001a77bd`, byte for byte:
+
+|mac addr|instruction|meaning|
+|-|-|-|
+|`0x001a78b6`|`MOV EAX,[ECX+0x1eea52]` / `CMP dword[EAX],0`|`BattleNetServerService` `0x005c8a50`; non-null skips the whole block|
+|`0x001a7a1a`|`MOV dword[EBP-0x60],6`|nReason = 6|
+|`0x001a7a21`|`CMP word[ESI+9],1`|the packet's game token must be 1|
+|`0x001a7a36`|`CALL 0x001abcff` with `[ESP]=1`|`SERVER_IsTokenValid(1)`|
+|`0x001a7a46`|`CALL 0x001abd47`|`QSERVER_FindAndLockGame`|
+|`0x001a7a53`/`0x001a7a5f`|`MOV ...,0x10` / `0x0f`|verbyte != 0xe / game already has 8 clients|
+
+`BattleNetServerService` `0x005c8a50` has 37 xrefs and all 37 are reads -- `SetupAsBnetServer`
+(win `0x0052c0e0`) was never linked into the Mac image, so the value is permanently null and the
+GS always runs open. That is not the blocker: open mode is a supported path, it just restricts the
+server to one game, on token 1, created by a client's `0x67`.
+
+Measured on the native host (`b4 06` before, `0x01` GameFlags after):
+
+|step|reply (raw / huffman-decoded)|
+|-|-|
+|`0x68` token 1 or 0x2a, no game|`04 05 48 78` -> `b4 06 00 00 00`|
+|`0x67` create-game on connection A|`06 7a 09 a5 f5 c0` -> `01 00 04 00 10 00 01 00 00 02` (GameFlags)|
+|`0x68` token 1 on connection B, game alive|same GameFlags -- accepted|
+|`0x6b` sent without waiting for `0x02`|`04 05 44 6e` -> `b4 0e 00 00 00` (no player unit)|
 
 ### runtime/pkttrace
 
