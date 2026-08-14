@@ -216,6 +216,9 @@ pub fn build(b: *std.Build) void {
         .{ "packages/realm-proto/realm_proto.zig", false, false },
         .{ "packages/macho/macho.zig", false, false },
         .{ "packages/darwin/darwin.zig", false, false },
+        // The native host's crash reporter. Rooted here rather than at main.zig because that one
+        // runs the game; this is the part with logic worth asserting.
+        .{ "apps/d2gs-native/crash.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{

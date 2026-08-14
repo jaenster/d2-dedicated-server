@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const macho = @import("macho");
 const darwin = @import("darwin");
+const crash = @import("crash.zig");
 
 /// `applyFixups` takes a plain function pointer with no context argument, so the resolver has to be
 /// reachable from file scope.
@@ -101,6 +102,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // From here on every fault is the image's, and the only trace worth having is one written in the
+    // image's own addresses.
+    crash.install(loaded.memory, loaded.slide);
+
     // Before the constructors, not after: any of them may read the command line, and the cache is
     // only fillable while it is still empty.
     setCommandLine(&loaded, envOr("D2MAC_CMDLINE", "-skiptobnet"));
@@ -164,6 +169,20 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // Neither has anything to enumerate here and the second dereferences what it gets back.
         .{ .at = 0x0019ce5a, .bytes = &.{0xc3}, .why = "no menu bar to enable" },
         .{ .at = 0x002b4e7e, .bytes = &.{0xc3}, .why = "no display to pre-setup" },
+        // MAC_LoadMediaMPQFiles. Graphics, Music and the expansion speech/movie archives are CD
+        // content a data-only install does not carry and a headless server would never read, and it
+        // asks an expansion-detect callback the launcher only fills in when it has a display.
+        // `mov eax, 1; ret`.
+        .{ .at = 0x00042c23, .bytes = &.{ 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 }, .why = "no media archives to load" },
+        // D2GFX_CreateWindow — a Carbon window and an AGL context. Its caller UI_DISPLAY_Create is
+        // left alone, so the display globals it owns are still initialised; only the window is not.
+        .{ .at = 0x002b576b, .bytes = &.{ 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 }, .why = "no window to create" },
+        // Carbon event handlers, installed on the window that no longer exists. The function is void
+        // and its only caller ignores it; left alone it takes the null-window fatal-error path.
+        .{ .at = 0x0004fca8, .bytes = &.{0xc3}, .why = "no window to install handlers on" },
+        // OPENGLMAC_SwapContext, which looks 800x600x32 up in a display-mode list that is empty here
+        // and logs "Failed to resize window... this is fatal!" when it is not found.
+        .{ .at = 0x002dfbe3, .bytes = &.{ 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 }, .why = "no resolution to swap to" },
     };
     for (patches) |p| {
         const at: [*]u8 = @ptrFromInt(loaded.at(p.at));
