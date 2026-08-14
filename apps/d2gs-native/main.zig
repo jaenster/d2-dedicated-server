@@ -183,6 +183,18 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // OPENGLMAC_SwapContext, which looks 800x600x32 up in a display-mode list that is empty here
         // and logs "Failed to resize window... this is fatal!" when it is not found.
         .{ .at = 0x002dfbe3, .bytes = &.{ 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 }, .why = "no resolution to swap to" },
+        // OPENGL_PresentFrame, the renderer vtable's present slot. It loads the context object from
+        // 0x5e9edc and calls through its vtable, and that object is only ever built by the
+        // D2GFX_CreateWindow above — so with no window the pointer is null and presenting a frame is
+        // a null vtable dereference. Returns 1, as the real one does.
+        .{ .at = 0x002df9b9, .bytes = &.{ 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 }, .why = "no context to present a frame to" },
+        // UI_DISPLAY_RenderFrame's draw block, which the menu loop enters every 40 ms once the event
+        // pump stops spinning. Everything between BeginScene and EndScene needs the window that is
+        // not there. This is not a branch being broken open but one being held shut: the game skips
+        // exactly this block itself whenever the display flag at 0x554e94 is set, so the state is
+        // one it already supports. The panel-update callbacks above it are outside the block and
+        // still run, which is what keeps the UI advancing. `JNZ rel32` -> `JMP rel32`, same target.
+        .{ .at = 0x0004a7c2, .bytes = &.{ 0xe9, 0xc9, 0x01, 0x00, 0x00, 0x90 }, .why = "no surface to draw the frame on" },
     };
     for (patches) |p| {
         const at: [*]u8 = @ptrFromInt(loaded.at(p.at));
