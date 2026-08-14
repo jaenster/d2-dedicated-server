@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const macho = @import("macho");
+const gslink = @import("gslink.zig");
 
 var image: *const macho.load.Loaded = undefined;
 
@@ -90,6 +91,9 @@ fn bootstrap() void {
     call(addr.qserver_initialize_server_state, fn () callconv(.c) void)();
     note("d2gs-native: QSERVER running={d} on :4000\n", .{running().*});
     reportJoinPreconditions();
+    // Only now: the link answers a create by calling into the engine, so it must not be reachable
+    // before the server state it creates games in exists.
+    gslink.start(image);
 }
 
 /// The two things the GAMELOGON handler consults before it will let anyone in, printed once so a
@@ -105,6 +109,9 @@ fn reportJoinPreconditions() void {
 /// every live game, then flush what the games queued back out. Exactly one sleep per pass either
 /// way — that is the engine's own pacing, and skipping it is what burns a core.
 fn tick() void {
+    // Before the packet drain, so a game the realm asked for exists before the client that was
+    // told about it can send its join.
+    gslink.pump();
     call(addr.net_d2gs_server_handle_any_incoming_packet, fn () callconv(.c) void)();
     const sleep = call(addr.mac_sleep, fn (u32) callconv(.c) void);
     if (call(addr.qserver_tick_all_games, fn (u32) callconv(.c) u32)(1) != 0) {

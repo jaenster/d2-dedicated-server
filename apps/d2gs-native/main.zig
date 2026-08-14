@@ -10,6 +10,7 @@ const macho = @import("macho");
 const darwin = @import("darwin");
 const crash = @import("crash.zig");
 const qserver = @import("qserver.zig");
+const gslink = @import("gslink.zig");
 
 /// `applyFixups` takes a plain function pointer with no context argument, so the resolver has to be
 /// reachable from file scope.
@@ -60,8 +61,10 @@ pub fn main(init: std.process.Init) !void {
     if (fits_32bit) {
         applyPatches(&loaded);
         // After the fixups, never before: the state table this rewrites holds image function
-        // pointers, and a rebase pass would slide our entry along with them.
+        // pointers, and a rebase pass would slide our entry along with them. Same for the join
+        // hook, which is a relative call to code of ours.
         qserver.install(&loaded);
+        gslink.installJoinHook(&loaded);
     }
 
     // Sealing is what makes the thunks executable, so it has to follow every bind, not precede it.
@@ -202,6 +205,30 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // one it already supports. The panel-update callbacks above it are outside the block and
         // still run, which is what keeps the UI advancing. `JNZ rel32` -> `JMP rel32`, same target.
         .{ .at = 0x0004a7c2, .bytes = &.{ 0xe9, 0xc9, 0x01, 0x00, 0x00, 0x90 }, .why = "no surface to draw the frame on" },
+        // GAMELOGON's no-realm branch serves one game and calls it token 1: it refuses any other
+        // token outright, then passes the immediate 1 to SERVER_IsTokenValid rather than the token
+        // the packet carried. Both are the same assumption written twice. Drop the refusal...
+        .{ .at = 0x001a7a26, .bytes = &.{ 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 }, .why = "any game token may be joined" },
+        // ...and look up the one that was asked for. `movzx eax, word [esi+9]; mov [esp], eax` is
+        // exactly the 7 bytes `mov dword [esp], 1` occupied, so nothing after it moves. EAX is dead
+        // here — the call overwrites it and the test that follows reads the result.
+        .{ .at = 0x001a7a2f, .bytes = &.{ 0x0f, 0xb7, 0x46, 0x09, 0x89, 0x04, 0x24 }, .why = "join the token the client asked for" },
+        // ...and then translate it somewhere with room. SERVER_IsTokenValid reads a table with one
+        // usable slot (index 0 aliases the server-running byte at 0x53756c, and the token allocator
+        // clamps its counter to 1), and it indexes with an unchecked u16 — so a realm token is both
+        // unstorable and unsafe to look up. `gslink.installJoinHook` redirects the call that
+        // follows; the table itself is left exactly as the engine keeps it.
+        // NET_D2GS_SERVER_SendPacketToClient 0x002ddd78 already has a verbatim path — the one the
+        // greeting itself rides — and mode 2 is how the engine asks for it. Windows reaches it with
+        // one patch because its compiler left one gate; this build split the same test in two, so
+        // both legs need sending down it: `JE raw` -> `JMP raw`, and the greeting-only test that
+        // guards the other leg NOPed out. What comes out is then Huffman-free and unframed, which
+        // is the only thing a client greeted with 0xAF00 can read.
+        .{ .at = 0x002dde12, .bytes = &.{ 0xeb, 0x09 }, .why = "send raw, not compressed" },
+        .{ .at = 0x002dde1b, .bytes = &.{ 0x90, 0x90 }, .why = "send raw on the unlogged leg too" },
+        // And say so: `movw $0x1af` builds the {0xAF, 0x01} greeting a byte at a time. 0x01 claims
+        // a compressed, length-framed stream, which is no longer what follows it.
+        .{ .at = 0x002ddd4b, .bytes = &.{0x00}, .why = "greet with 0xAF00 to match" },
     };
     for (patches) |p| {
         const at: [*]u8 = @ptrFromInt(loaded.at(p.at));

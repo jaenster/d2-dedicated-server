@@ -262,6 +262,19 @@ pub fn build(b: *std.Build) void {
     });
     d2gs_native.root_module.addImport("macho", macho);
     d2gs_native.root_module.addImport("darwin", darwin);
+    d2gs_native.root_module.addImport("realm_proto", realm_proto);
+    const gslink_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/d2gs-native/gslink.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    gslink_tests.root_module.addImport("macho", macho);
+    gslink_tests.root_module.addImport("realm_proto", realm_proto);
+    test_step.dependOn(&b.addRunArtifact(gslink_tests).step);
+
     b.step("d2gs-native", "Build the wine-free native game server").dependOn(
         &b.addInstallArtifact(d2gs_native, .{}).step,
     );
