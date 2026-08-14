@@ -11,6 +11,7 @@ const darwin = @import("darwin");
 const crash = @import("crash.zig");
 const qserver = @import("qserver.zig");
 const gslink = @import("gslink.zig");
+const chardb = @import("chardb.zig");
 
 /// `applyFixups` takes a plain function pointer with no context argument, so the resolver has to be
 /// reachable from file scope.
@@ -65,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
         // hook, which is a relative call to code of ours.
         qserver.install(&loaded);
         gslink.installTokenResolver(&loaded);
+        chardb.installLoadHook(&loaded);
     }
 
     // Sealing is what makes the thunks executable, so it has to follow every bind, not precede it.
