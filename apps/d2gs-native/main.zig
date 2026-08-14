@@ -98,6 +98,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // Before the constructors, not after: any of them may read the command line, and the cache is
+    // only fillable while it is still empty.
+    setCommandLine(&loaded, "-server");
+
     // dyld's last job before the entry point, and the one with no visible symptom when it is
     // skipped: 45 C++ constructors that every global here depends on.
     macho.load.runInitializers(&loaded, if (std.mem.eql(u8, envOr("D2MAC_TRACE", "0"), "1")) traceInit else null);
@@ -113,6 +117,29 @@ pub fn main(init: std.process.Init) !void {
 
 /// `PreInitApplication`, the first thing the image's own entry point calls.
 const pre_init_application: u32 = 0x0019d582;
+
+/// `StormMac::MAC_GetCommandLine`'s cache: an 0x800 byte buffer it fills once from
+/// `[[NSProcessInfo processInfo] arguments]`, guarded by "is the first byte still zero".
+const command_line_buffer: u32 = 0x003f1a74;
+const command_line_len: u32 = 0x003f2278;
+
+/// The application mode is not taken from argv. `CLIENT_CheckIfApplicationModeIsInCommandLine...`
+/// asks MAC_GetCommandLine for it and strtok's the result on '-', matching each token against the
+/// six mode names at 0x3e0e9c — "server" is one of them, and selecting it is what makes the process
+/// headless by construction rather than by patching out the renderer.
+///
+/// Writing the cache rather than the arguments is the whole trick: the buffer is only filled while
+/// its first byte is zero, so a value put there first is the value the game reads, and the
+/// Objective-C path that would otherwise need NSProcessInfo never runs.
+fn setCommandLine(loaded: *const macho.load.Loaded, cmdline: []const u8) void {
+    const buf: [*]u8 = @ptrFromInt(loaded.at(command_line_buffer));
+    @memcpy(buf[0..cmdline.len], cmdline);
+    buf[cmdline.len] = 0;
+
+    const len: *u32 = @ptrFromInt(loaded.at(command_line_len));
+    len.* = @intCast(cmdline.len);
+    note("d2gs-native: command line \"{s}\"\n", .{cmdline});
+}
 
 /// Unbuffered on purpose: this exists to survive a segfault, and anything buffered is lost.
 fn note(comptime fmt: []const u8, args: anytype) void {
