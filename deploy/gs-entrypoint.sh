@@ -82,7 +82,10 @@ for dll in $D2GS_EXTRA_DLLS; do
   set -- "$@" --loaddll "$win"
   echo "  + mod dll $win"
 done
-set -- "$@" --d2gs --d2gs-boot --realm --create-games
+# --no-compress because qqserver owns the client-facing port and swallows the GS's duplicate 0xAF00
+# so the S->C stream matches a non-compressing client. Without it the local stack and a deployed
+# container disagree, and the join dies silently: the client never sends 0x6b.
+set -- "$@" --d2gs --d2gs-boot --realm --create-games --no-compress
 # Extra engine flags (e.g. -direct -txt for the loose /moddata data/ tree).
 [ -n "$D2GS_EXTRA_ARGS" ] && set -- "$@" $D2GS_EXTRA_ARGS
 
