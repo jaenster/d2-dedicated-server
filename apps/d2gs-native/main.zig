@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const macho = @import("macho");
 const darwin = @import("darwin");
 const crash = @import("crash.zig");
+const qserver = @import("qserver.zig");
 
 /// `applyFixups` takes a plain function pointer with no context argument, so the resolver has to be
 /// reachable from file scope.
@@ -56,7 +57,12 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     // Before the segments get their real protections, while __TEXT is still writable.
-    if (fits_32bit) applyPatches(&loaded);
+    if (fits_32bit) {
+        applyPatches(&loaded);
+        // After the fixups, never before: the state table this rewrites holds image function
+        // pointers, and a rebase pass would slide our entry along with them.
+        qserver.install(&loaded);
+    }
 
     // Sealing is what makes the thunks executable, so it has to follow every bind, not precede it.
     try resolver.seal();
@@ -135,18 +141,19 @@ const pre_init_application: u32 = 0x0019d582;
 /// `geD2DefaultApplicationMode` — where the command-line parser starts before any token matches.
 const default_app_mode: u32 = 0x005c8a30;
 
-/// The mode to boot into — launcher, NOT server. The bootstrap table at 0x3e0eb8 is six 8-byte
-/// slots and slot 2 is {0, 0}, so ApplicationMain fatals out on server by construction: the Mac
-/// build has no dedicated-server mode compiled in.
+/// The mode to boot into — client, NOT server. The bootstrap table at 0x3e0eb8 is six 8-byte slots
+/// and slot 2 is {0, 0}, so ApplicationMain fatals out on server by construction: the Mac build has
+/// no dedicated-server mode compiled in.
 ///
 ///   0 modstate0  {0, 0}              3 multiplayer  UIMENU_SetLobbyLoopParamAndGetPtr
 ///   1 client     AppModeClientInit   4 launcher     fAPPMODE_launcher_SetAppMode
 ///   2 server     {0, 0}              5 expand       AppModeClientInit
 ///
-/// That costs nothing, because the Windows build is driven the same way. d2gs does not use an
-/// application mode there either: it boots the client, hooks the out-of-game and in-game loops, and
-/// calls the engine's own QSERVER entry points itself. Launcher is where that boot lands.
-const appmode_launcher: u32 = 4;
+/// That costs nothing, because the Windows build is driven the same way: d2gs boots the client
+/// there too and calls the engine's own QSERVER entry points itself. Client is the mode that
+/// initialises the memory managers and loads the game tables, and `qserver.install` cuts in at the
+/// first state of the client state machine, before any of the client proper runs.
+const appmode_client: u32 = 1;
 
 /// The two gates between a loaded image and a running game. Both are conditional jumps taken on a
 /// condition a headless Linux process cannot satisfy, and both are answered the same way the
@@ -205,7 +212,7 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
     // Belt and braces with the command line: the parser starts from this and only moves if a token
     // matches, so setting it means a parse that finds nothing still lands on the server.
     const mode: *u32 = @ptrFromInt(loaded.at(default_app_mode));
-    mode.* = appmode_launcher;
+    mode.* = appmode_client;
 }
 
 /// `StormMac::MAC_GetCommandLine`'s cache: an 0x800 byte buffer it fills once from
