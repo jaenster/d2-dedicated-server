@@ -18,6 +18,7 @@ pub const mach = @import("mach.zig");
 pub const cxx = @import("cxx.zig");
 pub const carbon = @import("carbon.zig");
 pub const files = @import("files.zig");
+pub const sockets = @import("sockets.zig");
 pub const memory = @import("memory.zig");
 pub const compat = @import("compat.zig");
 
@@ -100,6 +101,14 @@ pub const Resolver = struct {
             self.libc_hits += 1;
             return addr;
         }
+        // Ahead of libc because libc still forwards `socket`, `listen`, `send`, `recv` and
+        // `setsockopt` — names it took as scalar-only before the option and flag constants turned out
+        // to differ. The socket layer owns them now; the forwards are dead entries, not a second
+        // answer.
+        if (sockets.address(norm)) |addr| {
+            self.libc_hits += 1;
+            return addr;
+        }
         if (libc.address(norm)) |addr| {
             self.libc_hits += 1;
             return addr;
@@ -176,6 +185,24 @@ test "the shims answer before the libc list, on the name the image uses" {
 
     try testing.expectEqual(@as(usize, 0), r.thunk_hits);
     try testing.expectEqual(@as(usize, 0), r.thunks.count());
+}
+
+test "the socket layer answers the names libc.zig also lists, and it answers first" {
+    var r = try Resolver.init(8);
+    defer r.deinit();
+
+    // These are still in the forwarded list, so the only thing keeping the game off the host's own
+    // setsockopt — where SOL_SOCKET is 1 rather than 0xffff — is the order of the two lookups.
+    try testing.expectEqual(@intFromPtr(&sockets.setsockopt), r.resolve("_setsockopt").?);
+    try testing.expectEqual(@intFromPtr(&sockets.socket), r.resolve("_socket").?);
+    try testing.expectEqual(@intFromPtr(&sockets.recv), r.resolve("_recv$UNIX2003").?);
+
+    // And the ones libc.zig never claimed, reached through the spelling the image binds.
+    try testing.expectEqual(@intFromPtr(&sockets.connect), r.resolve("_connect$UNIX2003").?);
+    try testing.expectEqual(@intFromPtr(&sockets.select), r.resolve("_select$UNIX2003").?);
+    try testing.expectEqual(@intFromPtr(&sockets.ioctl), r.resolve("_ioctl").?);
+
+    try testing.expectEqual(@as(usize, 0), r.thunk_hits);
 }
 
 test "an unimplemented name gets one thunk of its own" {

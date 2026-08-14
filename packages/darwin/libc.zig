@@ -103,13 +103,9 @@ pub const names = [_][]const u8{
     "chmod",
     "mprotect",
     "msync",
-    "socket",
-    "listen",
-    "send",
-    "recv",
-    // SOL_SOCKET and the SO_* values differ between the platforms; a wrong option fails the call
-    // rather than corrupting anything, which is a translation the host can add when it matters.
-    "setsockopt",
+    // Sockets are NOT here. `sockets.zig` owns every one of them, because the sockaddr length byte,
+    // the SO_* values and the MSG_* flags all differ — Darwin's MSG_WAITALL is Linux's MSG_DONTWAIT,
+    // so a forward would quietly invert blocking rather than fail.
     "inet_addr",
     "inet_ntoa",
     "gethostname",
