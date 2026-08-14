@@ -292,6 +292,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    probe.root_module.addImport("libd2", libd2); // the BNFTP wire, shared with realmd's server side
     b.installArtifact(probe);
     const run_probe = b.addRunArtifact(probe);
     if (b.args) |args| run_probe.addArgs(args);

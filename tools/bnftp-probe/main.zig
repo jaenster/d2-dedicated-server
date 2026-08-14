@@ -20,6 +20,7 @@
 //!         --proto-ver 0xNNNN (BNFTP version, default 0x0100)
 //!   product: 4CC, default D2XP (LoD). Use D2DV for classic.
 const std = @import("std");
+const wire = @import("libd2").bnet.bnftp;
 
 // ── libc sockets (native host target; std.posix socket wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -453,9 +454,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("\n[2] BNFTP request for \"{s}\" ({d}-byte header)\n", .{ file_to_get, w });
         if (!head_only) hexdump("BNFTP request", req[0..w]);
 
-        // --head: read only enough for the reply header (size + name), then stop.
-        // The reply leads with u32 headerLen, u32 fileSize — so existence/size is
-        // known without pulling the (multi-MB) body. Good for sweeping filenames.
+        // --head: read only enough for the reply header (size + name), then stop, so a
+        // filename sweep never pulls a multi-MB body just to learn a file exists.
         if (head_only) {
             var hb: [256]u8 = undefined;
             var got: usize = 0;
@@ -464,12 +464,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (n == 0) break;
                 got += n;
             }
-            if (got >= 8) {
-                const hlen = std.mem.readInt(u32, hb[0..4], .little);
-                const fsize = std.mem.readInt(u32, hb[4..8], .little);
-                const rname = if (hlen >= 0x19 and 0x18 < got) cstrAt(hb[0..got], 0x18) else "";
-                std.debug.print("  HEAD: fileSize={d}  headerLen={d}  name=\"{s}\"  {s}\n", .{ fsize, hlen, rname, if (fsize == 0) "NOT HOSTED" else "EXISTS" });
-            } else {
+            if (wire.ReplyHeader.decode(hb[0..got])) |hdr| {
+                std.debug.print("  HEAD: fileSize={d}  headerLen={d}  name=\"{s}\"  {s}\n", .{ hdr.file_size, hdr.header_len, hdr.filename, if (hdr.notHosted()) "NOT HOSTED" else "EXISTS" });
+            } else |_| {
                 std.debug.print("  HEAD: short reply ({d} bytes) — not hosted\n", .{got});
             }
             std.debug.print("\ndone.\n", .{});
@@ -489,14 +486,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("\n[2] BNFTP reply: {d} bytes total\n", .{total});
         hexdump("BNFTP reply header (first 64)", data[0..@min(64, data.len)]);
 
-        if (data.len >= 8) {
-            const hlen = std.mem.readInt(u32, data[0..4], .little);
-            const fsize = std.mem.readInt(u32, data[4..8], .little);
+        if (wire.ReplyHeader.decode(data)) |hdr| {
+            const hlen = hdr.header_len;
+            const fsize = hdr.file_size;
             std.debug.print("  parsed: headerLen={d}  fileSize={d}\n", .{ hlen, fsize });
-            if (hlen >= 0x18 and hlen <= data.len) {
-                const ftime = std.mem.readInt(u64, data[0x10..0x18], .little);
-                const rname = cstrAt(data, 0x18);
-                std.debug.print("  filetime=0x{x}  filename=\"{s}\"\n", .{ ftime, rname });
+            if (hlen <= data.len) {
+                std.debug.print("  filetime=0x{x}  filename=\"{s}\"\n", .{ hdr.file_time, hdr.filename });
                 const body = data[hlen..];
                 // Save the file payload for inspection.
                 // With --out-dir, store under the real filename (drop straight
@@ -513,6 +508,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 std.debug.print("  headerLen 0x{x} out of range — dumping more:\n", .{hlen});
                 hexdump("BNFTP reply (first 256)", data[0..@min(256, data.len)]);
             }
+        } else |e| {
+            // A probe pointed at a real server is exactly where a reply that is not the shape
+            // we think it is should be SHOWN rather than swallowed.
+            std.debug.print("  unreadable reply header ({s}) — dumping:\n", .{@errorName(e)});
+            hexdump("BNFTP reply (first 256)", data[0..@min(256, data.len)]);
         }
     }
     std.debug.print("\ndone.\n", .{});
