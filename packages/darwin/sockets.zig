@@ -12,8 +12,9 @@
 //!                    forward it — but a refused SO_REUSEADDR is still a server that cannot restart.
 //!   MSG_*            Only OOB, PEEK and DONTROUTE agree. WAITALL is 0x40 on Darwin and 0x100 on
 //!                    Linux, where 0x40 means DONTWAIT — so a forwarded blocking read stops blocking.
-//!   struct timeval   Darwin i386 is two 32-bit longs. musl is a time64 libc on every architecture,
-//!                    so its is two 64-bit ones, and the game's eight bytes cannot be read as sixteen.
+//!   struct timeval   Darwin i386 is two 32-bit longs, and musl publishes two different structs
+//!                    under that name — see `HostTimeval` and `SelectTimeval` below. Which one a
+//!                    call wants depends on which symbol it reaches, not on the platform.
 //!   errno            The game reads it through `___error` and compares against its own errno.h,
 //!                    where EWOULDBLOCK is 35 and EINPROGRESS 36 rather than Linux's 11 and 115. Each
 //!                    failing call translates before it returns, the way pthread.zig returns Darwin's
@@ -456,17 +457,35 @@ pub fn socketOptionToHost(option: c_int) ?c_int {
 /// Darwin i386's `struct timeval`: `time_t` and `suseconds_t` are both 32-bit longs there.
 pub const DarwinTimeval = extern struct { sec: i32, usec: i32 };
 
-/// What the host libc reads. musl is time64 on every architecture, so both fields are 64-bit even on
-/// i386 — and `std.os.linux.timeval` models the kernel's struct rather than musl's, so it cannot be
-/// used here.
+/// musl's own `struct timeval`, which is time64 on every architecture: both fields are 64-bit even
+/// on i386. `std.os.linux.timeval` models the kernel's struct rather than musl's, so it cannot be
+/// used here. This is the one `setsockopt` reads, and SO_RCVTIMEO_NEW is the option that goes with
+/// it — measured on i386 musl, where the OLD number or an eight-byte payload is refused outright.
 pub const HostTimeval = switch (builtin.os.tag) {
     .linux => extern struct { sec: i64, usec: i64 },
     else => extern struct { sec: c_long, usec: i32 },
 };
 
+/// What `select` reads, which on i386 musl is NOT the struct above.
+///
+/// musl ships the time64 transition as two entry points. C compiled against its headers is
+/// redirected to `__select_time64` and passes `HostTimeval`; the exported `select` symbol keeps the
+/// legacy `{long, long}` — eight bytes on i386. A Zig `extern fn` binds by name and no header
+/// redirect applies, so it always reaches the legacy one. Handing that sixteen bytes makes it take
+/// tv_usec from the high half of tv_sec, so every timeout reads as zero: `select` returns 0 the
+/// instant it is called, forever, and a thread that is supposed to block on it burns a core.
+/// `setsockopt` has no second entry point and so keeps `HostTimeval`; the two really do differ.
+pub const SelectTimeval = switch (builtin.os.tag) {
+    .linux => extern struct { sec: c_long, usec: c_long },
+    else => extern struct { sec: c_long, usec: i32 },
+};
+
 comptime {
     std.debug.assert(@sizeOf(DarwinTimeval) == 8);
-    if (builtin.os.tag == .linux) std.debug.assert(@sizeOf(HostTimeval) == 16);
+    if (builtin.os.tag == .linux) {
+        std.debug.assert(@sizeOf(HostTimeval) == 16);
+        std.debug.assert(@sizeOf(SelectTimeval) == 2 * @sizeOf(c_long));
+    }
 }
 
 /// 1024 bits either way. Darwin stores them as 32 `__int32_t`; musl as `unsigned long` words, so 32 of
@@ -544,7 +563,7 @@ const host = struct {
     extern fn getsockname(fd: c_int, addr: *anyopaque, len: *u32) c_int;
     extern fn getpeername(fd: c_int, addr: *anyopaque, len: *u32) c_int;
     extern fn setsockopt(fd: c_int, level: c_int, option: c_int, value: ?*const anyopaque, len: u32) c_int;
-    extern fn select(nfds: c_int, r: ?*anyopaque, w: ?*anyopaque, e: ?*anyopaque, t: ?*HostTimeval) c_int;
+    extern fn select(nfds: c_int, r: ?*anyopaque, w: ?*anyopaque, e: ?*anyopaque, t: ?*SelectTimeval) c_int;
     /// Declared variadic because it is: a fixed third parameter would put the argument in the wrong
     /// place on any ABI that passes variadic arguments differently.
     extern fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
@@ -704,8 +723,8 @@ pub fn select(
     exceptfds: ?*FdSet,
     timeout: ?*DarwinTimeval,
 ) callconv(.c) c_int {
-    var t: HostTimeval = undefined;
-    var tp: ?*HostTimeval = null;
+    var t: SelectTimeval = undefined;
+    var tp: ?*SelectTimeval = null;
     if (timeout) |d| {
         t = .{ .sec = d.sec, .usec = d.usec };
         tp = &t;
@@ -912,8 +931,12 @@ test "the ioctl requests carry their direction and payload size" {
 test "the layouts that need no translation, stated rather than assumed" {
     try testing.expectEqual(@as(usize, 128), @sizeOf(FdSet));
     try testing.expectEqual(@as(usize, 8), @sizeOf(DarwinTimeval));
-    // The one that does: Darwin's eight bytes are not musl's sixteen.
-    if (translating) try testing.expectEqual(@as(usize, 16), @sizeOf(HostTimeval));
+    // The one that does — and it is two structs, not one: setsockopt reads musl's time64 timeval,
+    // while the exported select symbol still reads the legacy pair of longs.
+    if (translating) {
+        try testing.expectEqual(@as(usize, 16), @sizeOf(HostTimeval));
+        try testing.expectEqual(2 * @sizeOf(c_long), @sizeOf(SelectTimeval));
+    }
 
     // struct hostent is the same five fields in the same order, so the host's object is the answer.
     try testing.expectEqual(2 * @sizeOf(usize), @offsetOf(Hostent, "addrtype"));
@@ -1007,6 +1030,26 @@ test "a real connection over the shim's own sockaddr translation" {
     // Darwin does not write the remaining time back, and neither does the shim.
     try testing.expectEqual(@as(i32, 1), wait.sec);
     try testing.expectEqual(@as(isize, 2), recv(client, &buf, 2, 0));
+}
+
+/// Monotonic milliseconds, for the one test that has to prove a call actually blocked.
+fn monotonicMs() ?i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return null;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+test "a select with nothing to wait for waits anyway" {
+    // The bug this exists for: a timeout struct handed to a host entry point that reads it narrower
+    // than it was written puts tv_usec in the padding, so every timeout is zero. Nothing fails —
+    // select just returns 0 the instant it is called, and the caller's loop spins at a million
+    // iterations a second. Only elapsed time can tell the two apart.
+    const t0 = monotonicMs() orelse return error.SkipZigTest;
+    var empty: FdSet = .{ .bits = @splat(0) };
+    var wait: DarwinTimeval = .{ .sec = 0, .usec = 150_000 };
+    try testing.expectEqual(@as(c_int, 0), select(0, &empty, null, null, &wait));
+    const elapsed = (monotonicMs() orelse return error.SkipZigTest) - t0;
+    try testing.expect(elapsed >= 100);
 }
 
 test "a failed call leaves a Darwin errno behind" {
