@@ -58,7 +58,11 @@ const per_ip_unlimited: i32 = -1;
 pub fn install(loaded: *const macho.load.Loaded) void {
     image = loaded;
     const slot: *u32 = @ptrFromInt(loaded.at(addr.pf_modes + 3 * 4));
-    slot.* = @intFromPtr(&run);
+    // The slot is a 32-bit function pointer because the image is i386. Truncating is only sound
+    // where our own code is also below 4 GiB, which is why the host refuses to run the image
+    // anywhere else — but the truncation still has to COMPILE on a 64-bit developer machine, since
+    // that is where `--dry-run` and the tests live.
+    slot.* = @truncate(@intFromPtr(&run));
 }
 
 fn run() callconv(.c) u32 {

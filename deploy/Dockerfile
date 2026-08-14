@@ -57,7 +57,9 @@ RUN zig build d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
 # files are still proprietary and still mounted at /game.
 FROM --platform=linux/386 scratch AS gs-native
 COPY --from=build-native /src/zig-out/bin/d2gs-native /d2gs-native
-VOLUME ["/game"]
+# The engine writes its resource file to the temporary-items folder during startup, and a scratch
+# image has no /tmp for it to land in. Declaring it as a volume is what creates the directory.
+VOLUME ["/game", "/tmp"]
 EXPOSE 4000
 ENTRYPOINT ["/d2gs-native"]
 
