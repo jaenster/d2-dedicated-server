@@ -109,6 +109,9 @@ fn reportJoinPreconditions() void {
 /// every live game, then flush what the games queued back out. Exactly one sleep per pass either
 /// way — that is the engine's own pacing, and skipping it is what burns a core.
 fn tick() void {
+    // Not gated on a realm being attached: the empty-game reap is a byte patch on the engine and
+    // applies to a game a client made for itself just as much as to one the realm asked for.
+    gslink.holdGameForItsFirstPlayer();
     // Before the packet drain, so a game the realm asked for exists before the client that was
     // told about it can send its join.
     gslink.pump();

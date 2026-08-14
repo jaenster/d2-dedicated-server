@@ -205,6 +205,16 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // one it already supports. The panel-update callbacks above it are outside the block and
         // still run, which is what keeps the UI advancing. `JNZ rel32` -> `JMP rel32`, same target.
         .{ .at = 0x0004a7c2, .bytes = &.{ 0xe9, 0xc9, 0x01, 0x00, 0x00, 0x90 }, .why = "no surface to draw the frame on" },
+        // QSERVER_DispatchAndCleanup destroys a game with nobody in it only once it has been empty
+        // for `CMP ESI, 0x493e0` — five minutes. The Windows build is patched the same way for the
+        // same reason (`apps/d2gs/runtime/gamereap.zig`), but there it is about not exhausting the
+        // eight Fog pool managers; here it is sharper than that. This engine has room for exactly
+        // one game, so the idle window IS the wait between games, and five minutes of it makes the
+        // server useless the moment anyone finishes a game. One millisecond, so a finished game is
+        // collected on the next dispatch pass. What stops that reaping a game the realm has only
+        // just made, before its client has had time to connect, is `gslink.pump`: it holds the
+        // engine's empty-since stamp at zero until the game has actually had someone in it.
+        .{ .at = 0x001ae8f2, .bytes = &.{ 0x01, 0x00, 0x00, 0x00 }, .why = "collect an empty game at once, not in five minutes" },
         // GAMELOGON's no-realm branch serves one game and calls it token 1: it refuses any other
         // token outright, then passes the immediate 1 to SERVER_IsTokenValid rather than the token
         // the packet carried. Both are the same assumption written twice. Drop the refusal...
