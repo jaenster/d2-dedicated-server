@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
         // pointers, and a rebase pass would slide our entry along with them. Same for the join
         // hook, which is a relative call to code of ours.
         qserver.install(&loaded);
-        gslink.installJoinHook(&loaded);
+        gslink.installTokenResolver(&loaded);
     }
 
     // Sealing is what makes the thunks executable, so it has to follow every bind, not precede it.
@@ -226,8 +226,9 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // ...and then translate it somewhere with room. SERVER_IsTokenValid reads a table with one
         // usable slot (index 0 aliases the server-running byte at 0x53756c, and the token allocator
         // clamps its counter to 1), and it indexes with an unchecked u16 — so a realm token is both
-        // unstorable and unsafe to look up. `gslink.installJoinHook` redirects the call that
-        // follows; the table itself is left exactly as the engine keeps it.
+        // unstorable and unsafe to look up. `gslink.installTokenResolver` replaces that function,
+        // which is where the translation has to be: a single GAMELOGON looks the token up from
+        // three separate functions. The table itself is left exactly as the engine keeps it.
         // NET_D2GS_SERVER_SendPacketToClient 0x002ddd78 already has a verbatim path — the one the
         // greeting itself rides — and mode 2 is how the engine asks for it. Windows reaches it with
         // one patch because its compiler left one gate; this build split the same test in two, so

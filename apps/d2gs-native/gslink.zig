@@ -44,12 +44,17 @@ const addr = struct {
     const is_token_valid: u32 = 0x001abcff;
     /// Where 0x002de1f9 files a game id whose client is null — i.e. every game we make.
     const last_gameid: u32 = 0x00552568;
-    /// GAMELOGON's `call SERVER_IsTokenValid`, and the instruction after it.
-    const join_lookup_call: u32 = 0x001a7a36;
-    const join_lookup_next: u32 = 0x001a7a3b;
-    /// (game id) -> the game struct, or 0. What `QSERVER_DispatchAndCleanup` turns the id at
-    /// 0x00537570 into before it reads anything out of the game.
+    /// `uint32 gpGameTable[]`, indexed by the u16 token, and the critical section
+    /// `SERVER_IsTokenValid` reads it under. 0 and -1 both mean "no game".
+    const token_table: u32 = 0x0053756c;
+    const token_table_cs: u32 = 0x00537578;
+    const enter_critical_section: u32 = 0x0002af3a;
+    const leave_critical_section: u32 = 0x0002af43;
+    /// (game id) -> the game struct with its critical section HELD, or 0. What
+    /// `QSERVER_DispatchAndCleanup` turns the id at 0x00537570 into before it reads anything out of
+    /// the game — and what it hands back to `game_unlock` the moment it is done.
     const game_from_id: u32 = 0x001abd47;
+    const game_unlock: u32 = 0x001abdda;
 };
 
 /// How many clients are in the game: what the reap reads to decide it is empty (0x001ae8bf) and
@@ -64,6 +69,11 @@ const game_empty_since: u32 = 0x1dc0;
 /// finished its GAMELOGON", which is well under a second — but a client that never arrives must not
 /// hold the server's only game slot forever either.
 const unjoined_grace_s: i64 = 30;
+
+/// How long a create will wait for the one slot to be freed by a game that is already over. It
+/// covers a dispatch pass, not a game — the alternative is refusing a realm that was told a moment
+/// ago that this server had room, and it is bounded well inside the control thread's own wait.
+const create_wait_s: i64 = 3;
 
 /// The engine's token table has three entries and no bounds check, so a lookup past the end is a
 /// wild read. Nothing above this may be handed to SERVER_IsTokenValid.
@@ -91,29 +101,67 @@ const max_games: u32 = 1;
 var live_gameid: u32 = 0;
 var live_join_id: u16 = 0;
 var next_join_id: u16 = 0;
+/// What the realm calls the game in the slot. Kept because a create naming it is a client that
+/// wants in, not a new game — see `slotIsReady`.
+var live_name: [36]u8 = @splat(0);
 
-/// Answers GAMELOGON's "what game is this". Replaces SERVER_IsTokenValid at its call site, and
-/// falls back to it for the ids that function can safely be asked about — which keeps the engine's
-/// own one-game-on-token-1 path working when no realm is attached.
-fn resolveJoinId(id: u32) callconv(.c) u32 {
-    const answer = if (id != 0 and id == live_join_id and live_gameid != 0)
+/// Answers "what game is this token", for realm join ids as well as engine ones.
+///
+/// One GAMELOGON asks this THREE times, from three different functions — 0x001a7a36 in the handler
+/// itself, 0x001aca92 in the name check and 0x001acda1 in the seating — and every one of them is
+/// handed the u16 the client sent. Translating only the first is what made the second game per
+/// process go silent rather than refused: the handler resolved the game and took its success path,
+/// then the name check asked the engine's table for token 2, got nothing, and returned 0. Its
+/// caller answers a 0 by falling straight out of the switch — no seat, no 0xB4, no anything.
+///
+/// So the translation belongs in the function, not at a call site. For an id the realm issued the
+/// live game is the answer; for anything else this is the engine's own lookup, lock and all, which
+/// is what keeps the no-realm path working — and it declines to index the table with a realm id,
+/// which the engine would have done unchecked.
+fn serverIsTokenValid(id: u32) callconv(.c) u32 {
+    const token: u16 = @truncate(id);
+    const mine = token != 0 and token == live_join_id and live_gameid != 0;
+    if (mine) join_resolved = true;
+    const answer = if (mine)
         live_gameid
-    else if (id <= engine_token_max) tokenValid(id) else 0;
-    // The one line that tells a refused join apart from a join that never arrived.
-    note("d2gs-native: GAMELOGON asked for game {d} -> 0x{x}\n", .{ id, answer });
+    else if (token <= engine_token_max) engineTokenValid(token) else 0;
+    // The one line that tells a refused join apart from a join that never arrived. The engine asks
+    // repeatedly with the same token, so only a change is worth a line.
+    if (token != last_note_token or answer != last_note_answer) {
+        last_note_token = token;
+        last_note_answer = answer;
+        note("d2gs-native: game token {d} -> 0x{x}\n", .{ token, answer });
+    }
     return answer;
 }
 
-/// Point GAMELOGON's lookup at `resolveJoinId`: same `call rel32`, new target. Runs before the
-/// image is made read-only, and only where our own code is addressable in 32 bits — which is the
-/// same condition the byte patches are already gated on.
-pub fn installJoinHook(loaded: *const macho.load.Loaded) void {
+var last_note_token: u16 = 0;
+var last_note_answer: u32 = 0;
+
+/// The engine's table lookup, under the engine's own lock: `gpGameTable[token]`, where 0 and -1
+/// both mean "no game". Open-coded rather than called, because the function it lives in is the one
+/// being replaced.
+fn engineTokenValid(token: u16) u32 {
+    const enter: *const fn (usize) callconv(.c) void = @ptrFromInt(image.at(addr.enter_critical_section));
+    const leave: *const fn (usize) callconv(.c) void = @ptrFromInt(image.at(addr.leave_critical_section));
+    const cs = image.at(addr.token_table_cs);
+    enter(cs);
+    defer leave(cs);
+    const table: [*]const u32 = @ptrFromInt(image.at(addr.token_table));
+    const v = table[token];
+    return if (v == 0 or v == 0xffff_ffff) 0 else v;
+}
+
+/// Replace `SERVER_IsTokenValid` outright: `jmp rel32` over its prologue. Runs before the image is
+/// made read-only, and only where our own code is addressable in 32 bits — which is the same
+/// condition the byte patches are already gated on.
+pub fn installTokenResolver(loaded: *const macho.load.Loaded) void {
     image = loaded;
-    const site = loaded.at(addr.join_lookup_call);
-    const rel: i32 = @bitCast(@as(u32, @truncate(@intFromPtr(&resolveJoinId))) -%
-        @as(u32, @truncate(loaded.at(addr.join_lookup_next))));
+    const site = loaded.at(addr.is_token_valid);
+    const rel: i32 = @bitCast(@as(u32, @truncate(@intFromPtr(&serverIsTokenValid))) -%
+        @as(u32, @truncate(site + 5)));
     const at: [*]u8 = @ptrFromInt(site);
-    at[0] = 0xe8;
+    at[0] = 0xe9;
     std.mem.writeInt(i32, at[1..5], rel, .little);
 }
 
@@ -125,6 +173,9 @@ var req_desc: [36]u8 = undefined;
 var req_flags: u32 = 0;
 var req_result: u32 = p.CREATE_FAILED;
 var req_gameid: u32 = 0;
+/// When `pump` must stop waiting for the slot and answer whatever it can. Whole seconds, because
+/// that is the clock the rest of this file keeps time on.
+var req_deadline_s: i64 = 0;
 
 /// Two senders share the socket: the control thread answers requests, the tick thread reports a
 /// game closing.
@@ -153,17 +204,40 @@ pub fn start(loaded: *const macho.load.Loaded) void {
 /// going away — the engine has no hook to tell us, but its token stops resolving.
 pub fn pump() void {
     if (!started) return;
-    if (req_pending.load(.acquire)) {
+    if (req_pending.load(.acquire) and slotIsReady()) {
         runCreate();
         req_pending.store(false, .release);
         req_done.store(true, .release);
     }
-    if (live_gameid != 0 and tokenValid(1) == 0) {
+    // A game with nobody left in it is finished as far as the realm is concerned, whether or not
+    // the engine has got round to freeing it: it must stop being somewhere a client can be sent,
+    // and this server's one slot must stop counting against the realm's capacity. Waiting for the
+    // engine's collect instead is what made the round after a finished one arrive at a realm that
+    // still thought this server was full.
+    if (live_gameid != 0 and (phase == .released or tokenValid(1) == 0)) {
         sendCloseGame(live_join_id);
         note("d2gs-native: gslink CLOSEGAME gameid={d}\n", .{live_join_id});
         live_gameid = 0;
         live_join_id = 0;
+        live_name = @splat(0);
     }
+}
+
+/// Whether a create can be answered now, or is worth holding for the one slot to come free.
+///
+/// The engine is about a second behind a client that walks out: the connection is gone, and the
+/// game still counts it until the engine gets round to the disconnect. On a server with one game
+/// slot that second IS the gap between one game and the next, so the create that arrives in it
+/// must wait rather than be refused — a refusal reaches the player as "the realm is down" for a
+/// server that is about to be idle.
+///
+/// What must NOT wait is the other client of the game already here: it lost the race to create a
+/// game its partner made, and a refusal is the answer it wants, because the realm turns that into
+/// a join. The name tells them apart — same name is the race, a different name is the next game.
+fn slotIsReady() bool {
+    if (tokenValid(1) == 0) return true;
+    if (std.mem.eql(u8, cstr(&live_name), cstr(&req_name))) return true;
+    return time(null) >= req_deadline_s;
 }
 
 // ── engine ───────────────────────────────────────────────────────────────────
@@ -175,6 +249,9 @@ var phase: Phase = .released;
 var held_id: u32 = 0;
 var held_since_s: i64 = 0;
 var last_clients: u32 = 0;
+/// Whether a client has asked to join the game currently in the slot. The engine's own client count
+/// cannot answer that on its own — see `holdGameForItsFirstPlayer`.
+var join_resolved = false;
 
 /// The engine's empty-game reap is a stopwatch, and `applyPatches` has shortened it to a
 /// millisecond so a finished game frees the one slot this build has immediately. That leaves the
@@ -198,18 +275,29 @@ pub fn holdGameForItsFirstPlayer() void {
         held_since_s = time(null);
         phase = .waiting;
     }
+    // This does not just find the game, it LOCKS it — `EnterCriticalSection(game->0x18)` — and
+    // every one of the engine's own callers unlocks before it returns. Reading two fields out of a
+    // game and walking away with its critical section held would leave the game permanently locked
+    // against its own destroy, once per tick.
     const from_id: *const fn (u32) callconv(.c) u32 = @ptrFromInt(image.at(addr.game_from_id));
     const game = from_id(id);
     if (game == 0) return;
+    const unlock: *const fn (u32) callconv(.c) void = @ptrFromInt(image.at(addr.game_unlock));
+    defer unlock(game);
 
     const clients: *const u32 = @ptrFromInt(game + game_clients);
     if (clients.* != last_clients) {
         last_clients = clients.*;
         note("d2gs-native: game {d} has {d} client(s), {d}s in\n", .{ live_join_id, clients.*, time(null) - held_since_s });
     }
+    // A brand-new game reports one client before it has any: `GAME_CreateGame` is given a null
+    // client and still files a player record for it, which the engine drops again a tick or two
+    // later. Taking that for a player is what let the reap collect a game the moment it was made —
+    // the count went 1, then 0, and the game was gone before the client it existed for had
+    // finished connecting. So a real player is one this server has answered a GAMELOGON for.
     if (clients.* != 0) {
-        if (phase == .waiting) phase = .played;
-        return;
+        if (phase == .waiting and join_resolved) phase = .played;
+        if (phase != .waiting) return;
     }
     switch (phase) {
         .played => {
@@ -229,9 +317,10 @@ pub fn holdGameForItsFirstPlayer() void {
     }
 }
 
+/// "Is the engine's one game slot occupied, and by what". The engine's table, not the resolver
+/// above it: this asks about the slot, and the resolver's job is to answer about realm ids.
 fn tokenValid(token: u32) u32 {
-    const f: *const fn (u32) callconv(.c) u32 = @ptrFromInt(image.at(addr.is_token_valid));
-    return f(token);
+    return engineTokenValid(@truncate(token));
 }
 
 /// The 0x67 handler's call, with the packet's fields spelled out. Everything but the name, the
@@ -260,8 +349,14 @@ fn runCreate() void {
     ) callconv(.c) void;
     const create: *const Create = @ptrFromInt(image.at(addr.game_create));
     create(0, @ptrCast(&req_name), 0, 1, @ptrCast(&req_desc), 0, req_flags, 0, 0, 0, 0, 0, 0, 0);
-    // Whatever id the engine reuses for it, this is a new game and nobody is in it yet.
+    // Whatever id the engine reuses for it, this is a new game and nobody is in it yet. The phase
+    // has to be set HERE and not left to the next tick's `holdGameForItsFirstPlayer`: the same pump
+    // that ran this create goes on to look for a game that has finished, and a phase still reading
+    // `released` from the last one makes it report the game it has just made as closed.
     held_id = 0;
+    held_since_s = time(null);
+    phase = .waiting;
+    join_resolved = false;
 
     const singleton: *const u32 = @ptrFromInt(image.at(addr.last_gameid));
     const id = singleton.*;
@@ -274,6 +369,7 @@ fn runCreate() void {
     next_join_id = if (next_join_id == std.math.maxInt(u16)) 1 else next_join_id + 1;
     live_join_id = next_join_id;
     live_gameid = id;
+    live_name = req_name;
     req_gameid = live_join_id;
     req_result = p.CREATE_OK;
 }
@@ -394,9 +490,13 @@ fn onCreateGame(body: []const u8) void {
         req_flags = gameFlags(body[2], body[1] != 0, body[3] != 0);
 
         req_done.store(false, .release);
+        req_deadline_s = time(null) + create_wait_s;
         req_pending.store(true, .release);
         var waited: u32 = 0;
         while (!req_done.load(.acquire) and waited < 5000) : (waited += 5) _ = usleep(5000);
+        // A request the tick thread never got to must not stay armed, or it would create a game
+        // nobody is waiting for the moment the slot frees.
+        req_pending.store(false, .release);
         if (req_done.load(.acquire)) {
             result = req_result;
             gid = req_gameid;
