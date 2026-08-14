@@ -39,7 +39,9 @@ if [ ! -x "$MPQMIN" ]; then
 fi
 
 # Case-insensitive lookup helper (installs vary: Game.exe / game.exe, D2.LNG / d2.lng).
-find_ci() { find "$D2_INSTALL" -maxdepth 1 -iname "$1" -print -quit 2>/dev/null; }
+# -L because an install is often reached through a symlink, and without it find silently matches
+# nothing and every file is reported missing while sitting in plain view.
+find_ci() { find -L "$D2_INSTALL" -maxdepth 1 -iname "$1" -print -quit 2>/dev/null; }
 
 missing=0
 take() { # take <name> [dest-name] — copy a file from the install verbatim
