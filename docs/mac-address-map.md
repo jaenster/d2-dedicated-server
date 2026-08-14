@@ -23,6 +23,9 @@ The Mac database is **not** authoritative. It has 594 imported symbols against 1
 names -- the names were propagated onto it, and spot checks show a meaningful error rate. A name
 collision was never accepted as a match on its own. Two independent checks were used:
 
+The TU technique below is now written up in full, with every range, in
+[`mac-tu-map.md`](mac-tu-map.md). Use that document rather than re-deriving ranges by hand.
+
 - **TU** -- the Mac build keeps full `__FILE__` assert strings (e.g.
   `.../DiabloAll/../D2Game/Src/Game.cpp`). 252 distinct source paths anchor 1,146 functions, which
   reconstructs the translation-unit layout of `__text`. Object-file sections are contiguous, so a
@@ -427,7 +430,7 @@ is a byte offset inside the function, not its entry.
 |ptr|`0x00478350`|`D2Game::Game::Msg::NET_D2GS_CLIENT_Send`|--|not found -- no function of this name in the Mac DB|
 |len|`0x004785d0`|`D2Game::Game::Msg::NET_D2GS_CLIENT_Send_SHORT_SHORT`|--|not found -- no function of this name in the Mac DB|
 |sendRunToLocation()|`0x004786a0`|`D2Game::Game::Msg::NET_D2GS_CLIENT_Send_INT_INT`|--|REFUTED -- DB says `0x000cbf8b`, inside the npcmenu.cpp/panel.cpp neighbourhood|
-|ImageLoadDC6Ex|`0x004788b0`|`D2Client::Core::Archive::IMAGE_LoadDC6Ex`|--|REFUTED -- DB says `0x0005cf38`; Archive.cpp TU run is 002b6888-002b6e68|
+|ImageLoadDC6Ex|`0x004788b0`|`D2Client::Core::Archive::IMAGE_LoadDC6Ex`|`0x0005cf38`|TU=D2Client/CORE/ARCHIVE.CPP, asserts against that file (the earlier REFUTED verdict confused it with D2Hell/SRC/Archive.cpp)|
 |GetMonsterOwner|`0x00479150`|`D2Game::Game::RosterPets::GetRosterOwnerGUID`|`0x00076a1a`?|UNCONFIRMED -- name-only, just past the RosterPets.cpp anchor run|
 |EscMenuShowMenu|`0x0047e090`|`D2Client::UI::EscMenu::ESCMENU_ShowMenu`|`0x000a0f64`?|UNCONFIRMED -- name-only, no EscMenu TU anchor in the Mac build|
 |TxtCharStatsGetLine|`0x004833e0`|`D2Common::DataTbls::INV_GetCharStatsTxtLine`|--|not found -- no function of this name in the Mac DB|
@@ -749,3 +752,59 @@ matches in the hook layer are demonstrably on the wrong function, and three more
 string fingerprints disagreed with the name. Roughly a third of the applied names are wrong.
 Reading addresses out of that database without re-confirming them will silently hook the wrong
 code.
+
+## Corrections applied to the Mac database
+
+Session `ce51a192` was repaired against the TU map. 39 names were changed. Nothing was renamed
+without stated evidence; where the truth could not be established the name was made neutral rather
+than left as a confident lie. Every changed function carries a PLATE comment recording why.
+
+### Identified and renamed
+
+|mac addr|was|now|evidence|
+|-|-|-|-|
+|`0x00034519`|`D2Common::Items::Items::ITEMS_FatalError`|`FOG_FatalError`|called by all 1,386 functions referencing the `"Unrecoverable internal error %08x line %d"` format string; body calls `MAC_DisplayFatalError` then the registered handler or `_ExitToShell`; sits in the StormMac region, not D2Common/ITEMS/Items.cpp|
+|`0x002f40fb`|`Fog::Memory::InitializePoolSystem`|`QSERVER_ReleaseClientRef`|asserts `__FILE__` QServer.cpp lines 0x37b/0x3a7/0x3ae/0x940, inside the QServer.cpp core range; refcount decrement then unlink from the id hash, unlink from the per-source-IP hash, decrement the per-IP connection count, free the client|
+
+### Neutralised (name refuted, true identity not established)
+
+37 functions were renamed to `UNVERIFIED_<tu>_<addr>` or `UNVERIFIED_<addr>` and moved out of their
+misleading namespaces. The full list is in the database; the QSERVER-path ones are:
+`0x001ad04e` (was `SrvJoinGame`), `0x001adaba` (a duplicate `SrvJoinAct`), `0x001ad074` (was
+`SERVER_GetClientFromGmeByClientId`), `0x00213930` (was `ProcessClientMessage_GameSetup`),
+`0x001b4b24` (was `SendPacketToClient`), `0x00211eb0` (was `SERVER_DisconnectClient`),
+`0x001e012d` (was `QSERVER_GenerateToken`), `0x0013b255` (was `QSERVER_FindAndLockGame`),
+`0x0023cfdb` (was `SendPacket_Helper`), `0x002ec7c2` (was `ERROR_UnrecoverableInternalError_Halt`),
+`0x002ef904` (was `SMemAlloc`), `0x002f33fa` (was `MessageGameLoop`).
+
+The real handlers that these names were stolen from are, where known: `SrvJoinAct` = `0x001ac90e`,
+`ProcessClientMessage_GameSetup` = `0x001a77bd` (the CCmd.cpp anchor), the assert halt =
+`0x00034519`.
+
+### Namespaces corrected
+
+83 functions inside the `D2Client/GAME/SCmd.cpp` and `D2Client/SKILLS/Skills.cpp` core ranges were
+filed under `D2Game` / `D2Common`. Their own leaf names say `NET_D2GS_CLIENT_*` and `SKILLS_Clt*`,
+which corroborates the TU, so they were moved to `D2Client::Game::SCmd` and
+`D2Client::Skills::Skills`. The whole client-side incoming-packet dispatch table had been reading
+as server code.
+
+### Measured error rates
+
+|scope|decidable|wrong|rate|
+|-|-|-|-|
+|whole database, namespace TU vs actual TU|936|289|31%|
+|QSERVER area, module vs actual TU module|63|7|11%|
+
+The QSERVER area additionally has **15 duplicate leaf names** across 33 functions
+(`EnterCriticalSection` x4, `LeaveCriticalSection` x3, `QSERVER_IsClientAllowedToJoin` x2,
+`QSERVER_TickAllGames` x2, `NET_D2GS_CLIENT_ParseRecvBufferIntoPacketQueues` x2, and more).
+Each duplicate guarantees at least one wrong name, so the true QSERVER-area error rate is well
+above the 11% the module test can prove.
+
+### One earlier verdict was itself wrong
+
+`IMAGE_LoadDC6Ex` at `0x0005cf38` was listed as REFUTED because "Archive.cpp TU run is
+002b6888-002b6e68". There are two Archive files: `D2Hell/SRC/Archive.cpp` (that range) and
+`D2Client/CORE/ARCHIVE.CPP` (`0005cf38-0005d0c1`). The function is the first anchor of the latter
+and asserts against it, so the name is correct. The row is now marked confirmed.
