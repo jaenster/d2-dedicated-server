@@ -106,13 +106,19 @@ pub fn main(init: std.process.Init) !void {
     // skipped: 45 C++ constructors that every global here depends on.
     macho.load.runInitializers(&loaded, if (std.mem.eql(u8, envOr("D2MAC_TRACE", "0"), "1")) traceInit else null);
 
-    // Not `loaded.entry()`. The image's `start` reads argc off a Darwin process stack, walks argv
-    // to find envp, discards the result and calls PreInitApplication — so building that stack
-    // would buy nothing but a crash in the walk.
-    const f: *const fn () callconv(.c) c_int = @ptrFromInt(loaded.at(pre_init_application));
-    note("d2gs-native: entering PreInitApplication\n", .{});
-    const rc = f();
-    note("d2gs-native: PreInitApplication returned {d}\n", .{rc});
+    // The game boots itself from here, exactly as it would under dyld. `start` is skipped only
+    // because everything it does is stack arithmetic we can do in Zig: it derives envp and apple
+    // from argc/argv and calls this with all four.
+    const Main = *const fn (c_int, [*:null]const ?[*:0]const u8, [*:null]const ?[*:0]const u8, [*:null]const ?[*:0]const u8) callconv(.c) c_int;
+    const game_main: Main = @ptrFromInt(loaded.at(pre_init_application));
+
+    const argv0: [*:0]const u8 = path.?.ptr;
+    var image_argv = [_:null]?[*:0]const u8{argv0};
+    var empty = [_:null]?[*:0]const u8{};
+
+    note("d2gs-native: entering main(1, [{s}], ...)\n", .{path.?});
+    const rc = game_main(1, &image_argv, &empty, &empty);
+    note("d2gs-native: main returned {d}\n", .{rc});
 }
 
 /// `PreInitApplication`, the first thing the image's own entry point calls.

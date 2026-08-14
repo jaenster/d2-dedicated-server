@@ -87,6 +87,9 @@ pub const names = [_][]const u8{
     "exit",
     "_Exit",
     "atexit",
+    // The C++ static-destructor registration. musl means the same thing by it, including the dso
+    // handle it ignores; the rest of the C++ ABI is in cxx.zig because no libc ships it.
+    "__cxa_atexit",
     "raise",
     "kill",
     "getpid",

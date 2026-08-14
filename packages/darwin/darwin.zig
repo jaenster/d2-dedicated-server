@@ -14,6 +14,9 @@ const std = @import("std");
 pub const unimplemented = @import("unimplemented.zig");
 pub const libc = @import("libc.zig");
 pub const pthread = @import("pthread.zig");
+pub const mach = @import("mach.zig");
+pub const cxx = @import("cxx.zig");
+pub const carbon = @import("carbon.zig");
 pub const compat = @import("compat.zig");
 
 /// `_close$UNIX2003` -> `close`, `_stat$INODE64` -> `stat`, `_realpath$DARWIN_EXTSN` -> `realpath`.
@@ -72,6 +75,18 @@ pub const Resolver = struct {
         // pthread before libc: the names the shim owns must not also be in the forwarded list, and
         // this is the order that makes a mistake there loud rather than silent.
         if (pthread.address(norm)) |addr| {
+            self.libc_hits += 1;
+            return addr;
+        }
+        if (mach.address(norm)) |addr| {
+            self.libc_hits += 1;
+            return addr;
+        }
+        if (cxx.address(norm)) |addr| {
+            self.libc_hits += 1;
+            return addr;
+        }
+        if (carbon.address(norm)) |addr| {
             self.libc_hits += 1;
             return addr;
         }
@@ -139,6 +154,11 @@ test "the shims answer before the libc list, on the name the image uses" {
     try testing.expectEqual(@intFromPtr(&pthread.condInit), r.resolve("_pthread_cond_init$UNIX2003").?);
     try testing.expectEqual(@intFromPtr(&pthread.condWait), r.resolve("_pthread_cond_wait$UNIX2003").?);
     try testing.expectEqual(@intFromPtr(&pthread.mutexattrSettype), r.resolve("_pthread_mutexattr_settype").?);
+
+    // Including the Mach data symbol, which the game binds a pointer at rather than calls.
+    try testing.expectEqual(@intFromPtr(&mach.mach_task_self_), r.resolve("_mach_task_self_").?);
+    try testing.expectEqual(@intFromPtr(&mach.threadSelf), r.resolve("_mach_thread_self").?);
+    try testing.expectEqual(@intFromPtr(&cxx.guardAcquire), r.resolve("___cxa_guard_acquire").?);
 
     // The mutex itself still forwards, because Darwin's is the bigger of the two.
     const host_lock = @intFromPtr(@extern(*const anyopaque, .{ .name = "pthread_mutex_lock" }));
