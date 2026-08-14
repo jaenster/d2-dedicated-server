@@ -694,6 +694,20 @@ fn folderPath(folderType: u32) ?[]const u8 {
     };
 }
 
+/// `kCreateFolder` is not advice. The game passes it, and the only reason it does is that it is
+/// about to create a file in there — so answering "found" for a directory that is not on disk is a
+/// success that the very next call turns into `paramErr`. It cost a boot: the deploy image is built
+/// `FROM scratch` and has no `/tmp`, so `FSpCreateResFile` failed, `ResError` reported -50 and
+/// PreInitApplication put up "critical error and cannot start. (6, -50)".
+fn ensureFolder(path: []const u8, createFolder: u8) OSErr {
+    if (isDir(path)) return noErr;
+    if (createFolder == 0) return fnfErr;
+    var z: [path_max]u8 = undefined;
+    const zp = terminate(&z, path) orelse return paramErr;
+    _ = std.c.mkdir(zp, 0o777);
+    return if (isDir(path)) noErr else fnfErr;
+}
+
 fn findFolder(
     vRefNum: i16,
     folderType: u32,
@@ -701,16 +715,20 @@ fn findFolder(
     foundVRefNum: ?*i16,
     foundDirID: ?*i32,
 ) callconv(.c) OSErr {
-    _ = .{ vRefNum, createFolder };
+    _ = vRefNum;
     const p = folderPath(folderType) orelse return fnfErr;
+    const err = ensureFolder(p, createFolder);
+    if (err != noErr) return err;
     if (foundVRefNum) |v| v.* = vol_ref;
     if (foundDirID) |d| d.* = dirId(p);
     return noErr;
 }
 
 fn fsFindFolder(vRefNum: i16, folderType: u32, createFolder: u8, foundRef: ?*FSRef) callconv(.c) OSErr {
-    _ = .{ vRefNum, createFolder };
+    _ = vRefNum;
     const p = folderPath(folderType) orelse return fnfErr;
+    const err = ensureFolder(p, createFolder);
+    if (err != noErr) return err;
     const slot = intern(p);
     if (slot < 0) return paramErr;
     writeRef(foundRef, slot);
@@ -1149,6 +1167,22 @@ test "a resource file reports its own last error" {
     // A spec no path can be built for fails, and the failure is what ResError has to report.
     _ = fspOpenResFile(null, 1);
     try testing.expectEqual(paramErr, resError());
+}
+
+test "a folder the caller asked to have created is on disk before it is reported found" {
+    withRoot("/game");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [path_max]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/Temporary Items", .{tmp.sub_path});
+
+    // Without the flag the answer is the truth about the file system, not a directory id.
+    try testing.expectEqual(fnfErr, ensureFolder(missing, 0));
+    try testing.expectEqual(noErr, ensureFolder(missing, 1));
+    try testing.expect(isDir(missing));
+    // Already there is still found, not dupFNErr — FindFolder has no such failure.
+    try testing.expectEqual(noErr, ensureFolder(missing, 1));
 }
 
 test "the file table hands out refnums from one and refuses an unknown one" {

@@ -21,6 +21,7 @@ pub const files = @import("files.zig");
 pub const sockets = @import("sockets.zig");
 pub const memory = @import("memory.zig");
 pub const compat = @import("compat.zig");
+pub const setjmp = @import("setjmp.zig");
 
 /// `_close$UNIX2003` -> `close`, `_stat$INODE64` -> `stat`, `_realpath$DARWIN_EXTSN` -> `realpath`.
 ///
@@ -90,6 +91,10 @@ pub const Resolver = struct {
             return addr;
         }
         if (carbon.address(norm)) |addr| {
+            self.libc_hits += 1;
+            return addr;
+        }
+        if (setjmp.address(norm)) |addr| {
             self.libc_hits += 1;
             return addr;
         }

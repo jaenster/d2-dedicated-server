@@ -40,6 +40,8 @@ pub fn address(name: []const u8) ?usize {
         .{ "GetProcessInformation", &getProcessInformation },
         .{ "GetProcessBundleLocation", &getProcessBundleLocation },
         .{ "GetNewMBar", &getNewMBar },
+        .{ "StandardAlert", &standardAlert },
+        .{ "ExitToShell", &exitToShell },
         .{ "AEInstallEventHandler", &aeInstallEventHandler },
         .{ "SetEventMask", &setEventMask },
         .{ "FlushEvents", &flushEvents },
@@ -158,6 +160,47 @@ pub fn getProcessBundleLocation(psn: ?*const ProcessSerialNumber, location: ?*fi
 pub fn getNewMBar(menuBarID: i16) callconv(.c) ?*anyopaque {
     _ = menuBarID;
     return null;
+}
+
+/// The modal error dialog. Every caller of it in the image is a dead end that puts a message on the
+/// screen and then quits, so the message is the only part worth keeping — and a stub that swallowed
+/// it would throw away the single sentence saying why the boot failed. Stderr is this process's
+/// screen.
+///
+/// `error` and `explanation` are Str255: a length byte, then the characters, no terminator.
+pub fn standardAlert(
+    alertType: i32,
+    err: ?[*]const u8,
+    explanation: ?[*]const u8,
+    alertParam: ?*const anyopaque,
+    itemHit: ?*i16,
+) callconv(.c) OSStatus {
+    _ = .{ alertType, alertParam };
+    report("darwin: alert: ", err);
+    report("darwin: alert: ", explanation);
+    // kAlertStdAlertOKButton. The dialog has one button and nobody to press it, so it is pressed.
+    if (itemHit) |out| out.* = 1;
+    return noErr;
+}
+
+/// Where the alert text goes. Stderr, because this process has no screen; negative silences it.
+pub var report_fd: c_int = 2;
+
+fn report(prefix: []const u8, pascal: ?[*]const u8) void {
+    const s = pascal orelse return;
+    const len = s[0];
+    if (len == 0 or report_fd < 0) return;
+    _ = std.c.write(report_fd, prefix.ptr, prefix.len);
+    _ = std.c.write(report_fd, s + 1, len);
+    _ = std.c.write(report_fd, "\n", 1);
+}
+
+/// Terminate the application, and the one call here that MUST NOT return. The image places it after
+/// the alert as the end of the road and emits nothing behind it, so a stub that returns falls
+/// straight through into whatever function the linker put next — which is how a clean "reinstall
+/// Diablo II" message turned into a segfault two functions later.
+pub fn exitToShell() callconv(.c) noreturn {
+    std.c._exit(1);
 }
 
 /// Apple Events arrive over a Mach port this process does not have, so no handler installed here
@@ -413,6 +456,20 @@ test "the optional toolbox calls report the outcome the caller already handles" 
     try testing.expectEqual(@as(?*anyopaque, null), getNewMBar(0x81));
     try testing.expectEqual(@as(OSErr, 0), aeInstallEventHandler(0, 0, null, 0, 0));
     setEventMask(-1);
+}
+
+test "the alert says what it was going to put on screen, and reports its one button pressed" {
+    report_fd = -1; // the build runner owns this process's stderr while tests run
+    defer report_fd = 2;
+    // A Str255 as the game builds it: a length byte, then the characters.
+    const message = "\x0chello, world";
+    var pressed: i16 = 0;
+    try testing.expectEqual(noErr, standardAlert(0, message, null, null, &pressed));
+    try testing.expectEqual(@as(i16, 1), pressed);
+
+    // The two calls that must never come back from this package are answered, not thunked.
+    try testing.expect(address("StandardAlert").? != 0);
+    try testing.expect(address("ExitToShell").? != 0);
 }
 
 test "the microsecond clock is nonzero and moves forward" {
