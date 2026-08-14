@@ -13,6 +13,10 @@
 //!   PTHREAD_MUTEX_*      RECURSIVE is 2 on Darwin and 1 on Linux, and ERRORCHECK is the mirror of
 //!                        that, so an untranslated `settype` turns a recursive mutex into one that
 //!                        fails the second lock.
+//!   sigset_t             Darwin's is one 32-bit word; the host reads eight bytes for the same
+//!                        argument. The signal NUMBERS differ too — SIGBUS is 10 there and 7 here,
+//!                        SIGUSR1/SIGUSR2 are 30/31 rather than 10/12 — and so do the three `how`
+//!                        constants, which Darwin counts from 1 and Linux from 0.
 //!
 //! Return values here are Darwin's errno numbers, not the host's: the game compares against its own
 //! `errno.h`, where ETIMEDOUT is 60 rather than Linux's 110.
@@ -65,6 +69,7 @@ pub fn address(name: []const u8) ?usize {
         .{ "pthread_get_stacksize_np", &getStacksizeNp },
         .{ "pthread_yield_np", &yieldNp },
         .{ "pthread_from_mach_thread_np", &fromMachThreadNp },
+        .{ "pthread_sigmask", &sigmask },
     };
     inline for (table) |entry| {
         if (std.mem.eql(u8, name, entry[0])) return @intFromPtr(entry[1]);
@@ -182,6 +187,95 @@ pub fn condTimedwaitRelative(cond: *anyopaque, mutex: *anyopaque, rel: ?*const D
 pub fn condBroadcast(cond: *anyopaque) callconv(.c) c_int {
     const c = adopt(cond) orelse return EINVAL;
     return if (std.c.pthread_cond_broadcast(c) == .SUCCESS) 0 else EINVAL;
+}
+
+// ── signal masks ──
+
+/// Darwin's signal numbers, in host order: `darwin_signal[n - 1]` is what the host calls Darwin's
+/// signal n. The first six agree and then they part company — Darwin kept the BSD numbering, where
+/// SIGBUS is 10 and SIGSYS 12, while Linux put SIGUSR1 and SIGUSR2 in those two slots.
+const darwin_signal = [31]u8{
+    1,  2,  3,  4,  5,  6, // HUP INT QUIT ILL TRAP ABRT
+    0,  8,  9,  7, 11, 31, // EMT(none) FPE KILL BUS SEGV SYS
+    13, 14, 15, 23, 19, 20, // PIPE ALRM TERM URG STOP TSTP
+    18, 17, 21, 22, 29, 24, // CONT CHLD TTIN TTOU IO XCPU
+    25, 26, 27, 28, 0, 10, // XFSZ VTALRM PROF WINCH INFO(none) USR1
+    12, // USR2
+};
+
+/// Signals that must reach the process however the game masks them.
+///
+/// Blocking a fault is not a way of surviving one: the kernel forces the default action for a
+/// synchronous SIGSEGV that arrives blocked, which is death with no handler run and no diagnostics
+/// — the crash reporter never gets to print an address. SIGUSR2 is on the list because that is the
+/// signal it takes to produce the same trace on demand, and a trace nobody can ask for is not one.
+const never_blocked: u64 = sigbit(4) | sigbit(5) | sigbit(7) | sigbit(8) | sigbit(10) | sigbit(11) | sigbit(12);
+
+fn sigbit(host_signal: u6) u64 {
+    return @as(u64, 1) << @intCast(host_signal - 1);
+}
+
+/// Darwin's one-word set as the host's bitmask.
+fn toHostSigset(darwin_set: u32) u64 {
+    var host: u64 = 0;
+    for (darwin_signal, 1..) |host_sig, darwin_sig| {
+        if (host_sig == 0) continue;
+        if (darwin_set & (@as(u32, 1) << @intCast(darwin_sig - 1)) != 0) host |= sigbit(@intCast(host_sig));
+    }
+    return host;
+}
+
+/// The reverse, for the set the game reads back.
+fn toDarwinSigset(host_set: u64) u32 {
+    var darwin: u32 = 0;
+    for (darwin_signal, 1..) |host_sig, darwin_sig| {
+        if (host_sig == 0) continue;
+        if (host_set & sigbit(@intCast(host_sig)) != 0) darwin |= @as(u32, 1) << @intCast(darwin_sig - 1);
+    }
+    return darwin;
+}
+
+/// Darwin's SIG_BLOCK/SIG_UNBLOCK/SIG_SETMASK are 1/2/3; the host's are 0/1/2. Forwarded as they
+/// stand, a request to block became one to unblock and a SETMASK became an invalid operation.
+fn toHostHow(darwin_how: c_int) ?c_int {
+    return switch (darwin_how) {
+        1, 2, 3 => darwin_how - 1,
+        else => null,
+    };
+}
+
+/// The host's `sigset_t` is far wider than the eight bytes that can carry a Darwin set, and
+/// `pthread_sigmask` reads all of it — which is the other half of why forwarding this call filled
+/// the mask with whatever followed the game's four-byte argument.
+const HostSigset = extern struct { bits: [128]u8 };
+
+extern fn pthread_sigmask(how: c_int, set: ?*const HostSigset, oset: ?*HostSigset) c_int;
+
+fn hostSigset(mask: u64) HostSigset {
+    var s = std.mem.zeroes(HostSigset);
+    std.mem.writeInt(u64, s.bits[0..8], mask, .little);
+    return s;
+}
+
+pub fn sigmask(how: c_int, set: ?*const u32, oset: ?*u32) callconv(.c) c_int {
+    var old = std.mem.zeroes(HostSigset);
+    const requested = set orelse {
+        // No set at all is a pure read of the current mask, and every `how` is legal for it.
+        if (pthread_sigmask(0, null, &old) != 0) return EINVAL;
+        if (oset) |o| o.* = toDarwinSigset(std.mem.readInt(u64, old.bits[0..8], .little));
+        return 0;
+    };
+    const host_how = toHostHow(how) orelse return EINVAL;
+
+    var wanted = toHostSigset(requested.*);
+    // SIG_UNBLOCK names signals to let through, so the protected ones only have to be taken out of
+    // the two operations that would mask them.
+    if (host_how != 1) wanted &= ~never_blocked;
+    const host_set = hostSigset(wanted);
+
+    if (pthread_sigmask(host_how, &host_set, &old) != 0) return EINVAL;
+    if (oset) |o| o.* = toDarwinSigset(std.mem.readInt(u64, old.bits[0..8], .little));
+    return 0;
 }
 
 // ── mutex attributes ──
@@ -447,11 +541,43 @@ test "every provided name has a live address and nothing else does" {
         "pthread_cond_broadcast",   "pthread_cond_destroy", "pthread_mutexattr_settype",
         "pthread_setname_np",       "pthread_getname_np",   "pthread_get_stackaddr_np",
         "pthread_get_stacksize_np", "pthread_yield_np",     "pthread_from_mach_thread_np",
+        "pthread_sigmask",
     }) |n| try testing.expect(address(n).? != 0);
 
     // Forwarded, so it must not be answered here as well.
     try testing.expectEqual(@as(?usize, null), address("pthread_mutex_lock"));
     try testing.expectEqual(@as(?usize, null), address("pthread_cond_signal"));
+}
+
+test "a Darwin signal set is renumbered, not reinterpreted" {
+    // The six that agree, and the four that do not: Darwin's BUS 10, SYS 12, USR1 30, USR2 31 are
+    // the host's 7, 31, 10, 12.
+    try testing.expectEqual(sigbit(11), toHostSigset(1 << 10)); // SEGV, same number both sides
+    try testing.expectEqual(sigbit(7), toHostSigset(1 << 9)); // Darwin BUS 10 -> host 7
+    try testing.expectEqual(sigbit(10), toHostSigset(1 << 29)); // Darwin USR1 30 -> host 10
+    try testing.expectEqual(sigbit(12), toHostSigset(1 << 30)); // Darwin USR2 31 -> host 12
+
+    // Round trips, and Darwin's SIGEMT/SIGINFO have no host signal so they simply drop.
+    const set: u32 = (1 << 10) | (1 << 9) | (1 << 30) | (1 << 1);
+    try testing.expectEqual(set, toDarwinSigset(toHostSigset(set)));
+    try testing.expectEqual(@as(u64, 0), toHostSigset((1 << 6) | (1 << 28)));
+}
+
+test "the three how constants shift by one, and nothing else is accepted" {
+    try testing.expectEqual(@as(?c_int, 0), toHostHow(1)); // BLOCK
+    try testing.expectEqual(@as(?c_int, 1), toHostHow(2)); // UNBLOCK
+    try testing.expectEqual(@as(?c_int, 2), toHostHow(3)); // SETMASK
+    try testing.expectEqual(@as(?c_int, null), toHostHow(0));
+    try testing.expectEqual(@as(?c_int, null), toHostHow(4));
+}
+
+test "the fault signals survive a block of everything" {
+    // What the engine asks for: block the lot. What it may have is the lot minus the signals that
+    // carry a diagnosis — SEGV, BUS, ILL, FPE, TRAP and the reporter's own USR2.
+    const wanted = toHostSigset(0xffff_ffff) & ~never_blocked;
+    for ([_]u6{ 4, 5, 7, 8, 11, 12 }) |sig| try testing.expectEqual(@as(u64, 0), wanted & sigbit(sig));
+    try testing.expect(wanted & sigbit(2) != 0); // SIGINT is still the game's to block
+    try testing.expect(wanted & sigbit(15) != 0); // and so is SIGTERM
 }
 
 test "yield and from_mach_thread" {

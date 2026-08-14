@@ -77,7 +77,6 @@ pub const names = [_][]const u8{
     "pthread_create",
     "pthread_exit",
     "pthread_self",
-    "pthread_sigmask",
     "pthread_mutex_destroy",
     "pthread_mutex_init",
     "pthread_mutex_lock",
@@ -197,7 +196,7 @@ test "an address is the host libc's own" {
 }
 
 test "the ABI-sensitive names are deliberately absent" {
-    for ([_][]const u8{ "stat", "connect", "select", "sigaction", "setjmp", "localtime_r", "realpath", "ioctl" }) |n| {
+    for ([_][]const u8{ "stat", "connect", "select", "sigaction", "setjmp", "localtime_r", "realpath", "ioctl", "pthread_sigmask" }) |n| {
         try testing.expectEqual(@as(?usize, null), address(n));
     }
 }
