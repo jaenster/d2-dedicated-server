@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const imports_only = argv.len > 2 and std.mem.eql(u8, argv[2], "--imports");
 
-    const bytes = try macho.readFile(gpa, argv[1]);
+    const bytes = try macho.mapFile(argv[1]);
     const img = try macho.image.parse(bytes);
     const names = try macho.collectImports(gpa, &img);
 

@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     // An installed game is not in the repo, so the tests and this host find it the same way.
     if (path == null) path = std.mem.span(getenv("D2MAC_BIN") orelse return usage());
 
-    const bytes = try macho.readFile(gpa, path.?.ptr);
+    const bytes = try macho.mapFile(path.?.ptr);
     var img = try macho.image.parse(bytes);
     const names = try macho.collectImports(gpa, &img);
 

@@ -413,16 +413,24 @@ const OpenFile = struct {
     /// steps, and a 32-bit `lseek` on this target is one of the easiest ABI mismatches to get wrong.
     /// `pread`/`pwrite` take the offset explicitly and cannot be got wrong.
     pos: u64 = 0,
+    /// Leaf name, kept only so a traced read can say which archive it came out of.
+    leaf: [name_max]u8 = @splat(0),
+    leaf_len: u8 = 0,
 };
+
+const name_max = 40;
 
 var files: [max_files]OpenFile = @splat(.{});
 
-fn claim(fd: std.c.fd_t) ?i16 {
+fn claim(fd: std.c.fd_t, path: []const u8) ?i16 {
+    const leaf = path[(std.mem.lastIndexOfScalar(u8, path, '/') orelse 0)..];
+    const n = @min(leaf.len, name_max);
     table_lock.lock();
     defer table_lock.unlock();
     for (&files, 0..) |*f, i| {
         if (f.used) continue;
-        f.* = .{ .used = true, .fd = fd, .pos = 0 };
+        f.* = .{ .used = true, .fd = fd, .pos = 0, .leaf_len = @intCast(n) };
+        @memcpy(f.leaf[0..n], leaf[0..n]);
         return @intCast(i + 1);
     }
     return null;
@@ -449,7 +457,7 @@ fn openPath(path: []const u8, writable: bool, refNum: ?*i16) OSErr {
     const flags: std.c.O = if (writable) .{ .ACCMODE = .RDWR } else .{ .ACCMODE = .RDONLY };
     const fd = std.c.open(p, flags);
     if (fd < 0) return fnfErr;
-    const ref = claim(fd) orelse {
+    const ref = claim(fd, path) orelse {
         _ = std.c.close(fd);
         return paramErr;
     };
@@ -956,12 +964,33 @@ fn pbReadSync(paramBlock: ?[*]u8) callconv(.c) OSErr {
         if (n <= 0) break;
         done += @intCast(n);
     }
+    trace(f, f.pos, done);
     f.pos += done;
     put32(p, pb.act_count, @intCast(done));
     put32(p, pb.pos_offset, @intCast(f.pos));
     const result: OSErr = if (done < want) eofErr else noErr;
     put16(p, pb.result, result);
     return result;
+}
+
+/// Which archive members the game actually reads, answered without an engine hook. Storm's member
+/// lookup is internal to the image and cannot be intercepted from here, but every byte it reads
+/// arrives through this one call — so a (file, offset, length) log plus the archive's own block
+/// offsets (`tools/mpqmin --list`) names the member exactly. Off unless `D2MAC_TRACE_IO=1`, and
+/// unbuffered so a crash cannot swallow the tail of the run.
+var trace_on: ?bool = null;
+
+fn trace(f: *const OpenFile, at: u64, len: usize) void {
+    const on = trace_on orelse blk: {
+        const v = std.c.getenv("D2MAC_TRACE_IO");
+        const on = v != null and v.?[0] == '1';
+        trace_on = on;
+        break :blk on;
+    };
+    if (!on or len == 0) return;
+    var buf: [128]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "io {s} {d} {d}\n", .{ f.leaf[0..f.leaf_len], at, len }) catch return;
+    _ = std.c.write(2, s.ptr, s.len);
 }
 
 fn pbFlushFileSync(paramBlock: ?[*]u8) callconv(.c) OSErr {

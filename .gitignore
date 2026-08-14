@@ -42,6 +42,7 @@ bnftp-*.bin
 
 # compiled standalone tools (built manually, not via build.zig)
 tools/mpqcat/mpqcat
+tools/mpqmin/mpqmin
 
 # arena-mode design/worklist — local planning doc, not in VCS
 ARENA.md
@@ -59,3 +60,4 @@ probegame/
 
 # a data dir named "=<port>" means something leaked an env assignment into a path
 /=*
+testgame-min-mac/

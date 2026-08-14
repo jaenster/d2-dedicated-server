@@ -64,28 +64,39 @@ pub fn countRebases(img: *const Image) !usize {
     return n;
 }
 
-/// Slurp the executable. Deliberately raw POSIX rather than std.Io: this is the one file the
-/// loader reads, it reads it once at startup, and threading an Io through for it would be the
+/// Map the executable read-only. Deliberately raw POSIX rather than std.Io: this is the one file
+/// the loader reads, it reads it once at startup, and threading an Io through for it would be the
 /// only reason the package needed one.
-pub fn readFile(gpa: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
+///
+/// Mapped rather than slurped because the bytes have to outlive the load either way — every import
+/// name a thunk reports, possibly hours later, points into them, as do the load commands. Held as a
+/// mapping they are file-backed and clean, so N server processes on one host share one copy and the
+/// kernel may evict it; slurped they were private dirty, duplicated per process, and the growing
+/// read left its abandoned generations behind in the arena as well.
+pub fn mapFile(path: [*:0]const u8) ![]align(std.heap.page_size_min) const u8 {
     const fd = open(path, 0); // O_RDONLY is 0 everywhere this runs
     if (fd < 0) return error.FileNotFound;
     defer _ = std.c.close(fd);
 
-    // Grown by reading rather than sized by fstat: musl's i386 fstat is not exposed as one symbol
-    // across targets, and a loop needs no agreement about which struct stat this platform uses.
-    // Appending only what was actually read matters — a short read is normal on a bind-mounted
-    // filesystem, and growing by a fixed block per iteration instead makes the buffer explode.
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(gpa);
+    // Sized by reading rather than by fstat, for the reason the slurp had: musl's i386 fstat is not
+    // exposed as one symbol across targets, and a counting loop needs no agreement about which
+    // struct stat this platform uses. A short read is normal on a bind-mounted filesystem, so this
+    // counts what it was actually given and stops only at end of file.
+    var size: usize = 0;
     var chunk: [64 << 10]u8 = undefined;
     while (true) {
         const got = std.c.read(fd, &chunk, chunk.len);
         if (got < 0) return error.ReadFailed;
         if (got == 0) break;
-        try out.appendSlice(gpa, chunk[0..@intCast(got)]);
+        size += @intCast(got);
     }
-    return out.toOwnedSlice(gpa);
+    if (size == 0) return error.ReadFailed;
+
+    return std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+}
+
+pub fn unmapFile(bytes: []align(std.heap.page_size_min) const u8) void {
+    std.posix.munmap(bytes);
 }
 
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
@@ -94,17 +105,16 @@ extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 /// is never in the repo — `D2MAC_BIN` points at an installed copy.
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]u8;
 
-fn testImage(gpa: std.mem.Allocator) !?[]u8 {
+fn testImage() !?[]align(std.heap.page_size_min) const u8 {
     const path = getenv("D2MAC_BIN") orelse return null;
-    return readFile(gpa, path) catch null;
+    return mapFile(path) catch null;
 }
 
 const testing = std.testing;
 
 test "the 1.14d Mac binary parses into the segments a loader has to map" {
-    const gpa = testing.allocator;
-    const bytes = (try testImage(gpa)) orelse return error.SkipZigTest;
-    defer gpa.free(bytes);
+    const bytes = (try testImage()) orelse return error.SkipZigTest;
+    defer unmapFile(bytes);
 
     const img = try image.parse(bytes);
 
@@ -127,9 +137,8 @@ test "the 1.14d Mac binary parses into the segments a loader has to map" {
 }
 
 test "entry point and fixup streams" {
-    const gpa = testing.allocator;
-    const bytes = (try testImage(gpa)) orelse return error.SkipZigTest;
-    defer gpa.free(bytes);
+    const bytes = (try testImage()) orelse return error.SkipZigTest;
+    defer unmapFile(bytes);
 
     const img = try image.parse(bytes);
     const text = img.segment("__TEXT").?;
@@ -146,8 +155,8 @@ test "entry point and fixup streams" {
 
 test "the import set is the shim's whole job" {
     const gpa = testing.allocator;
-    const bytes = (try testImage(gpa)) orelse return error.SkipZigTest;
-    defer gpa.free(bytes);
+    const bytes = (try testImage()) orelse return error.SkipZigTest;
+    defer unmapFile(bytes);
 
     const img = try image.parse(bytes);
     const names = try collectImports(gpa, &img);
