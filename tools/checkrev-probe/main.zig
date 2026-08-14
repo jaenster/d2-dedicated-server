@@ -16,9 +16,9 @@
 //! no account, no SRP, no login. Usage:
 //!   zig build checkrev-probe -- <host> [product] [gameVersion] [--sig0]
 const std = @import("std");
-const core = @import("d2_bnet").checkrev;
-const cdkey = @import("d2_bnet").cdkey;
-const xsha1 = @import("d2_bnet").xsha1;
+const core = @import("libd2").bnet.checkrev;
+const cdkey = @import("libd2").bnet.cdkey;
+const xsha1 = @import("libd2").bnet.xsha1;
 
 // ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
 const Socket = c_int;

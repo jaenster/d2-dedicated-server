@@ -6,18 +6,15 @@
 //! checksum; since we accept any SID_AUTH_CHECK, the value is irrelevant — we
 //! just have to deliver the file correctly. (Also used for ads/news/MOTD files.)
 //!
-//! BNFTP v1 (protocol version 0x0100). Request (after the 0x02 byte):
-//!   u16 reqLen, u16 protocolVer, u32 platform, u32 product, u32 bannerId,
-//!   u32 bannerExt, u32 startPos, u64 fileTime, cstr filename
-//! Reply:
-//!   u16 headerLen, u32 fileSize, u32 bannerId, u32 bannerExt, u64 fileTime,
-//!   cstr filename, <file bytes from startPos>
+//! The wire format lives in libd2's d2-bnet, shared with the clientless fetcher and the probe
+//! that points at real Battle.net, so all three read and write one definition of it. What is
+//! here is the SERVING: which file, from where, and how much of it.
 //!
 //! Files are served from <data_dir>/bnftp/<filename>.
 const std = @import("std");
+const bnftp = @import("libd2").bnet.bnftp;
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
-const proto = @import("proto.zig");
 const store = @import("store.zig");
 
 const max_file = 1 << 20; // 1 MiB — version MPQs are tiny; ads small
@@ -34,8 +31,8 @@ pub fn handle(fd: net.Socket, tag: []const u8, initial: []const u8) void {
         if (n == 0) return;
         len += n;
     }
-    const reqlen = std.mem.readInt(u16, req[0..2], .little);
-    if (reqlen < 33 or reqlen > req.len) {
+    const reqlen = bnftp.Request.declaredLen(req[0..len]) catch return;
+    if (reqlen < bnftp.Request.min_len or reqlen > req.len) {
         log.line(tag, "BNFTP bad request length {d}", .{reqlen});
         return;
     }
@@ -45,17 +42,13 @@ pub fn handle(fd: net.Socket, tag: []const u8, initial: []const u8) void {
         len += n;
     }
 
-    var r = proto.Reader.init(req[0..reqlen]);
-    _ = r.getU16(); // request length
-    const protover = r.getU16();
-    _ = r.getU32(); // platform
-    _ = r.getU32(); // product
-    const banner_id = r.getU32();
-    const banner_ext = r.getU32();
-    const start_pos = r.getU32();
-    _ = r.getU64(); // local file time
-    const fname = r.getStr();
-    log.line(tag, "BNFTP request file='{s}' startPos={d} protoVer=0x{x}", .{ fname, start_pos, protover });
+    const request = bnftp.Request.decode(req[0..reqlen]) catch |e| {
+        log.line(tag, "BNFTP malformed request: {s}", .{@errorName(e)});
+        return;
+    };
+    const fname = request.filename;
+    const start_pos = request.start_pos;
+    log.line(tag, "BNFTP request file='{s}' startPos={d} protoVer=0x{x}", .{ fname, start_pos, request.protocol_ver });
 
     // Load the requested file from <data_dir>/bnftp/.
     var fbuf: [max_file]u8 = undefined;
@@ -69,19 +62,14 @@ pub fn handle(fd: net.Socket, tag: []const u8, initial: []const u8) void {
         log.line(tag, "BNFTP serving '{s}' ({d} bytes, from offset {d})", .{ fname, total, from });
     }
 
-    // Reply header. The client reads the FIRST 4 BYTES as the header length (a
-    // u32) and HALTS if it is > 0xff (BnetDownloadFile_II @0x51f310, line 0x2ee),
-    // so the length field is u32, not u16. Then: fileSize@4, fileTime@0x10,
-    // filename@0x18 (BNDOWNLOAD_GetCachedFileSize reads those offsets).
     var hbuf: [256]u8 = undefined;
-    var w = proto.Writer.init(&hbuf);
-    w.putU32(0); // [0x00] header length placeholder (u32, <= 0xff)
-    w.putU32(total); // [0x04] total file size
-    w.putU32(banner_id); // [0x08]
-    w.putU32(banner_ext); // [0x0C]
-    w.putU64(0); // [0x10] file time
-    w.putStr(fname); // [0x18] filename
-    w.patchU32(0, @intCast(w.pos));
-    if (!net.writeAll(fd, w.slice())) return;
+    const header = (bnftp.ReplyHeader{
+        .header_len = 0, // encode counts itself
+        .file_size = total,
+        .banner_id = request.banner_id,
+        .banner_ext = request.banner_ext,
+        .filename = fname,
+    }).encode(&hbuf) catch return;
+    if (!net.writeAll(fd, header)) return;
     if (data.len > 0) _ = net.writeAll(fd, data);
 }

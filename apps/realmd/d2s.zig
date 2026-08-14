@@ -12,7 +12,7 @@
 //! pulls in the item model and the full excel table set to do it — a lot of machinery for
 //! "read one integer", so the realm keeps this narrow reader and shares the widths.
 const std = @import("std");
-const formats = @import("d2_formats");
+const formats = @import("libd2").formats;
 
 // ── the format, from libd2 ───────────────────────────────────────────────────
 pub const off_checksum = formats.d2s.off_checksum;
@@ -113,7 +113,7 @@ test "the attribute widths agree with libd2's" {
     // If d2-save's table and this one ever diverge, one of them decodes garbage. They are
     // the same table from the same column of ItemStatCost.txt, so assert it rather than
     // trusting two copies to stay in step.
-    const save = @import("d2_formats");
+    const save = @import("libd2").formats;
     _ = save;
     try std.testing.expectEqual(@as(usize, 16), stat_bits.len);
     try std.testing.expectEqual(@as(u8, 32), stat_bits[stat_experience]);

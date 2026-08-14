@@ -48,23 +48,22 @@ pub fn build(b: *std.Build) void {
     });
     realm_infra.addImport("obs", obs);
 
-    // One dependency on the libd2 monorepo, whose root re-exports every package's module.
+    // One dependency on libd2, and one import from it. The library re-exports every layer off
+    // a single `libd2` module, so what this repo consumes reads as libd2.formats / libd2.bnet
+    // rather than a list of module names that has to be kept in step with the library's own
+    // layering. Naming a layer costs nothing until it is used.
     //
-    // d2-formats is the clean-room 1.14d file formats — the realm's .d2s handling comes from
-    // there rather than a second copy in this repo, because the header layout, the checksum and
-    // the fresh-character writer are all already modelled there and two implementations of a byte
-    // format is one more than can stay correct.
-    const libd2 = b.dependency("libd2", .{ .target = host, .optimize = optimize });
-    const d2_formats = libd2.module("d2-formats");
-
-    // d2-bnet is the Battle.net protocol: the broken-SHA-1 password hash, the version
-    // check, the CD-key decode, and the chat/realm message vocabulary they travel in. It lives
-    // there and not here because a realm server is not its only consumer — the clientless
-    // harnesses need the same hashes, and so does the version-check DLL below, which is why the
-    // module is taken twice: libd2's packages bind their target, and that DLL is not this host.
-    const d2_bnet = libd2.module("d2-bnet");
-    const libd2_win = b.dependency("libd2", .{ .target = target, .optimize = optimize });
-    const d2_bnet_win = libd2_win.module("d2-bnet");
+    // formats is the clean-room 1.14d file formats — the realm's .d2s handling comes from there
+    // rather than a second copy here, because the header layout, the checksum and the fresh
+    // character writer are all already modelled there and two implementations of a byte format
+    // is one more than can stay correct. bnet is the Battle.net logon protocol, for the same
+    // reason: it was three byte-identical copies across two repos before it moved.
+    //
+    // Taken TWICE, once per target: libd2's packages bind their target at addModule, and the
+    // version-check DLL below is not this host. Deleting the second one breaks ver-IX86-1.dll
+    // and nothing else.
+    const libd2 = b.dependency("libd2", .{ .target = host, .optimize = optimize }).module("libd2");
+    const libd2_win = b.dependency("libd2", .{ .target = target, .optimize = optimize }).module("libd2");
 
     // The concrete persistence backends (fs/redis/pg) behind the store facade, imported by
     // realmd. Includes the Postgres client, so the pg dependency lives here (lazy, only fetched
@@ -126,8 +125,7 @@ pub fn build(b: *std.Build) void {
     realmd.root_module.addImport("realm_proto", realm_proto);
     realmd.root_module.addImport("realm_infra", realm_infra);
     realmd.root_module.addImport("realm_store", realm_store);
-    realmd.root_module.addImport("d2_bnet", d2_bnet);
-    realmd.root_module.addImport("d2_formats", d2_formats);
+    realmd.root_module.addImport("libd2", libd2);
 
     // Web UI: -Dwebui=true builds webui/ (Vite + React → one self-contained
     // dist/index.html) and embeds it; otherwise embed a stub page so plain builds
@@ -187,8 +185,7 @@ pub fn build(b: *std.Build) void {
     realm_tests.root_module.addImport("realm_proto", realm_proto);
     realm_tests.root_module.addImport("realm_infra", realm_infra);
     realm_tests.root_module.addImport("realm_store", realm_store);
-    realm_tests.root_module.addImport("d2_bnet", d2_bnet);
-    realm_tests.root_module.addImport("d2_formats", d2_formats);
+    realm_tests.root_module.addImport("libd2", libd2);
     test_step.dependOn(&b.addRunArtifact(realm_tests).step);
 
     // qqserver's pure wire logic (the 0xAF greeting strip it applies to the GS→client splice),
@@ -242,7 +239,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    checkrev.root_module.addImport("d2_bnet", d2_bnet_win);
+    checkrev.root_module.addImport("libd2", libd2_win);
     // Module-definition file: export `CheckRevision` UNDECORATED (ordinal 1) so the
     // client's GetProcAddress("CheckRevision") resolves it (stdcall would otherwise
     // mangle it to CheckRevision@28).
@@ -262,7 +259,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    e2e.root_module.addImport("d2_bnet", d2_bnet);
+    e2e.root_module.addImport("libd2", libd2);
     const run_e2e = b.addRunArtifact(e2e);
     run_e2e.step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
     run_e2e.step.dependOn(&b.addInstallArtifact(qqserver, .{}).step); // qqserver_routing spawns it
@@ -278,7 +275,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const realmclient = b.createModule(.{ .root_source_file = b.path("tools/e2e/realmclient.zig") });
-    realmclient.addImport("d2_bnet", d2_bnet);
+    realmclient.addImport("libd2", libd2);
     gamestress_mod.addImport("realmclient", realmclient);
     const gamestress = b.addExecutable(.{ .name = "gamestress", .root_module = gamestress_mod });
     const run_gamestress = b.addRunArtifact(gamestress);
@@ -301,7 +298,7 @@ pub fn build(b: *std.Build) void {
     b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
 
     // checkrev-probe — clientless BNCS *version-check* client (selector 0x01): runs
-    // SID_AUTH_INFO -> compute response (the same d2-bnet the DLL uses) -> SID_AUTH_CHECK
+    // SID_AUTH_INFO -> compute response (the same libd2.bnet the DLL uses) -> SID_AUTH_CHECK
     // against a real bnet and prints the result code. Separate from BNFTP.
     const crprobe = b.addExecutable(.{
         .name = "checkrev-probe",
@@ -312,7 +309,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    crprobe.root_module.addImport("d2_bnet", d2_bnet);
+    crprobe.root_module.addImport("libd2", libd2);
     b.installArtifact(crprobe);
     const run_crprobe = b.addRunArtifact(crprobe);
     if (b.args) |args| run_crprobe.addArgs(args);

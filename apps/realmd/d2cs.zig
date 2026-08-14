@@ -22,20 +22,22 @@ const guilds = @import("guilds.zig");
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d2s create time
 
 // MCP message ids (subset; everything else is logged).
-const MCP_STARTUP = 0x01;
-const MCP_CHARCREATE = 0x02;
-const MCP_CREATEGAME = 0x03;
-const MCP_JOINGAME = 0x04;
-const MCP_GAMELIST = 0x05;
-const MCP_GAMEINFO = 0x06;
-const MCP_CHARLOGON = 0x07;
-const MCP_CHARDELETE = 0x0a;
-const MCP_LADDERDATA = 0x11;
-const MCP_MOTD = 0x12;
-const MCP_CANCELCREATE = 0x13;
-const MCP_CHARRANK = 0x16;
-const MCP_CHARUPGRADE = 0x18;
-const MCP_CHARLIST2 = 0x19;
+const mcp = @import("libd2").bnet.mcp;
+
+const MCP_STARTUP = @intFromEnum(mcp.Op.startup);
+const MCP_CHARCREATE = @intFromEnum(mcp.Op.charcreate);
+const MCP_CREATEGAME = @intFromEnum(mcp.Op.creategame);
+const MCP_JOINGAME = @intFromEnum(mcp.Op.joingame);
+const MCP_GAMELIST = @intFromEnum(mcp.Op.gamelist);
+const MCP_GAMEINFO = @intFromEnum(mcp.Op.gameinfo);
+const MCP_CHARLOGON = @intFromEnum(mcp.Op.charlogon);
+const MCP_CHARDELETE = @intFromEnum(mcp.Op.chardelete);
+const MCP_LADDERDATA = @intFromEnum(mcp.Op.ladderdata);
+const MCP_MOTD = @intFromEnum(mcp.Op.motd);
+const MCP_CANCELCREATE = @intFromEnum(mcp.Op.cancelcreate);
+const MCP_CHARRANK = @intFromEnum(mcp.Op.charrank);
+const MCP_CHARUPGRADE = @intFromEnum(mcp.Op.charupgrade);
+const MCP_CHARLIST2 = @intFromEnum(mcp.Op.charlist2);
 
 // MCP result codes, taken from the client's own switch statements in
 // OOG_PollJoinCreatePump @0x441770 (D2Client/OOGUtilities.cpp), with the string-table id
@@ -47,30 +49,30 @@ const MCP_CHARLIST2 = 0x19;
 // one, so every failure path below must pick from this list.
 //
 // CREATEGAME (0x03) replies:
-const CREATE_OK: u32 = 0x00;
-const CREATE_INVALID_NAME: u32 = 0x1e; // str 0x1411 "Invalid Game Name"
-const CREATE_NAME_TAKEN: u32 = 0x1f; // str 0x1412 "A Game Already Exists With That Name"
-const CREATE_SERVER_DOWN: u32 = 0x20; // str 0x1413 "Server Down"
+const CREATE_OK: u32 = @intFromEnum(mcp.CreateResult.created);
+const CREATE_INVALID_NAME: u32 = @intFromEnum(mcp.CreateResult.invalid_name); // str 0x1411 "Invalid Game Name"
+const CREATE_NAME_TAKEN: u32 = @intFromEnum(mcp.CreateResult.already_exists); // str 0x1412 "A Game Already Exists With That Name"
+const CREATE_SERVER_DOWN: u32 = @intFromEnum(mcp.CreateResult.servers_down); // str 0x1413 "Server Down"
 // There is NO "servers are full" code on the create path: JoinOrCreateGame @0x441500 bounds the
 // switch at 0x20 and sends everything else to str 0x1415 "Error Creating Game" (0x2b "Game is
 // Full" exists only on the JOIN path, and means that one game is full — not this). So a full
 // fleet gets the default bucket on purpose: "Error Creating Game" is vague but TRUE, whereas
 // "Server Down" would be a plain lie about servers that are up and busy.
-const CREATE_ERROR_GENERIC: u32 = 0x21; // > 0x20 -> str 0x1415 "Error Creating Game"
+const CREATE_ERROR_GENERIC: u32 = @intFromEnum(mcp.CreateResult.generic); // > 0x20 -> str 0x1415 "Error Creating Game"
 
 // JOINGAME (0x04) replies. NOTE the first two — they are not in the order you would
 // guess from the numbers, and realmd had them the wrong way round: 0x29 is the PASSWORD
 // failure and 0x2a is the MISSING-GAME failure.
-const JOIN_OK: u32 = 0x00;
-const JOIN_BAD_PASSWORD: u32 = 0x29; // str 0x1428 "Game name and password don't match."
-const JOIN_NO_SUCH_GAME: u32 = 0x2a; // str 0x1427 "Game does not exist."
-const JOIN_FULL: u32 = 0x2b; // str 0x1429 "Game is Full."
-const JOIN_HARDCORE_MIX: u32 = 0x71; // str 0x1426 hardcore and normal may not share a game
-const JOIN_CLASSIC_INTO_EXPANSION: u32 = 0x78; // str 0x2775 classic char, expansion game
-const JOIN_EXPANSION_INTO_CLASSIC: u32 = 0x79; // str 0x2776 expansion char, classic game
-const JOIN_LADDER_MISMATCH: u32 = 0x7d; 
-const JOIN_NEED_NIGHTMARE: u32 = 0x73; // str 0x14f4/0x5522 "must kill Diablo/Baal to play Nightmare"
-const JOIN_NEED_HELL: u32 = 0x74; // str 0x14f3/0x5521 "...in Nightmare difficulty to play Hell" // str 0x2ab1/0x2ab2 (client picks by its own ladder flag)
+const JOIN_OK: u32 = @intFromEnum(mcp.JoinResult.ok);
+const JOIN_BAD_PASSWORD: u32 = @intFromEnum(mcp.JoinResult.password_incorrect); // str 0x1428 "Game name and password don't match."
+const JOIN_NO_SUCH_GAME: u32 = @intFromEnum(mcp.JoinResult.no_such_game); // str 0x1427 "Game does not exist."
+const JOIN_FULL: u32 = @intFromEnum(mcp.JoinResult.game_full); // str 0x1429 "Game is Full."
+const JOIN_HARDCORE_MIX: u32 = @intFromEnum(mcp.JoinResult.hardcore_mix); // str 0x1426 hardcore and normal may not share a game
+const JOIN_CLASSIC_INTO_EXPANSION: u32 = @intFromEnum(mcp.JoinResult.classic_into_expansion); // str 0x2775 classic char, expansion game
+const JOIN_EXPANSION_INTO_CLASSIC: u32 = @intFromEnum(mcp.JoinResult.expansion_into_classic); // str 0x2776 expansion char, classic game
+const JOIN_LADDER_MISMATCH: u32 = @intFromEnum(mcp.JoinResult.ladder_mismatch); 
+const JOIN_NEED_NIGHTMARE: u32 = @intFromEnum(mcp.JoinResult.need_nightmare); // str 0x14f4/0x5522 "must kill Diablo/Baal to play Nightmare"
+const JOIN_NEED_HELL: u32 = @intFromEnum(mcp.JoinResult.need_hell); // str 0x14f3/0x5521 "...in Nightmare difficulty to play Hell" // str 0x2ab1/0x2ab2 (client picks by its own ladder flag)
 
 /// Character status bits as they sit in the .d2s header at 0x24 — the same bits the
 /// CharSel statstring and MCP_CHARCREATE speak in. A game stores the creator's, so a

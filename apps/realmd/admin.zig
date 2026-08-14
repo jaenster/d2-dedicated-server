@@ -16,7 +16,7 @@ const net = @import("realm_infra").net;
 const gslink = @import("gslink.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
-const xsha1 = @import("d2_bnet").xsha1;
+const xsha1 = @import("libd2").bnet.xsha1;
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const b64 = std.base64.url_safe_no_pad;

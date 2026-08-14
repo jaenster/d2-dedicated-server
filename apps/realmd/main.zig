@@ -31,7 +31,7 @@ const state = @import("state.zig");
 const health = @import("health.zig");
 const admin = @import("admin.zig");
 const shutdown = @import("shutdown.zig");
-const xsha1 = @import("d2_bnet").xsha1;
+const xsha1 = @import("libd2").bnet.xsha1;
 
 fn mapBackend(b: config.Backend) store.Backend {
     return switch (b) {
