@@ -26,6 +26,15 @@ extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
 extern "c" fn usleep(usec: c_uint) c_int;
 extern "c" fn time(t: ?*i64) i64;
 
+/// Milliseconds off the monotonic clock, for the one deadline here that is too short to be
+/// measured in whole seconds. Falls back to `time()` if the clock cannot be read, which only
+/// costs this the sub-second precision it was reaching for.
+fn nowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return time(null) *% 1000;
+    return @as(i64, @intCast(ts.sec)) *% 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 var image: *const macho.load.Loaded = undefined;
 var sock: c_int = -1;
 var seqno: u32 = 0;
@@ -73,7 +82,13 @@ const unjoined_grace_s: i64 = 30;
 /// How long a create will wait for the one slot to be freed by a game that is already over. It
 /// covers a dispatch pass, not a game — the alternative is refusing a realm that was told a moment
 /// ago that this server had room, and it is bounded well inside the control thread's own wait.
-const create_wait_s: i64 = 3;
+///
+/// It has to outlast the gap between a client's socket closing and the engine counting it gone,
+/// which is up to three seconds, not the one the disconnect path suggests. In milliseconds because
+/// `time()` counts whole seconds: a deadline of `time() + 3` elapses anywhere from two seconds to
+/// three depending on where in the second it was set, and the create that lost this race lost it
+/// by less than that truncation.
+const create_wait_ms: i64 = 4000;
 
 /// The engine's token table has three entries and no bounds check, so a lookup past the end is a
 /// wild read. Nothing above this may be handed to SERVER_IsTokenValid.
@@ -173,9 +188,8 @@ var req_desc: [36]u8 = undefined;
 var req_flags: u32 = 0;
 var req_result: u32 = p.CREATE_FAILED;
 var req_gameid: u32 = 0;
-/// When `pump` must stop waiting for the slot and answer whatever it can. Whole seconds, because
-/// that is the clock the rest of this file keeps time on.
-var req_deadline_s: i64 = 0;
+/// When `pump` must stop waiting for the slot and answer whatever it can.
+var req_deadline_ms: i64 = 0;
 
 /// Two senders share the socket: the control thread answers requests, the tick thread reports a
 /// game closing.
@@ -237,7 +251,7 @@ pub fn pump() void {
 fn slotIsReady() bool {
     if (tokenValid(1) == 0) return true;
     if (std.mem.eql(u8, cstr(&live_name), cstr(&req_name))) return true;
-    return time(null) >= req_deadline_s;
+    return nowMs() >= req_deadline_ms;
 }
 
 // ── engine ───────────────────────────────────────────────────────────────────
@@ -490,7 +504,7 @@ fn onCreateGame(body: []const u8) void {
         req_flags = gameFlags(body[2], body[1] != 0, body[3] != 0);
 
         req_done.store(false, .release);
-        req_deadline_s = time(null) + create_wait_s;
+        req_deadline_ms = nowMs() + create_wait_ms;
         req_pending.store(true, .release);
         var waited: u32 = 0;
         while (!req_done.load(.acquire) and waited < 5000) : (waited += 5) _ = usleep(5000);
