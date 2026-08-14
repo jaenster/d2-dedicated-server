@@ -17,6 +17,7 @@
 
 const log = @import("../log.zig");
 const memstat = @import("memstat.zig");
+const poolgrow = @import("poolgrow.zig");
 
 const MANAGERS: usize = 0x0074_f104; // D2PoolManagerStrc[8]
 const MANAGER_STRIDE: usize = 0x17cc; // sizeof(D2PoolManagerStrc) = 6092
@@ -53,9 +54,15 @@ pub fn markAttach() void {
 /// Managers still available. Zero means the next game to start raises 0xe0000001 and takes the
 /// whole process — every other game on it included — so this is a number to check BEFORE
 /// creating a game, not a statistic to look at afterwards.
+///
+/// Includes poolgrow's spare managers, which is the whole point of it: without them counted the
+/// create-game guard keeps refusing at seven while the allocator is perfectly able to serve more.
+/// poolgrow reports zero until both its call-site detours are actually live, so an install that
+/// failed leaves this reading exactly as it did before.
 pub fn freeManagers() u32 {
     const used = inUse();
-    return if (used < MAX_MANAGERS) @intCast(MAX_MANAGERS - used) else 0;
+    const engine_free: u32 = if (used < MAX_MANAGERS) @intCast(MAX_MANAGERS - used) else 0;
+    return engine_free + poolgrow.freeSlots();
 }
 
 /// Print every live manager with the memory it is holding. Cheap (eight reads) but noisy, so
@@ -80,9 +87,16 @@ pub fn dump() void {
     // manager is still handed out and the NINTH request is the one that raises. One of the eight
     // is the Global Pool System, which never goes back — hence seven concurrent games, measured.
     const used = inUse();
+    const spare = poolgrow.freeSlots();
     if (used >= MAX_MANAGERS) {
-        log.print("pools: manager table FULL — the next game to start kills the process (0xe0000001)");
-    } else if (used == MAX_MANAGERS - 1) {
+        if (spare > 0) {
+            // Not the wall it used to be: the engine's eight are gone, but poolgrow serves the
+            // next create out of its own array.
+            log.hex2("pools: engine slots gone — poolgrow serving, extra in-use / free:", poolgrow.inUse(), spare);
+        } else {
+            log.print("pools: manager table FULL — the next game to start kills the process (0xe0000001)");
+        }
+    } else if (used == MAX_MANAGERS - 1 and spare == 0) {
         log.print("pools: one manager left — room for exactly one more game");
     }
 }

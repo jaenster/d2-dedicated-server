@@ -30,6 +30,7 @@ const joindiag = @import("runtime/joindiag.zig");
 const rejoin = @import("runtime/rejoin.zig");
 const eipprof = @import("runtime/eipprof.zig");
 const poolstat = @import("runtime/poolstat.zig");
+const poolgrow = @import("runtime/poolgrow.zig");
 const pkttrace = @import("runtime/pkttrace.zig");
 const realmgw = @import("runtime/realmgw.zig");
 const d2bsload = @import("runtime/d2bsload.zig"); // deferred D2BS.dll injection (post game-window)
@@ -69,6 +70,10 @@ var gs_public_port: u16 = 4000;
 // number is advertised to realmd and realmd honours it when placing games, so a wrong one
 // here is how a busy realm kills a GS. --max-games still overrides it.
 var gs_max_games: u32 = 7;
+// Whether the 7 above was overridden on the command line / env. If it was not, the bootstrap
+// raises it once poolgrow is installed — advertising seven from a GS that can host thirty-one
+// wastes the capacity poolgrow exists to create.
+var gs_max_games_explicit: bool = false;
 var gsid: u32 = 0;
 
 const BOOL = win.BOOL; // enum(c_int){ FALSE, TRUE } in zig 0.16
@@ -347,7 +352,10 @@ fn parseEndpoints() void {
                     any = true;
                 }
             }
-            if (any and v > 0) gs_max_games = v;
+            if (any and v > 0) {
+                gs_max_games = v;
+                gs_max_games_explicit = true;
+            }
         }
     }
     gsid = computeGsId();
@@ -409,6 +417,18 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // default server path stays byte-identical.
     // Always install the per-game RoomInit fan-out (cainfix/srvdiag/ubers all consume it).
     roominit.install();
+    // Lift the engine's eight-pool-manager ceiling before anything creates a game, so this GS
+    // is not stuck at seven concurrent. Redirects only the game create/destroy call sites; if
+    // either patch fails it reports no capacity and the old seven-game guard stands.
+    // Opt-in: it currently faults inside the first create (see docs/PERFORMANCE.md).
+    if (hasFlag("poolgrow")) poolgrow.install();
+    if (!gs_max_games_explicit) {
+        const grown = 7 + poolgrow.freeSlots(); // zero extra if the install did not take
+        if (grown > gs_max_games) {
+            gs_max_games = grown;
+            log.hex("d2gs: advertised capacity raised by poolgrow to 0x", gs_max_games);
+        }
+    }
     // Pace the engine's WinMain out-of-game loop: on a headless GS it runs forever and
     // is the real idle-CPU cost (~50% of a core on the cluster). ~10 Hz is plenty for a
     // server with no menu UI.
