@@ -14,11 +14,15 @@
 # --target realmd builds only the realmd binary. Neither builds the other's artifacts.
 
 # ── shared toolchain base: zig + the source tree ─────────────────────────────────
-FROM alpine:3.20 AS zig
+# Pinned to the BUILD platform, not the target: every stage below cross-compiles with -Dtarget, so
+# the toolchain never needs to match what it produces. On an arm64 developer machine that is the
+# difference between a native build and an emulated one.
+FROM --platform=$BUILDPLATFORM alpine:3.20 AS zig
 RUN apk add --no-cache curl xz
 ARG ZIG_VERSION=0.16.0
-RUN curl -sSL https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz \
-      | tar -xJ -C /opt && ln -s /opt/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
+RUN ZA="$(uname -m)" && \
+    curl -sSL https://ziglang.org/download/${ZIG_VERSION}/zig-${ZA}-linux-${ZIG_VERSION}.tar.xz \
+      | tar -xJ -C /opt && ln -s /opt/zig-${ZA}-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 WORKDIR /src
 COPY build.zig build.zig.zon ./
 COPY apps ./apps
@@ -41,6 +45,21 @@ RUN zig build qqserver -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 # ── build: injected DLLs (x86-windows; dbghelp proxy + d2gs payload only) ─────────
 FROM zig AS build-dlls
 RUN zig build dlls -Doptimize=ReleaseSafe
+
+# ── build: d2gs-native (static musl, i386) ───────────────────────────────────────
+# The game is i386 code, so its host has to be i386 too — it is loaded into this process, not
+# launched as a child. Static musl because the runtime image below has nothing else in it.
+FROM zig AS build-native
+RUN zig build d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
+
+# ── gs-native: the same server without wine ──────────────────────────────────────
+# One statically linked file against the wine image's debian + wine32 + wine + Xvfb. The game
+# files are still proprietary and still mounted at /game.
+FROM --platform=linux/386 scratch AS gs-native
+COPY --from=build-native /src/zig-out/bin/d2gs-native /d2gs-native
+VOLUME ["/game"]
+EXPOSE 4000
+ENTRYPOINT ["/d2gs-native"]
 
 # ── gs: headless wine runtime (no X, no desktop) ─────────────────────────────────
 FROM debian:bookworm-slim AS gs

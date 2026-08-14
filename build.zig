@@ -41,6 +41,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("packages/obs/obs.zig"),
     });
 
+    // Loading 1.14d's Mac build into a process: segments, dyld's rebase/bind streams, no dyld and
+    // no format conversion. Host-target so the parser can be tested here; the i386 Linux build
+    // that actually runs the image picks it up under its own target.
+    const macho = b.addModule("macho", .{
+        .root_source_file = b.path("packages/macho/macho.zig"),
+    });
+
     // Host-side infrastructure (net/log/config/lock/store types) for the NATIVE binaries.
     // Deliberately NOT given to the DLL, so libc-socket / POSIX code never enters that build.
     const realm_infra = b.addModule("realm_infra", .{
@@ -207,6 +214,8 @@ pub fn build(b: *std.Build) void {
         .{ "packages/realm-infra/realm_infra.zig", true, false },
         .{ "packages/realm-store/realm_store.zig", true, true },
         .{ "packages/realm-proto/realm_proto.zig", false, false },
+        .{ "packages/macho/macho.zig", false, false },
+        .{ "packages/darwin/darwin.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -226,7 +235,50 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     }
 
+    // ── apps/d2gs-native ─────────────────────────────────────────────────────────
+    //
+    // The same game server without wine: 1.14d's Mac build, loaded into this process and run as
+    // i386 Linux code. Nothing is emulated and nothing is converted — the Mach-O is mapped as it
+    // ships and its imports are answered by packages/darwin.
+    //
+    // Built for whatever -Dtarget says, because it has two jobs: `-Dtarget=x86-linux-musl` for the
+    // deployable (one static file, so the runtime image is scratch), and the developer's own host
+    // for `--dry-run`, which exercises the whole load path without an i386 machine.
+    const darwin = b.addModule("darwin", .{
+        .root_source_file = b.path("packages/darwin/darwin.zig"),
+    });
+
+    const d2gs_native = b.addExecutable(.{
+        .name = "d2gs-native",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/d2gs-native/main.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    d2gs_native.root_module.addImport("macho", macho);
+    d2gs_native.root_module.addImport("darwin", darwin);
+    b.step("d2gs-native", "Build the wine-free native game server").dependOn(
+        &b.addInstallArtifact(d2gs_native, .{}).step,
+    );
+    b.installArtifact(d2gs_native);
+
     // ── tools ────────────────────────────────────────────────────────────────────
+
+    // machoinfo — what the Mac build declares it needs. `--imports` prints the symbol list that
+    // packages/darwin has to answer, read out of the image rather than maintained by hand.
+    const machoinfo = b.addExecutable(.{
+        .name = "machoinfo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/machoinfo/main.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    machoinfo.root_module.addImport("macho", macho);
+    b.installArtifact(machoinfo);
 
     // ver-IX86-1.dll — the CheckRevision module packed into the version-check MPQ realmd serves
     // over BNFTP. Built for the client's target (x86-windows), not this host's.
