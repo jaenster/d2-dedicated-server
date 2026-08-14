@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Before the constructors, not after: any of them may read the command line, and the cache is
     // only fillable while it is still empty.
-    setCommandLine(&loaded, "-server");
+    setCommandLine(&loaded, envOr("D2MAC_CMDLINE", "-skiptobnet"));
 
     // dyld's last job before the entry point, and the one with no visible symptom when it is
     // skipped: 45 C++ constructors that every global here depends on.
@@ -130,9 +130,18 @@ const pre_init_application: u32 = 0x0019d582;
 /// `geD2DefaultApplicationMode` — where the command-line parser starts before any token matches.
 const default_app_mode: u32 = 0x005c8a30;
 
-/// APPMODE_server. The six names at 0x3e0e9c are 1 client, 2 server, 3 multiplayer, 4 launcher,
-/// 5 expand.
-const appmode_server: u32 = 2;
+/// The mode to boot into — launcher, NOT server. The bootstrap table at 0x3e0eb8 is six 8-byte
+/// slots and slot 2 is {0, 0}, so ApplicationMain fatals out on server by construction: the Mac
+/// build has no dedicated-server mode compiled in.
+///
+///   0 modstate0  {0, 0}              3 multiplayer  UIMENU_SetLobbyLoopParamAndGetPtr
+///   1 client     AppModeClientInit   4 launcher     fAPPMODE_launcher_SetAppMode
+///   2 server     {0, 0}              5 expand       AppModeClientInit
+///
+/// That costs nothing, because the Windows build is driven the same way. d2gs does not use an
+/// application mode there either: it boots the client, hooks the out-of-game and in-game loops, and
+/// calls the engine's own QSERVER entry points itself. Launcher is where that boot lands.
+const appmode_launcher: u32 = 4;
 
 /// The two gates between a loaded image and a running game. Both are conditional jumps taken on a
 /// condition a headless Linux process cannot satisfy, and both are answered the same way the
@@ -165,7 +174,7 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
     // Belt and braces with the command line: the parser starts from this and only moves if a token
     // matches, so setting it means a parse that finds nothing still lands on the server.
     const mode: *u32 = @ptrFromInt(loaded.at(default_app_mode));
-    mode.* = appmode_server;
+    mode.* = appmode_launcher;
 }
 
 /// `StormMac::MAC_GetCommandLine`'s cache: an 0x800 byte buffer it fills once from
