@@ -861,8 +861,10 @@ fn onJoinGame(body: []const u8) void {
         seated = chardb.place(account, charname);
         // The realm has placed this character in a game, which is what makes releasing whatever
         // seat it still holds ELSEWHERE legitimate — see `takeVouch`.
-        const target = if (slotByJoinId(@truncate(gid))) |s| s.gameid else 0;
-        vouchFor(charname, target);
+        // Only when the game is actually known. A vouch recorded with a zero target authorises
+        // releasing the seat from ANY game, since no game's id is zero — which evicts a player who
+        // is still in the world rather than one who has left.
+        if (slotByJoinId(@truncate(gid))) |s| vouchFor(charname, s.gameid);
     }
     note("d2gs-native: gslink JOINGAMEREQ gameid={d} char=\"{s}\" seated={} known={}\n", .{
         gid, charname, seated, slotByJoinId(@truncate(gid)) != null,
