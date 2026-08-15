@@ -147,7 +147,13 @@ fn sendAuthReply() void {
     ai.port = public_port;
     _ = sendPacket(std.mem.asBytes(&ai));
     log.print("d2cs: sent ADDRINFO");
+    registered = true;
 }
+
+/// True between "the realm has our ADDRINFO" and the control connection dropping.
+/// Readiness, as opposed to liveness: a GS whose gslink is down is perfectly alive
+/// but cannot be given a game, so it should not be in a Service's endpoint list.
+pub var registered: bool = false;
 
 fn handleEcho(body: []const u8) void {
     // echo back the same payload with type echo
@@ -404,6 +410,7 @@ fn run(addr: u32, port: u16) void {
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) return;
     defer {
+        registered = false;
         _ = closesocket(sock);
         sock = INVALID_SOCKET;
     }

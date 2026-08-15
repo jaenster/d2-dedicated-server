@@ -43,6 +43,41 @@ empty realm-activity row means no games were created in the window, not a broken
 `--pkttrace` adds `pkt_in` / `pkt_out` events for every `:4000` packet; it is verbose and gated
 behind its flag. See [`docs/FLAGS.md`](FLAGS.md).
 
+## The game server's own endpoint
+
+Logs answer "what happened"; they are a poor way to ask "what is true right now", because that
+means a range query over an event stream to reconstruct a number the server already knows. So
+the GS also serves its counters directly, on the port it was already using for probes
+(`:8086`, `D2GS_HEALTH_PORT`), routed by path
+([`apps/d2gs/runtime/feature/health.zig`](../apps/d2gs/runtime/feature/health.zig)):
+
+| path | answers |
+|-|-|
+| `/healthz` | liveness — 200 only while the ENGINE tick heartbeat is advancing |
+| `/readyz` | readiness — the above, AND registered with the realm over gs-link |
+| `/stats` | the counters as JSON |
+| `/metrics` | the same counters in Prometheus exposition format |
+| `/` | unchanged from before there were paths, so old probes keep working |
+
+The distinction between the first two is the one that matters: a process can be perfectly alive
+with a dead engine, and that GS answers TCP, accepts connections and serves nobody. `/healthz`
+is measured from the tick loop's heartbeat and from nothing else, so that state reads 503. The
+chart wires liveness to `/healthz` and readiness to `/readyz`, so a GS that merely lost its
+control connection leaves the Service (no new games routed to it) without being restarted out
+from under the games it is still hosting.
+
+The counters themselves live in
+[`apps/d2gs/runtime/feature/stats.zig`](../apps/d2gs/runtime/feature/stats.zig), a registry
+feature fed by the hook surface: uptime, ticks and tick rate, games created/destroyed/live with
+each live game's token, name, client count and age, players joined/left/in-game, the Fog pool
+census, and **items rolled** broken down by quality and by Items.txt code.
+
+Item counts come from a first-class `itemRoll` hook driven by
+[`apps/d2gs/runtime/itemroll.zig`](../apps/d2gs/runtime/itemroll.zig), which wraps the tail of
+the engine's `ITEM_CreateItemInstance` rather than its entry — at the entry the generation
+context holds only the quality that was *asked for*, and the affix roll inside still downgrades
+it when no valid affix set exists, so counting there over-reports rares and uniques.
+
 ## Health and lifecycle
 
 realmd exposes health/readiness on `:8080` (`/readyz` returns 200 once the configured stores are
