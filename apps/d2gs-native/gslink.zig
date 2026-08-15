@@ -8,7 +8,7 @@
 //! is also where the new game's id ends up (0x00552568).
 //!
 //! Several games at once, which the engine's own scheduler does not do — see `max_games` for what
-//! that takes and `game_cap` for why it is not the default yet.
+//! that takes.
 
 const std = @import("std");
 const macho = @import("macho");
@@ -70,7 +70,24 @@ const addr = struct {
     /// Flushes what the games queued. Unlike the loop it DOES read `gpGameTable[1]`, so it is run
     /// once per game with that word pointed at the game in question.
     const dispatch_and_cleanup: u32 = 0x001ae82b;
+    /// (name, out_existing_name) -> 1 when the name is FREE, 0 when a client still holds the seat.
+    /// The GAMELOGON path refuses on a 0 and refuses silently, so this is where a character that
+    /// cannot come back gets stuck. Replaced outright, like `SERVER_IsTokenValid`.
+    const find_player_by_name: u32 = 0x001aa39a;
+    /// (game, client id, notify) — unlinks the client from its game and from both server tables and
+    /// frees it. The character is saved either way; `notify` only gates one extra call, which a
+    /// client whose socket is already gone has nobody to receive.
+    const clean_up_client: u32 = 0x001a8e10;
+    /// `D2ClientStrc*[256]`, keyed by a hash of the character name, and its critical section.
+    const client_by_name: u32 = 0x0053716c;
+    const client_by_name_cs: u32 = 0x00537140;
 };
+
+/// Client fields, as `CreateClient` 0x001a88f5 fills them.
+const client_id: u32 = 0x00;
+const client_name: u32 = 0x0d;
+const client_next_by_name: u32 = 0x4b0;
+const client_game: u32 = 0x1a8;
 
 /// What `QSERVER_TickAllGames` writes into the game before running its loop, and the word the reap
 /// stopwatch sits next to.
@@ -125,19 +142,13 @@ const engine_token_max: u32 = 2;
 /// Pool System keeps one, which is where the Windows build's seven comes from.
 const max_games: u32 = 7;
 
-/// How many of those slots this server will actually use, from `D2GS_MAX_GAMES`.
+/// How many of those slots this server actually uses, from `D2GS_MAX_GAMES`.
 ///
-/// It defaults to one, and not because the rest do not work — seven concurrent games run clean.
-/// It is because a character cannot yet re-enter quickly on this build: `NET_D2GS_SERVER_IsValidChecks`
-/// refuses a GAMELOGON whose character still holds a seat, silently, and the seat outlives the game
-/// by a second or two because it belongs to the client and `GAME_DestroyGame` never calls
-/// `CleanUpClient`. While games were made one at a time the create waited long enough to hide that.
-/// Overlapping them does not, so one player playing back-to-back games is refused about half the
-/// time. `apps/d2gs/runtime/rejoin.zig` is the same fix on Windows and is what this wants next.
-///
-/// So: several players in several games is what this serves today, and that is what raising this
-/// buys. One player round-tripping wants the default until the seat is released properly.
-var game_cap: u32 = 1;
+/// All of them by default. That needed the seat release in `gameFindPlayerByName` first: while
+/// games were made one at a time the create waited long enough for a departing character's client
+/// to be cleaned up, and overlapping games do not, so a player going straight into the next game
+/// was refused about half the time.
+var game_cap: u32 = max_games;
 
 fn readGameCap() void {
     const v = env("D2GS_MAX_GAMES") orelse return;
@@ -251,12 +262,132 @@ fn engineTokenValid(token: u16) u32 {
 /// condition the byte patches are already gated on.
 pub fn installTokenResolver(loaded: *const macho.load.Loaded) void {
     image = loaded;
-    const site = loaded.at(addr.is_token_valid);
-    const rel: i32 = @bitCast(@as(u32, @truncate(@intFromPtr(&serverIsTokenValid))) -%
-        @as(u32, @truncate(site + 5)));
+    jmpTo(loaded.at(addr.is_token_valid), @intFromPtr(&serverIsTokenValid));
+    jmpTo(loaded.at(addr.find_player_by_name), @intFromPtr(&gameFindPlayerByName));
+}
+
+fn jmpTo(site: usize, target: usize) void {
+    const rel: i32 = @bitCast(@as(u32, @truncate(target)) -% @as(u32, @truncate(site + 5)));
     const at: [*]u8 = @ptrFromInt(site);
     at[0] = 0xe9;
     std.mem.writeInt(i32, at[1..5], rel, .little);
+}
+
+/// What the realm last told us about a character, which is the only thing that makes throwing it
+/// out of a game legitimate. Only realmd writes it, so a client cannot name somebody else's
+/// character to have them evicted.
+/// It also names the game the realm placed the character in, and that is what makes it safe. A
+/// seat held inside THAT game is the character arriving, and the engine is right to call the name
+/// taken; a seat anywhere else is the game it has just left and has not been cleaned out of yet.
+/// Without the distinction the release fires on the join it is meant to let through.
+const Vouch = struct {
+    name: [16]u8 = @splat(0),
+    game: u32 = 0,
+    at_ms: i64 = 0,
+};
+var vouches: [max_games * 4]Vouch = @splat(.{});
+var vouch_next: usize = 0;
+
+fn vouchFor(name: []const u8, game: u32) void {
+    const v = &vouches[vouch_next % vouches.len];
+    vouch_next += 1;
+    v.* = .{ .game = game, .at_ms = nowMs() };
+    const n = @min(name.len, v.name.len - 1);
+    @memcpy(v.name[0..n], name[0..n]);
+}
+
+/// The realm's outstanding join for this character, if it has one. Single use: a released seat must
+/// not authorise releasing the next one, or a character that legitimately re-joins is thrown out of
+/// the game it just entered.
+fn takeVouch(name: []const u8) ?u32 {
+    for (&vouches) |*v| {
+        if (v.at_ms == 0) continue;
+        // Only has to cover the walk from JOINGAMEREQ to the GAMELOGON that follows it.
+        if (nowMs() - v.at_ms > 30_000) {
+            v.at_ms = 0;
+            continue;
+        }
+        if (!eqlName(cstr(&v.name), name)) continue;
+        const g = v.game;
+        v.at_ms = 0;
+        return g;
+    }
+    return null;
+}
+
+fn eqlName(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+/// Let a character come straight back after the game it was in.
+///
+/// The engine refuses a GAMELOGON whose character still holds a seat, and refuses it with SILENCE —
+/// the caller answers a 0 by falling out of its switch, so nothing goes back on the wire and the
+/// client sits at the loading screen until its own timeout. The seat outlives the game because it
+/// belongs to the CLIENT: `GAME_DestroyGame` frees the game and never calls `CleanUpClient`, and the
+/// client's own teardown lands a second or so after its socket died. While games were made one at a
+/// time the create waited long enough to hide it; overlapping games do not, and one player going
+/// straight into the next game is refused about half the time.
+///
+/// So the seat is released rather than the check bypassed: find the client in the by-name table,
+/// take its game off its own `pGame`, and hand both to the engine's own `CleanUpClient`, which
+/// unlinks it from the game and from both tables and saves the character on the way out. The realm
+/// having issued a join is the authorization; without one this answers exactly as the engine would.
+///
+/// This is `apps/d2gs/runtime/rejoin.zig` for the Mac build, and the same reasoning.
+fn gameFindPlayerByName(name_ptr: [*:0]const u8, out: ?[*]u8) callconv(.c) u32 {
+    const name = std.mem.span(name_ptr);
+
+    var holder: u32 = 0;
+    {
+        const enter: *const fn (usize) callconv(.c) void = @ptrFromInt(image.at(addr.enter_critical_section));
+        const leave: *const fn (usize) callconv(.c) void = @ptrFromInt(image.at(addr.leave_critical_section));
+        const cs = image.at(addr.client_by_name_cs);
+        enter(cs);
+        defer leave(cs);
+        // Every bucket, rather than the engine's hash of the name: it costs 256 pointer reads once
+        // per join and needs no agreement about which hash this build uses.
+        const buckets: [*]const u32 = @ptrFromInt(image.at(addr.client_by_name));
+        outer: for (0..256) |b| {
+            var c = buckets[b];
+            while (c != 0) {
+                const cname: [*:0]const u8 = @ptrFromInt(c + client_name);
+                if (eqlName(std.mem.span(cname), name)) {
+                    holder = c;
+                    break :outer;
+                }
+                c = @as(*const u32, @ptrFromInt(c + client_next_by_name)).*;
+            }
+        }
+    }
+
+    if (holder == 0) return 1; // free, which is what the engine says with a 1
+
+    const held_in = @as(*const u32, @ptrFromInt(holder + client_game)).*;
+    const target = takeVouch(name);
+    // Answer as the engine would when there is nothing to release: no realm join behind this
+    // name, or the seat is in the very game the realm is sending it to, which is a duplicate
+    // logon rather than a leftover. The caller wants the existing name for its message.
+    if (held_in == 0 or target == null or held_in == target.?) {
+        if (out) |o| {
+            const cname: [*:0]const u8 = @ptrFromInt(holder + client_name);
+            const s = std.mem.span(cname);
+            const n = @min(s.len, 15);
+            @memcpy(o[0..n], s[0..n]);
+            o[n] = 0;
+        }
+        return 0;
+    }
+
+    const id = @as(*const u32, @ptrFromInt(holder + client_id)).*;
+    const cleanup: *const fn (u32, u32, u32) callconv(.c) void = @ptrFromInt(image.at(addr.clean_up_client));
+    cleanup(held_in, id, 0);
+    note("d2gs-native: released \"{s}\" from game 0x{x} so it can join 0x{x}\n", .{ name, held_in, target.? });
+    return 1;
 }
 
 /// The create is engine work, so it runs on the tick thread; this is the handoff.
@@ -692,7 +823,13 @@ fn onJoinGame(body: []const u8) void {
     const account = readCStr(body, &off);
 
     var seated = false;
-    if (charname.len > 0 and account.len > 0) seated = chardb.place(account, charname);
+    if (charname.len > 0 and account.len > 0) {
+        seated = chardb.place(account, charname);
+        // The realm has placed this character in a game, which is what makes releasing whatever
+        // seat it still holds ELSEWHERE legitimate — see `takeVouch`.
+        const target = if (slotByJoinId(@truncate(gid))) |s| s.gameid else 0;
+        vouchFor(charname, target);
+    }
     note("d2gs-native: gslink JOINGAMEREQ gameid={d} char=\"{s}\" seated={} known={}\n", .{
         gid, charname, seated, slotByJoinId(@truncate(gid)) != null,
     });
