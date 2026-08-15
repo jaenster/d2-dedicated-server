@@ -48,6 +48,12 @@ const addr = struct {
     /// uint32[0x401] token -> game-server id (win: DATA_LastGameServer). Indexed by the u16
     /// game token at 0x001abd1f; zero or -1 means "no such game".
     const token_table: u32 = 0x0053756c;
+
+    /// `QSERVER_ServerThread`'s two unguarded uses of a client socket — see `guardClosedSockets`.
+    const closed_socket_clear_jnz: u32 = 0x002f5a76;
+    const socket_index_site: u32 = 0x002f5c34;
+    const socket_index_resume: u32 = 0x002f5c39;
+    const server_thread_next_client: u32 = 0x002f5f13;
 };
 
 /// CONNECTIONTYPE_SERVER — the dedicated path, the same 0 the host branch passes.
@@ -72,6 +78,63 @@ pub fn install(loaded: *const macho.load.Loaded) void {
     // anywhere else — but the truncation still has to COMPILE on a 64-bit developer machine, since
     // that is where `--dry-run` and the tests live.
     slot.* = @truncate(@intFromPtr(&run));
+    guardClosedSockets(loaded);
+}
+
+/// Stop `sServerThread` indexing its `fd_set` with a socket that has since been closed.
+///
+/// The listener thread snapshots every client's socket into an `fd_set`, skipping any that is
+/// already -1, and then reads the socket twice MORE — once before `select` and once after it, both
+/// times without the check. A player leaving a game closes that socket in between, and `-1 >> 5` is
+/// 0x07ffffff, so `readfds[socket >> 5]` lands half a gigabyte past the thread's own stack frame:
+///
+///   0x002f5a78  AND byte ptr [EBP + 0x1ffffe67], 0x7f  — the compiler folded the constant already
+///   0x002f5c40  MOV ESI, dword ptr [EBP + EBX*4 - 0x218]  — EBX = socket >> 5, freshly reloaded
+///
+/// That is what a returning client crashes on: it is the one thing that closes a socket while the
+/// game it belonged to is still being served. The reporter names 0x002f5c40 with ECX = 0xffffffff.
+///
+/// The first site sits inside `if (socket == -1)` and so can do nothing BUT fault — the bit it
+/// means to clear was never set, the snapshot having skipped this client for that same reason. Its
+/// `JNZ` past the block becomes an unconditional `JMP`.
+///
+/// The second is the live path, where the socket is usually real, so it gets the bounds test the
+/// engine never wrote and skips to the loop's own next-client at 0x002f5f13. `MOV EAX, 1` is
+/// exactly the five bytes a `JMP rel32` needs, and both EAX and the flags are dead across it.
+fn guardClosedSockets(loaded: *const macho.load.Loaded) void {
+    // The guard below is i386 instructions; there is no image running anywhere else to patch.
+    if (comptime @import("builtin").cpu.arch != .x86) return;
+
+    const jnz: [*]u8 = @ptrFromInt(loaded.at(addr.closed_socket_clear_jnz));
+    jnz[0] = 0xeb;
+
+    socket_index_resume = @truncate(loaded.at(addr.socket_index_resume));
+    server_thread_next_client = @truncate(loaded.at(addr.server_thread_next_client));
+
+    const site = loaded.at(addr.socket_index_site);
+    const rel: i32 = @bitCast(@as(u32, @truncate(@intFromPtr(&socketIndexGuard))) -% @as(u32, @truncate(site + 5)));
+    const at: [*]u8 = @ptrFromInt(site);
+    at[0] = 0xe9;
+    std.mem.writeInt(i32, at[1..5], rel, .little);
+}
+
+/// Filled in by `guardClosedSockets`; the guard jumps back through them rather than through a
+/// relative displacement it would have to compute against the slide.
+export var socket_index_resume: u32 = 0;
+export var server_thread_next_client: u32 = 0;
+
+/// ECX is the socket the thread just reloaded. Past the end of an `fd_set` it belongs to nobody, so
+/// this client is skipped — ESI restored first, exactly as the engine's own skip at 0x002f5c52 does.
+fn socketIndexGuard() callconv(.naked) void {
+    asm volatile (
+        \\cmpl $0x400, %%ecx
+        \\jae 1f
+        \\movl $1, %%eax
+        \\jmp *socket_index_resume
+        \\1:
+        \\movl %%edi, %%esi
+        \\jmp *server_thread_next_client
+    );
 }
 
 fn run() callconv(.c) u32 {

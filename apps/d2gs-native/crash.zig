@@ -65,41 +65,86 @@ pub fn install(memory: []const u8, image_slide: i64) void {
 
     const linux = std.os.linux;
     var act: linux.Sigaction = .{
-        .handler = .{ .sigaction = onFault },
+        .handler = .{ .sigaction = @ptrCast(&realign) },
         .mask = linux.sigemptyset(),
         // The faulting instruction is game code on a stack the kernel can still use, so the handler
-        // runs on it rather than on an alternate one; nothing here recurses.
+        // runs on it rather than on an alternate one; nothing here recurses and it keeps no frame
+        // worth speaking of, its buffer being static.
         .flags = linux.SA.SIGINFO | linux.SA.RESETHAND,
     };
     for ([_]linux.SIG{ .SEGV, .BUS, .ILL, .FPE }) |sig| _ = linux.sigaction(sig, &act, null);
 
     // A hang is a failure with no address, and `kill -USR2` is how it gets one: the same trace, on
     // demand, as often as asked — so it stays armed and the process stays up. USR2 and not QUIT,
-    // because the game blocks INT, QUIT, ABRT and TERM in every thread it makes.
+    // because the game blocks INT, QUIT, ABRT and TERM in every thread it makes. It gets no chance
+    // to block this one, or the fault signals above — see `pthread.sigmask`.
     act.flags = linux.SA.SIGINFO;
     _ = linux.sigaction(.USR2, &act, null);
 }
 
+/// The handler's scratch, deliberately not a local. Four kilobytes of frame is more than the game
+/// leaves spare on the thread stacks it makes, and a handler that overflows the stack it was called
+/// on faults again — which with RESETHAND is a silent death. Static, it costs no frame. Two signals
+/// at once would share it, and a garbled trace beats none.
+var scratch: [4096]u8 = undefined;
+
+/// The i386 ABI promises a handler that ESP+4 is 16-byte aligned on entry, and the compiler spends
+/// that promise on `movaps` — an aligned SSE store into the frame. qemu-user builds the signal frame
+/// it hands the guest to eight-byte alignment instead, so that store faults, inside the handler,
+/// with RESETHAND already armed: a silent death. That is why this reporter never described a crash
+/// and why `kill -USR2` killed the process instead of tracing it. Realigning here is cheaper than
+/// forbidding SSE in everything the handler calls, and the arguments are simply passed on.
+fn realign() callconv(.naked) void {
+    asm volatile (
+        \\pushl %%ebp
+        \\movl %%esp, %%ebp
+        \\andl $-16, %%esp
+        \\subl $4, %%esp
+        \\pushl 0x10(%%ebp)
+        \\pushl 0xc(%%ebp)
+        \\pushl 0x8(%%ebp)
+        \\calll d2gs_on_fault
+        \\movl %%ebp, %%esp
+        \\popl %%ebp
+        \\ret
+    );
+}
+
+comptime {
+    if (enabled) @export(&onFault, .{ .name = "d2gs_on_fault" });
+}
+
 fn onFault(sig: std.os.linux.SIG, info: *const std.os.linux.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
-    var buf: [4096]u8 = undefined;
+    // The signal number and the context pointer, by themselves, before anything that could fault.
+    // A handler that dies partway through is only debuggable if what it managed to reach is already
+    // out — and `@tagName` is not on this side of that line, being a lookup the optimiser is free to
+    // turn into a trap for a signal number it has no name for.
     var n: usize = 0;
-    n = str(&buf, n, "\nd2gs-native: ");
-    n = str(&buf, n, @tagName(sig));
+    n = str(&scratch, n, "\nd2gs-native: signal ");
+    n = hex(&scratch, n, @intFromEnum(sig));
+    n = str(&scratch, n, " ctx 0x");
+    n = hex(&scratch, n, @intFromPtr(ctx));
+    n = str(&scratch, n, "\n");
+    _ = std.os.linux.write(2, &scratch, n);
+
+    n = 0;
     // Only a fault has a faulting address; on the asked-for trace that union member is stale.
     if (sig != .USR2) {
-        n = str(&buf, n, " at 0x");
-        n = hex(&buf, n, @intFromPtr(info.fields.sigfault.addr));
+        n = str(&scratch, n, "  at 0x");
+        n = hex(&scratch, n, @intFromPtr(info.fields.sigfault.addr));
+        n = str(&scratch, n, "\n");
+        _ = std.os.linux.write(2, &scratch, n);
+        n = 0;
     }
 
     const uc: *const UContext = @ptrCast(@alignCast(ctx orelse {
-        n = str(&buf, n, " (no context)\n");
-        _ = std.os.linux.write(2, &buf, n);
+        _ = std.os.linux.write(2, "  (no context)\n", 15);
         return;
     }));
     const m = &uc.mcontext;
 
-    n = str(&buf, n, "\n  eip");
-    n = code(&buf, n, m.eip);
+    n = str(&scratch, n, "  eip");
+    n = code(&scratch, n, m.eip);
     for ([_]struct { []const u8, u32 }{
         .{ "  esp 0x", m.esp },
         .{ " ebp 0x", m.ebp },
@@ -110,20 +155,20 @@ fn onFault(sig: std.os.linux.SIG, info: *const std.os.linux.siginfo_t, ctx: ?*an
         .{ " esi 0x", m.esi },
         .{ " edi 0x", m.edi },
     }) |reg| {
-        n = str(&buf, n, reg[0]);
-        n = hex(&buf, n, reg[1]);
+        n = str(&scratch, n, reg[0]);
+        n = hex(&scratch, n, reg[1]);
     }
 
     // Out before the stack is touched: ESP itself may be the thing that is wrong, and a second fault
     // in here is a silent death with RESETHAND armed.
-    n = str(&buf, n, "\n");
-    _ = std.os.linux.write(2, &buf, n);
+    n = str(&scratch, n, "\n");
+    _ = std.os.linux.write(2, &scratch, n);
 
     // A call through a null pointer faults with the return address already pushed, so this one word
     // names the caller exactly. Everything after it is a guess by range.
-    n = str(&buf, 0, "  [esp]");
-    n = code(&buf, n, @as(*const u32, @ptrFromInt(m.esp)).*);
-    n = str(&buf, n, "\n  stack:");
+    n = str(&scratch, 0, "  [esp]");
+    n = code(&scratch, n, @as(*const u32, @ptrFromInt(m.esp)).*);
+    n = str(&scratch, n, "\n  stack:");
 
     var addr: usize = m.esp;
     var found: usize = 0;
@@ -131,12 +176,14 @@ fn onFault(sig: std.os.linux.SIG, info: *const std.os.linux.siginfo_t, ctx: ?*an
         const word = @as(*const u32, @ptrFromInt(addr)).*;
         if (word < low or word >= high) continue;
         found += 1;
-        n = code(&buf, n, word);
-        if (n + 64 > buf.len) break;
+        n = code(&scratch, n, word);
+        if (n + 64 > scratch.len) break;
     }
-    n = str(&buf, n, "\n");
-    _ = std.os.linux.write(2, &buf, n);
-    if (sig != .USR2) std.process.exit(3);
+    n = str(&scratch, n, "\n");
+    _ = std.os.linux.write(2, &scratch, n);
+    // `exit_group`, not `std.process.exit`: the fault left locks held all over the engine and an
+    // orderly exit would take one of them. The trace is already out; nothing else has to work.
+    if (sig != .USR2) std.os.linux.exit_group(3);
 }
 
 /// An image address as Ghidra spells it; anything else raw, since only the image has a symbol table.
