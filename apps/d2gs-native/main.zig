@@ -33,15 +33,17 @@ pub fn main(init: std.process.Init) !void {
     // An installed game is not in the repo, so the tests and this host find it the same way.
     if (path == null) path = std.mem.span(getenv("D2MAC_BIN") orelse return usage());
 
-    const bytes = try macho.mapFile(path.?.ptr);
-    var img = try macho.image.parse(bytes);
+    var file = try macho.openImage(path.?.ptr);
+    var img = try macho.image.parse(file.bytes);
     const names = try macho.collectImports(gpa, &img);
 
     resolver = try darwin.Resolver.init(names.len);
     defer resolver.deinit();
 
-    var loaded = try macho.load.map(&img);
+    // The descriptor is only needed while the segments are being mapped from it.
+    var loaded = try macho.load.map(&img, file.fd);
     defer loaded.unmap();
+    file.closeFd();
 
     // Resolve up front rather than only through the bind walk: it is the same work and the same
     // memoised addresses, and it still produces an exact import report on a host where the fixups

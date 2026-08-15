@@ -94,20 +94,23 @@ const create_wait_ms: i64 = 4000;
 /// wild read. Nothing above this may be handed to SERVER_IsTokenValid.
 const engine_token_max: u32 = 2;
 
-/// How many games this engine hosts at once, and it is one — not as a placeholder but as a
-/// measurement. What looks like a game table at 0x0053756c is not one:
+/// How many games this engine hosts at once as it stands, which is one — because of what the
+/// engine's own scheduler does, not because a game is expensive:
 ///
-///   * `QSERVER_TickAllGames` 0x001ae778 advances `0x00537570` and nothing else. There is no walk
-///     and no list head; a second game would exist and never tick.
+///   * `QSERVER_TickAllGames` 0x001ae778 services `gpGameTable[1]` (0x00537570) and nothing else.
+///     Its argument is a catch-up flag for the 40 ms budget, not a token, so a game anywhere else
+///     in the table exists and never ticks.
+///   * `QSERVER_GenerateGameToken` 0x001ac1d9 walks the table from a counter its own arithmetic
+///     pins at 1, so after the first two calls it always reports the table full.
 ///   * `GAME_DestroyGame` 0x001acf33 clears that same word when the game it is destroying is the
-///     one in it, and `SERVER_IsTokenValid` 0x001abcff hands it straight back.
-///   * `QSERVER_GenerateGameToken` 0x001ac1d9 rotates a counter clamped to 1 (`CMP DX,1; CMOVA
-///     DX,CX`) over that word, so it can only ever issue one token, and the word above it
-///     (0x00537574) is an unrelated global `QSERVER_InitializeServerState` fills from the registry.
+///     one in it.
 ///
-/// So the Windows cap of seven — Fog hands out eight pool managers and the Global Pool System keeps
-/// one — is never the binding constraint here: this build has room for a single game pointer, and
-/// runs out of that first. Raising this number would place games the engine cannot tick.
+/// It is not one because the engine cannot run two. `ServerGameLoop` takes the game as a parameter,
+/// and `0x00537570` has ten references in the whole image — all of them in QSERVER/GAME management,
+/// none inside a game's own tick. So a host that kept its own list, pointed that word at each game
+/// in turn and ran the per-game body itself would tick as many as it liked. That is a real change
+/// to the riskiest part of this port, and until it is made and tested, one is the honest number:
+/// raising it here alone would place games the engine never ticks.
 const max_games: u32 = 1;
 
 /// The engine's id for the live game, and the small id the realm knows it by. The two differ

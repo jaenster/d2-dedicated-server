@@ -74,9 +74,29 @@ pub fn countRebases(img: *const Image) !usize {
 /// kernel may evict it; slurped they were private dirty, duplicated per process, and the growing
 /// read left its abandoned generations behind in the arena as well.
 pub fn mapFile(path: [*:0]const u8) ![]align(std.heap.page_size_min) const u8 {
+    var f = try openImage(path);
+    f.closeFd();
+    return f.bytes;
+}
+
+/// The same mapping with its descriptor still open, which is what a loader needs: the segments are
+/// mapped from the file a second time, so the pages the image never writes stay clean and shared
+/// instead of being copied into anonymous memory per process.
+pub const File = struct {
+    bytes: []align(std.heap.page_size_min) const u8,
+    fd: c_int,
+
+    /// The descriptor is only needed until the segments are mapped; the mapping outlives it.
+    pub fn closeFd(self: *File) void {
+        if (self.fd >= 0) _ = std.c.close(self.fd);
+        self.fd = -1;
+    }
+};
+
+pub fn openImage(path: [*:0]const u8) !File {
     const fd = open(path, 0); // O_RDONLY is 0 everywhere this runs
     if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    errdefer _ = std.c.close(fd);
 
     // Sized by reading rather than by fstat, for the reason the slurp had: musl's i386 fstat is not
     // exposed as one symbol across targets, and a counting loop needs no agreement about which
@@ -92,7 +112,8 @@ pub fn mapFile(path: [*:0]const u8) ![]align(std.heap.page_size_min) const u8 {
     }
     if (size == 0) return error.ReadFailed;
 
-    return std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+    const bytes = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+    return .{ .bytes = bytes, .fd = fd };
 }
 
 pub fn unmapFile(bytes: []align(std.heap.page_size_min) const u8) void {

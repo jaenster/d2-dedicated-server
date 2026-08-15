@@ -1,9 +1,9 @@
 //! Mapping the image and applying the fixups dyld would have.
 //!
-//! The image is copied into anonymous memory rather than mapped from the file. It costs a few
-//! megabytes of memcpy once, and it buys the ability to write rebases and binds into __TEXT before
-//! that segment is made read-only — which a file-backed private mapping would also allow, but only
-//! by dirtying the same pages anyway.
+//! Segments are mapped from the file, privately and writable, so the rebases and binds that land in
+//! __TEXT dirty only the pages they touch and the rest stays clean and shareable. The whole span is
+//! reserved anonymously first and the segments mapped over it, which keeps their relative layout —
+//! the game computes addresses across segment boundaries — and leaves the bss reading as zeroes.
 
 const std = @import("std");
 const image = @import("image.zig");
@@ -43,14 +43,23 @@ pub const Loaded = struct {
     }
 };
 
-/// Map every segment and copy its file contents in. Nothing is executable yet and no fixup has
-/// been applied — the image is inert until `applyFixups` and `protect` have run.
-pub fn map(img: *const image.Image) Error!Loaded {
+/// Map every segment. Nothing is executable yet and no fixup has been applied — the image is inert
+/// until `applyFixups` and `protect` have run.
+///
+/// With a descriptor, each segment is mapped from the file rather than copied into anonymous
+/// memory, and only the pages a fixup lands on go private. That is most of the image: it is 6.1 MB
+/// across 1575 pages, the rebases and binds cluster in a few dozen of them, and everything else was
+/// being made private dirty per process for no reason. Pass -1 to copy instead — the fallback for a
+/// segment whose file offset or length is not a whole number of pages, where a mapping would either
+/// be refused or would round over the next segment.
+pub fn map(img: *const image.Image, fd: c_int) Error!Loaded {
+    const page = std.heap.page_size_min;
     const span = img.span();
-    const total = std.mem.alignForward(usize, span.high - span.low, std.heap.page_size_min);
+    const total = std.mem.alignForward(usize, span.high - span.low, page);
 
     // One reservation for the whole image so the segments keep their relative layout; the game
     // computes addresses across segment boundaries and a per-segment mapping would scatter them.
+    // It also backs the bss, which has no file behind it and must read as zeroes.
     const memory = try std.posix.mmap(
         null,
         total,
@@ -68,6 +77,21 @@ pub fn map(img: *const image.Image) Error!Loaded {
         if (seg.filesize == 0) continue; // bss: the anonymous mapping is already zeroed
         const dst_off = seg.vmaddr - span.low;
         const n = @min(seg.filesize, seg.vmsize);
+
+        if (fd >= 0 and seg.fileoff % page == 0 and n % page == 0 and dst_off % page == 0) {
+            const at: [*]align(page) u8 = @alignCast(memory.ptr + dst_off);
+            _ = std.posix.mmap(
+                at,
+                n,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE, .FIXED = true },
+                fd,
+                seg.fileoff,
+            ) catch {
+                @memcpy(memory[dst_off..][0..n], img.bytes[seg.fileoff..][0..n]);
+            };
+            continue;
+        }
         @memcpy(memory[dst_off..][0..n], img.bytes[seg.fileoff..][0..n]);
     }
 
