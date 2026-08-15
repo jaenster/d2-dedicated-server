@@ -617,6 +617,9 @@ fn holdOne(s: *Slot) void {
     if (clients.* != s.last_clients) {
         s.last_clients = clients.*;
         note("d2gs-native: game {d} has {d} client(s), {d}ms in\n", .{ s.join_id, clients.*, nowMs() - s.held_since_ms });
+        // On every change, including back down to zero, which is the one realmd cannot work out
+        // for itself.
+        sendPlayers(s.join_id, clients.*);
     }
     // A brand-new game reports one client before it has any: `GAME_CreateGame` is given a null
     // client and still files a player record for it, which the engine drops again a tick or two
@@ -870,6 +873,30 @@ fn onJoinGame(body: []const u8) void {
     r.result = if (slotByJoinId(@truncate(gid)) != null and seated) 0 else 1;
     r.gameid = gid;
     _ = sendAll(std.mem.asBytes(&r));
+}
+
+/// Tell the realm how many players a game holds now.
+///
+/// realmd increments its own count on every join it authorises (`d2cs.zig` `g.players + 1`) and
+/// never decrements: it cannot, because it only ever sees the request to join, never the arrival or
+/// the departure. The count comes back down solely because the server that hosts the game reports
+/// an absolute figure — which this one did not do at all, so a game's count only ever went up. A
+/// game whose name is reused across sessions therefore reached the engine's eight-player ceiling
+/// and every further join was refused `0x2b`, "game is full", with nobody in it.
+///
+/// Absolute, never a delta, so a lost message cannot make it drift. The name is left empty: the
+/// count is what is wrong, and realmd's roster ignores an empty one rather than filing a blank
+/// member. A GS that knows who arrived should send the name and `GAMEINFO_ENTER`/`_LEAVE` instead.
+fn sendPlayers(gid: u16, players: u32) void {
+    var buf: [@sizeOf(p.UpdateGameInfo) + 1]u8 = undefined;
+    var r = std.mem.zeroes(p.UpdateGameInfo);
+    r.h = header(.updategameinfo, buf.len);
+    r.flag = p.GAMEINFO_UPDATE;
+    r.gameid = gid;
+    r.players = players;
+    @memcpy(buf[0..@sizeOf(p.UpdateGameInfo)], std.mem.asBytes(&r));
+    buf[@sizeOf(p.UpdateGameInfo)] = 0; // the empty character name
+    _ = sendAll(&buf);
 }
 
 fn sendCloseGame(gid: u32) void {
