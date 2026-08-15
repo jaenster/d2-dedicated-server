@@ -57,6 +57,11 @@ probegame/
 # local launchers: they hardcode this machine's wine prefixes and install dirs
 /run.sh
 /run-*.sh
+# ...except the two that no longer do. They take every path from the environment or a gitignored
+# .env, the committed docs cite them by name, and the measurements in docs/native-vs-wine.md are
+# not reproducible without them.
+!/run-stack.sh
+!/run-stress.sh
 
 # a data dir named "=<port>" means something leaked an env assignment into a path
 /=*

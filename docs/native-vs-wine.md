@@ -62,6 +62,70 @@ where the native build hosts exactly one — the Mac image's QSERVER has a singl
 (`QSERVER_GenerateGameToken` clamps its counter to 1), so that is architectural, not a tuning
 knob. For a fleet, seven games on ~96 MiB beats one game on ~22 MiB per unit of capacity.
 
+## Where the latency difference actually is
+
+The round times above were taken with `date +%s`. A round is about four seconds, so every sample
+was quantised by a quarter of itself and the 12-14% gap was mostly rounding. `run-stress.sh` now
+times rounds in milliseconds.
+
+It does not subtract the dwell, though the first version of this did. The dwell is not a floor the
+round sits on: a client starts its dwell clock when it sends 0x6b, so the world arrives during it
+— at `--dwell 0` the client leaves before the world does and every round fails — and a longer
+dwell also gives the previous game more time to be reaped, which shortens the next create. On one
+server "round minus dwell" was 2.05 s at `--dwell 1` and 1.40 s at `--dwell 3`. A quantity that
+moves when you change what you subtract is not the server's time. Compare rounds, at one dwell.
+
+Re-measured that way, both variants in Docker on one arm64 Mac — so both i386 images run under the
+same `qemu-i386`, which is slower than either would be on real hardware but slower for both:
+
+| metric | native | wine |
+|-|-|-|
+| rounds clean | 20/20 | 20/20 |
+| mean round | 4.40 s | 3.64 s |
+| median round | 4.35 s | 3.58 s |
+| wall clock | 88.17 s | 72.85 s |
+| container RSS idle | 21.3 MiB | 296.1 MiB |
+| container RSS peak | 32.1 MiB | 300.0 MiB |
+
+The wine RSS here is not comparable to the 96 MiB measured on the NAS — this container carries
+Xvfb and a different base, and everything is under emulation. Only the two columns are comparable
+to each other, and only within this table.
+
+The native server logs how long each create waited for its one game slot. Over those 20 rounds:
+min 4 ms, median 704 ms, mean 742 ms, max 1785 ms, **total 14.85 s** — and the whole run was
+15.3 s slower than wine's. The gap is not general slowness; it is one queue.
+
+It is a queue because this build hosts one game (see `max_games` in
+`apps/d2gs-native/gslink.zig`). Round N+1's create arrives while round N's game still has clients,
+so it blocks until the engine has counted them gone and destroyed the game. Wine has seven slots
+and never queues. Two intervals make up the wait, and only the second is ours: the engine takes
+~350 ms per departing client to notice the socket is gone, and 79 ms after that to free the slot
+(measured, `engine freed the slot ...ms after the game emptied`).
+
+The per-client notice is engine work, so `qemu-i386` inflates it — which means this local run
+overstates the native side's disadvantage and the number to fix against is the NAS one. Nothing
+here says the queue is not real; it says its size is not yet known on real hardware.
+
+The queue belongs to the process, not to the design. With a second native container registered and
+`--spread --clients 2`, the realm placed ten games on each: the first server still queued (median
+714 ms) and the second barely did (median 14 ms, mean 21 ms), because its create arrived a moment
+later in the round, by which time its own previous game was already gone. So the way to spend
+21 MiB on more capacity is another process, and each one carries its own slot. Throughput could
+not be compared here — two emulated servers on one Mac contend for the same cores, and the run was
+slower than either alone.
+
+## The two builds do not bind the same port
+
+The wine GS moves the engine's QServer off :4000 to whatever `D2GS_GS_ADDR` advertises
+(`gsport.apply(gs_public_port)` in `apps/d2gs/d2gs.zig`). The native GS always binds 4000 — the
+Mac image has the port as an immediate in `QSERVER_CreateAndInit`, and nothing patches it.
+
+So a container publishing `-p 14000:4000` is right for the native image and wrong for wine, which
+is listening on 14000 inside. The failure does not look like a port problem: `docker-proxy`
+accepts the connection first and only then fails to reach the container, so the client gets a
+connection that closes without a byte, and every log in between says the game was created and the
+join acked. That cost an hour; it is written down so it costs nobody else one.
+
 `memory.usage_in_bytes` reaches 1370 MiB for wine on a warm container. That is page cache
 (`total_cache` 1271 MiB) from reading the 614 MB prefix and the MPQs, not the server's memory —
 after a restart the same figure is 101 MiB. RSS is the honest number.

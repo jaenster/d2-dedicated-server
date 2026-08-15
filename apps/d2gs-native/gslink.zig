@@ -190,6 +190,11 @@ var req_result: u32 = p.CREATE_FAILED;
 var req_gameid: u32 = 0;
 /// When `pump` must stop waiting for the slot and answer whatever it can.
 var req_deadline_ms: i64 = 0;
+/// When the request was handed to the tick thread, and how much of the answer's latency was spent
+/// waiting for the previous game to leave the one slot. On a server that hosts a single game that
+/// wait is the gap between one game and the next, so it is the thing to measure before tuning it.
+var req_armed_ms: i64 = 0;
+var req_slot_ms: i64 = 0;
 
 /// Two senders share the socket: the control thread answers requests, the tick thread reports a
 /// game closing.
@@ -219,6 +224,7 @@ pub fn start(loaded: *const macho.load.Loaded) void {
 pub fn pump() void {
     if (!started) return;
     if (req_pending.load(.acquire) and slotIsReady()) {
+        req_slot_ms = nowMs() - req_armed_ms;
         runCreate();
         req_pending.store(false, .release);
         req_done.store(true, .release);
@@ -234,6 +240,14 @@ pub fn pump() void {
         live_gameid = 0;
         live_join_id = 0;
         live_name = @splat(0);
+        freeing = true;
+    }
+    // The realm has been told, but the slot is not free until the engine has destroyed the game,
+    // and only then can the next create be answered. On a one-game server that interval is dead
+    // time between rounds, so it is reported rather than inferred.
+    if (freeing and tokenValid(1) == 0) {
+        freeing = false;
+        note("d2gs-native: engine freed the slot {d}ms after the game emptied\n", .{nowMs() - empty_ms});
     }
 }
 
@@ -261,8 +275,11 @@ fn slotIsReady() bool {
 const Phase = enum { waiting, played, released };
 var phase: Phase = .released;
 var held_id: u32 = 0;
-var held_since_s: i64 = 0;
+var held_since_ms: i64 = 0;
 var last_clients: u32 = 0;
+/// When the game was seen with nobody in it, and whether the engine still has to free the slot.
+var empty_ms: i64 = 0;
+var freeing = false;
 /// Whether a client has asked to join the game currently in the slot. The engine's own client count
 /// cannot answer that on its own — see `holdGameForItsFirstPlayer`.
 var join_resolved = false;
@@ -286,7 +303,7 @@ pub fn holdGameForItsFirstPlayer() void {
     // game's "someone has been in this" into a game that is still waiting for its first client.
     if (id != held_id) {
         held_id = id;
-        held_since_s = time(null);
+        held_since_ms = nowMs();
         phase = .waiting;
     }
     // This does not just find the game, it LOCKS it — `EnterCriticalSection(game->0x18)` — and
@@ -302,7 +319,7 @@ pub fn holdGameForItsFirstPlayer() void {
     const clients: *const u32 = @ptrFromInt(game + game_clients);
     if (clients.* != last_clients) {
         last_clients = clients.*;
-        note("d2gs-native: game {d} has {d} client(s), {d}s in\n", .{ live_join_id, clients.*, time(null) - held_since_s });
+        note("d2gs-native: game {d} has {d} client(s), {d}ms in\n", .{ live_join_id, clients.*, nowMs() - held_since_ms });
     }
     // A brand-new game reports one client before it has any: `GAME_CreateGame` is given a null
     // client and still files a player record for it, which the engine drops again a tick or two
@@ -316,11 +333,12 @@ pub fn holdGameForItsFirstPlayer() void {
     switch (phase) {
         .played => {
             phase = .released;
+            empty_ms = nowMs();
             note("d2gs-native: game {d} is empty — the engine may collect it\n", .{live_join_id});
         },
         .released => {},
         .waiting => {
-            if (time(null) - held_since_s > unjoined_grace_s) {
+            if (nowMs() - held_since_ms > unjoined_grace_s * 1000) {
                 phase = .released;
                 note("d2gs-native: game {d} was never joined — the engine may collect it\n", .{live_join_id});
                 return;
@@ -368,7 +386,7 @@ fn runCreate() void {
     // that ran this create goes on to look for a game that has finished, and a phase still reading
     // `released` from the last one makes it report the game it has just made as closed.
     held_id = 0;
-    held_since_s = time(null);
+    held_since_ms = nowMs();
     phase = .waiting;
     join_resolved = false;
 
@@ -504,7 +522,9 @@ fn onCreateGame(body: []const u8) void {
         req_flags = gameFlags(body[2], body[1] != 0, body[3] != 0);
 
         req_done.store(false, .release);
-        req_deadline_ms = nowMs() + create_wait_ms;
+        req_armed_ms = nowMs();
+        req_slot_ms = -1;
+        req_deadline_ms = req_armed_ms + create_wait_ms;
         req_pending.store(true, .release);
         var waited: u32 = 0;
         while (!req_done.load(.acquire) and waited < 5000) : (waited += 5) _ = usleep(5000);
@@ -521,7 +541,9 @@ fn onCreateGame(body: []const u8) void {
     r.result = result;
     r.gameid = gid;
     _ = sendAll(std.mem.asBytes(&r));
-    note("d2gs-native: gslink CREATEGAME \"{s}\" -> result={d} gameid={d}\n", .{ cstr(&req_name), result, gid });
+    note("d2gs-native: gslink CREATEGAME \"{s}\" -> result={d} gameid={d} slot={d}ms total={d}ms\n", .{
+        cstr(&req_name), result, gid, req_slot_ms, nowMs() - req_armed_ms,
+    });
 }
 
 /// JOINGAMEREQ: gameid, token, charname\0, account\0, guild\0. It arrives before the client does,
