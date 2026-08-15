@@ -117,12 +117,9 @@ fn tick() void {
     gslink.pump();
     call(addr.net_d2gs_server_handle_any_incoming_packet, fn () callconv(.c) void)();
     const sleep = call(addr.mac_sleep, fn (u32) callconv(.c) void);
-    if (call(addr.qserver_tick_all_games, fn (u32) callconv(.c) u32)(1) != 0) {
-        _ = call(addr.qserver_dispatch_and_cleanup, fn (usize, u32) callconv(.c) u32)(0, 0);
-        sleep(30);
-    } else {
-        sleep(10);
-    }
+    // Not `QSERVER_TickAllGames`: it services the one game in `gpGameTable[1]` on a single global
+    // budget, so calling it once per hosted game would advance the first and skip the rest.
+    if (gslink.tickGames()) sleep(30) else sleep(10);
 }
 
 fn call(comptime static_addr: u32, comptime Fn: type) *const Fn {

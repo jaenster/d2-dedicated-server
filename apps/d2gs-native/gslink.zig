@@ -7,9 +7,8 @@
 //! it in the new player record and hand it to a map that has a null-client singleton branch, which
 //! is also where the new game's id ends up (0x00552568).
 //!
-//! One game at a time, always — see `max_games` for why that is a measurement rather than a
-//! placeholder. A second create is refused rather than allowed to produce a game the engine would
-//! never tick.
+//! Several games at once, which the engine's own scheduler does not do — see `max_games` for what
+//! that takes and `game_cap` for why it is not the default yet.
 
 const std = @import("std");
 const macho = @import("macho");
@@ -64,7 +63,18 @@ const addr = struct {
     /// the game — and what it hands back to `game_unlock` the moment it is done.
     const game_from_id: u32 = 0x001abd47;
     const game_unlock: u32 = 0x001abdda;
+    /// One game's tick. `QSERVER_TickAllGames` reaches it through the lock/unlock pair above and
+    /// passes the locked game, so it needs nothing from `gpGameTable` — which is what lets a host
+    /// run more than the one game that table schedules.
+    const server_game_loop: u32 = 0x001ae017;
+    /// Flushes what the games queued. Unlike the loop it DOES read `gpGameTable[1]`, so it is run
+    /// once per game with that word pointed at the game in question.
+    const dispatch_and_cleanup: u32 = 0x001ae82b;
 };
+
+/// What `QSERVER_TickAllGames` writes into the game before running its loop, and the word the reap
+/// stopwatch sits next to.
+const game_tick_flag: u32 = 0x1dbc;
 
 /// How many clients are in the game: what the reap reads to decide it is empty (0x001ae8bf) and
 /// what the join gate compares against 7 before it will admit an eighth (0x001a7a66).
@@ -105,23 +115,89 @@ const engine_token_max: u32 = 2;
 ///   * `GAME_DestroyGame` 0x001acf33 clears that same word when the game it is destroying is the
 ///     one in it.
 ///
-/// It is not one because the engine cannot run two. `ServerGameLoop` takes the game as a parameter,
-/// and `0x00537570` has ten references in the whole image — all of them in QSERVER/GAME management,
-/// none inside a game's own tick. So a host that kept its own list, pointed that word at each game
-/// in turn and ran the per-game body itself would tick as many as it liked. That is a real change
-/// to the riskiest part of this port, and until it is made and tested, one is the honest number:
-/// raising it here alone would place games the engine never ticks.
-const max_games: u32 = 1;
+/// None of that stops the engine running several, and this server does. `ServerGameLoop` is passed
+/// the game, and `0x00537570` has ten references in the whole image — all of them in QSERVER/GAME
+/// management, none inside a game's own tick. So a created game is taken straight back out of that
+/// word and kept here (`runCreate`), and `tickGames` points the word at each game in turn and runs
+/// the per-game body itself.
+///
+/// The ceiling is Fog's, not QSERVER's: the pool allocator hands out eight managers and the Global
+/// Pool System keeps one, which is where the Windows build's seven comes from.
+const max_games: u32 = 7;
 
-/// The engine's id for the live game, and the small id the realm knows it by. The two differ
-/// because the engine counts games from a large seed while the realm's id has to survive being
-/// truncated to the u16 the client carries in its GAMELOGON.
-var live_gameid: u32 = 0;
-var live_join_id: u16 = 0;
+/// How many of those slots this server will actually use, from `D2GS_MAX_GAMES`.
+///
+/// It defaults to one, and not because the rest do not work — seven concurrent games run clean.
+/// It is because a character cannot yet re-enter quickly on this build: `NET_D2GS_SERVER_IsValidChecks`
+/// refuses a GAMELOGON whose character still holds a seat, silently, and the seat outlives the game
+/// by a second or two because it belongs to the client and `GAME_DestroyGame` never calls
+/// `CleanUpClient`. While games were made one at a time the create waited long enough to hide that.
+/// Overlapping them does not, so one player playing back-to-back games is refused about half the
+/// time. `apps/d2gs/runtime/rejoin.zig` is the same fix on Windows and is what this wants next.
+///
+/// So: several players in several games is what this serves today, and that is what raising this
+/// buys. One player round-tripping wants the default until the seat is released properly.
+var game_cap: u32 = 1;
+
+fn readGameCap() void {
+    const v = env("D2GS_MAX_GAMES") orelse return;
+    const n = std.fmt.parseInt(u32, v, 10) catch return;
+    game_cap = @min(@max(n, 1), max_games);
+}
+
+/// Where a game is in its life. Only `waiting` is held open: a game that has had a player in it is
+/// finished the moment it empties, and one already given up on must not be revived.
+const Phase = enum { waiting, played, released };
+
+/// One hosted game. `gameid` is the engine's, from a large seed; `join_id` is the small one the
+/// realm knows it by, because that is what survives being truncated to the u16 a client carries in
+/// its GAMELOGON. A zero `gameid` means the slot is free.
+const Slot = struct {
+    gameid: u32 = 0,
+    join_id: u16 = 0,
+    /// What the realm calls it. Kept because a create naming it is a client that wants in, not a
+    /// new game — see `freeSlotFor`.
+    name: [36]u8 = @splat(0),
+    phase: Phase = .released,
+    held_since_ms: i64 = 0,
+    last_clients: u32 = 0,
+    /// Whether a client has asked to join this game. The engine's own client count cannot answer
+    /// that on its own — see `holdGameForItsFirstPlayer`.
+    join_resolved: bool = false,
+    empty_ms: i64 = 0,
+    freeing: bool = false,
+};
+
+var slots: [max_games]Slot = @splat(.{});
 var next_join_id: u16 = 0;
-/// What the realm calls the game in the slot. Kept because a create naming it is a client that
-/// wants in, not a new game — see `slotIsReady`.
-var live_name: [36]u8 = @splat(0);
+
+fn slotByJoinId(id: u16) ?*Slot {
+    if (id == 0) return null;
+    for (&slots) |*s| if (s.gameid != 0 and s.join_id == id) return s;
+    return null;
+}
+
+fn liveGames() u32 {
+    var n: u32 = 0;
+    for (&slots) |*s| {
+        if (s.gameid != 0) n += 1;
+    }
+    return n;
+}
+
+/// The engine schedules exactly one game, out of `gpGameTable[1]`. Everything that reads that word
+/// is management — the name check, the dispatch, the destroy — so servicing several games is a
+/// matter of pointing it at each in turn rather than leaving one there forever. It is left cleared
+/// between passes, which is also what keeps `QSERVER_GenerateGameToken` willing to issue again.
+fn setEngineSlot(id: u32) void {
+    const enter: *const fn (usize) callconv(.c) void = @ptrFromInt(image.at(addr.enter_critical_section));
+    const leave: *const fn (usize) callconv(.c) void = @ptrFromInt(image.at(addr.leave_critical_section));
+    const cs = image.at(addr.token_table_cs);
+    enter(cs);
+    defer leave(cs);
+    const table: [*]u32 = @ptrFromInt(image.at(addr.token_table));
+    table[1] = id;
+}
 
 /// Answers "what game is this token", for realm join ids as well as engine ones.
 ///
@@ -138,10 +214,10 @@ var live_name: [36]u8 = @splat(0);
 /// which the engine would have done unchecked.
 fn serverIsTokenValid(id: u32) callconv(.c) u32 {
     const token: u16 = @truncate(id);
-    const mine = token != 0 and token == live_join_id and live_gameid != 0;
-    if (mine) join_resolved = true;
-    const answer = if (mine)
-        live_gameid
+    const mine = slotByJoinId(token);
+    if (mine) |s| s.join_resolved = true;
+    const answer = if (mine) |s|
+        s.gameid
     else if (token <= engine_token_max) engineTokenValid(token) else 0;
     // The one line that tells a refused join apart from a join that never arrived. The engine asks
     // repeatedly with the same token, so only a change is worth a line.
@@ -215,6 +291,7 @@ pub fn start(loaded: *const macho.load.Loaded) void {
         return;
     };
     gsid = identity();
+    readGameCap();
     started = true;
     _ = std.Thread.spawn(.{}, thread, .{realm}) catch |e| {
         note("d2gs-native: gslink thread: {s}\n", .{@errorName(e)});
@@ -226,59 +303,122 @@ pub fn start(loaded: *const macho.load.Loaded) void {
 /// going away — the engine has no hook to tell us, but its token stops resolving.
 pub fn pump() void {
     if (!started) return;
-    if (req_pending.load(.acquire) and slotIsReady()) {
-        req_slot_ms = nowMs() - req_armed_ms;
-        runCreate();
-        req_pending.store(false, .release);
-        req_done.store(true, .release);
-    }
+    if (req_pending.load(.acquire)) switch (admit(cstr(&req_name))) {
+        .wait => {},
+        .refuse => {
+            req_slot_ms = nowMs() - req_armed_ms;
+            req_gameid = 0;
+            req_result = p.CREATE_SERVER_FULL;
+            req_pending.store(false, .release);
+            req_done.store(true, .release);
+        },
+        .take => |s| {
+            req_slot_ms = nowMs() - req_armed_ms;
+            runCreate(s);
+            req_pending.store(false, .release);
+            req_done.store(true, .release);
+        },
+    };
     // A game with nobody left in it is finished as far as the realm is concerned, whether or not
     // the engine has got round to freeing it: it must stop being somewhere a client can be sent,
-    // and this server's one slot must stop counting against the realm's capacity. Waiting for the
-    // engine's collect instead is what made the round after a finished one arrive at a realm that
-    // still thought this server was full.
-    if (live_gameid != 0 and (phase == .released or tokenValid(1) == 0)) {
-        sendCloseGame(live_join_id);
-        note("d2gs-native: gslink CLOSEGAME gameid={d}\n", .{live_join_id});
-        live_gameid = 0;
-        live_join_id = 0;
-        live_name = @splat(0);
-        freeing = true;
-    }
-    // The realm has been told, but the slot is not free until the engine has destroyed the game,
-    // and only then can the next create be answered. On a one-game server that interval is dead
-    // time between rounds, so it is reported rather than inferred.
-    if (freeing and tokenValid(1) == 0) {
-        freeing = false;
-        note("d2gs-native: engine freed the slot {d}ms after the game emptied\n", .{nowMs() - empty_ms});
+    // and its slot must stop counting against the realm's capacity. Waiting for the engine's
+    // collect instead is what made the round after a finished one arrive at a realm that still
+    // thought this server was full.
+    for (&slots) |*s| {
+        if (s.gameid == 0) continue;
+        if (s.phase != .released and gameIsAlive(s.gameid)) continue;
+        sendCloseGame(s.join_id);
+        note("d2gs-native: gslink CLOSEGAME gameid={d} ({d} game(s) left)\n", .{ s.join_id, liveGames() - 1 });
+        s.* = .{};
     }
 }
 
-/// Whether a create can be answered now, or is worth holding for the one slot to come free.
+/// The slot a create should be answered into, or null to keep waiting for one.
 ///
 /// The engine is about a second behind a client that walks out: the connection is gone, and the
-/// game still counts it until the engine gets round to the disconnect. On a server with one game
-/// slot that second IS the gap between one game and the next, so the create that arrives in it
-/// must wait rather than be refused — a refusal reaches the player as "the realm is down" for a
-/// server that is about to be idle.
+/// game still counts it until the engine gets round to the disconnect. A create that arrives in
+/// that second on a server with nothing free must wait rather than be refused — a refusal reaches
+/// the player as "the realm is down" for a server that is about to be idle.
 ///
-/// What must NOT wait is the other client of the game already here: it lost the race to create a
-/// game its partner made, and a refusal is the answer it wants, because the realm turns that into
-/// a join. The name tells them apart — same name is the race, a different name is the next game.
-fn slotIsReady() bool {
-    if (tokenValid(1) == 0) return true;
-    if (std.mem.eql(u8, cstr(&live_name), cstr(&req_name))) return true;
-    return nowMs() >= req_deadline_ms;
+/// What must NOT wait is the other client of a game already here: it lost the race to create a game
+/// its partner made, and a refusal is the answer it wants, because the realm turns that into a
+/// join. The name tells them apart — same name is the race, a different name is a new game.
+const Admission = union(enum) {
+    /// Make the game here.
+    take: *Slot,
+    /// Answer now, with a refusal the realm turns into a join or reports as full.
+    refuse,
+    /// Keep holding: nothing is free, but a game is on its way out.
+    wait,
+};
+
+fn admit(name: []const u8) Admission {
+    for (&slots) |*s| {
+        if (s.gameid != 0 and std.mem.eql(u8, cstr(&s.name), name)) return .refuse;
+    }
+    for (slots[0..game_cap]) |*s| {
+        if (s.gameid == 0) return .{ .take = s };
+    }
+    return if (nowMs() >= req_deadline_ms) .refuse else .wait;
 }
 
-// ── engine ───────────────────────────────────────────────────────────────────
+/// Whether the engine still has this game. Not `gpGameTable` — the games we host are not in it —
+/// but the engine's own id lookup, which is what the join path resolves through too. It hands the
+/// game back LOCKED, so every caller has to give it up again.
+fn gameIsAlive(id: u32) bool {
+    const from_id: *const fn (u32) callconv(.c) u32 = @ptrFromInt(image.at(addr.game_from_id));
+    const g = from_id(id);
+    if (g == 0) return false;
+    const unlock: *const fn (u32) callconv(.c) void = @ptrFromInt(image.at(addr.game_unlock));
+    unlock(g);
+    return true;
+}
 
-/// Where the live game is in its life. Only `waiting` is held open: a game that has had a player in
-/// it is finished the moment it empties, and one already given up on must not be revived.
-const Phase = enum { waiting, played, released };
-var phase: Phase = .released;
-var held_id: u32 = 0;
-var held_since_ms: i64 = 0;
+/// Service every game this server hosts, the way `QSERVER_TickAllGames` services the one the engine
+/// schedules: lock the game, arm it, run its loop, unlock, then let the dispatch flush what it
+/// queued. The pacing is ours because the engine's is a single global budget — calling its tick
+/// once per game would advance the first and skip the rest.
+pub fn tickGames() bool {
+    if (nowMs() - last_tick_ms < tick_period_ms) return false;
+    last_tick_ms = nowMs();
+
+    const from_id: *const fn (u32) callconv(.c) u32 = @ptrFromInt(image.at(addr.game_from_id));
+    const unlock: *const fn (u32) callconv(.c) void = @ptrFromInt(image.at(addr.game_unlock));
+    const loop: *const fn (u32) callconv(.c) void = @ptrFromInt(image.at(addr.server_game_loop));
+    const dispatch: *const fn (usize, u32) callconv(.c) u32 = @ptrFromInt(image.at(addr.dispatch_and_cleanup));
+
+    var ticked = false;
+    for (&slots) |*s| {
+        if (s.gameid == 0) continue;
+        // The dispatch reads this word, and a destroy during the loop clears it — so it is set for
+        // the whole of one game's turn and cleared again below.
+        setEngineSlot(s.gameid);
+        const g = from_id(s.gameid);
+        if (g != 0) {
+            const armed: *u32 = @ptrFromInt(g + game_tick_flag);
+            armed.* = 0x400;
+            loop(g);
+            unlock(g);
+            ticked = true;
+        }
+        // Forced, because the dispatch keeps a 40 ms budget of its own in a global and honours it
+        // only when both arguments are zero. Called the engine's way, the first game would spend
+        // that budget and every game after it would return without flushing — which reads as
+        // clients that never leave and joins that never land. A forced call does not touch the
+        // global either, so the pacing stays the one `tickGames` does.
+        _ = dispatch(1, 0);
+    }
+    // Left clear: `QSERVER_GenerateGameToken` will only issue while the slot it walks is free, and
+    // the name check reads the same word.
+    setEngineSlot(0);
+    return ticked;
+}
+
+var last_tick_ms: i64 = 0;
+/// The engine's own budget between passes over a game, in `QSERVER_TickAllGames`.
+const tick_period_ms: i64 = 40;
+
+// ── engine ───────────────────────────────────────────────────────────────────
 var last_clients: u32 = 0;
 /// When the game was seen with nobody in it, and whether the engine still has to free the slot.
 var empty_ms: i64 = 0;
@@ -295,34 +435,26 @@ var join_resolved = false;
 /// it re-stamps it to now, and the window never elapses. Once someone has been in, the stopwatch is
 /// left alone and the engine collects the game on its own, through its own locked destroy path.
 pub fn holdGameForItsFirstPlayer() void {
-    const id = tokenValid(1);
-    if (id == 0) {
-        held_id = 0;
-        return;
+    for (&slots) |*s| {
+        if (s.gameid != 0) holdOne(s);
     }
-    // A game id this has not seen before is a game nobody has joined yet. `runCreate` clears the id
-    // as well as setting it, because the engine hands out game structs from a pool and the next game
-    // can land on the address the last one had — going by the id alone would carry the finished
-    // game's "someone has been in this" into a game that is still waiting for its first client.
-    if (id != held_id) {
-        held_id = id;
-        held_since_ms = nowMs();
-        phase = .waiting;
-    }
+}
+
+fn holdOne(s: *Slot) void {
     // This does not just find the game, it LOCKS it — `EnterCriticalSection(game->0x18)` — and
     // every one of the engine's own callers unlocks before it returns. Reading two fields out of a
     // game and walking away with its critical section held would leave the game permanently locked
     // against its own destroy, once per tick.
     const from_id: *const fn (u32) callconv(.c) u32 = @ptrFromInt(image.at(addr.game_from_id));
-    const game = from_id(id);
+    const game = from_id(s.gameid);
     if (game == 0) return;
     const unlock: *const fn (u32) callconv(.c) void = @ptrFromInt(image.at(addr.game_unlock));
     defer unlock(game);
 
     const clients: *const u32 = @ptrFromInt(game + game_clients);
-    if (clients.* != last_clients) {
-        last_clients = clients.*;
-        note("d2gs-native: game {d} has {d} client(s), {d}ms in\n", .{ live_join_id, clients.*, nowMs() - held_since_ms });
+    if (clients.* != s.last_clients) {
+        s.last_clients = clients.*;
+        note("d2gs-native: game {d} has {d} client(s), {d}ms in\n", .{ s.join_id, clients.*, nowMs() - s.held_since_ms });
     }
     // A brand-new game reports one client before it has any: `GAME_CreateGame` is given a null
     // client and still files a player record for it, which the engine drops again a tick or two
@@ -330,20 +462,20 @@ pub fn holdGameForItsFirstPlayer() void {
     // the count went 1, then 0, and the game was gone before the client it existed for had
     // finished connecting. So a real player is one this server has answered a GAMELOGON for.
     if (clients.* != 0) {
-        if (phase == .waiting and join_resolved) phase = .played;
-        if (phase != .waiting) return;
+        if (s.phase == .waiting and s.join_resolved) s.phase = .played;
+        if (s.phase != .waiting) return;
     }
-    switch (phase) {
+    switch (s.phase) {
         .played => {
-            phase = .released;
-            empty_ms = nowMs();
-            note("d2gs-native: game {d} is empty — the engine may collect it\n", .{live_join_id});
+            s.phase = .released;
+            s.empty_ms = nowMs();
+            note("d2gs-native: game {d} is empty — the engine may collect it\n", .{s.join_id});
         },
         .released => {},
         .waiting => {
-            if (nowMs() - held_since_ms > unjoined_grace_s * 1000) {
-                phase = .released;
-                note("d2gs-native: game {d} was never joined — the engine may collect it\n", .{live_join_id});
+            if (nowMs() - s.held_since_ms > unjoined_grace_s * 1000) {
+                s.phase = .released;
+                note("d2gs-native: game {d} was never joined — the engine may collect it\n", .{s.join_id});
                 return;
             }
             const empty_since: *u32 = @ptrFromInt(game + game_empty_since);
@@ -352,20 +484,13 @@ pub fn holdGameForItsFirstPlayer() void {
     }
 }
 
-/// "Is the engine's one game slot occupied, and by what". The engine's table, not the resolver
-/// above it: this asks about the slot, and the resolver's job is to answer about realm ids.
-fn tokenValid(token: u32) u32 {
-    return engineTokenValid(@truncate(token));
-}
-
 /// The 0x67 handler's call, with the packet's fields spelled out. Everything but the name, the
 /// description and the flags is the constant that path passes for a plain expansion game.
-fn runCreate() void {
+fn runCreate(slot: *Slot) void {
     req_gameid = 0;
-    if (tokenValid(1) != 0) {
-        req_result = p.CREATE_SERVER_FULL;
-        return;
-    }
+    // The engine files a new game in `gpGameTable[1]`, and `QSERVER_GenerateGameToken` only issues
+    // while that word is free. It is kept clear between passes for exactly this.
+    setEngineSlot(0);
     const Create = fn (
         client: u32,
         name: [*:0]const u8,
@@ -384,28 +509,34 @@ fn runCreate() void {
     ) callconv(.c) void;
     const create: *const Create = @ptrFromInt(image.at(addr.game_create));
     create(0, @ptrCast(&req_name), 0, 1, @ptrCast(&req_desc), 0, req_flags, 0, 0, 0, 0, 0, 0, 0);
+
+    const singleton: *const u32 = @ptrFromInt(image.at(addr.last_gameid));
+    const id = singleton.*;
+    // A game the engine did not file under the token it schedules is one it never made.
+    if (id == 0 or engineTokenValid(1) != id) {
+        setEngineSlot(0);
+        req_result = p.CREATE_FAILED;
+        return;
+    }
+    // Take it out of the engine's one scheduled slot and keep it here instead. From now on this
+    // server decides when the game is serviced, and the word is free for the next create. Nothing
+    // is lost by moving it: `ServerGameLoop` is passed the game, and the join path resolves through
+    // `SERVER_IsTokenValid`, which is ours.
+    setEngineSlot(0);
+
+    next_join_id = if (next_join_id == std.math.maxInt(u16)) 1 else next_join_id + 1;
     // Whatever id the engine reuses for it, this is a new game and nobody is in it yet. The phase
     // has to be set HERE and not left to the next tick's `holdGameForItsFirstPlayer`: the same pump
     // that ran this create goes on to look for a game that has finished, and a phase still reading
     // `released` from the last one makes it report the game it has just made as closed.
-    held_id = 0;
-    held_since_ms = nowMs();
-    phase = .waiting;
-    join_resolved = false;
-
-    const singleton: *const u32 = @ptrFromInt(image.at(addr.last_gameid));
-    const id = singleton.*;
-    // A game the engine did not file under token 1 is one no join can reach, so it is not a game
-    // we can honestly report.
-    if (id == 0 or tokenValid(1) != id) {
-        req_result = p.CREATE_FAILED;
-        return;
-    }
-    next_join_id = if (next_join_id == std.math.maxInt(u16)) 1 else next_join_id + 1;
-    live_join_id = next_join_id;
-    live_gameid = id;
-    live_name = req_name;
-    req_gameid = live_join_id;
+    slot.* = .{
+        .gameid = id,
+        .join_id = next_join_id,
+        .name = req_name,
+        .phase = .waiting,
+        .held_since_ms = nowMs(),
+    };
+    req_gameid = slot.join_id;
     req_result = p.CREATE_OK;
 }
 
@@ -499,18 +630,18 @@ fn sendRegistration() void {
 
     var info = std.mem.zeroes(p.SetGsInfo);
     info.h = header(.setgsinfo, @sizeOf(p.SetGsInfo));
-    info.maxgame = max_games;
+    info.maxgame = game_cap;
     _ = sendAll(std.mem.asBytes(&info));
 
     var ai = std.mem.zeroes(p.AddrInfo);
     ai.h = header(.addrinfo, @sizeOf(p.AddrInfo));
-    ai.maxgame = max_games;
+    ai.maxgame = game_cap;
     ai.gsid = gsid;
     ai.ip = public_ip;
     ai.port = public_port;
     _ = sendAll(std.mem.asBytes(&ai));
     note("d2gs-native: gslink registered {d}.{d}.{d}.{d}:{d} maxgame={d}\n", .{
-        public_ip[0], public_ip[1], public_ip[2], public_ip[3], public_port, max_games,
+        public_ip[0], public_ip[1], public_ip[2], public_ip[3], public_port, game_cap,
     });
 }
 
@@ -562,10 +693,13 @@ fn onJoinGame(body: []const u8) void {
 
     var seated = false;
     if (charname.len > 0 and account.len > 0) seated = chardb.place(account, charname);
+    note("d2gs-native: gslink JOINGAMEREQ gameid={d} char=\"{s}\" seated={} known={}\n", .{
+        gid, charname, seated, slotByJoinId(@truncate(gid)) != null,
+    });
 
     var r = std.mem.zeroes(p.JoinGameReply);
     r.h = header(.joingame, @sizeOf(p.JoinGameReply));
-    r.result = if (gid == live_join_id and gid != 0 and seated) 0 else 1;
+    r.result = if (slotByJoinId(@truncate(gid)) != null and seated) 0 else 1;
     r.gameid = gid;
     _ = sendAll(std.mem.asBytes(&r));
 }
