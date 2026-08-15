@@ -955,9 +955,57 @@ fn env(name: []const u8) ?[]const u8 {
 fn parseAddr(text: []const u8, ip: *[4]u8, port: *u16) !void {
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.NoPort;
     port.* = try std.fmt.parseInt(u16, text[colon + 1 ..], 10);
-    var it = std.mem.splitScalar(u8, text[0..colon], '.');
-    for (ip) |*o| o.* = try std.fmt.parseInt(u8, it.next() orelse return error.NotDotted, 10);
-    if (it.next() != null) return error.NotDotted;
+    const host = text[0..colon];
+    if (dottedQuad(host)) |oct| {
+        ip.* = oct;
+        return;
+    }
+    // A name, which is what a k8s Service is. Refusing one meant every deployment had to be given a
+    // ClusterIP by hand, and that changes whenever the Service is recreated.
+    ip.* = try resolve(host);
+}
+
+fn dottedQuad(host: []const u8) ?[4]u8 {
+    var oct: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, host, '.');
+    for (&oct) |*o| o.* = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+    if (it.next() != null) return null;
+    return oct;
+}
+
+const AddrInfoC = extern struct {
+    flags: c_int,
+    family: c_int,
+    socktype: c_int,
+    protocol: c_int,
+    addrlen: u32,
+    addr: ?*std.posix.sockaddr.in,
+    canonname: ?[*:0]u8,
+    next: ?*AddrInfoC,
+};
+extern "c" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const AddrInfoC, res: **AddrInfoC) c_int;
+extern "c" fn freeaddrinfo(res: *AddrInfoC) void;
+
+fn resolve(host: []const u8) ![4]u8 {
+    var z: [256]u8 = undefined;
+    if (host.len >= z.len) return error.NameTooLong;
+    @memcpy(z[0..host.len], host);
+    z[host.len] = 0;
+
+    var hints = std.mem.zeroes(AddrInfoC);
+    hints.family = std.posix.AF.INET;
+    hints.socktype = std.posix.SOCK.STREAM;
+    var res: *AddrInfoC = undefined;
+    if (getaddrinfo(@ptrCast(&z), null, &hints, &res) != 0) return error.NotResolved;
+    defer freeaddrinfo(res);
+
+    var it: ?*AddrInfoC = res;
+    while (it) |a| : (it = a.next) {
+        if (a.family != std.posix.AF.INET) continue;
+        const sa = a.addr orelse continue;
+        return @bitCast(sa.addr);
+    }
+    return error.NotResolved;
 }
 
 /// A fleet needs one id per server, and the host name alone is not it: two servers on one machine

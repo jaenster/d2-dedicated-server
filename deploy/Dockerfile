@@ -55,7 +55,11 @@ RUN zig build d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
 # ── gs-native: the same server without wine ──────────────────────────────────────
 # One statically linked file against the wine image's debian + wine32 + wine + Xvfb. The game
 # files are still proprietary and still mounted at /game.
-FROM --platform=linux/386 scratch AS gs-native
+# Labelled amd64, not 386, even though the binary inside is a 32-bit ELF. containerd matches the
+# image platform against the node's and refuses a linux/386 image on an amd64 node outright ("no
+# match for platform in manifest") — while the kernel it would have run on executes the i386 binary
+# without help. The label is metadata; the ELF is what runs.
+FROM --platform=linux/amd64 scratch AS gs-native
 COPY --from=build-native /src/zig-out/bin/d2gs-native /d2gs-native
 # The engine writes its resource file to the temporary-items folder during startup, and a scratch
 # image has no /tmp for it to land in. Declaring it as a volume is what creates the directory.
