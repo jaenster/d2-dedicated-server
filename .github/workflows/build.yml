@@ -5,6 +5,7 @@
 #   ghcr.io/jaenster/realmd    — clean-room Zig realm server (scratch, static musl)
 #   ghcr.io/jaenster/d2gs      — headless wine GS runtime (game files mounted at runtime)
 #   ghcr.io/jaenster/qqserver  — token-translating game-traffic gateway (scratch, musl)
+#   ghcr.io/jaenster/d2gs-native — wine-free GS: the Mac 1.14d image loaded in-process (scratch)
 #
 # The cluster pulls these anonymously (public packages) — flip a NEW package to public
 # once under github.com/users/jaenster/packages. The PRIVATE d2gs-deploy repo's ArgoCD
@@ -52,6 +53,11 @@ jobs:
             image: d2gs
           - target: qqserver
             image: qqserver
+          # The wine-free GS: one static i386 ELF in scratch. The image claims linux/amd64 like
+          # the rest — containerd matches an image's platform against the node's and refuses a
+          # linux/386 image outright, while that same node's kernel runs the i386 binary.
+          - target: gs-native
+            image: d2gs-native
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
