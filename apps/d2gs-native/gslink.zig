@@ -81,11 +81,15 @@ const addr = struct {
     /// `D2ClientStrc*[256]`, keyed by a hash of the character name, and its critical section.
     const client_by_name: u32 = 0x0053716c;
     const client_by_name_cs: u32 = 0x00537140;
+    /// The same clients keyed by id, which is the list `CleanUpClient` walks.
+    const client_by_id: u32 = 0x00536d40;
+    const client_by_id_cs: u32 = 0x00536d14;
 };
 
 /// Client fields, as `CreateClient` 0x001a88f5 fills them.
 const client_id: u32 = 0x00;
 const client_name: u32 = 0x0d;
+const client_next_by_id: u32 = 0x4ac;
 const client_next_by_name: u32 = 0x4b0;
 const client_game: u32 = 0x1a8;
 
@@ -144,11 +148,13 @@ const max_games: u32 = 7;
 
 /// How many of those slots this server actually uses, from `D2GS_MAX_GAMES`.
 ///
-/// All of them by default. That needed the seat release in `gameFindPlayerByName` first: while
-/// games were made one at a time the create waited long enough for a departing character's client
-/// to be cleaned up, and overlapping games do not, so a player going straight into the next game
-/// was refused about half the time.
-var game_cap: u32 = max_games;
+/// One, until the crash below is fixed. Concurrent games SIGSEGV inside the engine's own
+/// `CleanUpClient` at 0x001a8ee1, within a round or two of `--spread`, always just after a game's
+/// last client leaves — measured on real amd64 hardware, where one game at a time ran 60/60 clean.
+/// `listedById` guards the one call this file makes into that function, but the fault has not been
+/// reproduced against the guard yet, and a default that crashes is worse than a default that
+/// serialises. Raise it with D2GS_MAX_GAMES to test.
+var game_cap: u32 = 1;
 
 fn readGameCap() void {
     const v = env("D2GS_MAX_GAMES") orelse return;
@@ -315,6 +321,22 @@ fn takeVouch(name: []const u8) ?u32 {
     return null;
 }
 
+/// Whether the by-id table still lists this exact client, which is what makes it safe to hand to
+/// `CleanUpClient`.
+fn listedById(id: u32, client: u32) bool {
+    const enter: *const fn (usize) callconv(.c) void = @ptrFromInt(image.at(addr.enter_critical_section));
+    const leave: *const fn (usize) callconv(.c) void = @ptrFromInt(image.at(addr.leave_critical_section));
+    const cs = image.at(addr.client_by_id_cs);
+    enter(cs);
+    defer leave(cs);
+    const buckets: [*]const u32 = @ptrFromInt(image.at(addr.client_by_id));
+    var c = buckets[id & 0xff];
+    while (c != 0) : (c = @as(*const u32, @ptrFromInt(c + client_next_by_id)).*) {
+        if (c == client) return true;
+    }
+    return false;
+}
+
 fn eqlName(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
@@ -384,6 +406,15 @@ fn gameFindPlayerByName(name_ptr: [*:0]const u8, out: ?[*]u8) callconv(.c) u32 {
     }
 
     const id = @as(*const u32, @ptrFromInt(holder + client_id)).*;
+    // `CleanUpClient` walks the by-ID bucket for this id and dereferences each link BEFORE testing
+    // it for null (0x001a8ee1; the `TEST EAX,EAX` two instructions later can never be reached with
+    // a null). A client the by-name table still lists but the by-id table has already dropped
+    // therefore faults instead of being cleaned up. The two go out of step exactly when a game's
+    // last client is leaving, which is when this is called.
+    if (!listedById(id, holder)) {
+        note("d2gs-native: seat \"{s}\" is half-unlinked; leaving it to the engine\n", .{name});
+        return 0;
+    }
     const cleanup: *const fn (u32, u32, u32) callconv(.c) void = @ptrFromInt(image.at(addr.clean_up_client));
     cleanup(held_in, id, 0);
     note("d2gs-native: released \"{s}\" from game 0x{x} so it can join 0x{x}\n", .{ name, held_in, target.? });
