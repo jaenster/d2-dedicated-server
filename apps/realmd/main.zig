@@ -26,6 +26,7 @@ const d2cs = @import("d2cs.zig");
 const d2dbs = @import("d2dbs.zig");
 const gslink = @import("gslink.zig");
 const gameedge = @import("gameedge.zig");
+const charflush = @import("charflush.zig");
 const store = @import("store.zig");
 const state = @import("state.zig");
 const health = @import("health.zig");
@@ -262,6 +263,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Optional embedded game edge: realmd fronts game traffic itself (in-process token
     // splice) instead of a standalone d2ingress — the lightweight single-binary path.
     var t_game: ?std.Thread = null;
+    // Moves saved characters from the redis cache to the store of record. Every instance runs
+    // one; they need no coordination because a flush reads the current bytes, so duplicated work
+    // writes the same save twice rather than the wrong one.
+    if (cfg.ephemeral_store == .redis and cfg.durable_store != .redis) {
+        _ = std.Thread.spawn(.{}, charflush.run, .{}) catch |e|
+            log.line("realmd", "WARNING character flush worker did not start: {s} — saves will stay in redis", .{@errorName(e)});
+    }
+
     if (cfg.game_port != 0) {
         const game_fd = try net.listenTcp(cfg.bind, cfg.game_port);
         log.line("realmd", "embedded game edge on {d} (in-process splice; no standalone d2ingress needed)", .{cfg.game_port});

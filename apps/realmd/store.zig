@@ -57,15 +57,46 @@ pub fn init(cfg: Config) void {
 
 // ── characters (durable) ─────────────────────────────────────────────────────
 
+/// True when redis is a CACHE in front of a different durable store, rather than being the
+/// durable store itself. With durable=redis there is nothing to cache and nothing to flush.
+fn cachingChars() bool {
+    return ephemeral == .redis and durable != .redis;
+}
+
+/// Read the live character. Redis first, because that is where a game's most recent save lands
+/// and Postgres may still be a flush behind it — reading Postgres first would hand back a stale
+/// character and undo the player's last session.
 pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
-    return switch (durable) {
+    if (cachingChars()) {
+        const cached = redis.getCharD2s(account, charname, out);
+        if (cached != 0) return cached;
+    }
+    const n = switch (durable) {
         .fs => fs.getCharD2s(account, charname, out),
         .redis => redis.getCharD2s(account, charname, out),
         .pg => pg.getCharD2s(account, charname, out),
     };
+    // Populate the cache, but do NOT mark it dirty: these bytes came FROM the durable store, so
+    // flushing them back would be a write for no reason.
+    //
+    // `n == out.len` means the read exactly filled the caller's buffer, which cannot be told apart
+    // from a save too big for it. Caching that would store a TRUNCATED character and then serve it
+    // in preference to the intact one on disk — a silent corruption that survives every later read.
+    if (n != 0 and n != out.len and cachingChars()) _ = redis.saveCharD2s(account, charname, out[0..n]);
+    return n;
 }
 
+/// Write the live character. Redis takes it and the character is marked dirty; the flush worker
+/// moves it to the store of record. The save is acknowledged once redis has it, so a game's save
+/// never waits on Postgres — which is the point of the cache, and why the dirty set has to be
+/// crash-safe.
 pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8) bool {
+    if (cachingChars()) {
+        if (!redis.saveCharD2s(account, charname, bytes)) return false;
+        // A save redis accepted but that never got marked would sit there looking clean while
+        // Postgres stayed behind, so a failed mark has to fail the save.
+        return markCharDirty(account, charname) != null;
+    }
     return switch (durable) {
         .fs => fs.saveCharD2s(account, charname, bytes),
         .redis => redis.saveCharD2s(account, charname, bytes),
@@ -333,6 +364,23 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 // CREATE/JOIN and looked up by the d2ingress from the token in the client's first
 // GAMELOGON packet. NAT-proof: the token is unique across the realm so two clients
 // behind one public IP never collide (unlike the source-IP route map above).
+
+/// Move one character from the cache to the store of record.
+///
+/// Reads the CURRENT bytes rather than anything handed in, which is what makes a flush idempotent
+/// and order-independent: two workers doing this at once both write the newest save.
+pub fn flushCharToDurable(account: []const u8, charname: []const u8) bool {
+    if (!cachingChars()) return true; // nothing behind the cache to fall behind
+    var buf: [max_d2s]u8 = undefined;
+    const n = redis.getCharD2s(account, charname, &buf);
+    if (n == 0) return false;
+    if (n == buf.len) return false; // implausibly large, likely truncated — do not persist it
+    return switch (durable) {
+        .fs => fs.saveCharD2s(account, charname, buf[0..n]),
+        .redis => true,
+        .pg => pg.saveCharD2s(account, charname, buf[0..n]),
+    };
+}
 
 // ── save durability ──────────────────────────────────────────────────────────
 //
