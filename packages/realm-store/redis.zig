@@ -891,6 +891,29 @@ fn tokenRouteKey(buf: []u8, token: u16) []const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "troute:{x}", .{token}) catch unreachable;
 }
 
+/// Next realm-global game token, or null if redis could not answer.
+///
+/// The token is what a client presents to the gateway, so it has to be unique across the whole
+/// realm — a per-process counter hands two realmd instances the same number and the second client
+/// is spliced to the first one's game. INCR is atomic across instances, which is the only reason
+/// several realmds can mint at once.
+///
+/// The wire field is 16 bits, so the counter is folded into 1..65535: 0 is skipped because the
+/// engine and the game list both read it as "no game". Wrapping is safe in practice — a route
+/// lives `route_ttl_s` (60s default), so a collision needs 65535 games inside that window.
+pub fn mintToken() ?u16 {
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "INCR", prefix ++ "token:seq" }) orelse return null;
+    const n = switch (rep) {
+        .int => |v| v,
+        else => return null,
+    };
+    // INCR is signed and unbounded; fold to the 16-bit wire field, avoiding 0.
+    return @intCast(@as(u64, @bitCast(n)) % 65535 + 1);
+}
+
 pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
     const key = tokenRouteKey(&kb, token);

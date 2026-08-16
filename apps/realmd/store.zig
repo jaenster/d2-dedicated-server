@@ -334,6 +334,24 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 // GAMELOGON packet. NAT-proof: the token is unique across the realm so two clients
 // behind one public IP never collide (unlike the source-IP route map above).
 
+/// Process-local fallback counter for the backends that cannot mint across instances.
+var local_token_ctr = std.atomic.Value(u16).init(1);
+
+/// Next game token, unique across the whole realm.
+///
+/// Only redis can promise that: the token identifies a route the gateway will resolve, so two
+/// instances handing out the same number splices the second client into the first one's game.
+/// INCR is atomic across instances; the fs and pg paths fall back to a process-local counter and
+/// are therefore single-instance only.
+pub fn mintToken() u16 {
+    if (ephemeral == .redis) {
+        if (redis.mintToken()) |t| return t;
+    }
+    // Wrap at u16, skipping 0 — the engine and the game list both read 0 as "no game".
+    const n = local_token_ctr.fetchAdd(1, .monotonic);
+    return if (n == 0) 1 else n;
+}
+
 pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {
     return switch (ephemeral) {
         .fs => fs.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s),

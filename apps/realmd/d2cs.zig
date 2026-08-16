@@ -124,16 +124,12 @@ const max_players_per_game: u16 = 8;
 pub var game_ip: [4]u8 = .{ 0, 0, 0, 0 };
 pub var route_ttl_s: u32 = 60;
 
-// Realm-global game-token counter. realmd OWNS the u16 token it hands the client, so a
-// process-global atomic makes it unique per CREATE/JOIN within this instance — two
-// clients behind one public IP get distinct tokens, which is what makes the qqserver's
-// token translation NAT-proof. NOTE: for multi-instance uniqueness this wants a redis
-// INCR / instance-id namespacing (same as session ids); the atomic is fine for now.
-var token_ctr = std.atomic.Value(u16).init(1);
-
-/// Mint the next realm-global game token (wraps at u16; fine for the test/MVP).
+/// Mint the next game token. realmd OWNS the token it hands the client — two clients behind one
+/// public IP get distinct ones, which is what makes the gateway's translation NAT-proof. The
+/// counter lives in the store so it is realm-global rather than per-process; see
+/// `store.mintToken`.
 fn mintToken() u16 {
-    return token_ctr.fetchAdd(1, .monotonic);
+    return store.mintToken();
 }
 
 const DConn = struct {
