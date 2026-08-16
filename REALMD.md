@@ -2,16 +2,17 @@
 
 `apps/realmd/` is a clean-room replacement for **PvPGN** (bnetd + d2cs + d2dbs), written in
 Zig as a single binary. It is the realm the unmodified 1.14d client logs into, and it dispatches
-games to our injected game server (`d2gs.dll` in `Game.exe`) over the same control protocol the GS
-already speaks.
+games to our injected game server (`d2gs.dll` in `Game.exe`) by putting them on that server's queue
+in redis — the two never connect to each other.
 
 It is a separate build target from the injection DLLs: a **native executable**, built for the host
 and cross-compiled to a static Linux binary for deploy.
 
 ## Why, vs PvPGN
 - **One process, not three.** PvPGN runs bnetd/d2cs/d2dbs as separate daemons glued over localhost
-  TCP with sed-patched config files. realmd is one binary with shared in-memory state behind a few
-  listeners.
+  TCP with sed-patched config files. realmd is one binary behind one client port, and it keeps no
+  cross-connection state of its own — that lives in Postgres and Redis, which is what lets you run
+  several of it.
 - **One client port, like real Battle.net.** The client speaks both BNCS (login) and MCP (realm) on
   **6112** -- realmd demuxes them on the byte after the `0x01` selector, exactly as real bnet tells
   them apart by host. There is no pvpgn-style fan of client-facing ports.
@@ -32,6 +33,7 @@ and cross-compiled to a static Linux binary for deploy.
 |-|-|-|
 | 6112 | client | bnetd login + MCP realm (list/select/create/join), muxed on one port |
 | 8080 | ops | health/readiness + admin API + (optional) embedded web UI |
+| `REALMD_GAME_PORT` | client | OFF by default. The embedded game-traffic edge — realmd being its own d2ingress, for a single host. See [`apps/d2ingress`](apps/d2ingress/README.md). |
 
 The game-server fleet has no port here: servers meet the realm in redis rather than connecting
 to it. See [`docs/redis.md`](docs/redis.md).
@@ -45,10 +47,11 @@ to it. See [`docs/redis.md`](docs/redis.md).
 | `REALMD_PG_DSN` | -- | REQUIRED — the store of record: characters, accounts, profiles, guilds |
 | `REALMD_REALM_NAME` | `TypeGuru` | realm name shown to clients |
 | `REALMD_REALM_ADDR` | `127.0.0.1` | public IPv4 clients dial for the realm (advertised on login) |
-| `REALMD_GAME_ADDR` | -- | GATEWAY mode: the d2ingress entry advertised for game traffic |
+| `REALMD_GAME_ADDR` | -- | REQUIRED — the address advertised for game traffic (d2ingress, or realmd's own edge) |
 | `REALMD_GS_ADDR` | (peer IP) | override the game-server IP given to clients (NAT) |
 | `REALMD_DATA_DIR` | `realmd-data` | where BNFTP assets are read from (read-only image content) |
-| `REALMD_INSTANCE` | `realmd-0` | instance id (must be unique per instance in shared mode) |
+| `REALMD_INSTANCE` | `realmd-0` | REQUIRED to differ per instance: it seeds session ids and dispatch request ids, so two instances sharing one collect each other's replies |
+| `REALMD_GAME_PORT` | `0` (off) | run the embedded game edge on this port instead of a separate d2ingress |
 | `REALMD_LOG_JSON` | off | structured JSON logs to stdout (for Loki) |
 | `REALMD_CAPTURE` | off | hexdump raw bytes instead of speaking the protocol |
 

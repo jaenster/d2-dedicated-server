@@ -8,17 +8,22 @@
 #
 #   tools/test-save-durability.sh
 #
-# Leaves the realm as it found it. Needs the dev stack (./run-stack.sh) and its redis.
+# Leaves the realm as it found it. Needs the dev stores up (./run-stack.sh brings them).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REDIS_CONTAINER="${REDIS_CONTAINER:-d2gs-dev-redis}"
+PG_CONTAINER="${PG_CONTAINER:-d2gs-dev-postgres}"
 ACCOUNT="${ACCOUNT:-tester}"
 CHAR="${CHAR:-DurabilityProbe}"
 DATA_DIR="${REALMD_DATA_DIR:-$PWD/realmd-data}"
-SAVE="$DATA_DIR/chars/$ACCOUNT/$CHAR.d2s"
 
 R() { docker exec "$REDIS_CONTAINER" redis-cli "$@"; }
+# Size of the character in the store of record, or empty if it is not there at all.
+PGSIZE() {
+  docker exec "$PG_CONTAINER" psql -U realmd -d realmd -tAc \
+    "select octet_length(d2s) from chars where account='$ACCOUNT' and name='$CHAR'" 2>/dev/null | tr -d '[:space:]'
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # A probe character of its own, so a real one is never the thing being overwritten.
@@ -27,7 +32,8 @@ cleanup() {
   R DEL "realmd:charver:$ACCOUNT/$CHAR" >/dev/null 2>&1 || true
   R SREM realmd:dirty "$ACCOUNT/$CHAR" >/dev/null 2>&1 || true
   R SREM "realmd:chars:$ACCOUNT" "$CHAR" >/dev/null 2>&1 || true
-  rm -f "$SAVE"
+  docker exec "$PG_CONTAINER" psql -U realmd -d realmd -qc \
+    "delete from chars where account='$ACCOUNT' and name='$CHAR'" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 cleanup
@@ -44,8 +50,8 @@ R SADD realmd:dirty "$ACCOUNT/$CHAR" >/dev/null
 
 [ "$(R STRLEN "realmd:char:$ACCOUNT:$CHAR")" = "$BYTES" ] || fail "redis did not take the staged save"
 [ "$(R SISMEMBER realmd:dirty "$ACCOUNT/$CHAR")" = "1" ] || fail "the save was not marked dirty"
-[ ! -f "$SAVE" ] || fail "the store of record already has it; the test proves nothing"
-echo "    redis has $BYTES bytes, marked dirty, nothing on disk"
+[ -z "$(PGSIZE)" ] || fail "the store of record already has it; the test proves nothing"
+echo "    redis has $BYTES bytes, marked dirty, postgres has nothing"
 
 echo "==> a fresh realmd starts and should finish what the dead one did not"
 # realmd is started DIRECTLY rather than through run-stack.sh. The flush worker lives in realmd and
@@ -74,10 +80,10 @@ for _ in $(seq 1 30); do
 done
 
 [ "$(R SISMEMBER realmd:dirty "$ACCOUNT/$CHAR")" = "0" ] || fail "still dirty after 30s — nothing picked it up"
-[ -f "$SAVE" ] || fail "the character never reached the store of record"
-got=$(stat -f%z "$SAVE" 2>/dev/null || stat -c%s "$SAVE")
+got=$(PGSIZE)
+[ -n "$got" ] || fail "the character never reached the store of record"
 [ "$got" = "$BYTES" ] || fail "persisted $got bytes, expected $BYTES — the save was altered on the way"
 
-echo "    recovered: $got bytes on disk, dirty flag cleared"
+echo "    recovered: $got bytes in postgres, dirty flag cleared"
 echo
 echo "PASS — a save orphaned by a dead instance is finished by the next one"

@@ -13,8 +13,8 @@ is what the container images and the Helm chart use.
 | `--realm` | join a realm: publish this server into the shared store, take create/join from its queue there, and read/write characters there |
 | `--create-games` | load data tables so the engine can create games |
 | `--redis <host:port>` | the shared store — this server's only link to a realm. Env: `D2GS_REDIS_ADDR` |
-| `--gs-addr <ip:port>` | public address clients dial for this GS's games (self-reported to realmd). Env: `D2GS_GS_ADDR` |
-| `--max-games <n>` | capacity this GS advertises to realmd. Env: `D2GS_MAX_GAMES` |
+| `--gs-addr <ip:port>` | public address clients dial for this GS's games (published in its own redis record). Env: `D2GS_GS_ADDR` |
+| `--max-games <n>` | capacity this GS publishes in its redis record. Env: `D2GS_MAX_GAMES` |
 | `--reap-ms <n>` | how long an empty game is kept before it is destroyed (default 5000). Also this server's throughput ceiling -- see [How many games per server](PERFORMANCE.md#how-many-games-per-server). Env: `D2GS_REAP_MS` |
 | `--realm-gw <ip>` | (client) point the game's bnet gateway list at your realm instead of Blizzard's |
 
@@ -62,5 +62,5 @@ environment, listed in [`apps/d2gs-native/README.md`](../apps/d2gs-native/README
 
 Two differences worth knowing if you run both kinds of server. `D2GS_MAX_GAMES` here is the
 **actual** cap on concurrent games (1..7, default 1), where above it is the capacity this GS
-advertises to realmd. And `D2GS_GS_ADDR` here only changes what clients are told -- the native
+publishes for the realm to route on. And `D2GS_GS_ADDR` here only changes what clients are told -- the native
 server always binds `:4000`, so map the port rather than expecting the listener to move.

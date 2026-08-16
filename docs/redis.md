@@ -107,8 +107,10 @@ saying which. It stopped being one backend among several the moment the realm be
 through it, and every one of those things — characters, seats, tokens, the fleet — fails in a way
 that reads as a game bug rather than a missing dependency.
 
-The **durable** store stays a choice: pg for a deployment, fs for one host. Neither carries any
-coordination, so requiring postgres would only make local iteration slower for nothing.
+Postgres is required for the same kind of reason, from the other end: it is the only copy of a
+character that outlives a redis restart. There is no filesystem mode to fall back to — that choice
+is what let account flags and profiles land on one instance's local disk, so it was removed rather
+than documented around.
 
 ## A character belongs to one seat
 

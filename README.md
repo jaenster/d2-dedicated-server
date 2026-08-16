@@ -100,7 +100,7 @@ open); Redis + Postgres behind them; an internal GS fleet whose pods register th
                     | flush worker (any realmd)
                     v
             +----------------+
-            |  postgres / fs |   the store of record
+            |    postgres    |   the store of record
             +----------------+
 ```
 
@@ -151,8 +151,9 @@ built against is a commit here rather than whatever happens to be on your disk.
 ### realmd: the realm
 
 `apps/realmd/` builds the `realmd` binary. One **pure-Zig** process that does the job of
-all of PvPGN's separate daemons: login/chat, the realm (character select, game create/join), the
-character database, and a registration endpoint the game-server fleet connects to.
+all of PvPGN's separate daemons: login/chat, the realm (character select, game create/join) and
+the character database. The game-server fleet connects to none of it — servers publish themselves
+into redis and take their work from there.
 
 To the retail client it looks exactly like Battle.net: the client logs in over **BNCS** (the
 Battle.net chat protocol, login + the version gate) and then talks **MCP** (the realm protocol:
@@ -287,6 +288,26 @@ The split that matters is `realm-proto` vs `realm-infra`. The first is std-only 
 into the x86-windows DLL as well as the native binaries, which is what makes both ends of the
 realm link agree on the wire by construction. The second is libc sockets and POSIX, and is
 deliberately never handed to the DLL build. Each app and package has its own README.
+
+## How it's verified
+
+Every claim above is something a command reproduces. None of them mock the realm or the engine:
+the e2e suite speaks the client's own wire protocol, and the stress and chat runs drive a real
+`Game.exe`.
+
+| | what it proves |
+|-|-|
+| `zig build test` | unit tests: wire codecs, save integrity, the seeded generators |
+| `zig build e2e` | 33 clientless scenarios against a real realmd — login, characters, games, the fleet, chat, the ingress. Starts its own Redis + Postgres containers, so it needs Docker and nothing else |
+| `./run-stack.sh` | brings the whole stack up on one host and finishes with a real login, game create and join — "it's up" as a fact rather than a hope |
+| `./run-stress.sh` | plays rounds of real games through wine until something breaks, then says what broke: in-world confirmation per client, resident memory and descriptors per round, and every save re-validated at the end |
+| `./tools/test-chat.sh` | two realmd instances, three real clients: Alice hears Bob from the other instance and does not hear Eva, who is in another channel |
+| `./tools/test-save-durability.sh` | kills a realmd in the window where redis holds the only copy of a save, and proves the next instance finishes the job |
+| `./tools/check-saves.sh` | every character the realm holds is still a structurally valid `.d2s` |
+
+Two more that are utilities rather than tests: `tools/seed-pg.sh` moves characters from an older
+filesystem realm into Postgres, and `tools/symbolize.sh` turns a game-server panic back into
+`file:line`.
 
 ## Documentation
 
