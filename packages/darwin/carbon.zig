@@ -539,15 +539,23 @@ test "a tight loop gets throttled and a paced caller does not" {
         try testing.expectEqual(@as(u32, 0), spin_run);
     }
 
-    // A caller that does not is, but only after a run long enough to rule out a burst.
+    // A caller that does not is, but only after a run long enough to rule out a burst. Asserted as
+    // two separate facts, because timing the whole run is a scheduling race: a deschedule longer
+    // than the spin gap resets the run, and on a loaded machine that leaves far fewer calls past
+    // the threshold than the arithmetic assumes.
     spin_run = 0;
     last_call_us = 0;
-    const extra = 100;
-    const start = now();
-    for (0..spin_calls + extra) |_| _ = waitNextEvent(0xffff, &event, 0, null);
-    // Only the calls past the threshold sleep, and each sleeps a millisecond.
-    try testing.expect(now() - start >= (extra / 2) * idle_sleep_us);
+    for (0..spin_calls) |_| _ = waitNextEvent(0xffff, &event, 0, null);
+    try testing.expect(spin_run > 0); // a tight run counts towards the threshold
     try testing.expectEqual(null_event, event.what);
+
+    // And once the run is long enough, the next call sleeps. Timed on ONE call, which cannot be
+    // shortened by anything the scheduler does: usleep is a floor.
+    spin_run = spin_calls;
+    last_call_us = now();
+    const start = now();
+    _ = waitNextEvent(0xffff, &event, 0, null);
+    try testing.expect(now() - start >= idle_sleep_us);
 
     spin_run = 0;
     last_call_us = 0;
