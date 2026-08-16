@@ -43,6 +43,11 @@ services:
       # The address bnetd advertises to the client for d2cs. For a client on the host,
       # this must be reachable from the host — 127.0.0.1 works with the published ports.
       REALMD_REALM_ADDR: "127.0.0.1"
+      # Game traffic goes through realmd's own edge rather than a separate qqserver: one
+      # host, one binary, no redis hop. Clients never dial the game server directly — the
+      # token they carry is realm-global and only an edge can translate it.
+      REALMD_GAME_PORT: "4000"
+      REALMD_GAME_ADDR: "127.0.0.1"
     volumes:
       - realmd-data:/data
     ports:
@@ -50,6 +55,7 @@ services:
       - "6113:6113"  # d2cs
       - "6114:6114"  # d2dbs
       - "6115:6115"  # gs-link (the wine GS connects here)
+      - "4000:4000"  # game traffic (the embedded edge; clients dial this)
       - "18080:8080" # health (8080 is often taken on the host)
 
   # The headless wine game server. It needs the proprietary D2 1.14d install, so it's

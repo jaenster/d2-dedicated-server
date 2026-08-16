@@ -35,9 +35,10 @@ pub const Config = struct {
     /// GS is behind NAT). Empty = use the control connection's peer IP.
     gs_addr: []const u8 = "",
 
-    /// Public address of the qqserver game-traffic gateway, advertised to clients on
-    /// JOINGAME instead of the GS's own IP (dotted-quad). Empty = advertise the GS IP
-    /// directly (back-compat, no qqserver deployed).
+    /// REQUIRED (dotted-quad). Public address of the game-traffic ingress, advertised to
+    /// clients on JOINGAME — either a standalone qqserver or realmd's own edge (`game_port`).
+    /// Never a game server's own address: the token clients are handed is realm-global, so
+    /// only an ingress can translate it. realmd refuses to start without it.
     game_addr: []const u8 = "",
     /// TTL (seconds) for the {client-ip → GS} routes realmd records on JOINGAME for
     /// the qqserver to consume.

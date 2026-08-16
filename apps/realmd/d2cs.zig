@@ -117,11 +117,11 @@ fn difficultyError(difficulty: u8, progression: u8, expansion: bool) ?u32 {
 /// a join away here means a clear "Game is Full." instead of a silent failure at the GS.
 const max_players_per_game: u16 = 8;
 
-// Set from main() (mirrors gslink.gs_ip_override). When `game_ip` is set, JOINGAME
-// advertises the qqserver's public IP to the client instead of the GS's own IP; the
-// real GS address is recorded as a route for the qqserver to splice to. `route_ttl_s`
-// is how long that route stays valid.
-pub var game_ip: ?[4]u8 = null;
+// The game-traffic ingress clients are told to dial, set from main() and required there.
+// JOINGAME never advertises a game server's own address: the token handed to the client is
+// realm-global, and only an ingress (qqserver, or the embedded edge) can translate it to the
+// engine's gameid. `route_ttl_s` is how long the recorded route stays valid.
+pub var game_ip: [4]u8 = .{ 0, 0, 0, 0 };
 pub var route_ttl_s: u32 = 60;
 
 // Realm-global game-token counter. realmd OWNS the u16 token it hands the client, so a
@@ -718,8 +718,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // share one public IP. (Source-IP recordRoute is no longer used by the gateway.)
     const token = mintToken();
     _ = store.recordTokenRoute(token, g.gs_ip, g.gs_port, g.gameid, route_ttl_s);
-    // Advertise the qqserver's public IP when configured, else the GS IP (back-compat).
-    const advertised_ip = game_ip orelse g.gs_ip;
+    const advertised_ip = game_ip;
     log.line(tag, "join game '{s}' (account={s}) gameid={d} token=0x{x} gs={d}.{d}.{d}.{d} -> client dials {d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, token, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3], advertised_ip[0], advertised_ip[1], advertised_ip[2], advertised_ip[3] });
     w.putU16(token); // game token
     w.putU16(0); // unknown

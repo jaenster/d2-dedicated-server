@@ -50,7 +50,12 @@ Measured cost is ~0.6 ms of CPU per connection and ~1 MiB resident; see
 
 ## When you don't need it
 
-In the lightweight single-binary path, realmd can splice in-process and you don't run qqserver
-at all. That is the **DIRECT** mode described in [`docs/DEPLOY.md`](../../docs/DEPLOY.md):
-the GS keeps a client-routable address and clients dial it themselves. Fine for one server on
-one host; it is exactly what stops working once the fleet is bigger than the addresses you own.
+An ingress is never optional — a client dialling a game server directly presents a realm-global
+token that server cannot resolve — but it does not have to be *this* one. realmd can splice
+in-process instead (`REALMD_GAME_PORT`, `apps/realmd/gameedge.zig`): same token rewrite, same
+recorded routes, but thread-per-connection against the in-process store rather than a poll loop
+against redis. One binary, no redis hop, fine for one host.
+
+Run qqserver when the fleet outgrows that: routes in redis mean any gateway pod resolves any
+connection, so the game servers keep internal pod IPs and capacity stops being bounded by the
+client-routable addresses you own.

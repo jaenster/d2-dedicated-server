@@ -4,14 +4,21 @@ Three ways to run the realm, in descending order of how much of it you want: Kub
 Compose, or native processes on your own box. The same binaries and the same images in every
 case.
 
-## Game traffic: DIRECT vs GATEWAY
+## Game traffic always goes through an ingress
 
-The one decision that shapes a deployment. Both modes use the same builds.
+Clients never dial a game server. On create/join realmd mints a **realm-global token** and records
+`token -> {game server, engine game id}`; the ingress reads that token from the client's first
+packet, rewrites it to the id the engine actually knows, and splices. A client pointed straight at
+a game server would present a token that server has never heard of.
 
-- **DIRECT** (`gameAddr` empty, default): the GS keeps a client-routable address and clients
-  dial it themselves. No qqserver. Fine for one server on one host.
-- **GATEWAY** (`floatingIPs` + `gameAddr` set): realmd advertises the qqserver entry instead, so
-  the GS fleet stays on internal pod IPs and scales past the node count.
+So `REALMD_GAME_ADDR` is **required** — realmd refuses to start without it — and it names one of
+two ingresses. Both use the same builds and the same recorded routes:
+
+- **qqserver** (`floatingIPs` + `gameAddr`): a separate stateless process, routes in redis, so any
+  gateway pod resolves any connection and the GS fleet stays on internal pod IPs. The Kubernetes
+  path.
+- **realmd's embedded edge** (`REALMD_GAME_PORT`): realmd splices in-process, no redis hop and no
+  second binary. For one host — Compose, or a native run.
 
 The client only ever uses two ports: **6112** (login + realm) and **4000** (game). Everything
 else (gs-link 6115, d2dbs 6114) is internal traffic between the game-server fleet and realmd.

@@ -226,16 +226,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
             log.line("realmd", "WARNING gs_addr '{s}' is not an IPv4; ignoring", .{cfg.gs_addr});
         }
     }
-    // qqserver: advertise its public address on JOINGAME and record routes for it.
+    // The game-traffic ingress clients dial, and the routes it resolves. Not optional: the token
+    // the client is handed is realm-global, so a client sent straight at a game server presents a
+    // token that server has never heard of. Refuse to start rather than serve joins that cannot
+    // land — the failure would otherwise surface as a game the client connects to and falls out of.
     d2cs.route_ttl_s = cfg.route_ttl_s;
-    if (cfg.game_addr.len > 0) {
-        if (parseIp4(cfg.game_addr)) |ip| {
-            d2cs.game_ip = ip;
-            log.line("realmd", "qqserver gateway: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.qq_port, cfg.route_ttl_s });
-        } else {
-            log.line("realmd", "WARNING game_addr '{s}' is not an IPv4; ignoring (advertising GS IP directly)", .{cfg.game_addr});
-        }
+    if (cfg.game_addr.len == 0) {
+        log.line("realmd", "FATAL REALMD_GAME_ADDR is required: the address clients dial for game traffic (qqserver, or realmd's own edge via REALMD_GAME_PORT)", .{});
+        return error.GameAddrRequired;
     }
+    d2cs.game_ip = parseIp4(cfg.game_addr) orelse {
+        log.line("realmd", "FATAL REALMD_GAME_ADDR '{s}' is not an IPv4", .{cfg.game_addr});
+        return error.GameAddrInvalid;
+    };
+    log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.qq_port, cfg.route_ttl_s });
 
     const bnet_fd = try net.listenTcp(cfg.bind, cfg.bnet_port);
     const d2cs_fd = try net.listenTcp(cfg.bind, cfg.d2cs_port);

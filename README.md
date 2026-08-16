@@ -95,8 +95,9 @@ open); Redis + Postgres behind them; an internal GS fleet whose pods register th
 The client only ever uses two ports: **6112** (login + realm) and **4000** (game). Everything
 else (gs-link 6115, d2dbs 6114) is internal traffic between the fleet and realmd.
 
-Locally you can skip the gateway (**DIRECT** mode): the client dials the single GS at `:4000`
-itself. In the cloud (**GATEWAY** mode) realmd advertises the qqserver entry instead. Same
+Game traffic always crosses an ingress -- the token realmd hands the client is realm-global, and
+only an ingress can translate it to the id the engine knows. On one host realmd can be that
+ingress itself (`REALMD_GAME_PORT`, no second binary); in the cloud it advertises qqserver. Same
 binaries either way -- see [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 The full model lives in [`docs/architecture/`](docs/architecture/) (LikeC4) and can be browsed
@@ -276,7 +277,7 @@ deliberately never handed to the DLL build. Each app and package has its own REA
 
 | | |
 |-|-|
-| [`docs/DEPLOY.md`](docs/DEPLOY.md) | Kubernetes, Compose, native; DIRECT vs GATEWAY |
+| [`docs/DEPLOY.md`](docs/DEPLOY.md) | Kubernetes, Compose, native; the game-traffic ingress |
 | [`docs/FLAGS.md`](docs/FLAGS.md) | every flag and its env equivalent |
 | [`docs/MODDING.md`](docs/MODDING.md) | how injection works; writing a feature |
 | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) | logs, the dashboard, where `evt` comes from |
