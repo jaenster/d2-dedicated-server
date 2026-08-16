@@ -310,4 +310,19 @@ if [ -n "$rss" ]; then
 fi
 echo "  client logs in $OUT"
 if [ -n "$first_fail" ]; then bad "$first_fail"; exit 1; fi
+
+# Rounds only prove a client reached the world — not that what it loaded was intact. A cache that
+# truncated every character to 1024 bytes once passed this harness 5/5 while quietly corrupting
+# saves, so the saves themselves are checked before a run is called clean.
+if [ -x ./tools/check-saves.sh ]; then
+  say "save integrity"
+  if ./tools/check-saves.sh > "$OUT/saves.log" 2>&1; then
+    ok "$(grep -c '^ok ' "$OUT/saves.log" 2>/dev/null || echo 0) saves valid and consistent"
+  else
+    grep -E '^BAD ' "$OUT/saves.log" | head -5
+    bad "a character is corrupt or inconsistent — see $OUT/saves.log"
+    exit 1
+  fi
+fi
+
 ok "no failures"
