@@ -16,7 +16,7 @@ server sits near-zero**. Measured on a real Hetzner k3s node with no players onl
 | `d2gs` (wine, headless `Game.exe`) | ~15m | ~300 MiB | debian + wine32 |
 | `d2gs-native` (no wine, Mac i386 image) | ~0m | ~8-10 MiB | scratch, one static i386 ELF |
 
-Postgres/Redis are optional -- `fs` persistence drops them entirely.
+Postgres and Redis are both required -- there is no filesystem mode to drop them.
 
 The two game servers are interchangeable to the realm and, on real amd64 hardware, indistinguishable
 on latency -- the native one just costs an order of magnitude less to keep resident. Measured side

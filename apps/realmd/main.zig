@@ -32,14 +32,6 @@ const admin = @import("admin.zig");
 const shutdown = @import("shutdown.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
 
-fn mapBackend(b: config.Backend) store.Backend {
-    return switch (b) {
-        .fs => .fs,
-        .redis => .redis,
-        .pg => .pg,
-    };
-}
-
 fn hashStr(s: []const u8) u32 {
     var h: u32 = 2166136261;
     for (s) |c| {
@@ -115,8 +107,6 @@ fn initStore(cfg: config.Config, io: anytype) void {
     store.init(.{
         .io = io,
         .data_dir = cfg.data_dir,
-        .durable = mapBackend(cfg.durable_store),
-        .ephemeral = mapBackend(cfg.ephemeral_store),
         .redis_addr = cfg.redis_addr,
         .pg_dsn = cfg.pg_dsn,
     });
@@ -155,8 +145,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // bearer token (scripts/break-glass), account login (REALMD_ADMINS), or SSO header.
     admin.token = cfg.admin_token;
     admin.instance = cfg.instance_id;
-    admin.durable = @tagName(cfg.durable_store);
-    admin.ephemeral = @tagName(cfg.ephemeral_store);
+    admin.durable = "pg";
+    admin.ephemeral = "redis";
     admin.admins = cfg.admins;
     admin.trusted_header = cfg.trusted_auth_header;
     admin.initSigning(cfg.admin_secret);
@@ -167,30 +157,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // bnetd advertises the d2cs address to the client. realm_addr must be an
     // IPv4 the client can dial (127.0.0.1 in dev, the public IP in prod).
     var threaded = std.Io.Threaded.init_single_threaded;
-    store.init(.{
-        .io = threaded.io(),
-        .data_dir = cfg.data_dir,
-        .durable = mapBackend(cfg.durable_store),
-        .ephemeral = mapBackend(cfg.ephemeral_store),
-        .redis_addr = cfg.redis_addr,
-        .pg_dsn = cfg.pg_dsn,
-    });
-    log.line("realmd", "store: durable={s} ephemeral={s}", .{ @tagName(cfg.durable_store), @tagName(cfg.ephemeral_store) });
-    // Redis is not one backend among several any more — it is where the realm's shared truth
-    // lives. Characters, the seat each one holds, game tokens and the fleet all coordinate
-    // through it, and every one of those fails in a way that reads as a game bug rather than a
-    // missing dependency. So it is checked here, once, and named.
-    //
-    // The DURABLE store stays a choice: pg for a deployment, fs for a single host. Neither is
-    // load-bearing for coordination, and requiring postgres would only make local iteration
-    // slower for nothing.
-    if (cfg.ephemeral_store != .redis) {
-        log.line("realmd", "FATAL REALMD_EPHEMERAL_STORE must be redis (got {s}): the realm coordinates through it", .{@tagName(cfg.ephemeral_store)});
-        return error.RedisRequired;
+    initStore(cfg, threaded.io());
+    log.line("realmd", "store: postgres for the record, redis for what is in flight", .{});
+    // Both are required, and both are checked here rather than discovered per request. Every
+    // failure they cause reads as a game bug — a character that will not load, a game nobody can
+    // join — so a missing dependency has to announce itself as one, once, by name.
+    if (cfg.pg_dsn.len == 0) {
+        log.line("realmd", "FATAL REALMD_PG_DSN is required: it is the store of record for characters and accounts", .{});
+        return error.PostgresRequired;
     }
     if (!store.ephemeralReachable()) {
         log.line("realmd", "FATAL redis at '{s}' did not answer", .{cfg.redis_addr});
         return error.RedisUnreachable;
+    }
+    if (!store.durableReachable()) {
+        log.line("realmd", "FATAL postgres did not answer (REALMD_PG_DSN)", .{});
+        return error.PostgresUnreachable;
     }
     // Seed a break-glass admin from REALMD_ADMIN_BOOTSTRAP=name[:password] (idempotent).
     if (cfg.admin_bootstrap.len > 0) {
@@ -206,11 +188,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     admin.any_db_admin = anyDbAdmin();
     if (admin.token.len > 0 or admin.admins.len > 0 or admin.trusted_header.len > 0 or admin.any_db_admin)
         log.line("realmd", "admin API + web UI enabled on health port {d} (token={} env-admins={} sso={} db-admins={})", .{ cfg.health_port, admin.token.len > 0, admin.admins.len > 0, admin.trusted_header.len > 0, admin.any_db_admin });
-    // A redis/pg ephemeral backend IS an external shared store — route sessions/games
-    // through it even without REALMD_SHARED (the in-memory table is fs-only).
-    state.shared = cfg.shared or cfg.ephemeral_store != .fs;
+    // Sessions and games always live in redis, so instances are interchangeable by construction
+    // rather than by being told to be. The instance hash keeps their minted ids apart.
+    state.shared = true;
     state.instance_hash = hashStr(cfg.instance_id);
-    if (cfg.shared) log.line("realmd", "multi-instance mode: sessions/games in shared store {s} (instance hash 0x{x})", .{ cfg.data_dir, state.instance_hash });
+    log.line("realmd", "instance {s} (hash 0x{x})", .{ cfg.instance_id, state.instance_hash });
     bncs.realm_name = cfg.realm_name;
     bncs.permissive_auth = cfg.permissive_auth;
     if (getenv("REALMD_TRACE") != null) {
@@ -275,10 +257,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Moves saved characters from the redis cache to the store of record. Every instance runs
     // one; they need no coordination because a flush reads the current bytes, so duplicated work
     // writes the same save twice rather than the wrong one.
-    if (cfg.ephemeral_store == .redis and cfg.durable_store != .redis) {
-        _ = std.Thread.spawn(.{}, charflush.run, .{}) catch |e|
-            log.line("realmd", "WARNING character flush worker did not start: {s} — saves will stay in redis", .{@errorName(e)});
-    }
+    _ = std.Thread.spawn(.{}, charflush.run, .{}) catch |e|
+        log.line("realmd", "WARNING character flush worker did not start: {s} — saves will stay in redis", .{@errorName(e)});
 
     if (cfg.game_port != 0) {
         const game_fd = try net.listenTcp(cfg.bind, cfg.game_port);

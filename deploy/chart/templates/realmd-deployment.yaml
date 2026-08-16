@@ -47,10 +47,6 @@ spec:
             {{- end }}
             - name: REALMD_GAME_ADDR
               value: {{ required "gameAddr is required: the d2ingress address clients dial for game traffic (defaults to the first floatingIP when set)" $gameAddr | quote }}
-            - name: REALMD_DURABLE_STORE
-              value: "pg"
-            - name: REALMD_EPHEMERAL_STORE
-              value: "redis"
             - name: REALMD_REDIS_ADDR
               value: "realmd-redis:6379"
             - name: REALMD_PG_DSN

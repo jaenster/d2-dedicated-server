@@ -18,7 +18,6 @@ const Lock = @import("realm_infra").lock.Lock;
 const store = @import("store.zig");
 const chat = @import("chat.zig");
 
-extern "c" fn system(cmd: [*:0]const u8) c_int;
 
 /// Key the friend list lives under, per account. The value is one name per line.
 const friends_key = "friends\\list";
@@ -253,73 +252,8 @@ pub fn list(owner: []const u8, out: []FriendInfo) usize {
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
-// These exercise the durable half. The in-memory pair table is cleared between cases so
-// each one genuinely goes back to the store rather than reading its own leftovers — which
-// is the only thing that distinguishes "persisted" from "still in RAM".
-
-var test_io: std.Io.Threaded = std.Io.Threaded.init_single_threaded;
-
-fn testInitStore(dir: []const u8) void {
-    store.init(.{ .io = test_io.io(), .data_dir = dir });
-}
-
-/// Drop everything cached this run, as though realmd had just started.
-fn testForgetCache() void {
-    lock.lock();
-    defer lock.unlock();
-    for (&pairs) |*p| p.* = .{};
-    for (&loaded) |*p| p.* = .{};
-    for (&online) |*p| p.* = .{};
-}
-
-test "a friend list survives losing the in-memory table" {
-    const dir = "/tmp/realmd-friends-test";
-    var cmd: [128]u8 = undefined;
-    const rm = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{dir}) catch return error.SkipZigTest;
-    _ = system(rm.ptr);
-    testInitStore(dir);
-    testForgetCache();
-
-    try std.testing.expect(add("Owner", "Gheed"));
-    try std.testing.expect(add("Owner", "Charsi"));
-    try std.testing.expect(!add("Owner", "Gheed")); // already there
-
-    // Wipe the working set: anything that comes back now came off disk.
-    testForgetCache();
-    var out: [8]FriendInfo = undefined;
-    try std.testing.expectEqual(@as(usize, 2), list("Owner", &out));
-    try std.testing.expectEqualStrings("Gheed", out[0].nameSlice());
-    try std.testing.expectEqualStrings("Charsi", out[1].nameSlice());
-
-    // A removal has to persist too — the failure mode of writing only on add is that
-    // deleted friends reappear on the next restart.
-    try std.testing.expect(remove("Owner", "Gheed"));
-    testForgetCache();
-    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
-    try std.testing.expectEqualStrings("Charsi", out[0].nameSlice());
-
-    _ = system(rm.ptr);
-}
-
-test "presence is per-run and never persisted" {
-    const dir = "/tmp/realmd-friends-test2";
-    var cmd: [128]u8 = undefined;
-    const rm = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{dir}) catch return error.SkipZigTest;
-    _ = system(rm.ptr);
-    testInitStore(dir);
-    testForgetCache();
-
-    try std.testing.expect(add("Owner", "Gheed"));
-    setOnline("Gheed");
-    var out: [8]FriendInfo = undefined;
-    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
-    try std.testing.expect(out[0].online);
-
-    // Who is online is a fact about live connections: a restart makes it false, and it
-    // would be wrong for the store to claim otherwise.
-    testForgetCache();
-    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
-    try std.testing.expect(!out[0].online);
-
-    _ = system(rm.ptr);
-}
+//
+// The durable half is not unit-tested here any more, and deliberately not faked. A friend list
+// lives in the account's profile, which is Postgres, and the only honest test of "it survives a
+// restart" is one that restarts against a real Postgres — the e2e suite's `friends_persist`
+// scenario, which does exactly that. A stand-in store here would have tested the stand-in.

@@ -337,9 +337,15 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
         if (is_get) return accountsList(fd);
         if (is_post) return accountsCreate(fd, req);
         return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+    } else if (std.mem.eql(u8, p, "/admin/accounts/delete")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return accountsDelete(fd, req, auth.?.name);
     } else if (std.mem.eql(u8, p, "/admin/accounts/admin")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return setAdminEndpoint(fd, req, auth.?.name);
+    } else if (std.mem.eql(u8, p, "/admin/chars/delete")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return charsDelete(fd, req);
     } else if (std.mem.eql(u8, p, "/admin/chars/copy")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return charsCopy(fd, req);
@@ -494,6 +500,17 @@ fn charsCopy(fd: net.Socket, req: []const u8) void {
     }
 }
 
+// POST /admin/chars/delete {"account","char"} — remove one character. The companion to
+// chars/copy: an operator who can clone a character should be able to undo it. Idempotent, so
+// a repeat is not an error.
+fn charsDelete(fd: net.Socket, req: []const u8) void {
+    const body = bodyOf(req);
+    const account = jsonStr(body, "account") orelse return respond(fd, bad_request, "{\"error\":\"missing account\"}");
+    const char = jsonStr(body, "char") orelse return respond(fd, bad_request, "{\"error\":\"missing char\"}");
+    if (!store.deleteCharD2s(account, char)) return respond(fd, conflict, "{\"error\":\"delete failed\"}");
+    respond(fd, ok, "{\"deleted\":true}");
+}
+
 /// True if the flat JSON body has `"key": true`. Crude (no nesting), matches jsonStr.
 fn jsonBool(body: []const u8, key: []const u8) bool {
     var kbuf: [64]u8 = undefined;
@@ -518,6 +535,20 @@ fn accountsCreate(fd: net.Socket, req: []const u8) void {
     if (!store.createAccount(name, pwhash)) return respond(fd, conflict, "{\"error\":\"exists\"}");
     if (jsonBool(body, "admin")) _ = store.setAdmin(name, true);
     respond(fd, ok, "{\"created\":true}");
+}
+
+// POST /admin/accounts/delete {"name"} — remove an account and everything under it.
+// `caller` is the logged-in identity: you cannot delete the account you are using, which is the
+// same lockout guard the demote path has and for the same reason.
+fn accountsDelete(fd: net.Socket, req: []const u8, caller: []const u8) void {
+    const body = bodyOf(req);
+    const name = jsonStr(body, "name") orelse return respond(fd, bad_request, "{\"error\":\"missing name\"}");
+    if (name.len == 0) return respond(fd, bad_request, "{\"error\":\"missing name\"}");
+    if (std.ascii.eqlIgnoreCase(name, caller))
+        return respond(fd, conflict, "{\"error\":\"refusing to delete yourself\"}");
+    if (!store.accountExists(name)) return respond(fd, not_found, "{\"error\":\"no such account\"}");
+    if (!store.deleteAccount(name)) return respond(fd, conflict, "{\"error\":\"delete failed\"}");
+    respond(fd, ok, "{\"deleted\":true}");
 }
 
 // POST /admin/accounts/admin {"name","admin":bool} — promote/demote an account's web-UI

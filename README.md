@@ -39,9 +39,8 @@ protocol that both ends import, so they agree on the wire by construction.
 
 Not "it has a Dockerfile". The design decisions that matter:
 
-- **Stateless where it counts.** realmd keeps **no durable state of its own** -- persistence
-  dispatches to `fs`, `redis`, or `pg` behind one facade, so sessions and games live in the
-  backing services. d2ingress keeps none at all: its route key is a realm-global token in redis,
+- **Stateless where it counts.** realmd keeps **no state of its own** -- everything goes to
+  Postgres (the record) or Redis (in flight), with no third option to get wrong. d2ingress keeps none at all: its route key is a realm-global token in redis,
   so **any** gateway pod resolves **any** connection. No session affinity, no warm-up.
 - **An ingress, not an IP per server.** The game port is fixed at `:4000`, so without a gateway
   every game server needs its own client-routable address and the fleet can never outgrow the
@@ -189,7 +188,7 @@ More: [`docs/MODDING.md`](docs/MODDING.md) (injection + the feature framework),
 
 Game servers publish themselves into redis; `CREATE` is routed to the least-loaded with room
 (picked and reserved in one script, so two realmds cannot choose the same slot) and `JOIN` to the
-one that owns the game, with persistence behind the `fs`/`redis`/`pg` facade:
+one that owns the game, with persistence behind the Postgres/Redis facade:
 
 ![GS fleet](docs/architecture/img/gs_fleet.png)
 

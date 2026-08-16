@@ -1,18 +1,23 @@
-//! Persistence — the domain's storage vocabulary, in D2 ubiquitous language. Callers
-//! say `getCharD2s` / `registerGame` / `mintSession`-side `putSession`; *which* backend
-//! serves them (filesystem, Redis, Postgres) is an internal detail, chosen once at
-//! startup. There is no Store/Repository adapter object threaded through callers — each
-//! domain op is a thin `switch (backend)` over the concrete backends. Add a backend by
-//! adding a branch, not by rewiring the call sites.
+//! Persistence — the domain's storage vocabulary, in D2 ubiquitous language. Callers say
+//! `getCharD2s` / `registerGame` / `putSession`; where it lands is not their business.
 //!
-//! Two independent backends so Postgres and Redis are co-equal: `durable` (character
-//! saves — the store of record) and `ephemeral` (sessions + games — short-lived, TTL'd).
-//! The common production split is durable=pg, ephemeral=redis. BNFTP assets are static
-//! files and always come from the filesystem.
+//! There are exactly two places anything can go, and no way to configure a third:
+//!
+//!   * **Postgres** is the store of record — characters, accounts, profiles, guilds.
+//!   * **Redis** is what is in flight — sessions, games, the fleet and its queues, and the
+//!     live character in front of Postgres.
+//!
+//! It used to be a choice of three backends per half, with a filesystem default. That default is
+//! what let account flags, profiles and guilds quietly land on one instance's local disk while
+//! everything else was shared, and no amount of care at the call sites would have caught it — the
+//! call sites all looked right. Removing the option removes the mistake.
+//!
+//! BNFTP assets are the one exception and are not in here at all (see realm-store/assets.zig):
+//! read-only image content, identical everywhere, nothing to keep in sync.
 const std = @import("std");
 const d2s = @import("d2s.zig");
 const adapter = @import("realm_store");
-const fs = adapter.fs;
+const assets = adapter.assets;
 const redis = adapter.redis;
 const pg = adapter.pg;
 const types = @import("realm_infra").types;
@@ -23,10 +28,6 @@ pub const Route = types.Route;
 pub const TokenRoute = types.TokenRoute;
 pub const max_chars = types.max_chars;
 
-pub const Backend = enum { fs, redis, pg };
-
-var durable: Backend = .fs; // character saves
-var ephemeral: Backend = .fs; // sessions + games
 
 // TTLs (seconds) for ephemeral records; 0 = no expiry. Games also get torn down
 // explicitly on CLOSEGAME / GS disconnect — the TTL is a backstop against leaks.
@@ -35,9 +36,8 @@ var game_ttl_s: u32 = 21600; // 6h
 
 pub const Config = struct {
     io: std.Io,
+    /// Where BNFTP assets are read from. Not a store — see assets.zig.
     data_dir: []const u8,
-    durable: Backend = .fs,
-    ephemeral: Backend = .fs,
     redis_addr: []const u8 = "",
     pg_dsn: []const u8 = "",
     session_ttl_s: u32 = 3600,
@@ -45,37 +45,22 @@ pub const Config = struct {
 };
 
 pub fn init(cfg: Config) void {
-    durable = cfg.durable;
-    ephemeral = cfg.ephemeral;
     session_ttl_s = cfg.session_ttl_s;
     game_ttl_s = cfg.game_ttl_s;
-    // fs is always initialised: it serves BNFTP and is the default/fallback.
-    fs.init(cfg.io, cfg.data_dir);
-    if (cfg.durable == .redis or cfg.ephemeral == .redis) redis.init(cfg.redis_addr);
-    if (cfg.durable == .pg or cfg.ephemeral == .pg) pg.init(cfg.pg_dsn);
+    assets.init(cfg.io, cfg.data_dir);
+    redis.init(cfg.redis_addr);
+    pg.init(cfg.pg_dsn);
 }
 
 // ── characters (durable) ─────────────────────────────────────────────────────
-
-/// True when redis is a CACHE in front of a different durable store, rather than being the
-/// durable store itself. With durable=redis there is nothing to cache and nothing to flush.
-fn cachingChars() bool {
-    return ephemeral == .redis and durable != .redis;
-}
 
 /// Read the live character. Redis first, because that is where a game's most recent save lands
 /// and Postgres may still be a flush behind it — reading Postgres first would hand back a stale
 /// character and undo the player's last session.
 pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
-    if (cachingChars()) {
-        const cached = redis.getCharD2s(account, charname, out);
-        if (cached != 0) return cached;
-    }
-    const n = switch (durable) {
-        .fs => fs.getCharD2s(account, charname, out),
-        .redis => redis.getCharD2s(account, charname, out),
-        .pg => pg.getCharD2s(account, charname, out),
-    };
+    const cached = redis.getCharD2s(account, charname, out);
+    if (cached != 0) return cached;
+    const n = pg.getCharD2s(account, charname, out);
     // Populate the cache, but do NOT mark it dirty: these bytes came FROM the durable store, so
     // flushing them back would be a write for no reason.
     //
@@ -88,7 +73,7 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
     // player did in between — and with several instances a shared miss makes that ordinary. The
     // conditional write is also why loading needs no lock: everyone who missed may read, one
     // wins, the rest discard.
-    if (n != 0 and n != out.len and cachingChars()) _ = redis.cacheCharIfAbsent(account, charname, out[0..n]);
+    if (n != 0 and n != out.len) _ = redis.cacheCharIfAbsent(account, charname, out[0..n]);
     return n;
 }
 
@@ -97,17 +82,10 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
 /// never waits on Postgres — which is the point of the cache, and why the dirty set has to be
 /// crash-safe.
 pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8) bool {
-    if (cachingChars()) {
-        if (!redis.saveCharD2s(account, charname, bytes)) return false;
-        // A save redis accepted but that never got marked would sit there looking clean while
-        // Postgres stayed behind, so a failed mark has to fail the save.
-        return markCharDirty(account, charname) != null;
-    }
-    return switch (durable) {
-        .fs => fs.saveCharD2s(account, charname, bytes),
-        .redis => redis.saveCharD2s(account, charname, bytes),
-        .pg => pg.saveCharD2s(account, charname, bytes),
-    };
+    if (!redis.saveCharD2s(account, charname, bytes)) return false;
+    // A save redis accepted but that never got marked would sit there looking clean while
+    // Postgres stayed behind, so a failed mark has to fail the save.
+    return markCharDirty(account, charname) != null;
 }
 
 /// The account's characters: the store of record, plus any the cache holds that it has not seen
@@ -128,12 +106,7 @@ fn caseEql(a: []const u8, b: []const u8) bool {
 }
 
 pub fn listChars(account: []const u8, names: []Name) usize {
-    var n = switch (durable) {
-        .fs => fs.listChars(account, names),
-        .redis => redis.listChars(account, names),
-        .pg => pg.listChars(account, names),
-    };
-    if (!cachingChars()) return n;
+    var n = pg.listChars(account, names);
     var cached: [max_chars]Name = undefined;
     const m = redis.listChars(account, &cached);
     for (cached[0..m]) |c| {
@@ -159,22 +132,17 @@ pub fn listChars(account: []const u8, names: []Name) usize {
 /// straight back. Cache first — a delete that removed the record of it but left the bytes would
 /// leave a character nobody can see and nobody can remove.
 pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
-    if (cachingChars()) _ = redis.deleteCharD2s(account, charname);
-    return switch (durable) {
-        .fs => fs.deleteCharD2s(account, charname),
-        .redis => redis.deleteCharD2s(account, charname),
-        .pg => pg.deleteCharD2s(account, charname),
-    };
+    _ = redis.deleteCharD2s(account, charname);
+    return pg.deleteCharD2s(account, charname);
 }
 
 // ── per-account userdata (BNCS profile: SID_READ/WRITEUSERDATA 0x26/0x27) ─────
-// Key-path addressed ("profile\\sex"), durable and low-volume → always fs (same
-// policy as accounts; redis/pg don't carry a parallel schema for it).
+// Key-path addressed ("profile\\sex").
 pub fn getUserData(account: []const u8, key: []const u8, out: []u8) usize {
-    return fs.getUserData(account, key, out);
+    return pg.getUserData(account, key, out);
 }
 pub fn setUserData(account: []const u8, key: []const u8, value: []const u8) bool {
-    return fs.setUserData(account, key, value);
+    return pg.setUserData(account, key, value);
 }
 
 /// Largest .d2s we will clone. A real 1.14d save is a few KB (a full char with stash is
@@ -225,151 +193,116 @@ pub fn upgradeCharToExpansion(account: []const u8, charname: []const u8) Upgrade
 
 /// Create an account. `pwhash` null = password-less. Returns false if it exists.
 pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
-    return switch (durable) {
-        .fs => fs.createAccount(name, pwhash),
-        .redis => redis.createAccount(name, pwhash),
-        .pg => pg.createAccount(name, pwhash),
-    };
+    return pg.createAccount(name, pwhash);
 }
 
 pub fn accountExists(name: []const u8) bool {
-    return switch (durable) {
-        .fs => fs.accountExists(name),
-        .redis => redis.accountExists(name),
-        .pg => pg.accountExists(name),
-    };
+    return pg.accountExists(name);
 }
 
 /// Whether the account has a password (filling `out` when true), null if no such
 /// account.
 pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
-    return switch (durable) {
-        .fs => fs.accountPwHash(name, out),
-        .redis => redis.accountPwHash(name, out),
-        .pg => pg.accountPwHash(name, out),
-    };
+    return pg.accountPwHash(name, out);
 }
 
-/// Set an account's password hash (single xSHA-1 of the new password). Durable,
-/// low-volume → always fs (same policy as account creation). False if no account.
+/// Set an account's password hash (single xSHA-1 of the new password). False if no account.
 pub fn setAccountPassword(name: []const u8, hash: [20]u8) bool {
-    return fs.setAccountPassword(name, hash);
+    return pg.setAccountPassword(name, hash);
 }
 
-/// List account names for the admin API. Accounts live on the filesystem for all
-/// backends (redis/pg route createAccount → fs), so this always reads fs.
+/// Remove an account, its characters and its profile. Idempotent.
+///
+/// The characters go with it deliberately: leaving them behind means saves no login can ever
+/// reach again, taking space and showing up in a ladder nobody can explain.
+pub fn deleteAccount(name: []const u8) bool {
+    var names: [max_chars]Name = undefined;
+    const n = listChars(name, &names);
+    for (names[0..n]) |c| _ = deleteCharD2s(name, c.slice());
+    return pg.deleteAccount(name);
+}
+
+/// List account names for the admin API.
 pub fn listAccounts(names: [][32]u8) usize {
-    return fs.listAccounts(names);
+    return pg.listAccounts(names);
 }
 
-/// Set/clear an account's admin flag (web-UI access). Accounts are always fs-backed.
+/// Set/clear an account's admin flag (web-UI access).
 pub fn setAdmin(name: []const u8, admin: bool) bool {
-    return fs.setAdmin(name, admin);
+    return pg.setAdmin(name, admin);
 }
 
 /// Whether an account is flagged admin in the store.
 pub fn accountIsAdmin(name: []const u8) bool {
-    return fs.accountIsAdmin(name);
+    return pg.accountIsAdmin(name);
 }
 
-/// BNFTP assets (version-check MPQ etc.) are static files — always filesystem.
+/// BNFTP assets (the version-check MPQ, the banner ad) — read-only image content, so a file is
+/// the right place for them and there is nothing to keep in sync.
 pub fn getBnftp(filename: []const u8, out: []u8) ?[]const u8 {
-    return fs.getBnftp(filename, out);
+    return assets.getBnftp(filename, out);
 }
 
 /// Last-modified time of a BNFTP asset (unix seconds), or null if we don't have it.
 pub fn bnftpMtime(filename: []const u8) ?i64 {
-    return fs.bnftpMtime(filename);
+    return assets.bnftpMtime(filename);
 }
 
 // ── guilds (durable) ─────────────────────────────────────────────────────────
-// The cut Guild Halls feature. Like accounts, guilds are always fs-backed (low
-// volume, durable); the service layer (server/guilds.zig) owns the blob format.
+// The cut Guild Halls feature; the service layer (guilds.zig) owns the blob format.
 
 pub fn saveGuild(name: []const u8, bytes: []const u8) bool {
-    return fs.saveGuild(name, bytes);
+    return pg.saveGuild(name, bytes);
 }
 
 pub fn getGuild(name: []const u8, out: []u8) usize {
-    return fs.getGuild(name, out);
+    return pg.getGuild(name, out);
 }
 
 pub fn deleteGuild(name: []const u8) bool {
-    return fs.deleteGuild(name);
+    return pg.deleteGuild(name);
 }
 
 pub fn listGuilds(names: []Name) usize {
-    return fs.listGuilds(names);
+    return pg.listGuilds(names);
 }
 
 // ── sessions (ephemeral) ─────────────────────────────────────────────────────
 
 pub fn saveSession(id: u64, account: []const u8) bool {
-    return switch (ephemeral) {
-        .fs => fs.saveSession(id, account, session_ttl_s),
-        .redis => redis.saveSession(id, account, session_ttl_s),
-        .pg => pg.saveSession(id, account, session_ttl_s),
-    };
+    return redis.saveSession(id, account, session_ttl_s);
 }
 
 pub fn accountForSession(id: u64, out: []u8) ?[]const u8 {
-    return switch (ephemeral) {
-        .fs => fs.accountForSession(id, out),
-        .redis => redis.accountForSession(id, out),
-        .pg => pg.accountForSession(id, out),
-    };
+    return redis.accountForSession(id, out);
 }
 
 pub fn expireSession(id: u64) void {
-    switch (ephemeral) {
-        .fs => fs.expireSession(id),
-        .redis => redis.expireSession(id),
-        .pg => pg.expireSession(id),
-    }
+    redis.expireSession(id);
 }
 
 // ── games (ephemeral) ────────────────────────────────────────────────────────
 
 pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8) bool {
-    return switch (ephemeral) {
-        .fs => fs.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, game_ttl_s),
-        .redis => redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, game_ttl_s),
-        .pg => pg.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, game_ttl_s),
-    };
+    return redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, game_ttl_s);
 }
 
 /// Overwrite a hosted game's player count (UPDATEGAMEINFO from the GS that hosts it).
 /// False if no live game carries that id.
 pub fn setGamePlayers(gameid: u32, players: u16) bool {
-    return switch (ephemeral) {
-        .fs => fs.setGamePlayers(gameid, players),
-        .redis => redis.setGamePlayers(gameid, players),
-        .pg => pg.setGamePlayers(gameid, players),
-    };
+    return redis.setGamePlayers(gameid, players);
 }
 
 pub fn findGame(name: []const u8) ?GameRec {
-    return switch (ephemeral) {
-        .fs => fs.findGame(name),
-        .redis => redis.findGame(name),
-        .pg => pg.findGame(name),
-    };
+    return redis.findGame(name);
 }
 
 pub fn removeGameById(gameid: u32) void {
-    switch (ephemeral) {
-        .fs => fs.removeGameById(gameid),
-        .redis => redis.removeGameById(gameid),
-        .pg => pg.removeGameById(gameid),
-    }
+    redis.removeGameById(gameid);
 }
 
 pub fn expireGamesByGs(gsid: u32) void {
-    switch (ephemeral) {
-        .fs => fs.expireGamesByGs(gsid),
-        .redis => redis.expireGamesByGs(gsid),
-        .pg => pg.expireGamesByGs(gsid),
-    }
+    redis.expireGamesByGs(gsid);
 }
 
 pub const NamedGame = types.NamedGame;
@@ -378,11 +311,7 @@ pub const NamedGame = types.NamedGame;
 /// backend walks its own game index: fs the games dir, redis the `games` set, pg the
 /// games table — all filtering on TTL/expiry.
 pub fn snapshotGames(out: []types.NamedGame) usize {
-    return switch (ephemeral) {
-        .fs => fs.snapshotGames(out),
-        .redis => redis.snapshotGames(out),
-        .pg => pg.snapshotGames(out),
-    };
+    return redis.snapshotGames(out);
 }
 
 // ── routes (ephemeral) ───────────────────────────────────────────────────────
@@ -390,19 +319,11 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
 // up by the d2ingress per connection to splice game traffic to the right GS.
 
 pub fn recordRoute(client_ip: [4]u8, gs_ip: [4]u8, gs_port: u16, ttl_s: u32) bool {
-    return switch (ephemeral) {
-        .fs => fs.recordRoute(client_ip, gs_ip, gs_port, ttl_s),
-        .redis => redis.recordRoute(client_ip, gs_ip, gs_port, ttl_s),
-        .pg => pg.recordRoute(client_ip, gs_ip, gs_port, ttl_s),
-    };
+    return redis.recordRoute(client_ip, gs_ip, gs_port, ttl_s);
 }
 
 pub fn lookupRoute(client_ip: [4]u8) ?Route {
-    return switch (ephemeral) {
-        .fs => fs.lookupRoute(client_ip),
-        .redis => redis.lookupRoute(client_ip),
-        .pg => pg.lookupRoute(client_ip),
-    };
+    return redis.lookupRoute(client_ip);
 }
 
 // ── token routes (ephemeral) ─────────────────────────────────────────────────
@@ -416,26 +337,24 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 /// Reads the CURRENT bytes rather than anything handed in, which is what makes a flush idempotent
 /// and order-independent: two workers doing this at once both write the newest save.
 pub fn flushCharToDurable(account: []const u8, charname: []const u8) bool {
-    if (!cachingChars()) return true; // nothing behind the cache to fall behind
     var buf: [max_d2s]u8 = undefined;
     const n = redis.getCharD2s(account, charname, &buf);
     if (n == 0) return false;
     if (n == buf.len) return false; // implausibly large, likely truncated — do not persist it
-    return switch (durable) {
-        .fs => fs.saveCharD2s(account, charname, buf[0..n]),
-        .redis => true,
-        .pg => pg.saveCharD2s(account, charname, buf[0..n]),
-    };
+    return pg.saveCharD2s(account, charname, buf[0..n]);
 }
 
 /// Is the shared store actually reachable? Asked once at startup, because everything the realm
 /// coordinates through it — characters, the seat a character holds, tokens, the fleet — fails in a
 /// way that looks like a game bug rather than a missing dependency.
 pub fn ephemeralReachable() bool {
-    return switch (ephemeral) {
-        .redis => redis.ping(),
-        .fs, .pg => true,
-    };
+    return redis.ping();
+}
+
+/// Is the store of record reachable? Same argument as above: a realm that starts without it
+/// serves logins and then loses every save.
+pub fn durableReachable() bool {
+    return pg.healthy();
 }
 
 // ── dispatch ─────────────────────────────────────────────────────────────────
@@ -445,34 +364,22 @@ pub fn ephemeralReachable() bool {
 // the realm to a single instance.
 
 pub fn pushGsRequest(gsid: u32, packet: []const u8, ttl_s: u32) bool {
-    return switch (ephemeral) {
-        .redis => redis.pushGsRequest(gsid, packet, ttl_s),
-        .fs, .pg => false,
-    };
+    return redis.pushGsRequest(gsid, packet, ttl_s);
 }
 
 pub fn takeGsReply(seq: u32, out: []u8) ?usize {
-    return switch (ephemeral) {
-        .redis => redis.takeGsReply(seq, out),
-        .fs, .pg => null,
-    };
+    return redis.takeGsReply(seq, out);
 }
 
 /// Pick the least-loaded game server with room and reserve a slot on it, atomically.
 /// Null when every server is full, which the caller reports differently from an empty fleet.
 pub fn pickAndReserveGs() ?u32 {
-    return switch (ephemeral) {
-        .redis => redis.pickAndReserveGs(),
-        .fs, .pg => null,
-    };
+    return redis.pickAndReserveGs();
 }
 
 /// Give back a slot whose create did not happen.
 pub fn releaseGsSlot(gsid: u32) void {
-    switch (ephemeral) {
-        .redis => redis.releaseGsSlot(gsid),
-        .fs, .pg => {},
-    }
+    redis.releaseGsSlot(gsid);
 }
 
 /// How many events a realm with nothing draining them keeps, and for how long. Both are backstops:
@@ -481,17 +388,11 @@ pub const gs_event_cap: u32 = 4096;
 pub const gs_event_ttl_s: u32 = 3600;
 
 pub fn popGsEvent(out: []u8) ?usize {
-    return switch (ephemeral) {
-        .redis => redis.popGsEvent(out),
-        .fs, .pg => null,
-    };
+    return redis.popGsEvent(out);
 }
 
 pub fn pushGsEvent(packet: []const u8) bool {
-    return switch (ephemeral) {
-        .redis => redis.pushGsEvent(packet, gs_event_cap, gs_event_ttl_s),
-        .fs, .pg => false,
-    };
+    return redis.pushGsEvent(packet, gs_event_cap, gs_event_ttl_s);
 }
 
 // ── save durability ──────────────────────────────────────────────────────────
@@ -501,35 +402,23 @@ pub fn pushGsEvent(packet: []const u8) bool {
 // walks that set. The mark carries a VERSION, which is what makes the flush safe: the flag is
 // only cleared if no newer save landed while the flush was in flight.
 //
-// Redis-only for the same reason as the char lock — one instance's idea of "dirty" is not a
-// durability mechanism. On fs/pg the durable backend is written directly, so nothing is pending.
+// Redis-only for the same reason as the char lock: one instance's idea of "dirty" is not a
+// durability mechanism.
 
 pub fn markCharDirty(account: []const u8, charname: []const u8) ?u64 {
-    return switch (ephemeral) {
-        .redis => redis.markCharDirty(account, charname),
-        .fs, .pg => null,
-    };
+    return redis.markCharDirty(account, charname);
 }
 
 pub fn dirtyChars(out: [][]u8, lens: []usize) usize {
-    return switch (ephemeral) {
-        .redis => redis.dirtyChars(out, lens),
-        .fs, .pg => 0,
-    };
+    return redis.dirtyChars(out, lens);
 }
 
 pub fn charVersion(account: []const u8, charname: []const u8) u64 {
-    return switch (ephemeral) {
-        .redis => redis.charVersion(account, charname),
-        .fs, .pg => 0,
-    };
+    return redis.charVersion(account, charname);
 }
 
 pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64) bool {
-    return switch (ephemeral) {
-        .redis => redis.clearDirtyIfUnchanged(account, charname, ver),
-        .fs, .pg => true,
-    };
+    return redis.clearDirtyIfUnchanged(account, charname, ver);
 }
 
 // ── character ownership ──────────────────────────────────────────────────────
@@ -546,24 +435,15 @@ pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64
 pub const char_lock_ttl_s: u32 = 300;
 
 pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
-    return switch (ephemeral) {
-        .redis => redis.lockChar(account, charname, owner, char_lock_ttl_s),
-        .fs, .pg => true,
-    };
+    return redis.lockChar(account, charname, owner, char_lock_ttl_s);
 }
 
 pub fn refreshCharLock(account: []const u8, charname: []const u8, owner: []const u8) bool {
-    return switch (ephemeral) {
-        .redis => redis.refreshCharLock(account, charname, owner, char_lock_ttl_s),
-        .fs, .pg => true,
-    };
+    return redis.refreshCharLock(account, charname, owner, char_lock_ttl_s);
 }
 
 pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
-    return switch (ephemeral) {
-        .redis => redis.unlockChar(account, charname, owner),
-        .fs, .pg => true,
-    };
+    return redis.unlockChar(account, charname, owner);
 }
 
 /// How long an unfinished create may hold a name. A backstop for a create that dies in flight,
@@ -574,26 +454,16 @@ pub const game_name_ttl_s: u32 = 30;
 /// here — where the loser can still be told — instead of at the game server, after which it has
 /// nothing to join.
 pub fn reserveGameName(name: []const u8) bool {
-    return switch (ephemeral) {
-        .redis => redis.reserveGameName(name, game_name_ttl_s),
-        // One instance already serialises creates through its own game table.
-        .fs, .pg => true,
-    };
+    return redis.reserveGameName(name, game_name_ttl_s);
 }
 
 /// Whether a create is holding this name right now.
 pub fn gameNameReserved(name: []const u8) bool {
-    return switch (ephemeral) {
-        .redis => redis.gameNameReserved(name),
-        .fs, .pg => false,
-    };
+    return redis.gameNameReserved(name);
 }
 
 pub fn releaseGameName(name: []const u8) void {
-    switch (ephemeral) {
-        .redis => redis.releaseGameName(name),
-        .fs, .pg => {},
-    }
+    redis.releaseGameName(name);
 }
 
 /// The owner id a game uses for the characters it holds. Stable across instances, because any
@@ -603,36 +473,24 @@ pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {
 }
 
 pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
-    return switch (ephemeral) {
-        .redis => redis.addGameChar(gameid, account, charname),
-        .fs, .pg => true,
-    };
+    return redis.addGameChar(gameid, account, charname);
 }
 
 pub fn releaseGameChars(gameid: u32) usize {
     var ob: [32]u8 = undefined;
     const owner = gameOwnerId(&ob, gameid);
-    return switch (ephemeral) {
-        .redis => redis.releaseGameChars(gameid, owner),
-        .fs, .pg => 0,
-    };
+    return redis.releaseGameChars(gameid, owner);
 }
 
 pub fn releaseGameCharByName(gameid: u32, charname: []const u8) bool {
     var ob: [32]u8 = undefined;
     const owner = gameOwnerId(&ob, gameid);
-    return switch (ephemeral) {
-        .redis => redis.releaseGameCharByName(gameid, charname, owner),
-        .fs, .pg => true,
-    };
+    return redis.releaseGameCharByName(gameid, charname, owner);
 }
 
 /// Which game holds this character, or null if it is free.
 pub fn charLockOwner(account: []const u8, charname: []const u8, out: []u8) ?[]const u8 {
-    return switch (ephemeral) {
-        .redis => redis.charLockOwner(account, charname, out),
-        .fs, .pg => null,
-    };
+    return redis.charLockOwner(account, charname, out);
 }
 
 // ── the game-server fleet (ephemeral, shared) ────────────────────────────────
@@ -650,25 +508,16 @@ pub const GsRec = types.GsRec;
 pub const gs_ttl_s: u32 = 90;
 
 pub fn registerGs(rec: GsRec) bool {
-    return switch (ephemeral) {
-        .redis => redis.registerGs(rec, gs_ttl_s),
-        .fs, .pg => false,
-    };
+    return redis.registerGs(rec, gs_ttl_s);
 }
 
 pub fn removeGs(gsid: u32) void {
-    switch (ephemeral) {
-        .redis => redis.removeGs(gsid),
-        .fs, .pg => {},
-    }
+    redis.removeGs(gsid);
 }
 
 /// The fleet as the whole realm sees it. 0 means "nothing shared" — not "no servers".
 pub fn snapshotGs(out: []GsRec) usize {
-    return switch (ephemeral) {
-        .redis => redis.snapshotGs(out),
-        .fs, .pg => 0,
-    };
+    return redis.snapshotGs(out);
 }
 
 /// Process-local fallback counter for the backends that cannot mint across instances.
@@ -676,46 +525,29 @@ var local_token_ctr = std.atomic.Value(u16).init(1);
 
 /// Next game token, unique across the whole realm.
 ///
-/// Only redis can promise that: the token identifies a route the gateway will resolve, so two
-/// instances handing out the same number splices the second client into the first one's game.
-/// INCR is atomic across instances; the fs and pg paths fall back to a process-local counter and
-/// are therefore single-instance only.
+/// The token identifies a route the gateway will resolve, so two instances handing out the same
+/// number splices the second client into the first one's game. INCR is atomic across instances,
+/// which is the only reason this can be answered at all; the process-local counter is a fallback
+/// for a redis that is briefly away, and is single-instance by nature.
 pub fn mintToken() u16 {
-    if (ephemeral == .redis) {
-        if (redis.mintToken()) |t| return t;
-    }
+    if (redis.mintToken()) |t| return t;
     // Wrap at u16, skipping 0 — the engine and the game list both read 0 as "no game".
     const n = local_token_ctr.fetchAdd(1, .monotonic);
     return if (n == 0) 1 else n;
 }
 
 pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {
-    return switch (ephemeral) {
-        .fs => fs.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s),
-        .redis => redis.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s),
-        .pg => pg.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s),
-    };
+    return redis.recordTokenRoute(token, gs_ip, gs_port, real_gameid, ttl_s);
 }
 
 pub fn lookupTokenRoute(token: u16) ?TokenRoute {
-    return switch (ephemeral) {
-        .fs => fs.lookupTokenRoute(token),
-        .redis => redis.lookupTokenRoute(token),
-        .pg => pg.lookupTokenRoute(token),
-    };
+    return redis.lookupTokenRoute(token);
 }
 
 // ── health ───────────────────────────────────────────────────────────────────
 
-fn backendHealthy(b: Backend) bool {
-    return switch (b) {
-        .fs => fs.healthy(),
-        .redis => redis.healthy(),
-        .pg => pg.healthy(),
-    };
-}
-
-/// Ready only if every backend actually in use is reachable.
+/// Ready only if both stores answer. Neither is optional: without redis nothing coordinates, and
+/// without Postgres nothing is kept.
 pub fn healthy() bool {
-    return backendHealthy(durable) and backendHealthy(ephemeral);
+    return redis.healthy() and pg.healthy();
 }

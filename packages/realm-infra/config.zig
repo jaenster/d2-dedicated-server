@@ -1,10 +1,10 @@
 //! realmd configuration. Everything comes from the environment with sane
 //! defaults — no config files, no sed. One binary, one set of env vars.
 //!
-//! Multi-instance note: every instance reads the same vars; what makes them
-//! distinct is REALMD_INSTANCE (an id for logging/coordination) and the shared
-//! Store backend (added later) they all point at. The protocol listeners
-//! themselves are stateless, so scaling out is just "run more of these".
+//! Multi-instance note: every instance reads the same vars; what makes them distinct is
+//! REALMD_INSTANCE, which must differ per instance (it seeds session and request id ranges).
+//! Everything else is shared — Postgres for the record, Redis for what is in flight — so the
+//! listeners are stateless and scaling out is just "run more of these".
 const std = @import("std");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -69,15 +69,10 @@ pub const Config = struct {
     shutdown_grace_ms: u32 = 5000,
 
     /// Persistence backends. `durable` serves character saves (the store of record);
-    /// `ephemeral` serves sessions + games (short-lived, TTL'd). They are independent
-    /// so Postgres and Redis are co-equal (durable=pg, ephemeral=redis is the common
-    /// split). REALMD_STORE sets both; REALMD_DURABLE_STORE / REALMD_EPHEMERAL_STORE
-    /// override each. Values: fs | redis | pg.
-    durable_store: Backend = .fs,
-    ephemeral_store: Backend = .fs,
-    /// "host:port" for the Redis backend (DNS name ok).
+    /// REQUIRED. Where the realm coordinates: sessions, games, the fleet and its queues, and the
+    /// live character in front of Postgres. "host:port", DNS name ok.
     redis_addr: []const u8 = "redis:6379",
-    /// libpq-style DSN for the Postgres backend.
+    /// REQUIRED. The store of record: characters, accounts, profiles, guilds. libpq-style DSN.
     pg_dsn: []const u8 = "",
 
     /// Bearer token for the HTTP admin API (served on the health port under
@@ -118,15 +113,6 @@ pub const Config = struct {
     trusted_auth_header: []const u8 = "",
 };
 
-pub const Backend = enum { fs, redis, pg };
-
-fn parseBackend(s: []const u8, current: Backend) Backend {
-    if (std.mem.eql(u8, s, "fs")) return .fs;
-    if (std.mem.eql(u8, s, "redis")) return .redis;
-    if (std.mem.eql(u8, s, "pg")) return .pg;
-    return current;
-}
-
 fn env(name: [*:0]const u8) ?[]const u8 {
     const v = getenv(name) orelse return null;
     return std.mem.span(v);
@@ -159,13 +145,6 @@ pub fn fromEnv() Config {
     if (env("REALMD_LOG_JSON")) |_| c.log_json = true;
     if (env("REALMD_REQUIRE_GS")) |_| c.require_gs = true;
     if (env("REALMD_SHUTDOWN_GRACE_MS")) |v| c.shutdown_grace_ms = std.fmt.parseInt(u32, v, 10) catch c.shutdown_grace_ms;
-    // REALMD_STORE sets both backends; the granular vars override each.
-    if (env("REALMD_STORE")) |v| {
-        c.durable_store = parseBackend(v, c.durable_store);
-        c.ephemeral_store = parseBackend(v, c.ephemeral_store);
-    }
-    if (env("REALMD_DURABLE_STORE")) |v| c.durable_store = parseBackend(v, c.durable_store);
-    if (env("REALMD_EPHEMERAL_STORE")) |v| c.ephemeral_store = parseBackend(v, c.ephemeral_store);
     if (env("REALMD_REDIS_ADDR")) |v| c.redis_addr = v;
     if (env("REALMD_PG_DSN")) |v| c.pg_dsn = v;
     if (env("REALMD_ADMIN_TOKEN")) |v| c.admin_token = v;

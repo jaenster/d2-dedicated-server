@@ -19,10 +19,11 @@ and cross-compiled to a static Linux binary for deploy.
   id in the MCP chunk: no shared-secret crypto and no `gameservlist` IP whitelist. There is no SNAT
   problem either, because there is no connection to observe an address from -- a game server states
   its own client-facing address in the record it publishes.
-- **Stateless fronts over a Store seam.** All durable/cross-connection state (sessions, games,
-  character saves) lives behind one interface, switch-dispatched to `fs` / `redis` / `pg`. So does
-  reaching a game server. realmd scales horizontally: any instance resolves what another created,
-  and dispatches to the whole fleet.
+- **Stateless fronts over a Store seam.** Every piece of cross-connection state — sessions, games,
+  characters, accounts, profiles, guilds — lives behind one interface, and each has exactly one
+  home: Postgres for the record, Redis for what is in flight. So does reaching a game server. Any
+  instance resolves what another created and dispatches to the whole fleet. The only thing read
+  from local disk is the BNFTP asset set, which is read-only image content.
 - One static binary, env-only config, no config files.
 
 ## Listeners
@@ -40,15 +41,13 @@ to it. See [`docs/redis.md`](docs/redis.md).
 |-|-|-|
 | `REALMD_BIND` | `0.0.0.0` | bind address |
 | `REALMD_BNET_PORT` | 6112 | the client-facing listener |
-| `REALMD_DURABLE_STORE` | `fs` | character saves backend: `fs` / `pg` |
-| `REALMD_EPHEMERAL_STORE` | `fs` | sessions + games backend: `fs` / `redis` |
-| `REALMD_REDIS_ADDR` / `REALMD_PG_DSN` | -- | backend endpoints when not `fs` |
+| `REALMD_REDIS_ADDR` | `redis:6379` | REQUIRED — sessions, games, the fleet, the live character |
+| `REALMD_PG_DSN` | -- | REQUIRED — the store of record: characters, accounts, profiles, guilds |
 | `REALMD_REALM_NAME` | `TypeGuru` | realm name shown to clients |
 | `REALMD_REALM_ADDR` | `127.0.0.1` | public IPv4 clients dial for the realm (advertised on login) |
 | `REALMD_GAME_ADDR` | -- | GATEWAY mode: the d2ingress entry advertised for game traffic |
 | `REALMD_GS_ADDR` | (peer IP) | override the game-server IP given to clients (NAT) |
-| `REALMD_DATA_DIR` | `realmd-data` | durable data dir for the `fs` store |
-| `REALMD_SHARED` | off | multi-instance mode (also implied by a non-`fs` ephemeral store) |
+| `REALMD_DATA_DIR` | `realmd-data` | where BNFTP assets are read from (read-only image content) |
 | `REALMD_INSTANCE` | `realmd-0` | instance id (must be unique per instance in shared mode) |
 | `REALMD_LOG_JSON` | off | structured JSON logs to stdout (for Loki) |
 | `REALMD_CAPTURE` | off | hexdump raw bytes instead of speaking the protocol |
@@ -62,8 +61,8 @@ zig build install             # just build -> zig-out/bin/realmd
 REALMD_REALM_ADDR=<your-ip> ./zig-out/bin/realmd
 
 # two instances in tandem over a shared redis (ephemeral) + pg (durable)
-REALMD_EPHEMERAL_STORE=redis REALMD_REDIS_ADDR=127.0.0.1:6379 \
-  REALMD_DURABLE_STORE=pg REALMD_PG_DSN=postgres://realmd:realmd@127.0.0.1:5432/realmd \
+REALMD_REDIS_ADDR=127.0.0.1:6379 \
+  REALMD_PG_DSN=postgres://realmd:realmd@127.0.0.1:5432/realmd \
   REALMD_INSTANCE=A ./zig-out/bin/realmd
 ```
 

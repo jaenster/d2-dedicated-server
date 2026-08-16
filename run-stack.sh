@@ -17,6 +17,7 @@
 #
 # Config (env or ./.env):
 #   REDIS_ADDR   default 127.0.0.1:6390     GS_PORT      default 14000  (engine, behind d2ingress)
+#   PG_ADDR/PG_DSN  default 127.0.0.1:55432   (both stores are required)
 #   INGRESS_PORT      default 4000  (client-hardcoded)
 #   HEALTH_PORT  default 18080
 #   TESTDIR      default ./testgame        LOG_DIR      default ./.stack
@@ -26,8 +27,8 @@ ROOT="$(pwd)"
 [ -f "$ROOT/.env" ] && set -a && . "$ROOT/.env" && set +a
 
 REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6390}"
-DURABLE="${DURABLE:-fs}"
 PG_DSN="${PG_DSN:-postgres://realmd:realmd@127.0.0.1:55432/realmd}"
+PG_ADDR="${PG_ADDR:-127.0.0.1:55432}"
 INGRESS_PORT="${INGRESS_PORT:-4000}"
 GS_PORT="${GS_PORT:-14000}"
 HEALTH_PORT="${HEALTH_PORT:-18080}"
@@ -94,6 +95,7 @@ await_gs_registered() {
 status() {
   say "status"
   listening "$REDIS_ADDR"        && ok "redis $REDIS_ADDR"          || bad "redis $REDIS_ADDR"
+  listening "$PG_ADDR"           && ok "postgres $PG_ADDR"          || bad "postgres $PG_ADDR"
   port_is "127.0.0.1:$BNET_PORT"   "realmd bnet :$BNET_PORT"     realmd
   port_is "127.0.0.1:$INGRESS_PORT"     "d2ingress :$INGRESS_PORT"          d2ingress
   # The GS picks its own game port and advertises it via ADDRINFO, so there is no fixed port to
@@ -118,7 +120,7 @@ down() {
   pkill -f 'zig-out/bin/realmd' 2>/dev/null && ok "realmd stopped (draining)" || ok "no realmd"
   await_gone "127.0.0.1:$INGRESS_PORT" 15 "d2ingress" && ok "d2ingress port released"
   await_gone "127.0.0.1:$BNET_PORT" 15 "realmd" && ok "realmd port released"
-  echo "redis left running (docker compose -f deploy/compose.dev.yaml down to stop it)"
+  echo "redis + postgres left running (docker compose -f deploy/compose.dev.yaml down to stop them)"
 }
 
 case "$MODE" in status) status; exit 0 ;; down) down; exit 0 ;; esac
@@ -141,15 +143,19 @@ install_dlls() {
 }
 
 say "redis"
-listening "$REDIS_ADDR" || docker compose -f deploy/compose.dev.yaml up -d >/dev/null 2>&1
-await "$REDIS_ADDR" 20 "redis" || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
+# Both stores, always. There is no filesystem fallback any more: postgres keeps the characters
+# and accounts, redis keeps what is in flight, and realmd refuses to start without either.
+if ! listening "$REDIS_ADDR" || ! listening "$PG_ADDR"; then
+  docker compose -f deploy/compose.dev.yaml up -d >/dev/null 2>&1
+fi
+await "$REDIS_ADDR" 20 "redis"    || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
+await "$PG_ADDR"    30 "postgres" || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
 
 say "realmd"
 if listening "127.0.0.1:$BNET_PORT"; then
   ok "already running (leaving it alone — restarting drops live realm sessions)"
 else
-  REALMD_EPHEMERAL_STORE=redis REALMD_DURABLE_STORE="$DURABLE" REALMD_REDIS_ADDR="$REDIS_ADDR" \
-  REALMD_PG_DSN="$PG_DSN" \
+  REALMD_REDIS_ADDR="$REDIS_ADDR" REALMD_PG_DSN="$PG_DSN" \
   REALMD_DATA_DIR="$REALMD_DATA_DIR" REALMD_REALM_ADDR=127.0.0.1 REALMD_GAME_ADDR=127.0.0.1 \
   REALMD_INGRESS_PORT="$INGRESS_PORT" REALMD_HEALTH_PORT="$HEALTH_PORT" REALMD_PERMISSIVE_AUTH=1 \
   REALMD_ADMIN_TOKEN="${REALMD_ADMIN_TOKEN:-}" \

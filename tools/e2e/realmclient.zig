@@ -622,6 +622,18 @@ pub const AdInfo = struct {
         return net.rdU32(r.body, 2);
     }
 
+    /// Create a character, first removing any left from an earlier run.
+    ///
+    /// Fixture setup, not a test of delete. The suite used to be re-runnable only because the
+    /// filesystem data dir was wiped between runs; against a store that actually persists —
+    /// Postgres — the second run met its own characters and every create failed as a name
+    /// already taken. A fixture that establishes what it needs rather than assuming an empty
+    /// world is re-runnable against any backend.
+    pub fn charCreateFresh(self: *RealmClient, class: u8, flags: u8, charname: []const u8) !u32 {
+        _ = self.charDelete(charname) catch 0;
+        return self.charCreate(class, flags, charname);
+    }
+
     /// MCP_LADDERDATA (0x11): request the ladder, parse the entry buffer into `out`
     /// (names copied into `dst`), return the entry count. Mirrors NET_MCP_CLIENT_Incoming0x11:
     /// body = [u8 flag][u16 total][u16 chunk][u16 offset][u32 rankBase][u32 count][u32 entrySize]

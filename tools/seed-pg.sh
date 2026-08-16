@@ -12,7 +12,7 @@
 #   ACCOUNT=tester ./tools/seed-pg.sh      # just one account's
 #
 # Needs redis and postgres up (docker compose -f deploy/compose.dev.yaml up -d) and a realmd
-# running with REALMD_DURABLE_STORE=pg — DURABLE=pg ./run-stack.sh does that.
+# running (./run-stack.sh does that; postgres is not optional any more).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -49,7 +49,7 @@ for _ in $(seq 1 30); do
 done
 left=$(R SCARD realmd:dirty)
 if [ "$left" != "0" ]; then
-    echo "FAIL: $left still dirty — is a realmd running with REALMD_DURABLE_STORE=pg?" >&2
+    echo "FAIL: $left still dirty — is a realmd running?" >&2
     exit 1
 fi
 

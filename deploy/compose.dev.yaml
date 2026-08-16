@@ -3,14 +3,15 @@
 # run NATIVELY on the host and the wine GS runs natively too; only the stores are containers.
 # The full containerized stack lives in compose.yaml.
 #
-# Redis is REQUIRED — realmd refuses to start without it, because the realm coordinates through
-# it. Postgres is optional: the durable store can be `fs` instead, which is what run-stack.sh
-# uses. It is here so the pg path can be exercised locally rather than only in a deployment,
-# since a store of record that is never run in dev is one nobody notices has broken.
+# Both are REQUIRED — realmd refuses to start without either. Redis is where the realm
+# coordinates; Postgres is the store of record. There is no filesystem option to fall back to,
+# which is deliberate: the one that existed is what let account flags and profiles quietly land
+# on one instance's local disk while everything else was shared.
 #
 #   docker compose -f deploy/compose.dev.yaml up -d
 #   # then, natively:
-#   REALMD_EPHEMERAL_STORE=redis REALMD_REDIS_ADDR=127.0.0.1:6390 \
+#   REALMD_REDIS_ADDR=127.0.0.1:6390 \
+#     REALMD_PG_DSN=postgres://realmd:realmd@127.0.0.1:55432/realmd \
 #     REALMD_GAME_ADDR=127.0.0.1 REALMD_INGRESS_PORT=14000 ./zig-out/bin/realmd &
 #   REALMD_REDIS_ADDR=127.0.0.1:6390 REALMD_INGRESS_PORT=14000 ./zig-out/bin/d2ingress &
 services:
@@ -38,6 +39,4 @@ services:
       interval: 3s
       retries: 10
 
-# Run realmd against postgres instead of the filesystem:
-#   REALMD_DURABLE_STORE=pg REALMD_PG_DSN=postgres://realmd:realmd@127.0.0.1:55432/realmd \
-#     DURABLE=pg ./run-stack.sh
+# ./run-stack.sh brings both of these up itself and points realmd at them.

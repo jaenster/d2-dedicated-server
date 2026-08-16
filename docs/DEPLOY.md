@@ -67,8 +67,6 @@ services:
     build: { context: ., dockerfile: deploy/Dockerfile, target: realmd }
     depends_on: [redis, postgres]
     environment:
-      REALMD_DURABLE_STORE: pg          # character saves
-      REALMD_EPHEMERAL_STORE: redis     # sessions + games (native TTL)
       REALMD_REDIS_ADDR: redis:6379
       REALMD_PG_DSN: postgres://realmd:realmd@postgres:5432/realmd
       REALMD_LOG_JSON: "1"

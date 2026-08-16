@@ -52,7 +52,7 @@ echo "==> a fresh realmd starts and should finish what the dead one did not"
 # touches no game server, so pulling in the whole stack would only add a smoke test that plays a
 # real game — which needs a live GS and fails for reasons that have nothing to do with durability.
 REALMD_BIND=127.0.0.1 REALMD_REALM_ADDR=127.0.0.1 REALMD_GAME_ADDR=127.0.0.1 \
-  REALMD_EPHEMERAL_STORE=redis REALMD_DURABLE_STORE=fs \
+  REALMD_PG_DSN="${PG_DSN:-postgres://realmd:realmd@127.0.0.1:55432/realmd}" \
   REALMD_REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6390}" REALMD_DATA_DIR="$DATA_DIR" \
   REALMD_BNET_PORT=16112 REALMD_D2DBS_PORT=16114 \
   REALMD_GS_PORT=16115 REALMD_HEALTH_PORT=18099 \

@@ -31,7 +31,8 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   through one and joined through the other, both players in the world together. Nothing
   connects a realm server to a game server any more: servers publish themselves into redis,
   take create/join from a queue there, and report back on an event stream any instance drains.
-  See [`docs/redis.md`](redis.md).
+  Everything durable is shared too -- an account created and flagged admin on one instance,
+  read back from another that shares nothing but Postgres. See [`docs/redis.md`](redis.md).
 - **A game server with no wine at all.** 1.14d's macOS i386 build, mapped and run directly on
   i386 Linux, serving real clients through the same realm and gateway: one process in a 4.4 MB
   image, and on real amd64 hardware as fast as the wine server. See
@@ -49,10 +50,6 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   start at the first join, not at creation.
 - Least-loaded routing breaks ties toward whichever server the set enumerates first, so with
   equal load one server takes the work until its count rises.
-- **Some account state is still filesystem-only**, whatever the durable backend is: the admin
-  flag, password changes, the BNCS profile and guilds. Accounts themselves reach Postgres;
-  these do not, so across replicas they diverge silently — an admin flagged on one instance is
-  an ordinary user on the other.
 - **The native game server has not been ported off the retired control socket.** It still
   dials :6115 and fetches characters over d2dbs, neither of which exists; it boots and serves
   nothing until it joins the realm through redis the way the wine server does.

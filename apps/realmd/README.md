@@ -21,9 +21,9 @@ Game servers have no port here at all — they meet the realm in redis.
 ## Architecture
 
 `fleet.zig` sees the whole fleet through the shared store and dispatches to it there, so any
-instance can serve any client. The store facade dispatches to `fs` / `redis` / `pg`; redis is
-required, the durable half is a choice. See [`../../docs/redis.md`](../../docs/redis.md), and
-the full model in
+instance can serve any client. Everything durable is Postgres and everything in flight is Redis;
+both are required and neither is selectable. See [`../../docs/redis.md`](../../docs/redis.md),
+and the full model in
 [`../../docs/architecture/`](../../docs/architecture/):
 
 ![GS fleet](../../docs/architecture/img/gs_fleet.png)

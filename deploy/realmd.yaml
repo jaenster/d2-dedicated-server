@@ -1,7 +1,8 @@
 # realmd on Kubernetes — the realm server (bnetd + d2cs + d2dbs + gs-link), fronted
 # by a LoadBalancer, with the game-server fleet in deploy/gs.yaml.
 #
-# State lives in a backend behind realmd's persistence facade (REALMD_STORE):
+# State lives behind realmd's persistence facade — Postgres for the record, Redis for what is
+# in flight. There is no third option:
 #   fs     — a shared RWX volume (no extra services; set up the PVC below)
 #   redis  — ephemeral sessions/games in Redis (this file deploys one)
 #   pg     — durable character saves in Postgres (this file deploys one)
@@ -149,10 +150,6 @@ spec:
             - name: REALMD_GAME_ADDR
               value: "127.0.0.1"
             # Persistence: durable chars in Postgres, ephemeral sessions/games in Redis.
-            - name: REALMD_DURABLE_STORE
-              value: "pg"
-            - name: REALMD_EPHEMERAL_STORE
-              value: "redis"
             - name: REALMD_REDIS_ADDR
               value: "realmd-redis:6379"
             - name: REALMD_PG_DSN

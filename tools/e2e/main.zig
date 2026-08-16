@@ -254,15 +254,15 @@ fn scClassicChar() Result {
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
     // A classic Barbarian (class 4, no expansion bit) must be allowed.
-    const barb = c.charCreate(4, 0, "ClassicBarb") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const barb = c.charCreateFresh(4, 0, "ClassicBarb") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (barb != 0) return fail(name, "classic Barbarian rejected (result=0x{x})", .{barb});
 
     // A classic Druid (class 5) must be REJECTED — Druid/Assassin are expansion-only.
-    const cdruid = c.charCreate(5, 0, "ClassicDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cdruid = c.charCreateFresh(5, 0, "ClassicDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (cdruid == 0) return fail(name, "classic Druid was allowed, want rejection", .{});
 
     // The same Druid WITH the expansion bit must be allowed.
-    const xdruid = c.charCreate(5, 0x20, "ExpacDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const xdruid = c.charCreateFresh(5, 0x20, "ExpacDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (xdruid != 0) return fail(name, "expansion Druid rejected (result=0x{x})", .{xdruid});
 
     return .{ .name = name, .status = .pass, .msg = msg("classic Barbarian ok, classic Druid rejected (0x{x}), expansion Druid ok", .{cdruid}) };
@@ -362,7 +362,7 @@ fn scCharUpgrade() Result {
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
     // A classic character: status carries no expansion bit, so the list reports flags 0.
-    const created = c.charCreate(4, 0, "Classicus") catch |e| return fail(name, "{s}", .{@errorName(e)}); // Barbarian
+    const created = c.charCreateFresh(4, 0, "Classicus") catch |e| return fail(name, "{s}", .{@errorName(e)}); // Barbarian
     if (created != 0) return fail(name, "create result=0x{x}", .{created});
 
     const before = charFlags(&c, "Classicus") orelse return fail(name, "'Classicus' missing from the list before upgrade", .{});
@@ -412,7 +412,7 @@ fn scCharCreate() Result {
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
     // MCP_CHARCREATE a Sorceress (class 1) — realmd must build + persist a level-1 .d2s.
-    const res = c.charCreate(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const res = c.charCreateFresh(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (res != 0) return fail(name, "create result={d} want 0", .{res});
 
     // It must now appear in CHARLIST2 as a level-1 Sorceress.
@@ -1495,26 +1495,46 @@ fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
 // d2ingress reads token routes from it asynchronously — so the harness brings up a real
 // redis in docker, points realmd + d2ingress at it, and flushes it for a clean slate.
 const REDIS_HOST_PORT: u16 = 6399;
+const PG_HOST_PORT: u16 = 55499;
 
-fn startRedis() void {
-    _ = system("docker rm -f e2e-redis >/dev/null 2>&1"); // clear any stale container
+/// Bring up the two stores realmd needs. Both, always: there is no filesystem fallback to fall
+/// back to, which is the point — a harness that could run without them would be testing a
+/// configuration that does not exist.
+fn startStores() void {
+    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1"); // clear stale containers
     if (system("docker run -d --rm --name e2e-redis -p 6399:6379 redis:7-alpine >/dev/null 2>&1") != 0) {
-        std.debug.print("ERROR: could not start redis container (docker is required for ephemeral=redis).\n", .{});
+        std.debug.print("ERROR: could not start the redis container (docker is required).\n", .{});
         std.process.exit(2);
     }
-    if (!waitPort(REDIS_HOST_PORT, 10_000)) {
-        std.debug.print("ERROR: redis container did not come up on :{d}\n", .{REDIS_HOST_PORT});
-        _ = system("docker rm -f e2e-redis >/dev/null 2>&1");
+    if (system("docker run -d --rm --name e2e-postgres -p 55499:5432 " ++
+        "-e POSTGRES_USER=realmd -e POSTGRES_PASSWORD=realmd -e POSTGRES_DB=realmd " ++
+        "postgres:16-alpine >/dev/null 2>&1") != 0)
+    {
+        std.debug.print("ERROR: could not start the postgres container (docker is required).\n", .{});
+        stopStores();
+        std.process.exit(2);
+    }
+    if (!waitPort(REDIS_HOST_PORT, 10_000) or !waitPort(PG_HOST_PORT, 30_000)) {
+        std.debug.print("ERROR: a store container did not come up (redis :{d}, postgres :{d})\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
+        stopStores();
         std.process.exit(2);
     }
     _ = system("docker exec e2e-redis redis-cli FLUSHALL >/dev/null 2>&1"); // clean slate
-    _ = setenv("REALMD_EPHEMERAL_STORE", "redis", 1);
     _ = setenv("REALMD_REDIS_ADDR", "127.0.0.1:6399", 1);
-    std.debug.print("started redis container e2e-redis on :{d} (ephemeral=redis)\n", .{REDIS_HOST_PORT});
+    _ = setenv("REALMD_PG_DSN", "postgres://realmd:realmd@127.0.0.1:55499/realmd", 1);
+    // The port being open is not the same as the server accepting connections; postgres listens
+    // briefly before it will talk. Wait for a query to actually succeed rather than for realmd to
+    // discover it the hard way.
+    var waited: u32 = 0;
+    while (waited < 30_000) : (waited += 250) {
+        if (system("docker exec e2e-postgres pg_isready -q -U realmd >/dev/null 2>&1") == 0) break;
+        _ = net.usleep(250_000);
+    }
+    std.debug.print("started e2e-redis :{d} and e2e-postgres :{d}\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
 }
 
-fn stopRedis() void {
-    _ = system("docker rm -f e2e-redis >/dev/null 2>&1");
+fn stopStores() void {
+    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1");
 }
 
 fn maybeStartRealmd() !?c_int {
@@ -2003,7 +2023,7 @@ const EchoServer = struct {
 };
 
 /// fork+execve the d2ingress binary (REALMD_D2INGRESS_BIN, default ./zig-out/bin/d2ingress).
-/// It reads token routes from redis (REALMD_REDIS_ADDR, inherited from startRedis) — the
+/// It reads token routes from redis (REALMD_REDIS_ADDR, inherited from startStores) — the
 /// same redis realmd writes them to — and listens on REALMD_INGRESS_PORT. Waits up to 10s for
 /// the port; exits the harness if it never comes up. Mirrors spawnRealmd.
 fn spawnD2ingress(ingress_port: u16) !c_int {
@@ -2220,6 +2240,37 @@ fn scEmbeddedGameEdge() Result {
     return .{ .name = name, .status = .pass, .msg = msg("embedded edge: token 0x{x} -> gameid {d}, rewritten + spliced (no d2ingress)", .{ token, GS_GAMEID }) };
 }
 
+/// Accounts these scenarios create, and therefore have to be able to create.
+///
+/// The suite used to be re-runnable only because the filesystem data dir was wiped between runs.
+/// Against a store that actually persists — Postgres — the second run met its own accounts and
+/// every create failed as "exists". Clearing them here makes a run independent of what the last
+/// one left, whatever the store is.
+const fixture_accounts = [_][]const u8{
+    "AdminMade", "AuthUser", "CopyAcct",
+};
+
+/// Characters a scenario expects to create, so a leftover must not be there to collide with.
+/// Named separately from the accounts because these belong to accounts the suite never creates —
+/// they are staged straight into the store.
+const fixture_chars = [_]struct { account: []const u8, char: []const u8 }{
+    .{ .account = "CopyAcct", .char = "CopyCat" },
+};
+
+fn resetFixtures() void {
+    var rxbuf: [4096]u8 = undefined;
+    for (fixture_accounts) |acct| {
+        var json: [128]u8 = undefined;
+        const body = std.fmt.bufPrint(&json, "{{\"name\":\"{s}\"}}", .{acct}) catch continue;
+        _ = net.httpRequest(HEALTH_PORT, "POST", "/admin/accounts/delete", ADMIN_TOKEN, body, &rxbuf) catch continue;
+    }
+    for (fixture_chars) |fc| {
+        var json: [160]u8 = undefined;
+        const body = std.fmt.bufPrint(&json, "{{\"account\":\"{s}\",\"char\":\"{s}\"}}", .{ fc.account, fc.char }) catch continue;
+        _ = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/delete", ADMIN_TOKEN, body, &rxbuf) catch continue;
+    }
+}
+
 pub fn main() !void {
     // A whole run can be moved off the default ports. Without this, a stray realm server
     // on 6112 quietly becomes the system under test.
@@ -2229,8 +2280,9 @@ pub fn main() !void {
         HEALTH_PORT = port_base + 1968; // keeps the usual 6112 -> 18080 relationship
         std.debug.print("port base overridden: bnet={d} health={d}\n", .{ rc.HOST_BNET, HEALTH_PORT });
     }
-    startRedis();
+    startStores();
     const child = try maybeStartRealmd();
+    resetFixtures();
 
     const results = [_]Result{
         scLogin(),
@@ -2271,7 +2323,7 @@ pub fn main() !void {
         _ = kill(pid, 15); // SIGTERM
         _ = waitpid(pid, null, 0);
     }
-    stopRedis();
+    stopStores();
 
     var npass: u32 = 0;
     var nfail: u32 = 0;

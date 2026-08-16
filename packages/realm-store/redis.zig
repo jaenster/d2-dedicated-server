@@ -20,7 +20,7 @@
 //!
 //! DDD role: this is one concrete backend, not an adapter layer. The facade
 //! (store.zig) picks exactly one of {fs, redis, pg} and calls it directly; each
-//! backend exposes the identical public surface (see persist_fs.zig) so the
+//! backend exposes the identical public surface so the
 //! facade can switch among them with zero glue. Keys live under a "realmd:"
 //! prefix; the schema mirrors the fs backend's records (chars durable; sessions
 //! and games ephemeral with PX TTL and reverse indexes by gameid and by gs).
@@ -28,7 +28,6 @@ const std = @import("std");
 const net = @import("realm_infra").net;
 const Lock = @import("realm_infra").lock.Lock;
 const types = @import("realm_infra").types;
-const fs = @import("fs.zig");
 const resp = @import("resp");
 
 const Name = types.Name;
@@ -38,16 +37,272 @@ const TokenRoute = types.TokenRoute;
 
 const prefix = "realmd:";
 
-// Accounts are durable, low-volume and simple — route them to the always-present
-// filesystem backend rather than carry a parallel RESP schema.
+// ── accounts, profiles and guilds (durable) ──────────────────────────────────
+//
+// One 22-byte record per account, the same layout the filesystem backend writes: [0] whether a
+// password is set, [1..21] its hash, [21] the admin flag. Sharing the shape means a realm can be
+// moved between backends by copying values, and means there is one thing to reason about rather
+// than two.
+//
+// These used to route to the filesystem backend on the argument that they are low-volume and
+// simple. That holds until there is more than one instance, at which point "the file on this pod"
+// is a different answer per pod.
+
+const account_rec_len = 22;
+
+fn accountKey(buf: []u8, name: []const u8) ?[]const u8 {
+    var nb: [64]u8 = undefined;
+    const a = sanitize(name, &nb) orelse return null;
+    return std.fmt.bufPrint(buf, prefix ++ "account:{s}", .{a}) catch null;
+}
+
+fn readAccount(name: []const u8, out: *[account_rec_len]u8) bool {
+    var kb: [128]u8 = undefined;
+    const key = accountKey(&kb, name) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", key }) orelse return false;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk false;
+            if (v.len < account_rec_len) break :blk false;
+            @memcpy(out, v[0..account_rec_len]);
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn writeAccount(name: []const u8, rec: *const [account_rec_len]u8, only_if_absent: bool) bool {
+    var kb: [128]u8 = undefined;
+    const key = accountKey(&kb, name) orelse return false;
+    var nb: [64]u8 = undefined;
+    const a = sanitize(name, &nb) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    if (only_if_absent) {
+        // SET NX decides the winner, so two instances creating the same account cannot both
+        // believe they did — which is the whole answer the caller wants.
+        const rep = command(s, &r, &.{ "SET", key, rec, "NX" }) orelse return false;
+        const won = switch (rep) {
+            .status => true,
+            .bulk => |b| b != null,
+            else => false,
+        };
+        if (!won) return false;
+    } else {
+        _ = command(s, &r, &.{ "SET", key, rec }) orelse return false;
+    }
+    var r2: Reader = undefined;
+    _ = command(s, &r2, &.{ "SADD", prefix ++ "accounts", a });
+    return true;
+}
+
 pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
-    return fs.createAccount(name, pwhash);
+    var rec: [account_rec_len]u8 = [_]u8{0} ** account_rec_len;
+    if (pwhash) |h| {
+        rec[0] = 1;
+        @memcpy(rec[1..21], &h);
+    }
+    return writeAccount(name, &rec, true);
 }
+
 pub fn accountExists(name: []const u8) bool {
-    return fs.accountExists(name);
+    var rec: [account_rec_len]u8 = undefined;
+    return readAccount(name, &rec);
 }
+
+/// Null if there is no such account; false if it exists without a password.
 pub fn accountPwHash(name: []const u8, out: *[20]u8) ?bool {
-    return fs.accountPwHash(name, out);
+    var rec: [account_rec_len]u8 = undefined;
+    if (!readAccount(name, &rec)) return null;
+    if (rec[0] == 0) return false;
+    @memcpy(out, rec[1..21]);
+    return true;
+}
+
+pub fn setAccountPassword(name: []const u8, hash: [20]u8) bool {
+    var rec: [account_rec_len]u8 = undefined;
+    if (!readAccount(name, &rec)) return false;
+    rec[0] = 1;
+    @memcpy(rec[1..21], &hash);
+    return writeAccount(name, &rec, false);
+}
+
+pub fn setAdmin(name: []const u8, admin: bool) bool {
+    var rec: [account_rec_len]u8 = undefined;
+    if (!readAccount(name, &rec)) return false;
+    rec[21] = if (admin) 1 else 0;
+    return writeAccount(name, &rec, false);
+}
+
+pub fn accountIsAdmin(name: []const u8) bool {
+    var rec: [account_rec_len]u8 = undefined;
+    if (!readAccount(name, &rec)) return false;
+    return rec[21] == 1;
+}
+
+/// Remove an account. Idempotent — true even if it was already gone.
+pub fn deleteAccount(name: []const u8) bool {
+    var kb: [128]u8 = undefined;
+    const key = accountKey(&kb, name) orelse return false;
+    var nb: [64]u8 = undefined;
+    const a = sanitize(name, &nb) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    _ = pipeline(s, &r, &.{
+        &.{ "DEL", key },
+        &.{ "SREM", prefix ++ "accounts", a },
+    });
+    return true;
+}
+
+pub fn listAccounts(names: [][32]u8) usize {
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "SMEMBERS", prefix ++ "accounts" }) orelse return 0;
+    const count = switch (rep) {
+        .array_len => |n| if (n <= 0) return 0 else @as(usize, @intCast(n)),
+        else => return 0,
+    };
+    var filled: usize = 0;
+    for (0..count) |_| {
+        const er = readReply(&r) orelse break;
+        const member = switch (er) {
+            .bulk => |b| b orelse continue,
+            else => break,
+        };
+        if (filled >= names.len) continue; // drain the rest
+        if (member.len == 0 or member.len >= names[filled].len) continue;
+        @memset(&names[filled], 0);
+        @memcpy(names[filled][0..member.len], member);
+        filled += 1;
+    }
+    return filled;
+}
+
+fn userDataKey(buf: []u8, account: []const u8, key_: []const u8) ?[]const u8 {
+    var nb: [64]u8 = undefined;
+    const a = sanitize(account, &nb) orelse return null;
+    // The key path is the client's ("profile\\sex"), so it is hashed into the field rather than
+    // pasted into the key: it carries backslashes, and a key name is not the place for them.
+    var h: u64 = 1469598103934665603;
+    for (key_) |c| {
+        h ^= c;
+        h *%= 1099511628211;
+    }
+    return std.fmt.bufPrint(buf, prefix ++ "userdata:{s}:{x}", .{ a, h }) catch null;
+}
+
+pub fn getUserData(account: []const u8, key_: []const u8, out: []u8) usize {
+    var kb: [128]u8 = undefined;
+    const key = userDataKey(&kb, account, key_) orelse return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", key }) orelse return 0;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk 0;
+            const n = @min(v.len, out.len);
+            @memcpy(out[0..n], v[0..n]);
+            break :blk n;
+        },
+        else => 0,
+    };
+}
+
+pub fn setUserData(account: []const u8, key_: []const u8, value: []const u8) bool {
+    var kb: [128]u8 = undefined;
+    const key = userDataKey(&kb, account, key_) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    return command(s, &r, &.{ "SET", key, value }) != null;
+}
+
+fn guildKey(buf: []u8, name: []const u8) ?[]const u8 {
+    var nb: [64]u8 = undefined;
+    const g = sanitize(name, &nb) orelse return null;
+    return std.fmt.bufPrint(buf, prefix ++ "guild:{s}", .{g}) catch null;
+}
+
+pub fn saveGuild(name: []const u8, bytes: []const u8) bool {
+    var kb: [128]u8 = undefined;
+    const key = guildKey(&kb, name) orelse return false;
+    var nb: [64]u8 = undefined;
+    const g = sanitize(name, &nb) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    return pipeline(s, &r, &.{
+        &.{ "SET", key, bytes },
+        &.{ "SADD", prefix ++ "guilds", g },
+    });
+}
+
+pub fn getGuild(name: []const u8, out: []u8) usize {
+    var kb: [128]u8 = undefined;
+    const key = guildKey(&kb, name) orelse return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", key }) orelse return 0;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk 0;
+            const n = @min(v.len, out.len);
+            @memcpy(out[0..n], v[0..n]);
+            break :blk n;
+        },
+        else => 0,
+    };
+}
+
+/// Idempotent — true even if it was already gone, so a repeated delete is not an error.
+pub fn deleteGuild(name: []const u8) bool {
+    var kb: [128]u8 = undefined;
+    const key = guildKey(&kb, name) orelse return false;
+    var nb: [64]u8 = undefined;
+    const g = sanitize(name, &nb) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    _ = pipeline(s, &r, &.{
+        &.{ "DEL", key },
+        &.{ "SREM", prefix ++ "guilds", g },
+    });
+    return true;
+}
+
+pub fn listGuilds(names: []Name) usize {
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "SMEMBERS", prefix ++ "guilds" }) orelse return 0;
+    const count = switch (rep) {
+        .array_len => |n| if (n <= 0) return 0 else @as(usize, @intCast(n)),
+        else => return 0,
+    };
+    var filled: usize = 0;
+    for (0..count) |_| {
+        const er = readReply(&r) orelse break;
+        const member = switch (er) {
+            .bulk => |b| b orelse continue,
+            else => break,
+        };
+        if (filled >= names.len) continue; // drain the rest
+        if (member.len == 0 or member.len > names[filled].buf.len) continue;
+        @memset(&names[filled].buf, 0);
+        @memcpy(names[filled].buf[0..member.len], member);
+        names[filled].len = @intCast(member.len);
+        filled += 1;
+    }
+    return filled;
 }
 
 // ── connection state ─────────────────────────────────────────────────────────
@@ -326,7 +581,7 @@ fn pipeline(s: *Slot, r: *Reader, cmds: []const []const []const u8) bool {
     return ok;
 }
 
-// ── name sanitising (matches persist_fs.sanitize) ────────────────────────────
+// ── name sanitising ──────────────────────────────────────────────────────────
 
 fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
     if (name.len == 0 or name.len >= out.len) return null;
@@ -669,7 +924,7 @@ pub fn findGame(name: []const u8) ?GameRec {
     return parseGame(val);
 }
 
-/// Decode the space-separated game record text (same format persist_fs writes).
+/// Decode the space-separated game record text.
 fn parseGame(val: []const u8) ?GameRec {
     var it = std.mem.splitScalar(u8, val, ' ');
     const idtxt = it.next() orelse return null;

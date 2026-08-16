@@ -34,8 +34,6 @@ services:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }
     environment:
-      REALMD_DURABLE_STORE: pg
-      REALMD_EPHEMERAL_STORE: redis
       REALMD_DATA_DIR: /data
       REALMD_REDIS_ADDR: redis:6379
       REALMD_PG_DSN: postgres://realmd:realmd@postgres:5432/realmd

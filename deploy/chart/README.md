@@ -56,8 +56,6 @@ realmd (`templates/realmd-deployment.yaml`):
 | `REALMD_REALM_NAME` | `.Values.realmName` |
 | `REALMD_REALM_ADDR` | `.Values.realmAddr` (public IP clients dial; **required**) |
 | `REALMD_GAME_ADDR` | `.Values.gameAddr` (the d2ingress entry advertised for game traffic; **required**) |
-| `REALMD_DURABLE_STORE` | `pg` |
-| `REALMD_EPHEMERAL_STORE` | `redis` |
 | `REALMD_REDIS_ADDR` | `realmd-redis:6379` |
 | `REALMD_PG_DSN` | secretKeyRef `realmd-pg/DSN` |
 | `REALMD_REQUIRE_GS` | `.Values.requireGS` |
