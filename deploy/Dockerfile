@@ -129,8 +129,10 @@ ENTRYPOINT ["/opt/d2gs/entrypoint.sh"]
 # realmd: static binary in scratch (default target)
 FROM scratch AS realmd
 COPY --from=build-realmd /src/zig-out/bin/realmd /realmd
-# bnetd + MCP realm (muxed, as real bnet does it) / health + admin
-EXPOSE 6112 8080
+# The only client-facing port: BNCS login + MCP realm, muxed as real bnet does it. 8080 is bound
+# too (health probes, admin API, web UI) but is deliberately NOT declared: it is cluster-internal
+# and never belongs on a public Service.
+EXPOSE 6112
 ENTRYPOINT ["/realmd"]
 
 # d2ingress: static binary in scratch

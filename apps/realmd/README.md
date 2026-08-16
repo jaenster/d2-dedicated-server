@@ -51,6 +51,12 @@ GS StatefulSet with `hostPort 4000`):
 - `log.zig` — line logger; one line costs one `write`.
 - `assets/` — `bnserver-D2DV.ini` (gateway/version config), the factored Blizzard weak-signature key, README.
 
+## Testing it
+
+`zig build e2e` runs 33 clientless scenarios (it starts its own redis + postgres containers), and
+`../../tools/test-chat.sh` proves chat across two live instances with the real wire client: Alice
+hears Bob from the other instance and does not hear Eva, who is in another channel.
+
 ## Protocol notes
 
 - BNCS framing: `FF <id:u8> <len:u16 LE>` (len includes the 4-byte header); the
