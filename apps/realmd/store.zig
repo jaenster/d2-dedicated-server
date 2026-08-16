@@ -334,6 +334,48 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 // GAMELOGON packet. NAT-proof: the token is unique across the realm so two clients
 // behind one public IP never collide (unlike the source-IP route map above).
 
+// ── character ownership ──────────────────────────────────────────────────────
+//
+// A character belongs to one game at a time, and the lock records WHICH — so a second login can
+// be refused with a reason rather than issued and then silently dropped by the game server.
+//
+// Redis only, and that is not a limitation to route around: a lock that is not shared does not
+// enforce anything across instances. On fs/pg `lockChar` reports success so a single instance
+// behaves exactly as it did before this existed.
+
+/// How long a character stays claimed without a refresh. Long enough to outlive a slow join,
+/// short enough that a game server lost mid-session frees its characters within a game's length.
+pub const char_lock_ttl_s: u32 = 300;
+
+pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
+    return switch (ephemeral) {
+        .redis => redis.lockChar(account, charname, owner, char_lock_ttl_s),
+        .fs, .pg => true,
+    };
+}
+
+pub fn refreshCharLock(account: []const u8, charname: []const u8, owner: []const u8) bool {
+    return switch (ephemeral) {
+        .redis => redis.refreshCharLock(account, charname, owner, char_lock_ttl_s),
+        .fs, .pg => true,
+    };
+}
+
+pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
+    return switch (ephemeral) {
+        .redis => redis.unlockChar(account, charname, owner),
+        .fs, .pg => true,
+    };
+}
+
+/// Which game holds this character, or null if it is free.
+pub fn charLockOwner(account: []const u8, charname: []const u8, out: []u8) ?[]const u8 {
+    return switch (ephemeral) {
+        .redis => redis.charLockOwner(account, charname, out),
+        .fs, .pg => null,
+    };
+}
+
 // ── the game-server fleet (ephemeral, shared) ────────────────────────────────
 //
 // Only redis carries this: the point of publishing the fleet is that an instance which does NOT

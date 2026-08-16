@@ -900,6 +900,124 @@ fn tokenRouteKey(buf: []u8, token: u16) []const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "troute:{x}", .{token}) catch unreachable;
 }
 
+// ── character ownership ──────────────────────────────────────────────────────
+//
+// A character may be in exactly one game. The holder writes its own id into the lock, so the
+// lock does not merely say "taken" — it says WHO by, which is what lets a join be refused with a
+// reason instead of silence, and what makes releasing safe.
+//
+// Every mutation is compare-and-swap against that owner id. A release that just DELs is the
+// classic distributed-lock bug: if the TTL lapses mid-session and another game takes the
+// character, a blind DEL frees somebody else's lock and two games hold one character.
+//
+// The TTL is a backstop for a holder that dies without releasing — refreshed while the game
+// lives, so it only fires when nothing is refreshing it.
+
+fn charLockKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch buf[0..0];
+}
+
+/// Take the character for `owner`. False if somebody else already holds it.
+/// Re-taking a character this same owner already holds succeeds and refreshes the lease, so a
+/// client that reconnects into its own game is not locked out by its own previous session.
+pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32) bool {
+    var kb: [96]u8 = undefined;
+    const key = charLockKey(&kb, account, charname);
+    if (key.len == 0) return false;
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    // SET NX first; if it loses, take it anyway when the holder is already us.
+    const rep = command(s, &r, &.{ "SET", key, owner, "NX", "PX", px }) orelse return false;
+    switch (rep) {
+        .status, .bulk => return true,
+        else => {},
+    }
+    const script =
+        \\if redis.call('GET', KEYS[1]) == ARGV[1] then
+        \\  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+        \\end
+        \\return 0
+    ;
+    var r2: Reader = undefined;
+    const rep2 = command(s, &r2, &.{ "EVAL", script, "1", key, owner, px }) orelse return false;
+    return switch (rep2) {
+        .int => |v| v == 1,
+        else => false,
+    };
+}
+
+/// Keep the lease alive while the game runs. False if we no longer hold it — which means the
+/// lease lapsed and somebody else took the character, and the caller must stop treating it as
+/// theirs rather than carry on regardless.
+pub fn refreshCharLock(account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32) bool {
+    var kb: [96]u8 = undefined;
+    const key = charLockKey(&kb, account, charname);
+    if (key.len == 0) return false;
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const script =
+        \\if redis.call('GET', KEYS[1]) == ARGV[1] then
+        \\  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+        \\end
+        \\return 0
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, px }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
+        else => false,
+    };
+}
+
+/// Release, but only if we still hold it. Compare-and-delete in one step, so a lapsed lease
+/// cannot make us free the game that took the character after us.
+pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
+    var kb: [96]u8 = undefined;
+    const key = charLockKey(&kb, account, charname);
+    if (key.len == 0) return false;
+    const script =
+        \\if redis.call('GET', KEYS[1]) == ARGV[1] then
+        \\  return redis.call('DEL', KEYS[1])
+        \\end
+        \\return 0
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
+        else => false,
+    };
+}
+
+/// Who holds this character, or null if nobody. The point of storing the owner rather than a
+/// bare flag: a refused join can say which game has it instead of failing silently.
+pub fn charLockOwner(account: []const u8, charname: []const u8, out: []u8) ?[]const u8 {
+    var kb: [96]u8 = undefined;
+    const key = charLockKey(&kb, account, charname);
+    if (key.len == 0) return null;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", key }) orelse return null;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk null;
+            const n = @min(v.len, out.len);
+            @memcpy(out[0..n], v[0..n]);
+            break :blk out[0..n];
+        },
+        else => null,
+    };
+}
+
 /// Next realm-global game token, or null if redis could not answer.
 ///
 /// The token is what a client presents to the gateway, so it has to be unique across the whole
