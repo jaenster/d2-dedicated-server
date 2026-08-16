@@ -14,8 +14,13 @@ server sits near-zero**. Measured on a real Hetzner k3s node with no players onl
 | `realmd` (login + realm + d2dbs + gs-link) | ~1m | ~6 MiB | scratch, static musl |
 | `qqserver` (game-traffic ingress) | **~0m** | **~1 MiB** | scratch, static musl |
 | `d2gs` (wine, headless `Game.exe`) | ~15m | ~300 MiB | debian + wine32 |
+| `d2gs-native` (no wine, Mac i386 image) | ~0m | ~8-10 MiB | scratch, one static i386 ELF |
 
 Postgres/Redis are optional -- `fs` persistence drops them entirely.
+
+The two game servers are interchangeable to the realm and, on real amd64 hardware, indistinguishable
+on latency -- the native one just costs an order of magnitude less to keep resident. Measured side
+by side in [`native-vs-wine.md`](native-vs-wine.md).
 
 ## Under load
 
@@ -42,6 +47,9 @@ a fixed table of 8 pool managers (`Fog/Memory.cpp` raises `0xe0000001` on the 9t
 held permanently by the global pool system. A game holds its manager until it is destroyed, and
 an empty game is destroyed after an idle window (`--reap-ms`, default 5s), so a server also has
 a *throughput* ceiling of roughly `7 / window` new games per second.
+
+It is the same engine either way, so `d2gs-native` inherits the same seven -- but it ships capped
+at one game (`D2GS_MAX_GAMES`), so today its capacity comes from running more of them.
 
 That ceiling is per process, so **capacity scales by adding game servers, not by tuning one**.
 Measured with eight characters running games back to back -- half of them re-entering one

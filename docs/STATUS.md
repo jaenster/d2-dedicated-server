@@ -1,7 +1,7 @@
 # Status
 
-What a real 1.14d client does against this today, and what it still cannot do. Everything
-below is tested under wine on the unmodified retail `Game.exe`.
+What a real 1.14d client does against this today, and what it still cannot do. Unless a line
+says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
 
 ## Working
 
@@ -24,6 +24,10 @@ below is tested under wine on the unmodified retail `Game.exe`.
 - **A second login cannot take a live session's place.** The character is refused and the
   session already in the world keeps playing; a character whose client died re-enters
   immediately.
+- **A game server with no wine at all.** 1.14d's macOS i386 build, mapped and run directly on
+  i386 Linux, serving real clients through the same realm and gateway: one process in a 4.4 MB
+  image, and on real amd64 hardware as fast as the wine server. See
+  [`native-vs-wine.md`](native-vs-wine.md).
 
 ## Rough edges / next
 
@@ -44,6 +48,10 @@ below is tested under wine on the unmodified retail `Game.exe`.
   start at the first join, not at creation.
 - Least-loaded routing breaks ties toward the first registered server, so with equal load one
   server takes the work until its count rises.
+- **The native server hosts several games, but ships capped at one.** With `D2GS_MAX_GAMES`
+  raised, about half of a round's games are admitted and the rest are refused cleanly -- no
+  crashes, no evictions, and the games that run are correct. The shortfall is not yet
+  understood, so the default keeps every game landing.
 - Replace the fixed init delay with a proper engine-init hook.
 
 ## Related

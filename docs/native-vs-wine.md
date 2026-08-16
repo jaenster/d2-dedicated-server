@@ -51,32 +51,53 @@ Both variants: **20/20 rounds clean**, both passes.
 | file descriptors (idle / after) | 13 / 13 | 524 / 524 |
 | stress wall clock | 84.0 / 85.7 s | 73.4 / 74.0 s |
 | mean round | 4.15 / 4.20 s | 3.65 / 3.50 s |
-| games hosted concurrently | 1 | 7 |
+| games hosted concurrently (when this ran) | 1 | 7 |
 
 Native is ~2.1x cheaper on CPU under load, ~4.3x smaller resident, one process instead of ten,
 and 40x fewer descriptors. Neither leaks: RSS and fds return to their starting values.
 
-**Wine wins on latency.** It finishes the same 20 rounds 12-14% faster (3.5-3.65 s per round
-against 4.15-4.20 s), reproducibly across both passes. Wine also hosts seven concurrent games
-where the native build hosts exactly one — the Mac image's QSERVER has a single game pointer
-(`QSERVER_GenerateGameToken` clamps its counter to 1), so that is architectural, not a tuning
-knob. For a fleet, seven games on ~96 MiB beats one game on ~22 MiB per unit of capacity.
+The round times in that table are **not** usable, and an earlier version of this document drew a
+conclusion from them that later measurement refuted. Both corrections are below, kept rather than
+quietly deleted because each was believed on evidence that looked sufficient at the time.
 
-## Where the latency difference actually is
+The concurrency row is also historical: the native server hosted one game when this ran. It now
+hosts up to seven, the same ceiling as wine — see "Concurrency" below.
+
+## Correction 1: the round times were an artefact, twice over
 
 The round times above were taken with `date +%s`. A round is about four seconds, so every sample
-was quantised by a quarter of itself and the 12-14% gap was mostly rounding. `run-stress.sh` now
-times rounds in milliseconds.
+was quantised by a quarter of itself. `run-stress.sh` now times rounds in milliseconds.
 
-It does not subtract the dwell, though the first version of this did. The dwell is not a floor the
-round sits on: a client starts its dwell clock when it sends 0x6b, so the world arrives during it
-— at `--dwell 0` the client leaves before the world does and every round fails — and a longer
+That fixed the clock but not the host. Re-measured in milliseconds, wine still appeared 12-14%
+faster — but only under `qemu-i386` on the arm64 Mac. On **real amd64 hardware** (a Hetzner k3s
+node, three interleaved repeats per variant, 120/120 rounds clean) the ordering reverses:
+
+| metric | native | wine |
+|-|-|-|
+| median round | 3.77 s | 3.85 s |
+| RSS idle | 8-10 MiB | 115-118 MiB |
+| RSS under load | ~24 MiB | ~120 MiB |
+
+An ~2% median difference is inside run-to-run variance — one binary measured three times on the
+Mac gave 3.57 / 3.93 / 4.43 s — so the honest reading is that **the two are indistinguishable on
+latency**, and the earlier "wine wins" was emulation, not the servers. Interleaving the repeats
+matters: run all of one variant then all of the other and the machine's own drift is
+indistinguishable from the effect.
+
+The memory difference is not within noise, and it is the number that decides fleet density.
+
+`run-stress.sh` also does not subtract the dwell, though the first version of it did. The dwell is
+not a floor the round sits on: a client starts its dwell clock when it sends 0x6b, so the world
+arrives during it — at `--dwell 0` the client leaves before the world does and every round fails
+— and a longer
 dwell also gives the previous game more time to be reaped, which shortens the next create. On one
 server "round minus dwell" was 2.05 s at `--dwell 1` and 1.40 s at `--dwell 3`. A quantity that
 moves when you change what you subtract is not the server's time. Compare rounds, at one dwell.
 
 Re-measured that way, both variants in Docker on one arm64 Mac — so both i386 images run under the
-same `qemu-i386`, which is slower than either would be on real hardware but slower for both:
+same `qemu-i386`. "Slower for both" was the assumption that made this look fair; it is wrong, and
+the k8s table above is the one to cite. Emulation does not tax two workloads equally, and wine's
+lead here is the artefact:
 
 | metric | native | wine |
 |-|-|-|
@@ -91,28 +112,46 @@ The wine RSS here is not comparable to the 96 MiB measured on the NAS — this c
 Xvfb and a different base, and everything is under emulation. Only the two columns are comparable
 to each other, and only within this table.
 
+## Correction 2: the slot queue was real but was not the gap
+
 The native server logs how long each create waited for its one game slot. Over those 20 rounds:
-min 4 ms, median 704 ms, mean 742 ms, max 1785 ms, **total 14.85 s** — and the whole run was
-15.3 s slower than wine's. The gap is not general slowness; it is one queue.
+min 4 ms, median 704 ms, mean 742 ms, max 1785 ms, **total 14.85 s** — against a run that was
+15.3 s slower than wine's. Two totals that close together are extremely persuasive, and the
+conclusion drawn here was that the gap *was* the queue.
 
-It is a queue because this build hosts one game (see `max_games` in
-`apps/d2gs-native/gslink.zig`). Round N+1's create arrives while round N's game still has clients,
-so it blocks until the engine has counted them gone and destroyed the game. Wine has seven slots
-and never queues. Two intervals make up the wait, and only the second is ours: the engine takes
-~350 ms per departing client to notice the socket is gone, and 79 ms after that to free the slot
-(measured, `engine freed the slot ...ms after the game emptied`).
+It was not. Raising the cap so the queue drains (median 742 ms -> 58 ms) **did not shorten the
+rounds**. The wait was real, it was measured correctly, and removing it bought nothing — the
+create simply waited elsewhere. Matching totals are a coincidence to be tested, not a mechanism.
 
-The per-client notice is engine work, so `qemu-i386` inflates it — which means this local run
-overstates the native side's disadvantage and the number to fix against is the NAS one. Nothing
-here says the queue is not real; it says its size is not yet known on real hardware.
+The queue itself is genuine and worth knowing: round N+1's create arrives while round N's game
+still has clients, so with one slot it blocks until the engine has counted them gone and destroyed
+the game. Two intervals make it up, and only the second is ours — the engine takes ~350 ms per
+departing client to notice the socket is gone, then 79 ms to free the slot (measured,
+`engine freed the slot ...ms after the game emptied`).
 
-The queue belongs to the process, not to the design. With a second native container registered and
-`--spread --clients 2`, the realm placed ten games on each: the first server still queued (median
-714 ms) and the second barely did (median 14 ms, mean 21 ms), because its create arrived a moment
-later in the round, by which time its own previous game was already gone. So the way to spend
-21 MiB on more capacity is another process, and each one carries its own slot. Throughput could
-not be compared here — two emulated servers on one Mac contend for the same cores, and the run was
-slower than either alone.
+The queue also belongs to the process, not to the design. With a second native container registered
+and `--spread --clients 2`, the realm placed ten games on each: the first server still queued
+(median 714 ms) and the second barely did (median 14 ms, mean 21 ms), because its create arrived a
+moment later in the round, by which time its own previous game was already gone. Throughput could
+not be compared there — two emulated servers on one Mac contend for the same cores.
+
+## Concurrency
+
+The native server hosts **up to seven games**, the same ceiling as wine, and the claim that one
+game was architectural — that `QSERVER_GenerateGameToken` clamps its counter to 1 — was wrong.
+
+The engine's own scheduler really does service a single game: `QSERVER_TickAllGames` reads only
+`gpGameTable[1]`, and its argument is a 40 ms catch-up flag rather than a game token. But
+`ServerGameLoop` is *passed* the game it advances, so it needs nothing from that table, and a host
+that keeps its own list can run the same body per game. That is what `tickGames()` does. The
+second 40 ms budget, in `QSERVER_DispatchAndCleanup`, is honoured only when both arguments are
+zero — so each game gets a forced dispatch, or the first game spends the budget and the rest never
+flush.
+
+It ships **capped at one** (`max_games` is 7, `game_cap` defaults to 1); `D2GS_MAX_GAMES` raises
+it. The cap is deliberate: with it raised, roughly half of a round's games are admitted and the
+rest are cleanly refused. No crashes, no evictions, and the games that do run are correct — but
+the admission shortfall is not yet understood, so the default stays where every game lands.
 
 ## The two builds do not bind the same port
 

@@ -57,3 +57,13 @@ Off by default unless noted. See [`docs/MODDING.md`](MODDING.md).
 
 `realmd` is configured by environment only (`REALMD_*`) -- see
 [`REALMD.md`](../REALMD.md#configuration-env-only).
+
+## d2gs-native configuration
+
+The wine-free game server takes no flags but `--dry-run`; everything else is `D2GS_*`
+environment, listed in [`apps/d2gs-native/README.md`](../apps/d2gs-native/README.md).
+
+Two differences worth knowing if you run both kinds of server. `D2GS_MAX_GAMES` here is the
+**actual** cap on concurrent games (1..7, default 1), where above it is the capacity this GS
+advertises to realmd. And `D2GS_GS_ADDR` here only changes what clients are told -- the native
+server always binds `:4000`, so map the port rather than expecting the listener to move.

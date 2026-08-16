@@ -19,17 +19,18 @@ with no client mods.
 
 If you run this, you can [sponsor the work](https://github.com/sponsors/jaenster).
 
-## The three services
+## The services
 
-Three independently-deployable pieces. Two are **pure-Zig native binaries** (no Windows, no game
-files -- they scale freely); the third is the injected Zig DLL that drives the real game engine
-under wine.
+Independently-deployable pieces. Two are **pure-Zig native binaries** (no Windows, no game files --
+they scale freely); the other two are game servers, one driving the Windows engine under wine and
+one running the Mac build of the same game directly on Linux with no wine at all.
 
 | service | what it is |
 |-|-|
 | **[`realmd`](#realmd-the-realm)** | The realm. One process doing every job PvPGN split across daemons: login/chat, character select, game create/join. To the client it *is* Battle.net, all on port 6112. |
 | **[`d2gs`](#d2gs-the-headless-game-server)** | The headless game server. An injected DLL that boots the real `Game.exe` with no display, drives its server tick, and hosts the games. |
 | **[`qqserver`](#qqserver-the-game-traffic-ingress)** | The ingress for game traffic. One public address in front of the whole game-server fleet, routed per connection on the game's own protocol. |
+| **[`d2gs-native`](#d2gs-native-the-wine-free-game-server)** | The same game server without wine: 1.14d's macOS i386 binary mapped and run directly on Linux. One process in a 4.4 MB `scratch` image instead of a wine process tree. |
 
 Underpinning all three, `packages/realm-proto/` (the `realm_proto` module) is the realmd<->d2gs wire
 protocol that both ends import, so they agree on the wire by construction.
@@ -197,6 +198,25 @@ all state in a single value on `main()`'s stack, and idle it sits in `poll(-1)` 
 
 More: [`apps/qqserver/README.md`](apps/qqserver/README.md).
 
+### d2gs-native: the wine-free game server
+
+`apps/d2gs-native/` builds a game server that needs no wine. Retail 1.14d shipped a macOS build,
+and that build is an i386 Mach-O — the same architecture Linux runs. So it is loaded directly:
+segments mapped as they ship, dyld rebase/bind opcodes applied, the image's own constructors run,
+imports bound to host functions or to thunks that name themselves when the game calls them. No
+emulation and no format conversion.
+
+The result is one process in a **4.4 MB `scratch` image** (1.7 MB to pull) against wine's 1.04 GB
+and ten processes, at
+8-10 MiB resident against ~115 MiB, with latency indistinguishable from wine's on real hardware.
+It speaks the same gs-link protocol to realmd, so a fleet can mix both kinds of server.
+
+It hosts one game by default and up to seven with `D2GS_MAX_GAMES`; the same seven-game engine
+ceiling applies. Measurements, and two corrections to earlier conclusions in it, are in
+[`docs/native-vs-wine.md`](docs/native-vs-wine.md).
+
+More: [`apps/d2gs-native/README.md`](apps/d2gs-native/README.md).
+
 ## Observability
 
 Structured **JSON to stdout** from every service, with a per-connection and per-packet trace
@@ -240,7 +260,7 @@ the authed ingress, never public. Full detail: [`webui/README.md`](webui/README.
 ## Layout
 
 ```
-apps/       one directory per deployed thing: d2gs (the injected DLL pair), realmd, qqserver
+apps/       one directory per deployed thing: d2gs (the injected DLL pair), d2gs-native, realmd, qqserver
 packages/   what more than one app needs: realm-proto, realm-infra, realm-store, bncs-auth, obs
 tools/      run by hand, never deployed: the e2e harness, the probes, ver-ix86, ghidra2cpp
 deploy/     Dockerfile, compose.yaml, k8s manifests, Helm chart, Grafana
@@ -261,6 +281,7 @@ deliberately never handed to the DLL build. Each app and package has its own REA
 | [`docs/MODDING.md`](docs/MODDING.md) | how injection works; writing a feature |
 | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) | logs, the dashboard, where `evt` comes from |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | measured footprint, the 7-games-per-server ceiling |
+| [`docs/native-vs-wine.md`](docs/native-vs-wine.md) | native vs wine game server, measured side by side |
 | [`docs/STATUS.md`](docs/STATUS.md) | what works, what doesn't yet |
 | [`REALMD.md`](REALMD.md) · [`REALM.md`](REALM.md) | the realm server; the engine-side realm bridge |
 | [`ARENA.md`](ARENA.md) · [`VERIFY.md`](VERIFY.md) · [`LEGAL.md`](LEGAL.md) | arena design; RE verification log; legal |
