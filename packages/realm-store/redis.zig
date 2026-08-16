@@ -1141,6 +1141,55 @@ pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) 
     };
 }
 
+/// Populate the cache from the store of record, but ONLY if nothing is cached yet.
+///
+/// The unconditional write this replaces could destroy a save. A miss reads the durable copy, and
+/// if a newer save lands in redis before that copy is written back, an unconditional SET would put
+/// the OLDER bytes over the newer ones — losing whatever the player did in between. Two instances
+/// missing at once makes the window ordinary rather than exotic.
+///
+/// SET NX also removes the need to lock the load: instances that miss together all read, one wins
+/// the write, and the losers simply discard what they read. Nothing to hold, nothing to expire,
+/// and no way for a loader to lose the character it was trying to warm.
+pub fn cacheCharIfAbsent(account: []const u8, charname: []const u8, bytes: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    var kb: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return false;
+    var sb: [192]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&sb, prefix ++ "chars:{s}", .{a}) catch return false;
+
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return false;
+    var cmd = CmdBuf{ .fd = fd };
+    cmd.add(&.{ "SET", key, bytes, "NX" });
+    // The account's char-set membership is what listChars reads, so it is not optional — and
+    // SADD is idempotent, so re-adding an existing member costs nothing.
+    cmd.add(&.{ "SADD", setkey, c });
+    cmd.flush();
+    if (!cmd.ok) {
+        dropConn(s);
+        return false;
+    }
+    var r: Reader = .{ .fd = fd };
+    const rep = readReply(&r) orelse {
+        dropConn(s);
+        return false;
+    };
+    // A nil reply means somebody else got there first, which is a success for our purposes:
+    // the cache holds a copy at least as new as ours.
+    const stored = switch (rep) {
+        .status, .int => true,
+        .bulk => |b| b != null,
+        else => false,
+    };
+    if (readReply(&r) == null) dropConn(s); // drain SADD or the connection desyncs
+    return stored;
+}
+
 /// Remember that this game holds this character, so its locks can be released when it ends.
 ///
 /// The game server reports a departure by character name only — it does not carry the account —

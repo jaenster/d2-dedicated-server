@@ -82,7 +82,13 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
     // `n == out.len` means the read exactly filled the caller's buffer, which cannot be told apart
     // from a save too big for it. Caching that would store a TRUNCATED character and then serve it
     // in preference to the intact one on disk — a silent corruption that survives every later read.
-    if (n != 0 and n != out.len and cachingChars()) _ = redis.saveCharD2s(account, charname, out[0..n]);
+    //
+    // Written only if the cache is still empty. An unconditional write here could put these
+    // durable bytes OVER a newer save that landed while we were reading — losing whatever the
+    // player did in between — and with several instances a shared miss makes that ordinary. The
+    // conditional write is also why loading needs no lock: everyone who missed may read, one
+    // wins, the rest discard.
+    if (n != 0 and n != out.len and cachingChars()) _ = redis.cacheCharIfAbsent(account, charname, out[0..n]);
     return n;
 }
 
