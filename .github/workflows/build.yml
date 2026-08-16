@@ -37,6 +37,9 @@ on:
       - deploy/gs-entrypoint.sh
       - build.zig
       - build.zig.zon
+      # The test suites themselves: a change to what verifies the images has to run before it is
+      # trusted, and tools/ is where both of them live.
+      - tools/**
       - .github/workflows/build.yml
   pull_request:
     branches: [main]
@@ -98,6 +101,32 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,scope=${{ matrix.target }},mode=max
 
+  # Unit tests + the clientless scenario suite. Runs on the runner rather than in an image: the
+  # harness starts its own redis and postgres containers, which is far simpler from the host than
+  # from inside one. Zig is fetched at the version deploy/Dockerfile pins, so this and the images
+  # cannot drift onto different compilers.
+  test:
+    runs-on: ubuntu-latest
+    env:
+      ZIG_VERSION: "0.16.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: install zig
+        run: |
+          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            | tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - name: unit tests
+        run: zig build test
+      - name: e2e scenarios
+        # E2E_NO_REUSE: refuse to test a realm this job did not start. There is none on a fresh
+        # runner, but a silent fallback to someone else's server is the kind of pass that means
+        # nothing, and it costs one variable to make impossible.
+        run: E2E_NO_REUSE=1 zig build e2e
+      - name: stop the harness containers
+        if: always()
+        run: docker rm -f e2e-redis e2e-postgres 2>/dev/null || true
+
   # Real-GS stress e2e (tools/stress-e2e — a round loop in Zig against a real
   # GS instead of a bash + subprocess fleet — see that tool's doc comment). The test client runs
   # AS A CONTAINER on the same compose network as realmd/gs-native (deploy/compose.e2e.yaml),
@@ -153,7 +182,7 @@ jobs:
   # Moves `:latest` to the sha `build` just pushed — a manifest copy, no rebuild. Only after e2e
   # passes, and only on a real push to main (never a PR: there's nothing to promote yet).
   promote-latest:
-    needs: [build, e2e]
+    needs: [build, test, e2e]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     strategy:
