@@ -31,13 +31,18 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
 
 ## Rough edges / next
 
-- **The realm-side character lock is not implemented.** The engine's callback table has
-  `fpUnlockDatabaseCharacter` and `fpRelockDatabaseCharacter`; Blizzard's realm held a
-  character while it was in a game and refused the second join upstream. Ours issues the
-  join, and the game server then refuses it -- correctly, but through a path that answers
-  nothing, so a double login sits at the loading screen until the client gives up instead of
-  being told. Refusing from realmd's own roster is the wrong fix: that roster is fed by the
-  game server, and one stale entry would lock a player out of their own character.
+- **The realm-side character lock is half done.** A character is now claimed in the shared
+  store by the game it enters and released when the player leaves or the game ends, so it
+  cannot be in **two games** at once -- enforced across instances, and refused upfront with a
+  message instead of the silent loading-screen wait.
+  What it does *not* yet stop is **two clients on one character in one game**: the claim is
+  owned by the game, and re-taking a character the same game already holds is allowed on
+  purpose, because that is what lets a client re-enter its own game after its previous session
+  died. Scoping the owner to the session would close the double login and reopen that, so the
+  two need separating before this is finished. The engine still refuses the second seat, so the
+  outcome is correct -- it is the *message* that is still missing in that one case.
+  There is also no client result code for "that character is already in a game"; the refusal
+  currently borrows "Game is Full.", which is visible but untrue.
 - Password-protected games are untested end to end.
 - Verbose join diagnostics compiled in by default; `pkttrace` gated.
 - Two headed clients in one wineprefix can trip the bnet gateway-list parser on the second
@@ -48,6 +53,12 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   start at the first join, not at creation.
 - Least-loaded routing breaks ties toward the first registered server, so with equal load one
   server takes the work until its count rises.
+- **Redis is becoming the realm's centre, and the migration is partway.** Characters live
+  there with Postgres behind them (a flush worker any instance runs moves them across), game
+  tokens are minted there, the fleet publishes itself there, and game names are claimed there.
+  Create and join dispatch still travel each game server's control socket, which is the one
+  thing that still stops realmd running as more than a single replica. See
+  [`docs/redis.md`](redis.md).
 - **The native server hosts several games, but ships capped at one.** With `D2GS_MAX_GAMES`
   raised, about half of a round's games are admitted and the rest are refused cleanly -- no
   crashes, no evictions, and the games that run are correct. The shortfall is not yet

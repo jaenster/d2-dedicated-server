@@ -283,6 +283,7 @@ deliberately never handed to the DLL build. Each app and package has its own REA
 | [`docs/MODDING.md`](docs/MODDING.md) | how injection works; writing a feature |
 | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) | logs, the dashboard, where `evt` comes from |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | measured footprint, the 7-games-per-server ceiling |
+| [`docs/redis.md`](docs/redis.md) | the realm's shared state: key schema, locks, save durability |
 | [`docs/native-vs-wine.md`](docs/native-vs-wine.md) | native vs wine game server, measured side by side |
 | [`docs/STATUS.md`](docs/STATUS.md) | what works, what doesn't yet |
 | [`REALMD.md`](REALMD.md) · [`REALM.md`](REALM.md) | the realm server; the engine-side realm bridge |
