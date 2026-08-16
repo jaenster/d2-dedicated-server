@@ -1141,6 +1141,82 @@ pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) 
     };
 }
 
+/// Remember that this game holds this character, so its locks can be released when it ends.
+///
+/// The game server reports a departure by character name only — it does not carry the account —
+/// so the realm has to keep the pairing itself. The set is keyed by game, which is also what
+/// makes closing a game able to free everything it held in one step.
+pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    var mb: [96]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    return switch (command(s, &r, &.{ "SADD", key, member }) orelse return false) {
+        .int, .status, .bulk => true,
+        else => false,
+    };
+}
+
+/// Free every character this game holds, and forget the pairing. Returns how many were freed.
+///
+/// Each release is still owner-checked: a character whose lease lapsed and was taken by another
+/// game must not be freed by this one closing. Done in a single script so a character cannot be
+/// claimed between the check and the delete.
+pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
+    const script =
+        \\local n = 0
+        \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+        \\  local lk = ARGV[2] .. m
+        \\  if redis.call('GET', lk) == ARGV[1] then
+        \\    redis.call('DEL', lk)
+        \\    n = n + 1
+        \\  end
+        \\end
+        \\redis.call('DEL', KEYS[1])
+        \\return n
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, prefix ++ "charlock:" }) orelse return 0;
+    return switch (rep) {
+        .int => |v| @intCast(@max(v, 0)),
+        else => 0,
+    };
+}
+
+/// Free one character this game holds, matched by name because that is all a departure carries.
+pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u8) bool {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    var sb: [64]u8 = undefined;
+    const suffix = std.fmt.bufPrint(&sb, "/{s}", .{charname}) catch return false;
+    const script =
+        \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+        \\  if string.sub(m, -string.len(ARGV[3])) == ARGV[3] then
+        \\    local lk = ARGV[2] .. m
+        \\    if redis.call('GET', lk) == ARGV[1] then redis.call('DEL', lk) end
+        \\    redis.call('SREM', KEYS[1], m)
+        \\    return 1
+        \\  end
+        \\end
+        \\return 0
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, prefix ++ "charlock:", suffix }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
+        else => false,
+    };
+}
+
 /// Who holds this character, or null if nobody. The point of storing the owner rather than a
 /// bare flag: a refused join can say which game has it instead of failing silently.
 pub fn charLockOwner(account: []const u8, charname: []const u8, out: []u8) ?[]const u8 {

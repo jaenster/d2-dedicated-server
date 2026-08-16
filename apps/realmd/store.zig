@@ -454,6 +454,37 @@ pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) 
     };
 }
 
+/// The owner id a game uses for the characters it holds. Stable across instances, because any
+/// realmd may be the one that closes the game.
+pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "game:{d}", .{gameid}) catch buf[0..0];
+}
+
+pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
+    return switch (ephemeral) {
+        .redis => redis.addGameChar(gameid, account, charname),
+        .fs, .pg => true,
+    };
+}
+
+pub fn releaseGameChars(gameid: u32) usize {
+    var ob: [32]u8 = undefined;
+    const owner = gameOwnerId(&ob, gameid);
+    return switch (ephemeral) {
+        .redis => redis.releaseGameChars(gameid, owner),
+        .fs, .pg => 0,
+    };
+}
+
+pub fn releaseGameCharByName(gameid: u32, charname: []const u8) bool {
+    var ob: [32]u8 = undefined;
+    const owner = gameOwnerId(&ob, gameid);
+    return switch (ephemeral) {
+        .redis => redis.releaseGameCharByName(gameid, charname, owner),
+        .fs, .pg => true,
+    };
+}
+
 /// Which game holds this character, or null if it is free.
 pub fn charLockOwner(account: []const u8, charname: []const u8, out: []u8) ?[]const u8 {
     return switch (ephemeral) {

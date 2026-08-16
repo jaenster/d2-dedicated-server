@@ -352,6 +352,10 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
                 // The roster is what makes the join screen's detail panel able to name
                 // anyone; the count alone only fills the PLAYERS column.
                 state.global.setGameMember(gameid, flag != TYPE_LEAVE_FLAG, char, @intCast(@min(level, 255)), @intCast(@min(class, 255)));
+                // Freed as the player leaves rather than when the game ends, so a character is
+                // available for its next game immediately. Matched by name because a departure
+                // carries no account, which is why the realm keeps the pairing itself.
+                if (flag == TYPE_LEAVE_FLAG and char.len > 0) _ = store.releaseGameCharByName(gameid, char);
                 log.line(tag, "GS UPDATEGAMEINFO gameid={d} players={d} flag={d} char='{s}' lvl={d} class={d}{s}", .{
                     gameid, players, flag, char, level, class, if (known) "" else " (no such game)",
                 });
@@ -359,6 +363,10 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
         },
         TYPE_CLOSEGAME => {
             const gameid = if (body.len >= 8) std.mem.readInt(u32, body[4..8], .little) else 0;
+            // Whatever the game still holds is free now. A backstop for players the engine never
+            // reported leaving — a client that vanished, or a server lost mid-game — since
+            // otherwise those characters would stay claimed until their lease ran out.
+            if (gameid != 0) _ = store.releaseGameChars(gameid);
             // Capacity first, store second. The slot is free the instant the GS says so, and it
             // is what the very next create is routed on; dropping the game record is a round trip
             // to the ephemeral store, and doing it first put a store's worth of latency between

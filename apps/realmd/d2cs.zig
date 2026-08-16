@@ -635,6 +635,13 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (rr.gsid != 0) _ = gslink.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName(), gtag1);
     // Mint a realm-global token and record {token -> GS addr + real gameid} so the
     // d2ingress can translate the client's token to the engine's gameid and splice.
+    // The creator is the game's first player, so it takes the character with it. A create cannot
+    // collide here — the game did not exist a moment ago — but recording it is what lets the
+    // close free everything the game held.
+    var cob: [32]u8 = undefined;
+    const cowner = store.gameOwnerId(&cob, rr.gameid);
+    _ = store.lockChar(c.accountName(), c.charName(), cowner);
+    _ = store.addGameChar(rr.gameid, c.accountName(), c.charName());
     const token = mintToken();
     _ = store.recordTokenRoute(token, rr.ip, rr.port, rr.gameid, route_ttl_s);
     log.line(tag, "create game '{s}' (account={s}) -> gameid={d} token=0x{x} gs=0x{x}@{d}.{d}.{d}.{d}:{d}", .{ name, c.accountName(), rr.gameid, token, rr.gsid, rr.ip[0], rr.ip[1], rr.ip[2], rr.ip[3], rr.port });
@@ -699,6 +706,29 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "join game '{s}' (account={s}) -> FULL ({d} players)", .{ name, c.accountName(), g.players });
         return rejectJoin(c, &w, JOIN_FULL);
     }
+    // A character is in one game at a time. Checked HERE, upfront, because the game server's
+    // own refusal answers nothing: the realm issues the join, the engine declines it silently,
+    // and the player sits at a loading screen until the client times out.
+    //
+    // Taking the lock IS the check — SET NX cannot report free and then be taken by someone
+    // else, whereas a separate look-then-take could. Re-taking a character this same game
+    // already holds succeeds, so a client re-entering its own game is not shut out by its own
+    // previous session.
+    var job: [32]u8 = undefined;
+    const jowner = store.gameOwnerId(&job, g.gameid);
+    if (!store.lockChar(c.accountName(), c.charName(), jowner)) {
+        var whob: [64]u8 = undefined;
+        const holder = store.charLockOwner(c.accountName(), c.charName(), &whob) orelse "another game";
+        // There is NO result code for "that character is already in a game" — the client's
+        // switch (OOG_PollJoinCreatePump @0x441770) does not have one. An unlisted code is worse
+        // than a wrong one: it falls to `default:` and the player gets no popup at all, which is
+        // the silent freeze this check exists to remove. "Game is Full." is the least-bad listed
+        // code — it is untrue about this game, but it does refuse visibly and tells the player to
+        // try another. Replace it the moment a truer code is found.
+        log.line(tag, "join game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
+        return rejectJoin(c, &w, JOIN_FULL);
+    }
+    _ = store.addGameChar(g.gameid, c.accountName(), c.charName());
     // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
     // both directions) as soon as the player is actually in the game.
     _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc());
