@@ -16,7 +16,7 @@ const proto = @import("proto.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
 const d2s = @import("d2s.zig");
-const gslink = @import("gslink.zig");
+const fleet = @import("fleet.zig");
 const guilds = @import("guilds.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d2s create time
@@ -590,7 +590,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "create game '{s}' -> invalid name", .{name});
         return fail(c, &w, CREATE_INVALID_NAME);
     }
-    if (!gslink.ready()) {
+    if (!fleet.ready()) {
         // "Server Down" is the honest one and, more to the point, the only one in the
         // client's switch that fits. The 0x06 that used to go out here isn't a case at
         // all, so the client fell to `default:` and left the player on a dead screen.
@@ -627,7 +627,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "create game '{s}' (account={s}) -> name already claimed", .{ name, c.accountName() });
         return fail(c, &w, CREATE_NAME_TAKEN);
     }
-    const routed = gslink.createGameRouted(name, pass, desc, ladder, expansion, difficulty, hardcore);
+    const routed = fleet.createGameRouted(name, pass, desc, ladder, expansion, difficulty, hardcore);
     // A create that did not produce a game must not keep the name.
     if (routed == null) store.releaseGameName(name);
     if (routed == null) {
@@ -636,7 +636,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // game knows the name is spoken for. When it says so, say so — the player gets
         // "that name already exists" and the offer to join, instead of being told the
         // realm is down while it plainly is not.
-        if (gslink.last_create_failure == .name_taken) {
+        if (fleet.last_create_failure == .name_taken) {
             log.line(tag, "create game '{s}' -> name already exists (GS refused; lost the race)", .{name});
             return fail(c, &w, CREATE_NAME_TAKEN);
         }
@@ -646,7 +646,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // "no server took your game", and a fleet that is merely busy is not an error to report
         // as one. The distinction that matters to a player is none; the one that matters to
         // whoever runs the realm is in the line above.
-        if (gslink.last_create_failure == .all_full) {
+        if (fleet.last_create_failure == .all_full) {
             log.line(tag, "create game '{s}' -> every GS is at its game limit (fleet is full)", .{name});
             return fail(c, &w, CREATE_SERVER_DOWN);
         }
@@ -677,7 +677,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // the character fetch (fpGetDatabaseCharacter) fails for the game's own creator.
     var gtagbuf1: [8]u8 = undefined;
     const gtag1 = guilds.tagOf(c.accountName(), &gtagbuf1); // cut Guild Halls: tell the GS the creator's guild
-    if (rr.gsid != 0) _ = gslink.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName(), gtag1);
+    if (rr.gsid != 0) _ = fleet.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName(), gtag1);
     // Mint a realm-global token and record {token -> GS addr + real gameid} so the
     // d2ingress can translate the client's token to the engine's gameid and splice.
     // The character is NOT claimed here. The client sends JOINGAME for the game it just made, and
@@ -812,7 +812,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // game (by its fleet id) so it can prefetch the joining account's character.
     var gtagbuf2: [8]u8 = undefined;
     const gtag2 = guilds.tagOf(c.accountName(), &gtagbuf2); // cut Guild Halls: tell the GS the joiner's guild
-    if (g.gsid != 0) _ = gslink.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName(), gtag2);
+    if (g.gsid != 0) _ = fleet.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName(), gtag2);
     // Mint a realm-global token for this joining client and record {token -> the real
     // GS + engine gameid}. The d2ingress reads the token from the client's first packet
     // and translates it — NAT-proof, since the token is unique even when two clients

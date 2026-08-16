@@ -135,7 +135,7 @@ fn scMcpOn6112() Result {
     const char = "MuxSorc";
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 7); // 1 = Sorceress
-    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+    const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
     if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
 
     // MCP muxed onto the SAME port as BNCS — the point of the scenario, so it follows
@@ -167,7 +167,7 @@ fn scCharListStatstring() Result {
     const char = "StatSorc";
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 42); // 1 = Sorceress
-    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
 
     var c = rc.RealmClient{};
@@ -204,7 +204,7 @@ fn scCharCopy() Result {
     const dst = "CopyCat";
     var d2sbuf: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2sbuf, src, 1, 20); // Sorceress, level 20
-    const sr = rc.d2dbsSave(acct, src, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const sr = rc.storePutChar(acct, src, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
 
     // Clone Original -> CopyCat within the same account via the admin API.
@@ -272,9 +272,9 @@ fn scLadder() Result {
     const name = "ladder_list";
     const acct = "LadderAcct";
     var d2s: [0x40]u8 = undefined;
-    const king = rc.d2dbsSave(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const king = rc.storePutChar(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (king != 0) return fail(name, "save LadderKing result={d}", .{king});
-    const pawn = rc.d2dbsSave(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const pawn = rc.storePutChar(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (pawn != 0) return fail(name, "save LadderPawn result={d}", .{pawn});
 
     var c = rc.RealmClient{};
@@ -313,9 +313,9 @@ fn scLadderExperience() Result {
     const name = "ladder_experience";
     const acct = "ExpAcct";
     var buf: [0x80]u8 = undefined;
-    const ahead = rc.d2dbsSave(acct, "ExpAhead", d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const ahead = rc.storePutChar(acct, "ExpAhead", d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (ahead != 0) return fail(name, "save ExpAhead result={d}", .{ahead});
-    const behind = rc.d2dbsSave(acct, "ExpBehind", d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const behind = rc.storePutChar(acct, "ExpBehind", d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (behind != 0) return fail(name, "save ExpBehind result={d}", .{behind});
 
     var c = rc.RealmClient{};
@@ -440,7 +440,7 @@ fn scCharDelete() Result {
     const char = "DeleteMe";
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 10);
-    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
 
     var c = rc.RealmClient{};
@@ -478,7 +478,7 @@ fn scCreateJoinGame() Result {
     var gs = FakeGS{ .gsid = 0xABCD, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 42 };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -516,7 +516,7 @@ fn scGamePopulation() Result {
     var gs = FakeGS{ .gsid = 0xF00D, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 4242 };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -599,7 +599,7 @@ fn scGameInfo() Result {
     var gs = FakeGS{ .gsid = 0x1F0, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 909 };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -658,7 +658,7 @@ fn scJoinErrors() Result {
     var gs = FakeGS{ .gsid = 0xE770, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 777 };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -750,35 +750,6 @@ fn scFleetCapacity() Result {
 /// Nightmare and Hell are earned. The thresholds are the client's own: CharSel @0x4349b0
 /// offers a difficulty at all only above progression 3 (classic) / 4 (expansion), and
 /// UIMENU_SelectDifficultySinglePlayerOrTcpip @0x439780 reveals Hell above 7 / 9.
-/// The d2dbs GET_DATA reply carries a create time and a ladder flag next to the save. Both
-/// were hardcoded to zero, which told the GS every character was brand new and non-ladder.
-fn scCharFetchMeta() Result {
-    const name = "char_fetch_meta";
-    const acct = "MetaAcct";
-    var buf: [0x80]u8 = undefined;
-
-    // A ladder character (status bit 0x40) with a known create time in the header.
-    const blob = d2sWithProgression(&buf, "MetaLadder", 1, 50, 5);
-    buf[0x24] = 0x20 | 0x40; // expansion + ladder
-    std.mem.writeInt(u32, buf[0x2c..][0..4], 0x5A5A1234, .little);
-    const sr = rc.d2dbsSave(acct, "MetaLadder", blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "save result={d}", .{sr});
-
-    const got = rc.d2dbsGet(acct, "MetaLadder") catch |e| return fail(name, "get {s}", .{@errorName(e)});
-    if (got.result != 0) return fail(name, "get result={d}", .{got.result});
-    if (got.createtime != 0x5A5A1234) return fail(name, "createtime 0x{x}, want the header's 0x5a5a1234", .{got.createtime});
-    if (got.allowladder != 1) return fail(name, "a ladder character reported allowladder={d}, want 1", .{got.allowladder});
-
-    // And a non-ladder one must not claim to be.
-    const plain = d2sWithProgression(&buf, "MetaPlain", 1, 50, 5);
-    buf[0x24] = 0x20; // expansion, no ladder
-    _ = rc.d2dbsSave(acct, "MetaPlain", plain) catch |e| return fail(name, "save {s}", .{@errorName(e)});
-    const got2 = rc.d2dbsGet(acct, "MetaPlain") catch |e| return fail(name, "get {s}", .{@errorName(e)});
-    if (got2.allowladder != 0) return fail(name, "a non-ladder character reported allowladder={d}, want 0", .{got2.allowladder});
-
-    return .{ .name = name, .status = .pass, .msg = msg("create time and ladder flag come from the save header, not zeros", .{}) };
-}
-
 fn scDifficultyGate() Result {
     const name = "difficulty_gate";
     const acct = "DiffAcct";
@@ -798,13 +769,13 @@ fn scDifficultyGate() Result {
     };
     for (chars) |ch| {
         const blob = d2sWithProgression(&buf, ch.name, 1, 80, ch.prog);
-        const r = rc.d2dbsSave(acct, ch.name, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+        const r = rc.storePutChar(acct, ch.name, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
         if (r != 0) return fail(name, "save {s} result={d}", .{ ch.name, r });
     }
 
     // The games themselves are made by a character that has cleared everything.
     const maker = d2sWithProgression(&buf, "DiffMaker", 1, 99, 15);
-    _ = rc.d2dbsSave(acct, "DiffMaker", maker) catch |e| return fail(name, "save maker {s}", .{@errorName(e)});
+    _ = rc.storePutChar(acct, "DiffMaker", maker) catch |e| return fail(name, "save maker {s}", .{@errorName(e)});
 
     var owner = rc.RealmClient{};
     defer owner.close();
@@ -1590,15 +1561,16 @@ fn maybeStartRealmd() !?c_int {
     var pbuf: [6][8]u8 = undefined;
     const ports = [_]struct { name: [*:0]const u8, port: u16 }{
         .{ .name = "REALMD_BNET_PORT", .port = rc.HOST_BNET },
-        .{ .name = "REALMD_D2CS_PORT", .port = rc.HOST_D2CS },
-        .{ .name = "REALMD_D2DBS_PORT", .port = rc.HOST_D2DBS },
-        .{ .name = "REALMD_GS_PORT", .port = rc.HOST_GS },
     };
     for (ports, 0..) |pp, i| {
         if (std.fmt.bufPrintZ(&pbuf[i], "{d}", .{pp.port})) |v| {
             _ = setenv(pp.name, v.ptr, 1);
         } else |_| {}
     }
+    // Mandatory: the address clients are told to dial for game traffic. realmd refuses to start
+    // without it, because a client sent straight at a game server presents a realm-global token
+    // that server has never heard of.
+    _ = setenv("REALMD_GAME_ADDR", "127.0.0.1", 1);
     _ = setenv("REALMD_ADMIN_TOKEN", ADMIN_TOKEN, 1); // enable the admin API (admin_api scenario)
     _ = setenv("REALMD_PERMISSIVE_AUTH", "1", 1); // legacy auth (auto-register + verify) for the synthetic xsha1 client
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
@@ -1690,11 +1662,9 @@ fn scBannerAd() Result {
         .{ .name = "REALMD_AD_FILE", .value = "banner.pcx" },
         .{ .name = "REALMD_AD_URL", .value = "https://example.invalid/promo" },
         .{ .name = "REALMD_BNET_PORT", .value = "20112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "20113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "20114" },
-        .{ .name = "REALMD_GS_PORT", .value = "20115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "20118" },
         .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const pid = spawnRealmd(bin, &envs, 20112) catch |e| return fail(name, "spawn {s}", .{@errorName(e)});
     defer {
@@ -1759,13 +1729,11 @@ fn scFriendsPersist() Result {
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_PERMISSIVE_AUTH", .value = "1" },
         .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const envs_w = base ++ [_]EnvVar{
         .{ .name = "REALMD_INSTANCE", .value = "FW" },
         .{ .name = "REALMD_BNET_PORT", .value = "21112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "21113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "21114" },
-        .{ .name = "REALMD_GS_PORT", .value = "21115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "21118" },
     };
     const writer_pid = spawnRealmd(bin, &envs_w, 21112) catch |e| return fail(name, "spawn writer {s}", .{@errorName(e)});
@@ -1794,9 +1762,6 @@ fn scFriendsPersist() Result {
     const envs_r = base ++ [_]EnvVar{
         .{ .name = "REALMD_INSTANCE", .value = "FR" },
         .{ .name = "REALMD_BNET_PORT", .value = "22112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "22113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "22114" },
-        .{ .name = "REALMD_GS_PORT", .value = "22115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "22118" },
     };
     const cold_pid = spawnRealmd(bin, &envs_r, 22112) catch |e| return fail(name, "spawn cold {s}", .{@errorName(e)});
@@ -1875,10 +1840,9 @@ fn scMultiInstance() Result {
         .{ .name = "REALMD_INSTANCE", .value = "A" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_BNET_PORT", .value = "16112" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "16114" },
-        .{ .name = "REALMD_GS_PORT", .value = "16115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
         .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (avoid 14001 clash)
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const a_pid = spawnRealmd(bin, &envs_a, 16112) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
 
@@ -1887,11 +1851,9 @@ fn scMultiInstance() Result {
         .{ .name = "REALMD_INSTANCE", .value = "B" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_BNET_PORT", .value = "17112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "17113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "17114" },
-        .{ .name = "REALMD_GS_PORT", .value = "17115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "17118" },
         .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (avoid 14001 clash)
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const b_pid = spawnRealmd(bin, &envs_b, 17112) catch |e| {
         _ = kill(a_pid, 15);
@@ -1905,11 +1867,12 @@ fn scMultiInstance() Result {
         _ = waitpid(b_pid, null, 0);
     }
 
-    // A fake GS registers with instance A's gs-link so A can actually host a game.
-    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gameid = 77, .connect_port = 16115 };
+    // One fake GS, published into the shared store. It belongs to neither instance — that is the
+    // point: both see it, and either can place a game on it.
+    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gameid = 77 };
     gs.start(2000) catch |e| return fail(name, "FakeGS {s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register with instance A", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     // Mint a session on instance A (bnetd 16112 -> d2cs handoff lives in shared store).
     var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16112 };
@@ -2187,11 +2150,9 @@ fn scEmbeddedGameEdge() Result {
         .{ .name = "REALMD_INSTANCE", .value = "E" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_BNET_PORT", .value = "18112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "18113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "18114" },
-        .{ .name = "REALMD_GS_PORT", .value = "18115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "18118" },
         .{ .name = "REALMD_GAME_PORT", .value = "14001" }, // the embedded edge under test
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const pid = spawnRealmd(bin, &envs, 18112) catch |e| return fail(name, "spawn edge realmd {s}", .{@errorName(e)});
     defer {
@@ -2204,7 +2165,7 @@ fn scEmbeddedGameEdge() Result {
     echo.start() catch |e| return fail(name, "echo start {s}", .{@errorName(e)});
     defer echo.stop();
 
-    var gs = FakeGS{ .gsid = 0x8888, .ip = .{ 127, 0, 0, 1 }, .gs_port = echo.port, .connect_port = 18115, .maxgame = 10, .gameid = GS_GAMEID };
+    var gs = FakeGS{ .gsid = 0x8888, .ip = .{ 127, 0, 0, 1 }, .gs_port = echo.port, .maxgame = 10, .gameid = GS_GAMEID };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
     if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
@@ -2299,7 +2260,6 @@ pub fn main() !void {
         scFriendsListLoad(),
         scNameResolution(),
         scLeaveChannel(),
-        scCharFetchMeta(),
         scDifficultyGate(),
         scGetFileTime(),
         scBannerAd(),

@@ -11,7 +11,7 @@
 //! pod that can't reach its database or has no game server is not sent traffic.
 const std = @import("std");
 const net = @import("realm_infra").net;
-const gslink = @import("gslink.zig");
+const fleet = @import("fleet.zig");
 const store = @import("store.zig");
 const shutdown = @import("shutdown.zig");
 const admin = @import("admin.zig");
@@ -57,7 +57,7 @@ fn readyReason() ?[]const u8 {
     if (!started.load(.acquire)) return "starting";
     if (shutdown.draining.load(.acquire)) return "draining";
     if (!store.healthy()) return "store unreachable";
-    if (require_gs and !gslink.ready()) return "no game server";
+    if (require_gs and !fleet.ready()) return "no game server";
     return null; // ready
 }
 

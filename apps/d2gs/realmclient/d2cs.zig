@@ -1,12 +1,14 @@
-//! D2CS client — the GS side of the PvPGN D2CS<->D2GS link.
+//! The realm-facing side of the game server.
 //!
-//! Connects outbound to PvPGN's D2CS, completes the auth handshake, advertises
-//! capacity, then services game create/join requests by driving the engine
-//! (token table + GAME_CreateBattleNetGame). Runs on its own thread.
+//! There is no control connection. This server publishes itself into the shared store, takes
+//! create/join requests from its own queue there, and reports what happens on it as events any
+//! realmd can apply. The realm and the game server never speak directly, which is what lets either
+//! side be replaced, restarted, or run several times over without the other noticing.
 //!
-//! Status: WIP. Framing + handshake + dispatch loop are implemented; the auth
-//! constants (version/checksum) and the create/join engine wiring still need to
-//! be matched against the live realm.
+//! The wire format is unchanged: the same 8-byte `{ size:u16, type:u16, seqno:u32 }` control
+//! packets that used to travel a socket now travel redis. The `seqno` finally does the job its name
+//! implies — over one socket with one request in flight "the next reply is mine" was true by
+//! construction, and through a shared queue it is simply false.
 
 const std = @import("std");
 const p = @import("realm_proto").protocol;
@@ -17,66 +19,24 @@ const redis = @import("redis.zig");
 const poolstat = @import("../runtime/poolstat.zig");
 const log = @import("../log.zig");
 
-// ── winsock (Game.exe already loaded ws2_32 + WSAStartup; we reuse it) ────────
-const SOCKET = usize;
-const INVALID_SOCKET: SOCKET = ~@as(SOCKET, 0);
-const AF_INET: i32 = 2;
-const SOCK_STREAM: i32 = 1;
-
-const sockaddr_in = extern struct {
-    family: u16,
-    port: u16, // big-endian
-    addr: u32, // big-endian
-    zero: [8]u8 = .{0} ** 8,
-};
-
-extern "ws2_32" fn WSAStartup(version: u16, data: *[512]u8) callconv(.winapi) i32;
-extern "ws2_32" fn socket(af: i32, t: i32, proto: i32) callconv(.winapi) SOCKET;
-extern "ws2_32" fn connect(s: SOCKET, name: *const sockaddr_in, namelen: i32) callconv(.winapi) i32;
-extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
-extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
-extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
-extern "ws2_32" fn htons(v: u16) callconv(.winapi) u16;
-extern "ws2_32" fn inet_addr(cp: [*:0]const u8) callconv(.winapi) u32;
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
+extern "kernel32" fn CreateThread(a: ?*anyopaque, st: usize, f: *const fn (?*anyopaque) callconv(.winapi) u32, p_: ?*anyopaque, fl: u32, id: ?*u32) callconv(.winapi) ?*anyopaque;
 
-// getaddrinfo (Win32 ADDRINFOA, 32-bit layout) so the GS can dial D2CS by DNS name
-// (e.g. a k8s Service) instead of a dotted-quad only.
-const addrinfo = extern struct {
-    flags: i32,
-    family: i32,
-    socktype: i32,
-    protocol: i32,
-    addrlen: usize,
-    canonname: ?[*:0]u8,
-    addr: ?*sockaddr_in,
-    next: ?*addrinfo,
-};
-extern "ws2_32" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const addrinfo, res: **addrinfo) callconv(.winapi) i32;
-extern "ws2_32" fn freeaddrinfo(res: *addrinfo) callconv(.winapi) void;
-
-const INADDR_NONE: u32 = 0xffff_ffff;
-
-// pvpgn d2gs identity — TODO: confirm against the realm's pvpgn build / d2cs.conf.
-const D2GS_VERSION: u32 = 0x01;
-const D2GS_CHECKSUM: u32 = 0x00;
-
-/// Game capacity this GS advertises to D2CS (SETGSINFO maxgame). Set by start().
+/// Game capacity this GS advertises. Set by start().
 pub var max_games: u32 = 100;
-/// Public address clients dial for game traffic, self-reported via ADDRINFO. Behind
-/// a k8s Service the control-conn peer IP is SNAT'd, so the GS must announce its own.
+/// Public address clients dial for game traffic. Behind a k8s Service the peer IP a realm would
+/// observe is SNAT'd, so the server announces its own.
 pub var public_ip: [4]u8 = .{ 0, 0, 0, 0 };
 pub var public_port: u16 = 4000;
 /// Stable id keying this GS in a fleet (hash of the pod/host name). Set by start().
 pub var gsid: u32 = 0;
 
-var sock: SOCKET = INVALID_SOCKET;
-var seqno: u32 = 0;
+/// True once this server's record is in the shared store — readiness, as opposed to liveness.
+/// A server the realm cannot see is perfectly alive but cannot be given a game.
+pub var registered: bool = false;
 
-// A tiny atomic lock (std.Thread.Mutex isn't built for the GS DLL target). Contention is
-// near-zero, but one guarded section is a blocking send(): on socket back-pressure a pure
-// spinner burns a core, and one of the two threads taking it is the engine tick thread, which
-// owes every live game a frame every 40 ms. So spin only briefly, then yield.
+/// A tiny atomic lock (std.Thread.Mutex isn't built for the GS DLL target).
 const Lock = struct {
     held: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     fn lock(self: *Lock) void {
@@ -90,106 +50,48 @@ const Lock = struct {
     }
 };
 
-// Replies are sent from the gslink control thread, but CLOSEGAME is sent from the
-// engine tick thread (srvtrace's game-destroy hook). Serialize so two senders can't
-// interleave bytes on the shared socket.
-var send_lock: Lock = .{};
-
-/// Set while a request taken from the store is being serviced, to the seq that arrived in its
-/// header. A reply to a queued request goes back through the store keyed by that seq, not down a
-/// socket — which is what lets the realmd that dispatched it collect the answer even though it
-/// never held a connection to this server.
-var queued_seq: ?u32 = null;
-
-/// How long a reply is worth keeping. The realm is waiting on it right now; one nobody collected
-/// is of no use to anyone later.
-const reply_ttl_s: u32 = 30;
-
-fn sendPacket(bytes: []const u8) bool {
-    if (queued_seq) |seq| return redis.putReply(seq, bytes, reply_ttl_s);
-    send_lock.lock();
-    defer send_lock.unlock();
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = send(sock, bytes.ptr + off, @intCast(bytes.len - off), 0);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
-
-/// Read exactly `buf.len` bytes (blocking). false on disconnect/error.
-fn recvAll(buf: []u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = recv(sock, buf.ptr + off, @intCast(buf.len - off), 0);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
+var seqno: u32 = 0;
 
 fn nextSeq() u32 {
     seqno +%= 1;
     return seqno;
 }
 
-fn sendAuthReply() void {
-    var r = std.mem.zeroes(p.AuthReply);
-    r.h = p.header(.authreply, @sizeOf(p.AuthReply), nextSeq());
-    r.version = D2GS_VERSION;
-    r.checksum = D2GS_CHECKSUM;
-    r.signlen = 0; // sign left zero — relies on pvpgn skipping verification
-    _ = sendPacket(std.mem.asBytes(&r));
-    log.print("d2cs: sent AUTHREPLY");
+/// How long a reply is worth keeping. The realm is waiting on it right now; one nobody collected is
+/// of no use to anyone later.
+const reply_ttl_s: u32 = 30;
+/// Backstops on the event list for a realm with nothing draining it.
+const event_cap: u32 = 4096;
+const event_ttl_s: u32 = 3600;
 
-    var info = std.mem.zeroes(p.SetGsInfo);
-    info.h = p.header(.setgsinfo, @sizeOf(p.SetGsInfo), nextSeq());
-    info.maxgame = max_games;
-    info.gameflag = 0;
-    _ = sendPacket(std.mem.asBytes(&info));
-    log.print("d2cs: sent SETGSINFO");
-
-    // Tell D2CS the public address clients must dial + our fleet id (our extension).
-    var ai = std.mem.zeroes(p.AddrInfo);
-    ai.h = p.header(.addrinfo, @sizeOf(p.AddrInfo), nextSeq());
-    ai.maxgame = max_games;
-    ai.gsid = gsid;
-    ai.ip = public_ip;
-    ai.port = public_port;
-    _ = sendPacket(std.mem.asBytes(&ai));
-    log.print("d2cs: sent ADDRINFO");
-    registered = true;
+/// Answer the request carrying `seq`. Only ever called from the queue thread, and the seq is passed
+/// down from the request rather than held in a global — game events fire on the engine tick thread,
+/// and a shared "currently servicing" flag routed those into a reply key instead. The realm then
+/// never learned a player had left, so the character stayed seated in a game that had ended.
+fn reply(seq: u32, bytes: []const u8) void {
+    _ = redis.putReply(seq, bytes, reply_ttl_s);
 }
 
-/// True between "the realm has our ADDRINFO" and the control connection dropping.
-/// Readiness, as opposed to liveness: a GS whose gslink is down is perfectly alive
-/// but cannot be given a game, so it should not be in a Service's endpoint list.
-pub var registered: bool = false;
-
-fn handleEcho(body: []const u8) void {
-    // echo back the same payload with type echo
-    var hbuf: [p.HEADER_LEN]u8 = undefined;
-    const h = p.header(.echo, @intCast(p.HEADER_LEN + body.len), nextSeq());
-    @memcpy(&hbuf, std.mem.asBytes(&h));
-    _ = sendPacket(&hbuf);
-    if (body.len > 0) _ = sendPacket(body);
+/// Report something that happened here. Fire and forget: nobody is waiting, and a store that is
+/// briefly away must not stall a game.
+fn emit(bytes: []const u8) void {
+    _ = redis.pushEvent(bytes, event_cap, event_ttl_s);
 }
 
-fn sendCreateGameReply(result: u32, gameid: u32) void {
+fn sendCreateGameReply(seq: u32, result: u32, gameid: u32) void {
     var r = std.mem.zeroes(p.CreateGameReply);
-    r.h = p.header(.creategame, @sizeOf(p.CreateGameReply), nextSeq());
+    r.h = p.header(.creategame, @sizeOf(p.CreateGameReply), seq);
     r.result = result;
     r.gameid = gameid;
-    _ = sendPacket(std.mem.asBytes(&r));
+    reply(seq, std.mem.asBytes(&r));
 }
 
-fn sendJoinGameReply(result: u32, gameid: u32) void {
+fn sendJoinGameReply(seq: u32, result: u32, gameid: u32) void {
     var r = std.mem.zeroes(p.JoinGameReply);
-    r.h = p.header(.joingame, @sizeOf(p.JoinGameReply), nextSeq());
+    r.h = p.header(.joingame, @sizeOf(p.JoinGameReply), seq);
     r.result = result;
     r.gameid = gameid;
-    _ = sendPacket(std.mem.asBytes(&r));
+    reply(seq, std.mem.asBytes(&r));
 }
 
 // ── game name -> gameid tracking (for CLOSEGAME on destroy) ───────────────────
@@ -209,73 +111,6 @@ var games_tracked = [_]GameSlot{.{}} ** 256;
 var live_count = std.atomic.Value(u32).init(0);
 
 /// Number of games live on this GS (create→destroy). Lock-free, called every tick.
-/// Publish this server's own record into the shared store, so any realmd can see it exists and
-/// how loaded it is — including instances that hold no connection to it.
-///
-/// The server reports itself rather than being reported by whichever realmd happens to hold its
-/// control link. That is the point: the record outlives any one instance's view of the fleet, and
-/// its TTL means a server that dies leaves on its own without anyone noticing it should.
-///
-/// Best-effort and silent on failure: the control link is still the path that carries create and
-/// join, so a store that is down must not take the game server with it.
-const heartbeat_ttl_s: u32 = 90;
-var last_heartbeat_ms: u32 = 0;
-extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
-
-/// Take one request from this server's queue and service it, if there is one.
-///
-/// Polled from the server tick rather than blocked on, so the connection stays free for the
-/// character fetches and heartbeats that share it. One per tick is deliberate: a create runs the
-/// engine's own game creation, and draining a backlog inside a single tick would stall the games
-/// already running.
-/// The queue is drained on its OWN thread, never from the server tick.
-///
-/// Creating a game hands work to the tick loop and waits for it, exactly as the socket path did
-/// from its receive thread. Calling it FROM the tick means the tick cannot advance to do that
-/// work, so every create returns 0 — which presents as the game server refusing perfectly good
-/// requests, with nothing in the log to say why.
-fn queueThreadMain(_: ?*anyopaque) callconv(.winapi) u32 {
-    while (true) {
-        pumpQueue();
-        Sleep(20);
-    }
-}
-
-var queue_thread_started = false;
-
-pub fn startQueueConsumer() void {
-    if (queue_thread_started or !redis.enabled()) return;
-    queue_thread_started = true;
-    _ = CreateThread(null, 0, queueThreadMain, null, 0, null);
-    log.print("d2cs: consuming create/join from the store");
-}
-
-pub fn pumpQueue() void {
-    if (!redis.enabled() or gsid == 0) return;
-    var buf: [1024]u8 = undefined;
-    const n = redis.popRequest(gsid, &buf);
-    if (n < p.HEADER_LEN) return;
-    const size = std.mem.readInt(u16, buf[0..2], .little);
-    const typ = std.mem.readInt(u16, buf[2..4], .little);
-    const seq = std.mem.readInt(u32, buf[4..8], .little);
-    if (size > n) return; // truncated; nothing sensible to answer
-    queued_seq = seq;
-    defer queued_seq = null;
-    dispatch(@enumFromInt(typ), buf[p.HEADER_LEN..size]);
-}
-
-pub fn heartbeat() void {
-    if (!redis.enabled() or gsid == 0) return;
-    const now_ms = GetTickCount();
-    // A third of the TTL: frequent enough that a healthy server never blinks out of the fleet,
-    // rare enough that it is not a store round trip per tick.
-    // Wrapping subtraction: GetTickCount rolls over about every 49 days, and a server that
-    // has been up that long must not stop reporting itself.
-    if (now_ms -% last_heartbeat_ms < heartbeat_ttl_s * 1000 / 3) return;
-    last_heartbeat_ms = now_ms;
-    _ = redis.putHeartbeat(gsid, public_ip, public_port, max_games, liveGames(), false, heartbeat_ttl_s);
-}
-
 pub fn liveGames() u32 {
     return live_count.load(.monotonic);
 }
@@ -325,25 +160,33 @@ fn takeGameId(name: []const u8) ?u32 {
     return null;
 }
 
-fn sendCloseGame(gameid: u32) void {
+/// srvtrace game-destroy observer: tell the realm to drop the game from the join list.
+/// Registered as `srvtrace.on_game_destroy` by the GS realm bootstrap. Runs on the engine
+/// tick thread.
+pub fn onGameDestroyed(name: []const u8) void {
+    const gid = takeGameId(name) orelse return;
     var r = std.mem.zeroes(p.CloseGame);
     r.h = p.header(.closegame, @sizeOf(p.CloseGame), nextSeq());
-    r.gameid = gameid;
-    _ = sendPacket(std.mem.asBytes(&r));
-    log.hex("d2cs: sent CLOSEGAME gameid=0x", gameid);
+    r.gameid = gid;
+    emit(std.mem.asBytes(&r));
+    log.hex("d2cs: game closed, gameid=0x", gid);
+    // The realm routes the next create on this server's published load, so a freed slot that
+    // waits for the next heartbeat is a slot the realm will not use for up to half a minute.
+    // On a server that hosts one game that is the whole gap between two games.
+    publish();
 }
 
-/// srvtrace game-destroy observer: tell realmd to drop the game from the join list.
-/// Registered as `srvtrace.on_game_destroy` by the GS realm bootstrap.
-pub fn onGameDestroyed(name: []const u8) void {
-    if (takeGameId(name)) |gid| sendCloseGame(gid);
-}
-
-fn sendUpdateGameInfo(gameid: u32, flag: u32, players: u32, char: []const u8, level: u32, class: u32) void {
+/// srvtrace player-count observer: report this GS's own client count for the game so
+/// the realm's join list stays honest. Fires on the engine tick thread.
+///
+/// A game we never tracked is one we didn't create, so we have no gameid to name it by
+/// and stay quiet rather than guess.
+pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []const u8, level: u32, class: u32) void {
+    const gid = peekGameId(name) orelse return;
     var buf: [@sizeOf(p.UpdateGameInfo) + 24]u8 = undefined;
     var r = std.mem.zeroes(p.UpdateGameInfo);
-    r.flag = flag;
-    r.gameid = gameid;
+    r.flag = if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE;
+    r.gameid = gid;
     r.players = players;
     r.charlevel = level;
     r.charclass = class;
@@ -358,24 +201,14 @@ fn sendUpdateGameInfo(gameid: u32, flag: u32, players: u32, char: []const u8, le
     const total = @sizeOf(p.UpdateGameInfo) + n + 1;
     const hdr = p.header(.updategameinfo, @intCast(total), nextSeq());
     @memcpy(buf[0..@sizeOf(p.Header)], std.mem.asBytes(&hdr));
-    _ = sendPacket(buf[0..total]);
-}
-
-/// srvtrace player-count observer: report this GS's own client count for the game so
-/// realmd's join list stays honest. Fires on the engine tick thread, like CLOSEGAME.
-///
-/// A game we never tracked is one we didn't create, so we have no gameid to name it by
-/// and stay quiet rather than guess.
-pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []const u8, level: u32, class: u32) void {
-    const gid = peekGameId(name) orelse return;
-    sendUpdateGameInfo(gid, if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE, players, char, level, class);
+    emit(buf[0..total]);
 }
 
 /// CREATEGAMEREQ: ladder/expansion/difficulty/hardcore byte flags, then
-/// gamename/gamepass/gamedesc/acct/char/ip cstrs (null-terminated in `body`).
-fn handleCreateGame(body: []const u8) void {
+/// gamename/gamepass/gamedesc cstrs (null-terminated in `body`).
+fn handleCreateGame(seq: u32, body: []const u8) void {
     if (body.len < 5) {
-        sendCreateGameReply(1, 0);
+        sendCreateGameReply(seq, 1, 0);
         return;
     }
     var off: usize = 4;
@@ -387,11 +220,9 @@ fn handleCreateGame(body: []const u8) void {
     // (SetGameName @0x52f940) formats the name pointer into a stack buffer with
     // `sprintf(buf + len, "~%d", (int)szGameName)` and blows the stack cookie —
     // the whole process dies with 0xC0000409, taking every other game with it.
-    // On a real realm D2CS guarantees uniqueness so the path is never walked; here
-    // two clients racing to create the same name reach it every time.
     if (peekGameId(name) != null) {
         log.print("d2cs: CREATEGAME refused — already hosting that name");
-        sendCreateGameReply(p.CREATE_NAME_TAKEN, 0);
+        sendCreateGameReply(seq, p.CREATE_NAME_TAKEN, 0);
         return;
     }
 
@@ -401,7 +232,8 @@ fn handleCreateGame(body: []const u8) void {
     // here turns a server death into the client being told the server is full.
     if (poolstat.freeManagers() == 0) {
         log.print("d2cs: CREATEGAME refused — no memory-pool manager free (this GS is at its game limit)");
-        sendCreateGameReply(p.CREATE_SERVER_FULL, 0);
+        sendCreateGameReply(seq, p.CREATE_SERVER_FULL, 0);
+        publish(); // say so in the record too, so the realm stops routing here
         return;
     }
 
@@ -416,10 +248,10 @@ fn handleCreateGame(body: []const u8) void {
     const game_id = command.createGame(name, pass, desc, flags, ladder);
     if (game_id != 0) {
         recordGame(name, game_id); // remember name->gameid so destroy can CLOSEGAME it
-        sendCreateGameReply(0, game_id);
+        sendCreateGameReply(seq, 0, game_id);
         log.hex("d2cs: CREATEGAME spawned, gameid=0x", game_id);
     } else {
-        sendCreateGameReply(1, 0);
+        sendCreateGameReply(seq, 1, 0);
         log.print("d2cs: CREATEGAME failed");
     }
 }
@@ -427,9 +259,9 @@ fn handleCreateGame(body: []const u8) void {
 /// JOINGAMEREQ: gameid, token, charname\0, account\0. We cache the
 /// token/char/account mapping so fpGetDatabaseCharacter can fetch the right save
 /// (the engine's join path carries the char + token but never the account).
-fn handleJoinGame(body: []const u8) void {
+fn handleJoinGame(seq: u32, body: []const u8) void {
     if (body.len < 8) {
-        sendJoinGameReply(1, 0);
+        sendJoinGameReply(seq, 1, 0);
         return;
     }
     const gameid = std.mem.readInt(u32, body[0..4], .little);
@@ -449,98 +281,114 @@ fn handleJoinGame(body: []const u8) void {
         joinctx.remember(token, gameid, charname, account, guild_tag);
         if (guild_tag.len > 0) log.print("d2cs: JOINGAME cached char/account/guild for fetch") else log.print("d2cs: JOINGAME cached char/account for fetch");
     }
-    sendJoinGameReply(if (command.allow_create) 0 else 1, gameid);
+    sendJoinGameReply(seq, if (command.allow_create) 0 else 1, gameid);
     log.hex("d2cs: JOINGAME ack for gameid=0x", gameid);
 }
 
-fn dispatch(t: p.Type, body: []const u8) void {
-    switch (t) {
-        .authreq => sendAuthReply(),
-        .echo => handleEcho(body),
-        .creategame => handleCreateGame(body),
-        .joingame => handleJoinGame(body),
-        .control => log.print("d2cs: CONTROL"),
+// ── the request queue ────────────────────────────────────────────────────────
+
+/// Drained on its OWN thread, never from the engine tick.
+///
+/// Creating a game hands work to the tick loop and waits for it. Calling it FROM the tick means
+/// the tick cannot advance to do that work, so every create returns 0 — which presents as the
+/// server refusing perfectly good requests, with nothing in the log to say why.
+fn queueThreadMain(_: ?*anyopaque) callconv(.winapi) u32 {
+    while (true) {
+        pumpQueue();
+        Sleep(20);
+    }
+}
+
+var queue_thread_started = false;
+
+pub fn startQueueConsumer() void {
+    if (queue_thread_started or !redis.enabled() or gsid == 0) return;
+    queue_thread_started = true;
+    _ = CreateThread(null, 0, queueThreadMain, null, 0, null);
+    log.print("d2cs: taking create/join from the store");
+}
+
+pub fn pumpQueue() void {
+    if (!redis.enabled() or gsid == 0) return;
+    var buf: [1024]u8 = undefined;
+    const n = redis.popRequest(gsid, &buf);
+    if (n < p.HEADER_LEN) return;
+    const size = std.mem.readInt(u16, buf[0..2], .little);
+    const typ = std.mem.readInt(u16, buf[2..4], .little);
+    const seq = std.mem.readInt(u32, buf[4..8], .little);
+    if (size > n or size < p.HEADER_LEN) return; // truncated; nothing sensible to answer
+    const body = buf[p.HEADER_LEN..size];
+    switch (@as(p.Type, @enumFromInt(typ))) {
+        .creategame => handleCreateGame(seq, body),
+        .joingame => handleJoinGame(seq, body),
         else => {},
     }
 }
 
-/// Resolve `host` to a network-order IPv4. Tries inet_addr (dotted-quad), then
-/// getaddrinfo (DNS) so a k8s Service name works. Null if it can't be resolved.
-fn resolveHost(host: [*:0]const u8) ?u32 {
-    const direct = inet_addr(host);
-    if (direct != INADDR_NONE) return direct;
-    var hints = std.mem.zeroes(addrinfo);
-    hints.family = AF_INET;
-    hints.socktype = SOCK_STREAM;
-    var res: *addrinfo = undefined;
-    if (getaddrinfo(host, null, &hints, &res) != 0) return null;
-    defer freeaddrinfo(res);
-    var cur: ?*addrinfo = res;
-    while (cur) |a| : (cur = a.next) {
-        if (a.family == AF_INET) {
-            if (a.addr) |sa| return sa.addr;
-        }
-    }
-    return null;
-}
+// ── publishing this server ───────────────────────────────────────────────────
 
-/// Connect + run the protocol loop once. Returns on disconnect.
-fn run(addr: u32, port: u16) void {
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET) return;
-    defer {
-        registered = false;
-        _ = closesocket(sock);
-        sock = INVALID_SOCKET;
-    }
-    const sa = sockaddr_in{ .family = AF_INET, .port = htons(port), .addr = addr };
-    if (connect(sock, &sa, @sizeOf(sockaddr_in)) != 0) {
-        log.print("d2cs: connect failed");
-        return;
-    }
-    log.print("d2cs: connected, waiting for AUTHREQ");
+const heartbeat_ttl_s: u32 = 90;
+var last_publish_ms: u32 = 0;
 
-    var hbuf: [p.HEADER_LEN]u8 = undefined;
-    var body: [4096]u8 = undefined;
-    while (true) {
-        if (!recvAll(&hbuf)) break;
-        const h: *const p.Header = @ptrCast(@alignCast(&hbuf));
-        const blen: usize = if (h.size >= p.HEADER_LEN) h.size - p.HEADER_LEN else 0;
-        if (blen > body.len) break; // oversized — bail
-        if (blen > 0 and !recvAll(body[0..blen])) break;
-        dispatch(@enumFromInt(h.type), body[0..blen]);
-    }
-    log.print("d2cs: disconnected");
-}
-
-const Args = struct { host: [*:0]const u8, port: u16 };
-var args: Args = undefined;
-
-fn threadMain(_: ?*anyopaque) callconv(.winapi) u32 {
-    var wsa: [512]u8 = undefined;
-    _ = WSAStartup(0x0202, &wsa);
-    while (true) {
-        // Resolve every attempt so a re-pointed Service / changed pod IP is picked up.
-        if (resolveHost(args.host)) |addr| {
-            run(addr, args.port);
-        } else {
-            log.print("d2cs: host resolve failed");
-        }
-        Sleep(5000); // reconnect backoff
+/// Write this server's record: it exists, where clients reach it, and how loaded it is.
+///
+/// The server reports itself rather than being reported by a realm that holds its connection. That
+/// is the point: the record outlives any one instance's view of the fleet, and its TTL is how a
+/// server that dies leaves without anyone having to notice.
+///
+/// `full` is the server answering a question its own game count cannot: a finished game holds its
+/// engine memory-pool slot through the reap window, so it can be out of room while the count still
+/// shows space.
+fn publish() void {
+    if (!redis.enabled() or gsid == 0) return;
+    const full = poolstat.freeManagers() == 0;
+    if (redis.putHeartbeat(gsid, public_ip, public_port, max_games, liveGames(), full, heartbeat_ttl_s)) {
+        last_publish_ms = GetTickCount();
+        registered = true;
     }
 }
 
-extern "kernel32" fn CreateThread(a: ?*anyopaque, st: usize, f: *const fn (?*anyopaque) callconv(.winapi) u32, p_: ?*anyopaque, fl: u32, id: ?*u32) callconv(.winapi) ?*anyopaque;
+/// Called every tick. Refreshes at a third of the TTL: often enough that a healthy server never
+/// blinks out of the fleet, rarely enough that it is not a store round trip per frame.
+pub fn heartbeat() void {
+    if (!redis.enabled() or gsid == 0) return;
+    // Wrapping subtraction: GetTickCount rolls over about every 49 days, and a server that has
+    // been up that long must not stop reporting itself.
+    if (registered and GetTickCount() -% last_publish_ms < heartbeat_ttl_s * 1000 / 3) return;
+    publish();
+}
 
-/// Start the D2CS client thread. `host` may be a dotted-quad IPv4 or a DNS name
-/// (resolved on the thread). `pub_ip`:`pub_port` is the public game address clients
-/// dial; `maxgame` the advertised capacity; `gs_id` this GS's stable fleet id.
-pub fn start(host: [*:0]const u8, port: u16, pub_ip: [4]u8, pub_port: u16, maxgame: u32, gs_id: u32) void {
-    args = .{ .host = host, .port = port };
+/// Announce this server has just started, so the realm expires whatever games still name it.
+///
+/// A server that just came up hosts nothing, so any game record naming it is a leftover — from one
+/// that died without deregistering, or from records that outlived a realmd restart. They must go,
+/// or their names stay taken forever and create-game rejects them as duplicates.
+fn announceBoot() void {
+    var ai = std.mem.zeroes(p.AddrInfo);
+    ai.h = p.header(.addrinfo, @sizeOf(p.AddrInfo), nextSeq());
+    ai.maxgame = max_games;
+    ai.gsid = gsid;
+    ai.ip = public_ip;
+    ai.port = public_port;
+    emit(std.mem.asBytes(&ai));
+}
+
+fn bootThreadMain(_: ?*anyopaque) callconv(.winapi) u32 {
+    // Retry: the game server and the store come up in whatever order the deployment gives them,
+    // and a server that gave up on its first attempt would be invisible to the realm forever.
+    while (!redis.enabled() or !redis.ping()) Sleep(2000);
+    publish();
+    announceBoot();
+    log.print("d2cs: published to the realm store");
+    return 0;
+}
+
+/// Join a realm. `pub_ip`:`pub_port` is the public game address clients dial; `maxgame` the
+/// advertised capacity; `gs_id` this GS's stable fleet id.
+pub fn start(pub_ip: [4]u8, pub_port: u16, maxgame: u32, gs_id: u32) void {
     public_ip = pub_ip;
     public_port = pub_port;
     max_games = maxgame;
     gsid = gs_id;
-    _ = CreateThread(null, 0, threadMain, null, 0, null);
-    log.print("d2cs: client thread started");
+    _ = CreateThread(null, 0, bootThreadMain, null, 0, null);
 }

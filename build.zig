@@ -351,6 +351,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     e2e.root_module.addImport("libd2", libd2);
+    // The harness's stand-in game server meets realmd in redis like a real one, so it needs the
+    // same IO-free RESP codec both real ends use — sharing it is what keeps the harness from
+    // drifting away from the thing it tests.
+    e2e.root_module.addImport("resp", resp);
     const run_e2e = b.addRunArtifact(e2e);
     run_e2e.step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
     run_e2e.step.dependOn(&b.addInstallArtifact(d2ingress, .{}).step); // d2ingress_routing spawns it

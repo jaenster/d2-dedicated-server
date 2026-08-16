@@ -61,11 +61,11 @@ spec:
             - { containerPort: 4000, name: game }
             - { containerPort: 8086, name: health }
           env:
-            # The gs-link Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
-            # Uses realmd-gslink (publishNotReadyAddresses) so the GS can register even
-            # while realmd is NotReady — otherwise REQUIRE_GS deadlocks registration.
-            - name: REALMD_HOST
-              value: realmd-gslink.{{ .Release.Namespace }}.svc.cluster.local
+            # The shared store. This is the game server's ONLY link to the realm: it publishes
+            # itself here, takes create/join from its queue here, and reads and writes characters
+            # here. There is no realmd address to point it at.
+            - name: D2GS_REDIS_ADDR
+              value: "realmd-redis:6379"
             # The GS registers its in-cluster POD IP — d2ingress (also in-cluster) dials
             # this to splice client game traffic through. No public exposure. POD_IP must
             # precede D2GS_GS_ADDR for the $(POD_IP) substitution to resolve.

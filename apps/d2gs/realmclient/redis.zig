@@ -311,6 +311,27 @@ pub fn putReply(seq: u32, packet: []const u8, ttl_s: u32) bool {
     };
 }
 
+/// Report something that happened here — a player entering or leaving, a game ending. Unlike a
+/// create or a join there is no answer to wait for and nobody in particular to tell, so it goes
+/// onto one list any realmd drains.
+///
+/// `cap` bounds the list against a realm with nothing running: the oldest go first, because a
+/// player who left an hour ago is not news.
+pub fn pushEvent(packet: []const u8, cap: u32, ttl_s: u32) bool {
+    const rep = commandBig(&.{ "RPUSH", "realmd:gsev" }, packet) orelse return false;
+    switch (rep.value) {
+        .int, .status => {},
+        else => return false,
+    }
+    var cb: [16]u8 = undefined;
+    const keep = std.fmt.bufPrint(&cb, "-{d}", .{cap}) catch return false;
+    _ = command(&.{ "LTRIM", "realmd:gsev", keep, "-1" }) orelse return false;
+    var pb: [16]u8 = undefined;
+    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+    _ = command(&.{ "EXPIRE", "realmd:gsev", secs }) orelse return false;
+    return true;
+}
+
 /// True if redis answers. Used at boot to say so once, rather than discovering it per game.
 pub fn ping() bool {
     const rep = command(&.{"PING"}) orelse return false;

@@ -6,7 +6,7 @@
 #
 # The reason this exists: every piece has a flag that is easy to omit and whose absence shows up
 # three layers away as something unrelated. A GS without --gs-addr binds a port d2ingress is not
-# looking at. A GS that never reaches gs-link is invisible to realmd, so JOINGAME resolves to
+# looking at. A GS that never publishes itself is invisible to realmd, so JOINGAME resolves to
 # nothing and the client fails at a screen that says nothing. A client without --realm-gw quietly
 # dials real Battle.net. Each of those cost an afternoon at least once; they are all baked in here.
 #
@@ -18,7 +18,7 @@
 # Config (env or ./.env):
 #   REDIS_ADDR   default 127.0.0.1:6390     GS_PORT      default 14000  (engine, behind d2ingress)
 #   INGRESS_PORT      default 4000  (client-hardcoded)
-#   GSLINK_PORT  default 6115              HEALTH_PORT  default 18080
+#   HEALTH_PORT  default 18080
 #   TESTDIR      default ./testgame        LOG_DIR      default ./.stack
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -30,7 +30,6 @@ DURABLE="${DURABLE:-fs}"
 PG_DSN="${PG_DSN:-postgres://realmd:realmd@127.0.0.1:55432/realmd}"
 INGRESS_PORT="${INGRESS_PORT:-4000}"
 GS_PORT="${GS_PORT:-14000}"
-GSLINK_PORT="${GSLINK_PORT:-6115}"
 HEALTH_PORT="${HEALTH_PORT:-18080}"
 BNET_PORT="${BNET_PORT:-6112}"
 TESTDIR="${TESTDIR:-$ROOT/testgame}"
@@ -75,19 +74,19 @@ await() { # await <host:port> <seconds> <what>
   bad "$3 never came up on $1"; return 1
 }
 
-# The GS is the one piece whose readiness is NOT a port of its own: it dials OUT to realmd's
-# gs-link and registers. Until that lands, realmd has no server to hand out and every join fails
-# somewhere that looks like a client problem. So wait for the registration, not the process.
+# The GS is the one piece whose readiness is NOT a port of its own: it publishes itself into redis
+# and takes work from there. Until that lands, realmd has no server to hand out and every join
+# fails somewhere that looks like a client problem. So wait for the registration, not the process.
 await_gs_registered() {
   local t=0 log="$LOG_DIR/gs.log"
   while [ "$t" -lt "${1:-90}" ]; do
-    if grep -aqiE 'addrinfo|setgsinfo|gs-link|gslink' "$log" 2>/dev/null; then
-      ok "GS registered with realmd gs-link"; return 0
+    if grep -aqi 'published to the realm store' "$log" 2>/dev/null; then
+      ok "GS published itself to the realm store"; return 0
     fi
     grep -aqi 'panic\|assert' "$log" 2>/dev/null && { bad "GS died during boot — see $log"; return 1; }
     sleep 1; t=$((t+1))
   done
-  bad "GS never registered with gs-link in ${1:-90}s — realmd has no game server, so every join
+  bad "GS never published itself in ${1:-90}s — realmd has no game server, so every join
        will fail before it reaches d2ingress. See $log"
   return 1
 }
@@ -96,7 +95,6 @@ status() {
   say "status"
   listening "$REDIS_ADDR"        && ok "redis $REDIS_ADDR"          || bad "redis $REDIS_ADDR"
   port_is "127.0.0.1:$BNET_PORT"   "realmd bnet :$BNET_PORT"     realmd
-  port_is "127.0.0.1:$GSLINK_PORT" "realmd gslink :$GSLINK_PORT" realmd
   port_is "127.0.0.1:$INGRESS_PORT"     "d2ingress :$INGRESS_PORT"          d2ingress
   # The GS picks its own game port and advertises it via ADDRINFO, so there is no fixed port to
   # probe — the process being alive and registered is the whole health signal.
@@ -120,7 +118,6 @@ down() {
   pkill -f 'zig-out/bin/realmd' 2>/dev/null && ok "realmd stopped (draining)" || ok "no realmd"
   await_gone "127.0.0.1:$INGRESS_PORT" 15 "d2ingress" && ok "d2ingress port released"
   await_gone "127.0.0.1:$BNET_PORT" 15 "realmd" && ok "realmd port released"
-  await_gone "127.0.0.1:$GSLINK_PORT" 15 "realmd gs-link" >/dev/null
   echo "redis left running (docker compose -f deploy/compose.dev.yaml down to stop it)"
 }
 
@@ -159,7 +156,6 @@ else
     ./zig-out/bin/realmd > "$LOG_DIR/realmd.log" 2>&1 &
   await "127.0.0.1:$BNET_PORT" 20 "realmd bnet" || die "see $LOG_DIR/realmd.log"
 fi
-await "127.0.0.1:$GSLINK_PORT" 10 "realmd gs-link" || die "see $LOG_DIR/realmd.log"
 
 say "d2ingress"
 # It must own the client-hardcoded port: D2 sends game traffic to the advertised IP on :4000 and
@@ -191,9 +187,9 @@ install_dlls
 WINPATH="Z:$(printf '%s' "$TESTDIR/d2gs.dll" | tr '/' '\\')"
 # These flags and no others. --create-games, --gs-addr, --d2cs and --d2dbs all appear in older
 # notes, and on this build adding them crashes the engine during boot: an access violation at
-# 0x4fa680 dereferencing 0x16, exit 0xc0000005, before it ever reaches d2cs. The GS finds gs-link
-# and picks its own game port without them, and registers the result via ADDRINFO — which is what
-# d2ingress reads, so nothing downstream needs to be told the port either.
+# 0x4fa680 dereferencing 0x16, exit 0xc0000005, before it ever reaches d2cs. The GS picks its own
+# game port without them and publishes the result to redis — which is what d2ingress reads, so
+# nothing downstream needs to be told the port either.
   # The boot is racy: the same command that works takes an access violation at 0x4fa680 often
   # enough that one attempt is not a fair test. Retry rather than report a broken stack.
   for attempt in 1 2 3; do

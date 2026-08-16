@@ -9,8 +9,8 @@
 // The player logs in via the floating IP on realmd (6112), then talks all game
 // traffic to the same floating IP on :4000 (d2ingress), which reads the realm-global
 // token, looks up {token -> GS pod ip:port,gameid} in redis, rewrites it and splices
-// to the owning INTERNAL GS pod. The GS, d2dbs (6114) and gs-link (6115) are never
-// public — gs-link/d2dbs ride a separate realmd-gslink ClusterIP Service.
+// to the owning INTERNAL GS pod. The GS pods are never public, and they never connect to
+// realmd at all — both sides meet in redis, so there is no internal Service between them.
 //
 // View it with:  npx likec4 start docs/architecture
 
@@ -43,17 +43,12 @@ deployment {
     service realmd_lb 'realmd Service (public)' {
       description 'externalIPs=FIP; exposes ONLY 6112 (bnet login + MCP realm, muxed); routes to ready realmd pods'
     }
-    // Internal gs-link/d2dbs Service — publishNotReadyAddresses so the GS can register
-    // while realmd is still NotReady (else REQUIRE_GS deadlocks). Never public.
-    service realmd_gslink_svc 'realmd-gslink Service (ClusterIP)' {
-      description 'Internal only: d2dbs (6114) + gs-link (6115). publishNotReadyAddresses=true so the GS registers while realmd is NotReady.'
-    }
     workload realmd_deploy 'realmd Deployment' {
-      description 'replicas 1, Recreate strategy (the GS holds gs-link to one pod). Public 6112 (bnet + MCP realm, muxed); internal d2dbs 6114 + gs-link 6115; health/webui 8080. SIGTERM drain.'
+      description 'Public 6112 (bnet + MCP realm, muxed); health/webui 8080. Nothing else is bound — game servers meet it in redis — so replicas are interchangeable and a rolling update needs no coordination. SIGTERM drain.'
       instanceOf d2gs.realmd.bncs
       instanceOf d2gs.realmd.bnftp
       instanceOf d2gs.realmd.rd2cs
-      instanceOf d2gs.realmd.rd2dbs
+      instanceOf d2gs.realmd.charflush
       instanceOf d2gs.realmd.gslink
       instanceOf d2gs.realmd.health
     }
@@ -84,18 +79,18 @@ deployment {
     }
 
     // GS fleet as a stateless Deployment — INTERNAL pods, no hostPort / public
-    // exposure. Each registers its POD IP (status.podIP:4000) over the gs-link; the
-    // d2ingress dials that pod IP to splice. Game data from the d2-gamedata init image
-    // into an emptyDir (no persistent volume); health probe on :8086.
+    // exposure. Each publishes its POD IP (status.podIP:4000) into redis; the d2ingress
+    // dials that pod IP to splice. Game data from the d2-gamedata init image into an
+    // emptyDir (no persistent volume); health probe on :8086.
     workload gs_set 'd2gs Deployment (fleet, stateless)' {
-      description 'soft anti-affinity. INTERNAL only (no hostPort); registers status.podIP:4000 over gs-link; game data via a d2-gamedata initContainer into an emptyDir; health :8086.'
+      description 'soft anti-affinity. INTERNAL only (no hostPort); publishes status.podIP:4000 into redis; game data via a d2-gamedata initContainer into an emptyDir; health :8086.'
 
       pod gs_pod_a 'd2gs pod' {
-        description 'Internal :4000; registers status.podIP:4000 over gs-link (ADDRINFO = pod IP); health :8086'
+        description 'Internal :4000; publishes status.podIP:4000 into redis; health :8086'
         instanceOf d2gs.gameserver
       }
       pod gs_pod_b 'd2gs pod' {
-        description 'Internal :4000; registers status.podIP:4000 over gs-link (ADDRINFO = pod IP); health :8086'
+        description 'Internal :4000; publishes status.podIP:4000 into redis; health :8086'
         instanceOf d2gs.gameserver
       }
     }
@@ -122,11 +117,10 @@ deployment {
   realmd_deploy -> redis_svc 'ephemeral (sessions+games); token counter + token->GS route'
   realmd_deploy -> pg_svc 'durable (chars)'
 
-  // GS pods register OUT to realmd's gs-link via the internal realmd-gslink Service
-  // (:6115, publishNotReadyAddresses); realmd routes create/join, d2dbs serves chars.
-  gs_pod_a -> realmd_gslink_svc 'gs-link register (:6115) + ADDRINFO (pod IP); d2dbs char fetch/save (:6114)'
-  gs_pod_b -> realmd_gslink_svc 'gs-link register (:6115) + ADDRINFO (pod IP); d2dbs char fetch/save (:6114)'
-  realmd_gslink_svc -> realmd_deploy 'incl. NotReady pods'
+  // GS pods never dial realmd. They publish themselves into redis, take create/join from
+  // their own queue there, report events back, and read/write characters directly.
+  gs_pod_a -> redis_svc 'publishes itself; takes create/join; reports events; chars'
+  gs_pod_b -> redis_svc 'publishes itself; takes create/join; reports events; chars'
 
   // The player talks game traffic to the floating IP on :4000; the gateway looks up
   // the token route in redis and splices to the owning internal GS pod.

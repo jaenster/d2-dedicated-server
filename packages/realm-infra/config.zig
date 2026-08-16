@@ -13,7 +13,6 @@ pub const Config = struct {
     instance_id: []const u8 = "realmd-0",
     bind: []const u8 = "0.0.0.0",
     bnet_port: u16 = 6112,
-    d2dbs_port: u16 = 6114,
 
     /// Realm advertised to clients (what bnetd hands back as the realm address).
     realm_name: []const u8 = "TypeGuru",
@@ -27,11 +26,8 @@ pub const Config = struct {
     ad_file: []const u8 = "",
     ad_url: []const u8 = "",
 
-    /// Port the game server (our injected d2gs) connects to for the control
-    /// link (its own port so we never confuse it with a client MCP connection).
-    gs_port: u16 = 6115,
     /// Optional override for the game-server IP advertised to clients (when the
-    /// GS is behind NAT). Empty = use the control connection's peer IP.
+    /// GS is behind NAT). Empty = use the address the server reports for itself.
     gs_addr: []const u8 = "",
 
     /// REQUIRED (dotted-quad). Public address of the game-traffic ingress, advertised to
@@ -146,8 +142,6 @@ pub fn fromEnv() Config {
     if (env("REALMD_INSTANCE")) |v| c.instance_id = v;
     if (env("REALMD_BIND")) |v| c.bind = v;
     c.bnet_port = envPort("REALMD_BNET_PORT", c.bnet_port);
-    c.d2dbs_port = envPort("REALMD_D2DBS_PORT", c.d2dbs_port);
-    c.gs_port = envPort("REALMD_GS_PORT", c.gs_port);
     if (env("REALMD_GS_ADDR")) |v| c.gs_addr = v;
     if (env("REALMD_GAME_ADDR")) |v| c.game_addr = v;
     if (env("REALMD_ROUTE_TTL_S")) |v| c.route_ttl_s = std.fmt.parseInt(u32, v, 10) catch c.route_ttl_s;

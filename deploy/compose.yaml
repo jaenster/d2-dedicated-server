@@ -52,9 +52,6 @@ services:
       - realmd-data:/data
     ports:
       - "6112:6112"  # bnetd
-      - "6113:6113"  # d2cs
-      - "6114:6114"  # d2dbs
-      - "6115:6115"  # gs-link (the wine GS connects here)
       - "4000:4000"  # game traffic (the embedded edge; clients dial this)
       - "18080:8080" # health (8080 is often taken on the host)
 
@@ -70,7 +67,7 @@ services:
     depends_on:
       realmd: { condition: service_started }
     environment:
-      REALMD_HOST: realmd                 # dials gslink:6115 + d2dbs:6114 over the network
+      D2GS_REDIS_ADDR: "redis:6379"       # its only link to the realm — no realmd address at all
       D2GS_GS_ADDR: "127.0.0.1:4000"      # what host clients dial for game traffic
       D2GS_MAX_GAMES: "50"
     volumes:
@@ -83,6 +80,30 @@ services:
       # - ./moddata:/moddata:ro
     ports:
       - "4000:4000"
+
+  # The wine-free GS. Unlike `gs` above, this one needs NO mounted install — the image bakes in
+  # its own minimal 1.14d data (deploy/Dockerfile's gs-native target) — so it's behind its own
+  # `native` profile rather than `gs`: no D2GS_GAME_SRC, no wine, no Xvfb. Useful for CI (see
+  # .github/workflows/build.yml's `e2e` job) and for local dev on a box without wine.
+  #
+  # No published port: clients never dial a game server directly (see the "always crosses an
+  # ingress" note above realmd) — only realmd's embedded edge (host 4000, published above) is
+  # ever dialled. D2GS_GS_ADDR is this container's DNS name on the compose network, which is
+  # what has to be reachable from realmd's container for the edge to splice to it; 127.0.0.1
+  # (the default) would be gs-native's own loopback, unreachable from anywhere else.
+  gs-native:
+    profiles: ["native"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: gs-native
+    depends_on:
+      realmd: { condition: service_started }
+    environment:
+      # NOT WIRED UP YET: the native server still speaks the retired control socket, so it does
+      # not join a realm at all until it is ported to the store. It boots and serves nothing.
+      D2GS_REDIS_ADDR: "redis:6379"
+      D2GS_GS_ADDR: "gs-native:4000"
 
 volumes:
   realmd-data:

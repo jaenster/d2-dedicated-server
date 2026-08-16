@@ -11,7 +11,7 @@ server sits near-zero**. Measured on a real Hetzner k3s node with no players onl
 
 | service | CPU | memory | image |
 |-|-|-|-|
-| `realmd` (login + realm + d2dbs + gs-link) | ~1m | ~6 MiB | scratch, static musl |
+| `realmd` (login + realm) | ~1m | ~6 MiB | scratch, static musl |
 | `d2ingress` (game-traffic ingress) | **~0m** | **~1 MiB** | scratch, static musl |
 | `d2gs` (wine, headless `Game.exe`) | ~15m | ~300 MiB | debian + wine32 |
 | `d2gs-native` (no wine, Mac i386 image) | ~0m | ~8-10 MiB | scratch, one static i386 ELF |

@@ -29,9 +29,9 @@ realm-global, and only the gateway can translate it to the id the engine knows.
 
 `floatingIPs` are stable public IPs (e.g. cloud floating IPs that fail over between nodes)
 set as `externalIPs` on the public realmd **and** d2ingress Services. The cluster firewall
-only needs the client-facing ports open to those FIPs: **6112-6113** (bnet + d2cs) **and
-4000** (d2ingress game traffic). d2dbs (6114) + gs-link (6115) are GS↔realmd internal
-traffic (the `realmd-gslink` ClusterIP Service) and stay unexposed.
+only needs the client-facing ports open to those FIPs: **6112** (bnet, which carries the realm
+protocol too) **and 4000** (d2ingress game traffic). Nothing else is reachable from outside —
+game servers meet the realm in redis rather than over a port of their own.
 
 ## Quick start
 
@@ -68,7 +68,7 @@ game server (`templates/gameserver-statefulset.yaml` — a stateless `Deployment
 
 | env | source |
 |-|-|
-| `REALMD_HOST` | `realmd-gslink.<namespace>.svc.cluster.local` |
+| `D2GS_REDIS_ADDR` | `realmd-redis:6379` (its only link to the realm) |
 | `POD_IP` | fieldRef `status.podIP` |
 | `D2GS_GS_ADDR` | `$(POD_IP):4000` (internal pod IP — d2ingress splices to it) |
 | `D2GS_MAX_GAMES` | `.Values.gameServer.maxGames` |

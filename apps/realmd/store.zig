@@ -110,16 +110,56 @@ pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8)
     };
 }
 
+/// The account's characters: the store of record, plus any the cache holds that it has not seen
+/// yet.
+///
+/// The union is not an optimisation. A save lands in redis and is moved to the durable store by a
+/// worker afterwards, so between those two moments the durable store does not know the character
+/// exists — and asking it alone means a player who just made a character is shown an empty list.
+/// It is the same gap for a copy, an upgrade, and the first save of a character created in-game.
+fn caseEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const lx = if (x >= 'A' and x <= 'Z') x + 32 else x;
+        const ly = if (y >= 'A' and y <= 'Z') y + 32 else y;
+        if (lx != ly) return false;
+    }
+    return true;
+}
+
 pub fn listChars(account: []const u8, names: []Name) usize {
-    return switch (durable) {
+    var n = switch (durable) {
         .fs => fs.listChars(account, names),
         .redis => redis.listChars(account, names),
         .pg => pg.listChars(account, names),
     };
+    if (!cachingChars()) return n;
+    var cached: [max_chars]Name = undefined;
+    const m = redis.listChars(account, &cached);
+    for (cached[0..m]) |c| {
+        if (n >= names.len) break;
+        var seen = false;
+        for (names[0..n]) |have| {
+            if (caseEql(have.slice(), c.slice())) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        names[n] = c;
+        n += 1;
+    }
+    return n;
 }
 
 /// Delete a character's save. Idempotent — true even if it was already gone.
+///
+/// The cache is purged too, and it has to be: `listChars` shows what the cache holds as well as
+/// what the durable store does, so a character deleted from one and left in the other comes
+/// straight back. Cache first — a delete that removed the record of it but left the bytes would
+/// leave a character nobody can see and nobody can remove.
 pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
+    if (cachingChars()) _ = redis.deleteCharD2s(account, charname);
     return switch (durable) {
         .fs => fs.deleteCharD2s(account, charname),
         .redis => redis.deleteCharD2s(account, charname),
@@ -415,6 +455,42 @@ pub fn takeGsReply(seq: u32, out: []u8) ?usize {
     return switch (ephemeral) {
         .redis => redis.takeGsReply(seq, out),
         .fs, .pg => null,
+    };
+}
+
+/// Pick the least-loaded game server with room and reserve a slot on it, atomically.
+/// Null when every server is full, which the caller reports differently from an empty fleet.
+pub fn pickAndReserveGs() ?u32 {
+    return switch (ephemeral) {
+        .redis => redis.pickAndReserveGs(),
+        .fs, .pg => null,
+    };
+}
+
+/// Give back a slot whose create did not happen.
+pub fn releaseGsSlot(gsid: u32) void {
+    switch (ephemeral) {
+        .redis => redis.releaseGsSlot(gsid),
+        .fs, .pg => {},
+    }
+}
+
+/// How many events a realm with nothing draining them keeps, and for how long. Both are backstops:
+/// in a running realm the list is empty nearly all the time.
+pub const gs_event_cap: u32 = 4096;
+pub const gs_event_ttl_s: u32 = 3600;
+
+pub fn popGsEvent(out: []u8) ?usize {
+    return switch (ephemeral) {
+        .redis => redis.popGsEvent(out),
+        .fs, .pg => null,
+    };
+}
+
+pub fn pushGsEvent(packet: []const u8) bool {
+    return switch (ephemeral) {
+        .redis => redis.pushGsEvent(packet, gs_event_cap, gs_event_ttl_s),
+        .fs, .pg => false,
     };
 }
 

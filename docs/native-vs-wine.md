@@ -14,7 +14,7 @@ The realm stays on the Mac and both variants face the same path:
 
     clientless (Mac) -> realmd bnet :6222 (Mac) -> d2ingress :4200 (Mac) -> GS :4000 (NAS)
 
-The GS registers over gs-link to the Mac and advertises `10.24.1.141:4000`. Without
+The GS publishes itself as `10.24.1.141:4000`. Without
 `D2GS_GS_ADDR` the native GS advertises `127.0.0.1:4000` — d2ingress's own port — and every round
 fails `MCP_CREATEGAME result=0x20`.
 

@@ -30,15 +30,17 @@ says so.
 | variable | meaning |
 |-|-|
 | `D2MAC_BIN` | path to the `DiabloII` Mach-O, if not given as the argument |
-| `D2GS_REALM` | `host:port` of realmd's gs-link. Unset = no realm |
+| `D2GS_REALM` | `host:port` of the realm control link. **Retired** — realmd no longer serves it, so this server cannot currently join a realm |
 | `D2GS_GS_ADDR` | the `host:port` this server advertises to clients, default `127.0.0.1:4000` |
-| `D2GS_D2DBS` | `host:port` of the character store. Defaults to the realm host, one port below gs-link |
+| `D2GS_D2DBS` | `host:port` of the d2dbs character store. **Retired** along with the listener |
 | `D2GS_GSID` | fleet id. Defaults to FNV-1a over hostname **and** advertised port, so two servers on one host do not collide |
 | `D2GS_MAX_GAMES` | concurrent games, 1..7, default 1 |
 | `D2GS_CHAR_SOURCE` | `memory` (default) or `file` |
 
-The realm link is the same protocol the wine server speaks, so a fleet can mix both kinds. On a
-join the character is fetched over the network from d2dbs — no shared disk.
+**Not yet ported to the shared store.** The wine server publishes itself into redis, takes
+create/join from a queue there and reads characters from it; this one still speaks the control
+socket and d2dbs, neither of which realmd serves any more. It boots and runs, but joins no realm
+until it is ported.
 
 **It always binds :4000.** Unlike the wine server, which moves its listener to whatever
 `D2GS_GS_ADDR` advertises, the port is an immediate inside `QSERVER_CreateAndInit` and nothing

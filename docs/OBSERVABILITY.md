@@ -54,7 +54,7 @@ the GS also serves its counters directly, on the port it was already using for p
 | path | answers |
 |-|-|
 | `/healthz` | liveness — 200 only while the ENGINE tick heartbeat is advancing |
-| `/readyz` | readiness — the above, AND registered with the realm over gs-link |
+| `/readyz` | readiness — the above, AND published into the realm's shared store |
 | `/stats` | the counters as JSON |
 | `/metrics` | the same counters in Prometheus exposition format |
 | `/` | unchanged from before there were paths, so old probes keep working |
@@ -82,5 +82,5 @@ it when no valid affix set exists, so counting there over-reports rares and uniq
 
 realmd exposes health/readiness on `:8080` (`/readyz` returns 200 once the configured stores are
 reachable) and drains cleanly on SIGTERM, so `kubectl rollout` and Compose restarts are
-uneventful. The game servers register over the gs-link and deregister on shutdown, so a rolling
+uneventful. The game servers publish themselves into the store and let the record expire, so a rolling
 GS update drains rather than dropping games on the floor.

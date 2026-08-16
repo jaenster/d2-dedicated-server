@@ -1,10 +1,12 @@
 # Redis: what the realm keeps there, and the rules that hold it up
 
-Redis is moving from "where sessions and games happen to live" to the realm's centre — the place
-every realmd instance agrees through, so that no instance owns anything the others cannot see.
+Redis is the realm's centre — the place every realmd instance and every game server agrees
+through, so that no instance owns anything the others cannot see.
 
-This is a migration in progress. What is here is live and tested; the last section says plainly
-what has not moved yet and what that still costs.
+Nothing connects a realm server to a game server any more. They meet here, and only here: a
+server publishes itself, takes create and join from its own queue, reports what happens on it as
+events, and reads and writes characters directly. That is what makes both sides replaceable —
+either can restart, or run several times over, without the other noticing.
 
 **How a character reaches a game.** The realm stages it into redis on join — the read itself is the
 mechanism, since the store populates its cache on a miss. The game server then reads it from redis
@@ -25,6 +27,9 @@ All under a `realmd:` prefix.
 | `gamechars:<gameid>` (set) | which characters a game holds | until the game ends |
 | `gamename:<name>` | a create in flight is claiming this name | 30 s backstop |
 | `token:seq` | realm-global game-token counter | none |
+| `gsq:<gsid>` (list) | create/join waiting for that game server | 30 s |
+| `gsreply:<seq>` | the answer to one request, keyed by its seq | 30 s |
+| `gsev` (list) | what happened on a server, for any instance to apply | 1 h |
 | `gs:<gsid>` | one game server: address, capacity, load | 90 s, refreshed |
 | `gs` (set) | which servers exist, for enumeration | none |
 | `game:<name>`, `games` | the game records and their index | 6 h backstop |
@@ -121,12 +126,36 @@ departing client to notice a socket has gone, a join **waits briefly** for a cha
 seat to clear before refusing — otherwise a character carried straight into its next game is
 turned away by the one it just left.
 
+## How a game reaches a server, with nothing connecting them
+
+A create goes onto the chosen server's queue and the answer comes back on a key named by the
+`seqno` already in the packet header. That seq finally does the job its name implies: over one
+socket with one request in flight, "the next reply is mine" was true by construction; through a
+queue several instances push to, it is simply false, and matching is the difference between an
+answer and somebody else's answer. Instances hold disjoint seq ranges (the instance hash owns the
+top half of the number), so they cannot collect each other's replies.
+
+The other direction is not a request at all. A player joining or leaving, and a game ending, are
+the server stating something already true with nobody waiting on it, so they go onto one event
+list any instance drains — each event taken by exactly one of them. Applying an event is the same
+code that used to run on the socket; what changed is which instance runs it.
+
+Sending a reply and reporting an event must not share a "currently servicing" flag. Game events
+fire on the engine's tick thread while the queue thread may be mid-request, and a shared flag
+routed a departure into a reply key: the realm never learned the player had left, so the character
+stayed seated in a game that had ended, and the next join was refused. The seq is passed down from
+the request that carries it, and events never look at it.
+
 ## What the game server does itself
 
-It reads and writes characters directly, and publishes its own presence — address, capacity, load —
-refreshing it on its own tick. The record belongs to the server rather than to whichever realmd
-happens to hold its control link, and its TTL is how a server that dies leaves without anyone
+It reads and writes characters directly, and publishes its own presence — address, capacity, load,
+and whether it is full — refreshing it on its own tick and immediately whenever a game starts or
+ends. The record belongs to the server, and its TTL is how one that dies leaves without anyone
 having to notice.
+
+`full` is the server answering a question its own game count cannot: a finished game holds its
+engine memory-pool slot through the reap window, so it can be out of room while the count still
+shows space. Only the server knows, so only the server says it.
 
 Its redis connection is a single socket and every command holds a lock over the whole
 request/reply cycle. Two threads sharing it without that desyncs the connection: the second caller
@@ -135,9 +164,14 @@ work. That failure looked exactly like a missing character.
 
 ## Ports that went away
 
-**6113** (the standalone d2cs listener) and **6114** (d2dbs) are both gone. MCP was always muxed
-onto the BNCS port the way real Battle.net does it, so no client ever dialled 6113 — only our own
-test harness did. And characters now come from redis, so nothing reaches d2dbs.
+**6113** (the standalone d2cs listener), **6114** (d2dbs) and **6115** (the game-server control
+link) are all gone. MCP was always muxed onto the BNCS port the way real Battle.net does it, so no
+client ever dialled 6113 — only our own test harness did. Characters come from redis, so nothing
+reaches d2dbs. And create/join, registration and game events all travel the store, so there is
+nothing left for a control link to carry.
+
+realmd now binds one client-facing port and a health port. A game server binds none that the realm
+uses.
 
 Retiring d2dbs took three attempts, and the first two failed in a way worth remembering: the engine
 path dialled the listener BEFORE fetching, and treated a failed dial as "no source". The fetch had
@@ -145,12 +179,11 @@ already moved to redis, but was never reached — so removing the listener produ
 FAILED" with the character sitting readable in the store, which reads exactly like a broken store.
 When a component looks like it ignores a change, check whether something upstream gates it.
 
-## What has not moved yet
+## More than one realmd
 
-Create and join **dispatch still travels each game server's control socket** (gs-link, 6115). That
-is the last thing keeping realmd a single replica: an instance can see the whole fleet in redis but
-can only dispatch to servers whose socket it holds, and the join-context notify silently does
-nothing on an instance that does not — so a second replica would not degrade, it would tell a
-client yes and let the game server refuse them.
+Verified, not assumed: two instances against one redis and one game server, a game created through
+one and **joined through the other**, both players in the world together. Each instance sees the
+whole fleet, dispatches to all of it, and drains the same event stream.
 
-Until dispatch moves, **run realmd as one replica.**
+What still holds a realm to one instance is nothing in this file. The remaining single-instance
+piece is the **native** game server, which has not been ported off the retired control socket yet.

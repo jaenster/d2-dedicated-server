@@ -13,7 +13,7 @@
 //!   POST /admin/chars/copy   {"src_account","src_char","dst_char"[,"dst_account"]} -> clone char
 const std = @import("std");
 const net = @import("realm_infra").net;
-const gslink = @import("gslink.zig");
+const fleet = @import("fleet.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
@@ -377,7 +377,7 @@ fn status(fd: net.Socket) void {
     const body = std.fmt.bufPrint(&buf, "{{\"sessions\":{d},\"games\":{d},\"gameservers\":{d},\"instance\":\"{s}\",\"durable\":\"{s}\",\"ephemeral\":\"{s}\"}}", .{
         state.global.sessionCount(),
         countGames(),
-        gslink.registeredCount(),
+        fleet.registeredCount(),
         instance,
         durable,
         ephemeral,
@@ -391,8 +391,8 @@ fn countGames() usize {
 }
 
 fn gameservers(fd: net.Socket) void {
-    var gs: [gslinkMax]gslink.GsInfo = undefined;
-    const n = gslink.snapshot(&gs);
+    var gs: [fleetMax]fleet.GsInfo = undefined;
+    const n = fleet.snapshot(&gs);
     var buf: [4096]u8 = undefined;
     var w: usize = 0;
     buf[w] = '[';
@@ -414,7 +414,7 @@ fn gameservers(fd: net.Socket) void {
     respond(fd, ok, buf[0..w]);
 }
 
-const gslinkMax = 64;
+const fleetMax = 64;
 
 /// JSON booleans: the format string needs a string, not a Zig bool.
 fn boolJson(v: bool) []const u8 {

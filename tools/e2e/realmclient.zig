@@ -3,6 +3,8 @@
 //! tools/e2e/realmclient.py; the Python encodes the exact wire formats.
 const std = @import("std");
 const net = @import("net.zig");
+const gsstore = @import("gsstore.zig");
+const fakegs = @import("fakegs.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
 const Socket = net.Socket;
 
@@ -14,15 +16,11 @@ pub var HOST_BNET: u16 = 6112;
 /// MCP is muxed onto the BNCS port, as real Battle.net does it, so this is the same port.
 /// The standalone d2cs listener it used to name is gone.
 pub var HOST_D2CS: u16 = 6112;
-pub var HOST_D2DBS: u16 = 6114;
-pub var HOST_GS: u16 = 6115;
 
-/// Move the block to `base`..`base+3`.
+/// Move the client-facing port.
 pub fn setPortBase(base: u16) void {
     HOST_BNET = base;
     HOST_D2CS = base; // muxed onto BNCS
-    HOST_D2DBS = base + 2;
-    HOST_GS = base + 3;
 }
 
 // BNCS opcodes
@@ -64,14 +62,12 @@ pub const DBS_SAVE = 0x30;
 pub const DBS_GET = 0x31;
 pub const DBS_DATATYPE_CHARSAVE = 0x01;
 
-// gs-link control opcodes
-pub const GS_AUTHREQ = 0x10;
-pub const GS_AUTHREPLY = 0x11;
-pub const GS_SETGSINFO = 0x12;
+// realm <-> game-server control opcodes. The same packets as before; they travel redis now.
 pub const GS_ADDRINFO = 0x24;
 pub const GS_CREATEGAME = 0x20;
 pub const GS_JOINGAME = 0x21;
 pub const GS_UPDATEGAMEINFO = 0x22;
+pub const GS_CLOSEGAME = 0x23;
 
 pub const CLASS_NAMES = [_][]const u8{
     "Amazon", "Sorceress", "Necromancer", "Paladin",
@@ -851,47 +847,38 @@ pub const AdInfo = struct {
 };
 
 // ---------------------------------------------------------------------------
-// d2dbs character-save store
+// character store
 // ---------------------------------------------------------------------------
-/// SAVE_DATA 0x30 -> result (0 = ok).
-pub const CharFetch = struct { result: u32, createtime: u32, allowladder: u32, data_len: usize };
+/// Put a character where a game server would: into redis, marked for the realm's flush worker.
+/// Fixture staging for the tests that need a character to exist before logging onto it — the realm
+/// has no listener to hand one to any more, so this writes what the store holds.
+///
+/// It then WAITS for the flush worker to move it to the store of record, because that is where the
+/// character list is read from. Waiting rather than writing there directly keeps the fixture on the
+/// same path a real save takes, so a break in that path fails these tests instead of hiding behind
+/// them.
+///
+/// Returns 0 on success, to keep the shape the callers already check.
+pub fn storePutChar(account: []const u8, charname: []const u8, d2s: []const u8) !u32 {
+    var c = try gsstore.Client.connect(fakegs.redis_port);
+    defer c.close();
+    var kb: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
+    _ = try c.cmdBig(&.{ "SET", key }, d2s);
+    var vb: [192]u8 = undefined;
+    _ = try c.cmd(&.{ "INCR", std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong });
+    var mb: [128]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    _ = try c.cmd(&.{ "SADD", "realmd:dirty", member });
 
-/// d2dbs GET_DATA (0x31): fetch a character's save plus the metadata beside it.
-/// Reply: result:u32, createtime:u32, allowladder:u32, datatype:u16, datalen:u16, char\0, bytes.
-pub fn d2dbsGet(account: []const u8, charname: []const u8) !CharFetch {
-    const fd = try net.connectLocal(HOST_D2DBS);
-    defer net.closeSocket(fd);
-    var body: [256]u8 = undefined;
-    var w = net.Writer.init(&body);
-    w.u16v(DBS_DATATYPE_CHARSAVE);
-    w.cstr(account);
-    w.cstr(charname);
-    try ctlSend(fd, DBS_GET, w.slice());
-    var rx: [16384]u8 = undefined;
-    const c = try ctlRecv(fd, &rx);
-    if (c.typ != DBS_GET) return error.D2dbsGetBadType;
-    if (c.body.len < 16) return error.D2dbsGetShort;
-    return .{
-        .result = net.rdU32(c.body, 0),
-        .createtime = net.rdU32(c.body, 4),
-        .allowladder = net.rdU32(c.body, 8),
-        .data_len = net.rdU16(c.body, 14),
-    };
-}
-
-pub fn d2dbsSave(acct: []const u8, char: []const u8, d2s: []const u8) !u32 {
-    const fd = try net.connectLocal(HOST_D2DBS);
-    defer net.closeSocket(fd);
-    var body: [4096]u8 = undefined;
-    var w = net.Writer.init(&body);
-    w.u16v(DBS_DATATYPE_CHARSAVE);
-    w.cstr(acct);
-    w.cstr(char);
-    w.u16v(@intCast(d2s.len));
-    w.bytes(d2s);
-    try ctlSend(fd, DBS_SAVE, w.slice());
-    var rx: [4096]u8 = undefined;
-    const c = try ctlRecv(fd, &rx);
-    if (c.typ != DBS_SAVE) return error.SaveReplyType;
-    return net.rdU32(c.body, 0);
+    var waited: u32 = 0;
+    while (waited < 5_000) : (waited += 20) {
+        const r = try c.cmd(&.{ "SISMEMBER", "realmd:dirty", member });
+        switch (r) {
+            .int => |v| if (v == 0) return 0,
+            else => {},
+        }
+        _ = net.usleep(20_000);
+    }
+    return error.FlushTimeout;
 }

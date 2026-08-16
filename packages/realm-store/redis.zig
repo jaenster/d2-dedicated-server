@@ -410,11 +410,21 @@ pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
+    var mb: [192]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ a, c }) catch return false;
+    var vb: [192]u8 = undefined;
+    const verkey = std.fmt.bufPrint(&vb, prefix ++ "charver:{s}/{s}", .{ a, c }) catch return false;
+
     // Drop the save blob and remove the name from the account's char set. Mirror of
     // saveCharD2s (SET + SADD); idempotent — a missing key is fine.
+    //
+    // The dirty mark goes with it. A deleted character left in that set is work the flush worker
+    // retries forever and can never finish, because the bytes it would move are gone.
     _ = pipeline(s, &r, &.{
         &.{ "DEL", key },
         &.{ "SREM", setkey, c },
+        &.{ "SREM", prefix ++ "dirty", member },
+        &.{ "DEL", verkey },
     });
     return true;
 }
@@ -1533,6 +1543,71 @@ pub fn takeGsReply(seq: u32, out: []u8) ?usize {
     };
 }
 
+// ── events (game server -> realm) ────────────────────────────────────────────
+//
+// Create and join are requests with an answer, so they are a queue plus a reply key. A player
+// joining or leaving, and a game ending, are neither: the server is telling the realm something
+// already true, and nobody is waiting on it. They go onto one shared list that any instance
+// drains, which is what lets the server report to "the realm" rather than to whichever realmd it
+// happens to hold a socket to.
+//
+// Order is preserved per server because a list is a list, and that is the only ordering that
+// matters: two events about the same game come from the same server.
+
+const gs_event_key = prefix ++ "gsev";
+
+/// Report something that happened on a game server. `cap` bounds the list so a realm with nothing
+/// running does not accumulate events forever — the oldest go first, since a player who left an
+/// hour ago is not news.
+pub fn pushGsEvent(packet: []const u8, cap: u32, ttl_s: u32) bool {
+    var cb: [16]u8 = undefined;
+    const keep = std.fmt.bufPrint(&cb, "-{d}", .{cap}) catch return false;
+    var pb: [16]u8 = undefined;
+    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return false;
+    var c = CmdBuf{ .fd = fd };
+    c.add(&.{ "RPUSH", gs_event_key, packet });
+    c.add(&.{ "LTRIM", gs_event_key, keep, "-1" });
+    c.add(&.{ "EXPIRE", gs_event_key, secs });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return false;
+    }
+    var r: Reader = .{ .fd = fd };
+    for (0..3) |_| {
+        if (readReply(&r) == null) {
+            dropConn(s);
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Take the next game-server event, oldest first. Null when there is nothing to apply.
+///
+/// Consumed as it is read, so exactly one instance applies each event. That is safe because every
+/// event here is idempotent in effect but not in accounting — a close applied twice would decrement
+/// a count that had already gone.
+pub fn popGsEvent(out: []u8) ?usize {
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "LPOP", gs_event_key }) orelse return null;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk null;
+            if (v.len > out.len) break :blk null;
+            @memcpy(out[0..v.len], v);
+            break :blk v.len;
+        },
+        else => null,
+    };
+}
+
 /// Choose a game server for a new game and reserve a slot on it, in one indivisible step.
 ///
 /// Selecting and then reserving as two operations is a read-modify-write across instances: two
@@ -1587,6 +1662,33 @@ pub fn pickAndReserveGs() ?u32 {
         },
         else => null,
     };
+}
+
+/// Give back a slot reserved by `pickAndReserveGs` when the create it was for did not happen.
+///
+/// Without this the reservation stands until the server's next heartbeat overwrites the count with
+/// the truth, and in that window a server can be passed over for games it has room for. Floors at
+/// zero and KEEPTTLs for the same reasons the reservation does.
+pub fn releaseGsSlot(gsid: u32) void {
+    const script =
+        \\local rec = redis.call('GET', KEYS[1])
+        \\if not rec or #rec < 15 then return 0 end
+        \\local live = string.byte(rec,11) + string.byte(rec,12)*256
+        \\          + string.byte(rec,13)*65536 + string.byte(rec,14)*16777216
+        \\if live == 0 then return 0 end
+        \\live = live - 1
+        \\local b = string.char(live % 256, math.floor(live/256) % 256,
+        \\                      math.floor(live/65536) % 256, math.floor(live/16777216) % 256)
+        \\redis.call('SET', KEYS[1], string.sub(rec,1,10) .. b .. string.sub(rec,15), 'KEEPTTL')
+        \\return 1
+    ;
+    var kb: [64]u8 = undefined;
+    const key = gsKey(&kb, gsid);
+    if (key.len == 0) return;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    _ = command(s, &r, &.{ "EVAL", script, "1", key });
 }
 
 /// Every game server the realm can currently see, from any instance. Members whose record has

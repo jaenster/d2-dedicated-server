@@ -27,6 +27,11 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
 - **A second login cannot take a live session's place.** The character is refused and the
   session already in the world keeps playing; a character whose client died re-enters
   immediately.
+- **More than one realm server.** Two realmd instances against one redis, a game created
+  through one and joined through the other, both players in the world together. Nothing
+  connects a realm server to a game server any more: servers publish themselves into redis,
+  take create/join from a queue there, and report back on an event stream any instance drains.
+  See [`docs/redis.md`](redis.md).
 - **A game server with no wine at all.** 1.14d's macOS i386 build, mapped and run directly on
   i386 Linux, serving real clients through the same realm and gateway: one process in a 4.4 MB
   image, and on real amd64 hardware as fast as the wine server. See
@@ -42,14 +47,11 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   reap countdown starts immediately. At the 5s default the client always wins that race, but
   it is why the window cannot simply be shortened to buy throughput -- the countdown needs to
   start at the first join, not at creation.
-- Least-loaded routing breaks ties toward the first registered server, so with equal load one
-  server takes the work until its count rises.
-- **Redis is becoming the realm's centre, and the migration is partway.** Characters live
-  there with Postgres behind them (a flush worker any instance runs moves them across), game
-  tokens are minted there, the fleet publishes itself there, and game names are claimed there.
-  Create and join dispatch still travel each game server's control socket, which is the one
-  thing that still stops realmd running as more than a single replica. See
-  [`docs/redis.md`](redis.md).
+- Least-loaded routing breaks ties toward whichever server the set enumerates first, so with
+  equal load one server takes the work until its count rises.
+- **The native game server has not been ported off the retired control socket.** It still
+  dials :6115 and fetches characters over d2dbs, neither of which exists; it boots and serves
+  nothing until it joins the realm through redis the way the wine server does.
 - **The native server hosts several games, but ships capped at one.** With `D2GS_MAX_GAMES`
   raised, about half of a round's games are admitted and the rest are refused cleanly -- no
   crashes, no evictions, and the games that run are correct. The shortfall is not yet

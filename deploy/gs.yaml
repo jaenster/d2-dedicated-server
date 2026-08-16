@@ -9,8 +9,9 @@
 # there is nothing to collide, so anti-affinity is a preference (spread for fault
 # tolerance) rather than a requirement.
 #
-# Each GS dials the realmd Service by DNS (REALMD_HOST) — the d2gs.dll resolves it
-# (getaddrinfo) and registers over the gs-link, self-reporting D2GS_GS_ADDR.
+# Each GS meets the realm in redis: it publishes itself there (self-reporting D2GS_GS_ADDR),
+# takes create/join from its own queue, and reads and writes characters there. It never dials
+# realmd, so the two scale independently.
 #
 # Game files are proprietary: populate the d2-gamefiles PVC with a real 1.14d install
 # (ReadOnlyMany) before scaling up.
@@ -61,9 +62,9 @@ spec:
           ports:
             - { containerPort: 4000, name: game }
           env:
-            # The realm server Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
-            - name: REALMD_HOST
-              value: realmd.realmd.svc.cluster.local
+            # The shared store — this GS's only link to the realm.
+            - name: D2GS_REDIS_ADDR
+              value: realmd-redis.realmd.svc.cluster.local:6379
             # Node IP → the public address clients dial for this pod's games.
             - name: POD_IP
               valueFrom:

@@ -16,7 +16,7 @@
 const std = @import("std");
 const server = @import("server.zig");
 const fastcall = @import("../runtime/fastcall.zig");
-const d2dbs = @import("../realmclient/d2dbs.zig");
+const gsredis = @import("../realmclient/redis.zig");
 const joinctx = @import("../realmclient/joinctx.zig");
 const obs = @import("obs");
 const patch = @import("../runtime/patch.zig");
@@ -41,19 +41,6 @@ const OnDatabaseCharacterReceived: *const fn (
     pn_filetimes: *const [2]u32, // [0] = FILETIME*, [1] = unk0x194
     p_container: ?*anyopaque, // must equal pClient->pClientContainer
 ) callconv(.winapi) u32 = @ptrFromInt(0x005306e0);
-
-// D2DBS endpoint (realmd's d2dbs listener) the GS fetches character saves from.
-var dbs_host: [*:0]const u8 = "";
-var dbs_port: u16 = 0;
-var dbs_ready = false;
-
-/// Point the realm char loader at a D2DBS server (host = dotted-quad IPv4).
-pub fn setDatabaseSource(host: [*:0]const u8, port: u16) void {
-    dbs_host = host;
-    dbs_port = port;
-    dbs_ready = port != 0;
-    log.print("realm: d2dbs char source set");
-}
 
 var load_filetime: [2]u32 = .{ 0, 0 }; // a zeroed FILETIME (load-time placeholder)
 var load_filetimes: [2]u32 = undefined; // { &load_filetime, unk0x194 }
@@ -139,12 +126,12 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
 
     var save_len: usize = 0;
     {
-        // No d2dbs connect to gate this any more: the character comes from the shared store, which
-        // holds its own connection. Dialling the realm first was what kept the old path alive even
-        // after the fetch itself moved — the fetch was never reached when the dial failed.
+        // Straight from the shared store. Nothing is dialled first: gating this on a connection
+        // to the realm is what kept the retired path alive after the fetch itself had moved — the
+        // fetch was never reached when the dial failed, and it read as a broken store.
         var sp = obs.enter("char_fetch");
         defer sp.exit();
-        save_len = d2dbs.fetchCharSave(acct_name, char_name, &slot.save);
+        save_len = gsredis.getChar(acct_name, char_name, &slot.save);
     }
 
     // Queue the delivery for the tick loop; do NOT call OnDatabaseCharacterReceived
@@ -214,9 +201,9 @@ fn saveDatabaseCharImpl(ecx: usize, edx: usize, s1: usize, s2: usize, s3: usize,
     log.cstr("realm:   char=", @intFromPtr(&d2s[0x14]));
     log.hex("realm:   bytes=0x", d2s.len);
 
-    // Straight to the store, with no realm to dial first — it holds its own connection, and the
-    // save is durable the moment it lands there.
-    const ok = d2dbs.saveCharSave(account, char_name, d2s);
+    // Straight to the store, with no realm to dial first — the save is durable the moment it
+    // lands there, and the realm's flush worker moves it to the store of record behind us.
+    const ok = gsredis.putChar(account, char_name, d2s);
     log.print(if (ok) "realm:   char saved" else "realm:   char save FAILED");
     return 1;
 }

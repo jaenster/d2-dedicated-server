@@ -20,8 +20,8 @@ two ingresses. Both use the same builds and the same recorded routes:
 - **realmd's embedded edge** (`REALMD_GAME_PORT`): realmd splices in-process, no redis hop and no
   second binary. For one host — Compose, or a native run.
 
-The client only ever uses two ports: **6112** (login + realm) and **4000** (game). Everything
-else (gs-link 6115, d2dbs 6114) is internal traffic between the game-server fleet and realmd.
+The client only ever uses two ports: **6112** (login + realm) and **4000** (game). There is no
+third — realmd and the game-server fleet never connect to each other, they meet in redis.
 
 See [`apps/d2ingress/README.md`](../apps/d2ingress/README.md) for why the gateway exists
 at all.
@@ -72,7 +72,7 @@ services:
       REALMD_REDIS_ADDR: redis:6379
       REALMD_PG_DSN: postgres://realmd:realmd@postgres:5432/realmd
       REALMD_LOG_JSON: "1"
-    ports: ["6112:6112", "6114:6114", "6115:6115", "18080:8080"]
+    ports: ["6112:6112", "18080:8080"]
 ```
 
 ```
@@ -94,11 +94,10 @@ add `-f deploy/compose.local.yaml`.
 #    fs (a data dir, default), or redis/pg via REALMD_*_STORE.
 REALMD_DATA_DIR=./realmd-data ./zig-out/bin/realmd
 
-# 2) headless game server (wine). Registers over the gs-link and fetches characters
-#    from realmd's d2dbs over the network -- it does NOT read a shared game-data mount.
-wine Game.exe -w -nosound --headless --loaddll Z:\...\d2gs.dll \
-    --d2gs --d2gs-boot --realm --create-games \
-    --d2cs 127.0.0.1:6115 --d2dbs 127.0.0.1:6114
+# 2) headless game server (wine). Publishes itself into redis and reads characters from there
+#    -- it never dials realmd, and does NOT read a shared game-data mount.
+D2GS_REDIS_ADDR=127.0.0.1:6379 wine Game.exe -w -nosound --headless --loaddll Z:\...\d2gs.dll \
+    --d2gs --d2gs-boot --realm
 
 # 3) a real client (point its bnet gateway at realmd on :6112, then log in normally)
 wine Game.exe -w -skiptobnet --loaddll Z:\...\d2gs.dll --d2gs --bypass-checkrev

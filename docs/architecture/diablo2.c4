@@ -260,19 +260,19 @@ model {
         #ours
         description 'Realm: char select, game create/join sessions'
       }
-      rd2dbs = component 'd2dbs' {
+      charflush = component 'charflush' {
         #ours
-        description 'Character database service'
+        description 'Moves saved characters from the redis cache to the store of record. Every instance runs one; they need no coordination because a flush reads the current bytes.'
       }
-      gslink = component 'gslink' {
+      gslink = component 'fleet' {
         #ours
-        description 'GS fleet registry: each GS connects out (:6115) + AUTHREQ/REPLY/SETGSINFO/ADDRINFO (self-reports <ip>:4000, gsid, maxgame). Routes CREATE to least-loaded GS, JOIN to the owning gsid; expires games on GS disconnect.'
+        description 'The game servers as the whole realm sees them, through redis: pick-and-reserve the least loaded with room (one EVAL, so two instances cannot choose the same slot), dispatch CREATE/JOIN to that server\'s queue and collect the reply by seq, and drain the event stream servers report on.'
       }
 
       // 12-factor app surface for k8s.
       health = component 'health' {
         #ours
-        description 'HTTP :8080 — /healthz liveness, /readyz readiness (store reachability + GS presence + draining)'
+        description 'HTTP :8080 — /healthz liveness, /readyz readiness (store reachability + a game server published in the store + draining); also the admin API and web UI'
       }
       shutdown = component 'shutdown' {
         #ours
@@ -283,7 +283,7 @@ model {
       // backend. Two independent selections — durable (chars) + ephemeral (sessions+games).
       db = store 'store facade' {
         #ours
-        description 'Domain ops (getCharD2s/saveCharD2s, mintSession/accountForSession, registerGame/findGame). Switch-dispatched: fs | redis | pg.'
+        description 'Domain ops (getCharD2s/saveCharD2s, mintSession/accountForSession, registerGame/findGame, the fleet + its queues). Switch-dispatched: fs | redis | pg — redis is required, the durable half is a choice.'
       }
       store_fs = store 'fs backend' {
         #ours
@@ -291,30 +291,30 @@ model {
       }
       store_redis = store 'redis backend' {
         #ours
-        description 'Ephemeral sessions + games with native TTL'
+        description 'The realm\'s centre: sessions, games, characters (cache), seats, tokens, the fleet and its request/reply/event channels'
       }
       store_pg = store 'pg backend' {
         #ours
         description 'Postgres: durable character saves'
       }
 
-      rd2dbs -> db 'reads/writes'
       rd2cs -> db 'sessions / games'
-      gslink -> db 'registerGame / findGame'
+      gslink -> db 'fleet, queues, events'
+      charflush -> db 'redis -> store of record'
       db -> store_fs 'durable+ephemeral (default)'
       db -> store_redis 'ephemeral (sessions+games)'
       db -> store_pg 'durable (chars)'
       health -> db 'readiness probe'
-      health -> gslink 'GS presence'
+      health -> gslink 'is any game server published'
       shutdown -> gslink 'drain games'
       gslink -> rd2cs 'announces games'
     }
 
-    // The headless game-server fleet — gslink keeps a registry of MANY of these.
-    // Each connects OUT to gslink, self-reports <ip>:4000 + gsid + capacity.
+    // The headless game-server fleet. Nothing connects it to realmd: each publishes itself
+    // into redis and takes its work from a queue there.
     gameserver = process 'd2gs game server (fleet, 1..N)' {
       #ours
-      description 'Headless Game.exe + d2gs.dll under wine+Xvfb. Connects out to gslink (:6115), ADDRINFO self-reports <ip>:4000 + gsid + maxgame; serves game traffic on :4000. On k8s it is INTERNAL (registers its status.podIP:4000, no hostPort) with an in-process health endpoint on :8086 for the k8s probes.'
+      description 'Headless Game.exe + d2gs.dll under wine+Xvfb. Publishes its own record into redis (<ip>:4000, gsid, capacity, load, full) and refreshes it on its tick; takes CREATE/JOIN from its own queue; reports players entering/leaving and games ending as events. Serves game traffic on :4000. On k8s it is INTERNAL (publishes status.podIP:4000, no hostPort) with an in-process health endpoint on :8086.'
     }
 
     // d2ingress — a SEPARATE binary (apps/d2ingress/main.zig): the cloud-native
@@ -340,14 +340,11 @@ model {
   servermods -> d2game 'hooks exp / kill / boss-AI / item+monster spawn logic'
   d2layer -> fog 'allocates from FOG memory pools (per-game lifetime)'
 
-  // ---- realm wiring (game server <-> backend) ----
-  realmclient -> rd2cs 'realm session'
-  realmclient -> rd2dbs 'fetch/store characters'
+  // ---- realm wiring: through the store, never point to point ----
+  realmclient -> db 'publishes itself; takes CREATE/JOIN from its queue; reads/writes characters'
+  gslink -> db 'picks + reserves a server, pushes the request, collects the reply by seq'
+  db -> gslink 'the events servers report: player enter/leave, game closed'
   gslink -> dll 'drives game lifecycle'
-
-  // ---- GS fleet registration + routing ----
-  gameserver -> gslink 'connects out (:6115): AUTHREQ/REPLY/SETGSINFO/ADDRINFO'
-  gslink -> gameserver 'routes CREATE (least-loaded) / JOIN (by gsid)'
   dll -> gameserver 'is one fleet member'
 
   // ---- d2ingress: the game-traffic gateway (separate binary) ----
@@ -402,15 +399,15 @@ views {
   // translates the token and splices through to the real GS behind it.
   view join_flow {
     title 'Player join flow'
-    include player, d2client, bncs, bnftp, rd2cs, rd2dbs, gslink, d2ingress, gameserver, dll, engine, d2game, db
+    include player, d2client, bncs, bnftp, rd2cs, gslink, d2ingress, gameserver, dll, engine, d2game, db
     autoLayout LeftRight
   }
 
-  // The GS fleet: realmd's gslink fronts many game servers; CREATE routes to the
-  // least-loaded, JOIN to the owning gsid, and the client talks game traffic direct.
+  // The GS fleet: servers publish themselves into redis and realmd dispatches through it —
+  // CREATE to the least-loaded with room, JOIN to the server that owns the game.
   view gs_fleet {
-    title 'GS fleet — gslink registry + routing'
-    include player, d2client, rd2cs, gslink, gameserver, dll, db, store_fs, store_redis, store_pg, health, shutdown
+    title 'GS fleet — published in redis, dispatched through it'
+    include player, d2client, rd2cs, gslink, charflush, gameserver, dll, db, store_fs, store_redis, store_pg, health, shutdown
     autoLayout LeftRight
   }
 }

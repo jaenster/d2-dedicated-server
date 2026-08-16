@@ -1,12 +1,11 @@
 //! realmd — a clean-room Battle.net / D2 realm server in Zig.
 //!
-//! Replaces pvpgn (bnetd + d2cs + d2dbs) with a single binary: three TCP
-//! listeners over shared in-memory state, durable state behind a Store seam so
-//! it survives restarts and can scale to multiple instances on a shared backend.
+//! Replaces pvpgn (bnetd + d2cs + d2dbs) with a single binary. It serves clients on one port
+//! and keeps everything shared in redis, so instances are interchangeable rather than each
+//! owning a piece of the realm.
 //!
-//! It is the realm the unmodified 1.14d client connects to, and it dispatches
-//! games to our injected d2gs (Game.exe) over the same d2cs<->d2gs protocol the
-//! GS already speaks.
+//! It is the realm the unmodified 1.14d client connects to. Games reach a game server through
+//! the shared store rather than a connection this instance holds — see fleet.zig.
 const std = @import("std");
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const config = @import("realm_infra").config;
@@ -23,8 +22,7 @@ fn nowMs() u64 {
 }
 const bncs = @import("bncs.zig");
 const d2cs = @import("d2cs.zig");
-const d2dbs = @import("d2dbs.zig");
-const gslink = @import("gslink.zig");
+const fleet = @import("fleet.zig");
 const gameedge = @import("gameedge.zig");
 const charflush = @import("charflush.zig");
 const store = @import("store.zig");
@@ -229,7 +227,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // onto :6112, exactly as real bnet does. There is no second listener — the client was never
     // told about one, so the only thing the old d2cs port ever served was our own test harness.
     bncs.d2cs_port = cfg.bnet_port;
-    gslink.realm_name = cfg.realm_name;
     if (parseIp4(cfg.realm_addr)) |ip| {
         bncs.d2cs_ip = ip;
     } else {
@@ -237,7 +234,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     if (cfg.gs_addr.len > 0) {
         if (parseIp4(cfg.gs_addr)) |ip| {
-            gslink.gs_ip_override = ip;
+            fleet.gs_ip_override = ip;
         } else {
             log.line("realmd", "WARNING gs_addr '{s}' is not an IPv4; ignoring", .{cfg.gs_addr});
         }
@@ -258,16 +255,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.ingress_port, cfg.route_ttl_s });
 
     const bnet_fd = try net.listenTcp(cfg.bind, cfg.bnet_port);
-    const gs_fd = try net.listenTcp(cfg.bind, cfg.gs_port);
     const health_fd = try net.listenTcp(cfg.bind, cfg.health_port);
-    log.line("realmd", "listening on {d} (gs link {d}, health {d})", .{ cfg.bnet_port, cfg.gs_port, cfg.health_port });
+    log.line("realmd", "listening on {d} (health {d})", .{ cfg.bnet_port, cfg.health_port });
 
     // Capture mode hexdumps raw bytes (protocol discovery); otherwise speak it.
     const bnet_handler: net.Handler = if (cfg.capture) net.captureHandler else bncs.handle;
-    const gs_handler: net.Handler = if (cfg.capture) net.captureHandler else gslink.handle;
 
-    const t_bnet = try std.Thread.spawn(.{}, net.serve, .{ "bnet", bnet_fd, bnet_handler });
     const t_health = try std.Thread.spawn(.{}, net.serve, .{ "health", health_fd, health.handle });
+
+    // Game servers report what happens on them into the shared store rather than down a socket
+    // to whichever instance they connected to. Every instance drains that stream; each event is
+    // taken by exactly one of them.
+    _ = std.Thread.spawn(.{}, fleet.consumeEvents, .{}) catch |e|
+        log.line("realmd", "WARNING game-server event consumer did not start: {s} — the join list will not update", .{@errorName(e)});
 
     // Optional embedded game edge: realmd fronts game traffic itself (in-process token
     // splice) instead of a standalone d2ingress — the lightweight single-binary path.
@@ -287,8 +287,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     health.markStarted(); // all listeners bound → probes may go green
-    net.serve("gs", gs_fd, gs_handler); // main thread runs the GS link listener
-    t_bnet.join();
+    net.serve("bnet", bnet_fd, bnet_handler); // main thread serves clients
     t_health.join();
     if (t_game) |t| t.join();
 }

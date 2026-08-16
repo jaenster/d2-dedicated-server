@@ -61,13 +61,11 @@ Not "it has a Dockerfile". The design decisions that matter:
 - **Small.** Two of the three ship as `scratch` images with static musl binaries and sit at
   ~1--6 MiB resident. The realm costs about `1m` CPU.
 
-One honest exception, and it is now the only one: a game server holds its gs-link control
-connection to exactly **one** realmd, and create/join is a synchronous request over that socket.
-Everything else a realmd needs is in redis — it can read the whole fleet, resolve any session,
-and serve any character — but it can only dispatch to servers whose socket it holds. So **run
-realmd as a single replica** today; the chart does, and says why. What closes it is moving
-dispatch itself into the store, which is the last piece of that migration
-([`docs/redis.md`](docs/redis.md)).
+- **Interchangeable instances.** Nothing connects a realm server to a game server. Servers
+  publish themselves into redis, take create/join from a queue there, and report back on an
+  event stream any instance drains — so any realmd can serve any client and reach the whole
+  fleet. Verified with two instances: a game created through one, joined through the other,
+  both players in the world together ([`docs/redis.md`](docs/redis.md)).
 
 realmd and d2ingress sit behind public LoadBalancers on stable floating IPs (only 6112 + 4000
 open); Redis + Postgres behind them; an internal GS fleet whose pods register their own pod IP:
@@ -87,18 +85,18 @@ open); Redis + Postgres behind them; an internal GS fleet whose pods register th
        |  :8080  health / UI  |        |         ingress      |
        +----------+-----------+        +-----------+----------+
             |     |                                |
-            |     |  create/join dispatch          |  splice to the owning GS
-            |     |  (gs-link :6115)               |
-            |     +--------------------+           |
-            |                          v           v
-            |                  +----------------------+
-            |  stages the      |  Game.exe + d2gs.dll |
-            |  character       |  fleet 1..N          |
-            v                  +----------+-----------+
-       +---------------------------+      | reads the character, writes it back,
-       |  redis                    |<-----+ publishes its own heartbeat
-       |  characters, seats,       |
-       |  tokens, routes, fleet    |
+            |                                      |  splice to the owning GS
+            |                                      |
+            |                                      v
+            |                          +----------------------+
+            |                          |  Game.exe + d2gs.dll |
+            |                          |  fleet 1..N          |
+            v                          +----------+-----------+
+       +---------------------------+              | takes create/join from its queue,
+       |  redis                    |<-------------+ reports what happens, reads and
+       |  characters, seats,       |                writes characters, publishes itself
+       |  tokens, routes, fleet,   |
+       |  the game-server queues   |
        +------------+--------------+
                     | flush worker (any realmd)
                     v
@@ -107,9 +105,8 @@ open); Redis + Postgres behind them; an internal GS fleet whose pods register th
             +----------------+
 ```
 
-The client only ever uses two ports: **6112** (login + realm) and **4000** (game). Everything
-else is internal: gs-link (6115), which carries create/join dispatch to the fleet. Characters do
-not travel it — the game server reads and writes them straight from redis.
+The client only ever uses two ports: **6112** (login + realm) and **4000** (game). There is no
+third: realmd and the game servers never speak to each other directly, they meet in redis.
 
 Game traffic always crosses an ingress -- the token realmd hands the client is realm-global, and
 only an ingress can translate it to the id the engine knows. On one host realmd can be that
@@ -164,10 +161,10 @@ list/select characters, create/join a game) -- and, like real Battle.net, **both
 port, 6112**. There is no pvpgn-style fan of client ports. Game-file delivery for the version
 check uses **BNFTP** on the same port.
 
-Behind that one client port, realmd also exposes two **internal** endpoints the fleet uses
-(never the client): a **gs-link** (`:6115`) the fleet registers over and that routes create/join
-to a server. Characters do not pass through realmd at all: it stages one into redis on join and
-the game server reads, plays and writes it back there. See [`docs/redis.md`](docs/redis.md).
+That is the only port. realmd exposes nothing to the fleet, because the fleet does not connect
+to it: game servers publish themselves into redis and take create/join from a queue there.
+Characters do not pass through realmd either — it stages one into redis on join and the game
+server reads, plays and writes it back. See [`docs/redis.md`](docs/redis.md).
 
 More: [`REALMD.md`](REALMD.md) (configuration, trust model) and
 [`apps/realmd/README.md`](apps/realmd/README.md) (internals).
@@ -184,13 +181,14 @@ More: [`REALMD.md`](REALMD.md) (configuration, trust model) and
 - **A built-in mod framework** -- a registry of pure feature modules that hook the engine (exp
   scaling, ubers, an arena mode, client-side maphack, ...), each toggled on its own.
 
-On a join the server does not read a shared disk -- it fetches the character over the network
-from realmd's d2dbs, which serves it from whichever store backend is configured.
+On a join the server does not read a shared disk, and does not ask the realm -- it reads the
+character straight from redis and writes it back there when the game ends.
 
 More: [`docs/MODDING.md`](docs/MODDING.md) (injection + the feature framework),
 [`apps/d2gs/engine/README.md`](apps/d2gs/engine/README.md), [`apps/d2gs/runtime/README.md`](apps/d2gs/runtime/README.md).
 
-realmd's gs-link registers many game servers; `CREATE` routes to the least-loaded, `JOIN` to the
+Game servers publish themselves into redis; `CREATE` is routed to the least-loaded with room
+(picked and reserved in one script, so two realmds cannot choose the same slot) and `JOIN` to the
 one that owns the game, with persistence behind the `fs`/`redis`/`pg` facade:
 
 ![GS fleet](docs/architecture/img/gs_fleet.png)
@@ -228,7 +226,8 @@ emulation and no format conversion.
 The result is one process in a **4.4 MB `scratch` image** (1.7 MB to pull) against wine's 1.04 GB
 and ten processes, at
 8-10 MiB resident against ~115 MiB, with latency indistinguishable from wine's on real hardware.
-It speaks the same gs-link protocol to realmd, so a fleet can mix both kinds of server.
+It is not yet ported off the retired control socket, so it cannot currently join a realm — see
+[`docs/STATUS.md`](docs/STATUS.md).
 
 It hosts one game by default and up to seven with `D2GS_MAX_GAMES`; the same seven-game engine
 ceiling applies. Measurements, and two corrections to earlier conclusions in it, are in

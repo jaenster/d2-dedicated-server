@@ -15,29 +15,31 @@ and cross-compiled to a static Linux binary for deploy.
 - **One client port, like real Battle.net.** The client speaks both BNCS (login) and MCP (realm) on
   **6112** -- realmd demuxes them on the byte after the `0x01` selector, exactly as real bnet tells
   them apart by host. There is no pvpgn-style fan of client-facing ports.
-- **We own both ends of the realm/GS link**, so the realm handoff carries a plain session id in the
-  MCP chunk: no shared-secret crypto, no `gameservlist` IP whitelist, and crucially **no SNAT
-  problem** (the gs-link has its own port and the GS's address is just the connection's peer IP).
+- **We own both ends of the realm/GS relationship**, so the realm handoff carries a plain session
+  id in the MCP chunk: no shared-secret crypto and no `gameservlist` IP whitelist. There is no SNAT
+  problem either, because there is no connection to observe an address from -- a game server states
+  its own client-facing address in the record it publishes.
 - **Stateless fronts over a Store seam.** All durable/cross-connection state (sessions, games,
-  character saves) lives behind one interface, switch-dispatched to `fs` / `redis` / `pg`. So realmd
-  scales horizontally: any instance resolves what another created.
+  character saves) lives behind one interface, switch-dispatched to `fs` / `redis` / `pg`. So does
+  reaching a game server. realmd scales horizontally: any instance resolves what another created,
+  and dispatches to the whole fleet.
 - One static binary, env-only config, no config files.
 
 ## Listeners
 
-Only **6112** is for the client. The rest are internal (the GS fleet talks to realmd) or back-compat.
-
 | Port | Facing | Role |
 |-|-|-|
 | 6112 | client | bnetd login + MCP realm (list/select/create/join), muxed on one port |
-| 6115 | internal | gs-link: the game-server fleet registers here and create/join is routed |
 | 8080 | ops | health/readiness + admin API + (optional) embedded web UI |
+
+The game-server fleet has no port here: servers meet the realm in redis rather than connecting
+to it. See [`docs/redis.md`](docs/redis.md).
 
 ## Configuration (env only)
 | Var | Default | Meaning |
 |-|-|-|
 | `REALMD_BIND` | `0.0.0.0` | bind address |
-| `REALMD_BNET_PORT` / `REALMD_D2CS_PORT` / `REALMD_D2DBS_PORT` / `REALMD_GS_PORT` | 6112-6115 | listener ports |
+| `REALMD_BNET_PORT` | 6112 | the client-facing listener |
 | `REALMD_DURABLE_STORE` | `fs` | character saves backend: `fs` / `pg` |
 | `REALMD_EPHEMERAL_STORE` | `fs` | sessions + games backend: `fs` / `redis` |
 | `REALMD_REDIS_ADDR` / `REALMD_PG_DSN` | -- | backend endpoints when not `fs` |
@@ -78,10 +80,10 @@ behind a LoadBalancer with Redis + Postgres backends; see [`deploy/chart`](deplo
 **Working** (driven by clients in `tools/realmd-test/` and by a real 1.14d client):
 - bnetd full login: AUTH_INFO -> AUTH_CHECK -> LOGON -> QUERYREALMS2 -> LOGONREALMEX.
 - d2cs: MCP_STARTUP (session resolve), CHARLIST2, CHARLOGON, CHARCREATE -- char select renders.
-- d2cs games: CREATEGAME / JOINGAME, driving the GS over the control link.
-- gs-link: AUTHREQ -> AUTHREPLY/SETGSINFO, CREATEGAME/JOINGAME request-reply, ADDRINFO routing.
-- d2dbs: GET/SAVE character saves; **restart survival proven**.
-- **Multi-instance proven**: session minted on A resolved on B; game created on A joined on B.
+- d2cs games: CREATEGAME / JOINGAME, dispatched to a game server through its store queue.
+- Characters: read and written by the game server itself, in redis; **restart survival proven**.
+- **Multi-instance proven**: session minted on A resolved on B; game created on A joined on B,
+  with two realmd processes against one fleet and both players in the world together.
 - **Real client end to end**: a retail 1.14d client logs in, creates/joins a game on the headless
   GS, and the character spawns in-world -- including two clients in one game (see the top-level
   README Status).
