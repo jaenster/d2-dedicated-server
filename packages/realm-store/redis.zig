@@ -2176,3 +2176,225 @@ test "a slot's connection is dropped independently of the rest of the pool" {
     try std.testing.expectEqual(@as(?net.Socket, 4242), a.fd);
     a.fd = null; // leave the pool as we found it
 }
+
+// ── chat (cross-instance) ────────────────────────────────────────────────────
+//
+// Chat used to be a process-global table keyed by socket, which made two realmd instances two
+// disjoint channels wearing the same name: talk did not cross, a whisper could not find someone
+// on the other instance, and the user list showed half the room. None of that degrades visibly —
+// it just looks like the other players are not there.
+//
+// So the room lives here and the sockets stay local. Each instance keeps its own members (it owns
+// their connections) and publishes them into a per-channel hash; anything that has to reach a
+// member somewhere else is handed to that instance's inbox. Local delivery never makes a round
+// trip, which keeps the common case — everyone in one channel on one instance — exactly as fast
+// as it was.
+//
+// The records are opaque here on purpose: their shape is chat's business, and this module has no
+// reason to know what a statstring is.
+
+fn chanKey(buf: []u8, channel: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "chan:{s}", .{channel}) catch null;
+}
+
+fn chatUserKey(buf: []u8, name: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "chatuser:{s}", .{name}) catch null;
+}
+
+/// Publish a member: into the channel's roster, and into a by-name index so a whisper can find
+/// which instance holds them without reading every channel.
+///
+/// The index carries a TTL and the caller refreshes it; that is what makes an instance which died
+/// without tidying up disappear rather than haunting the roster forever.
+pub fn chatPutMember(channel: []const u8, name: []const u8, rec: []const u8, ttl_s: u32) bool {
+    var ck: [96]u8 = undefined;
+    var uk: [96]u8 = undefined;
+    const chan = chanKey(&ck, channel) orelse return false;
+    const user = chatUserKey(&uk, name) orelse return false;
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return false;
+    var c = CmdBuf{ .fd = fd };
+    c.add(&.{ "HSET", chan, name, rec });
+    c.add(&.{ "SET", user, rec, "PX", px });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return false;
+    }
+    var r: Reader = .{ .fd = fd };
+    for (0..2) |_| {
+        if (readReply(&r) == null) {
+            dropConn(s);
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Refresh only the by-name index, without putting them in a channel roster. A player who went
+/// off to a game, or left the channel, is still online and still whisperable — they are just not
+/// in the room any more, so channel talk must stop reaching them while /whois keeps working.
+pub fn chatPutIndex(name: []const u8, rec: []const u8, ttl_s: u32) bool {
+    var uk: [96]u8 = undefined;
+    const user = chatUserKey(&uk, name) orelse return false;
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    return command(s, &r, &.{ "SET", user, rec, "PX", px }) != null;
+}
+
+/// Take a member out of a channel. Called on leave, on disconnect, and when someone goes off to
+/// play — a player in a game is still connected but is not in the room.
+pub fn chatDelMember(channel: []const u8, name: []const u8, drop_index: bool) void {
+    var ck: [96]u8 = undefined;
+    var uk: [96]u8 = undefined;
+    const chan = chanKey(&ck, channel) orelse return;
+    const user = chatUserKey(&uk, name) orelse return;
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return;
+    var c = CmdBuf{ .fd = fd };
+    c.add(&.{ "HDEL", chan, name });
+    if (drop_index) c.add(&.{ "DEL", user });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return;
+    }
+    var r: Reader = .{ .fd = fd };
+    for (0..(if (drop_index) @as(usize, 2) else 1)) |_| {
+        if (readReply(&r) == null) {
+            dropConn(s);
+            return;
+        }
+    }
+}
+
+/// Everyone in a channel, across every instance. `cb` is called per member with the name and its
+/// record; both point into a shared buffer and are only valid for that call.
+pub fn chatRoster(channel: []const u8, ctx: anytype, cb: *const fn (@TypeOf(ctx), []const u8, []const u8) void) usize {
+    var ck: [96]u8 = undefined;
+    const chan = chanKey(&ck, channel) orelse return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "HGETALL", chan }) orelse return 0;
+    const count = switch (rep) {
+        .array_len => |n| if (n <= 0) return 0 else @as(usize, @intCast(n)),
+        else => return 0,
+    };
+    // HGETALL returns a flat field,value,field,value stream.
+    var namebuf: [64]u8 = undefined;
+    var namelen: usize = 0;
+    var n: usize = 0;
+    for (0..count) |i| {
+        const er = readReply(&r) orelse {
+            dropConn(s);
+            return n;
+        };
+        const v = switch (er) {
+            .bulk => |b| b orelse continue,
+            else => continue,
+        };
+        if (i % 2 == 0) {
+            namelen = @min(v.len, namebuf.len);
+            @memcpy(namebuf[0..namelen], v[0..namelen]);
+        } else {
+            cb(ctx, namebuf[0..namelen], v);
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// How many are in a channel, realm-wide. Its own call because deciding who gets channel-operator
+/// needs a count and nothing else.
+pub fn chatChannelSize(channel: []const u8) usize {
+    var ck: [96]u8 = undefined;
+    const chan = chanKey(&ck, channel) orelse return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "HLEN", chan }) orelse return 0;
+    return switch (rep) {
+        .int => |v| if (v > 0) @intCast(v) else 0,
+        else => 0,
+    };
+}
+
+/// Find one member by name, wherever they are. Null when nobody by that name is online.
+pub fn chatFindMember(name: []const u8, out: []u8) ?usize {
+    var uk: [96]u8 = undefined;
+    const user = chatUserKey(&uk, name) orelse return null;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", user }) orelse return null;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk null;
+            if (v.len > out.len) break :blk null;
+            @memcpy(out[0..v.len], v);
+            break :blk v.len;
+        },
+        else => null,
+    };
+}
+
+fn chatInboxKey(buf: []u8, instance: u32) ?[]const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "chatin:{x}", .{instance}) catch null;
+}
+
+/// Hand an event to another instance to deliver to its own members.
+pub fn chatPush(instance: u32, packet: []const u8, ttl_s: u32) bool {
+    var kb: [64]u8 = undefined;
+    const key = chatInboxKey(&kb, instance) orelse return false;
+    var pb: [16]u8 = undefined;
+    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return false;
+    var c = CmdBuf{ .fd = fd };
+    c.add(&.{ "RPUSH", key, packet });
+    // A chat line nobody drained is worthless in a minute's time, and an inbox for an instance
+    // that has gone must not grow without bound.
+    c.add(&.{ "EXPIRE", key, secs });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return false;
+    }
+    var r: Reader = .{ .fd = fd };
+    for (0..2) |_| {
+        if (readReply(&r) == null) {
+            dropConn(s);
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Take the next event addressed to this instance.
+pub fn chatPop(instance: u32, out: []u8) ?usize {
+    var kb: [64]u8 = undefined;
+    const key = chatInboxKey(&kb, instance) orelse return null;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "LPOP", key }) orelse return null;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk null;
+            if (v.len > out.len) break :blk null;
+            @memcpy(out[0..v.len], v);
+            break :blk v.len;
+        },
+        else => null,
+    };
+}

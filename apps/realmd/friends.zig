@@ -239,7 +239,7 @@ pub fn list(owner: []const u8, out: []FriendInfo) usize {
         }
     }
     for (out[0..n]) |*fi| {
-        const pres = chat.presenceOf(fi.nameSlice()) orelse continue;
+        const pres = chat.presenceOfAnywhere(fi.nameSlice()) orelse continue;
         fi.away = pres.away;
         fi.dnd = pres.dnd;
         fi.in_game = pres.in_game;

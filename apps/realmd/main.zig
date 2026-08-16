@@ -21,6 +21,7 @@ fn nowMs() u64 {
     return @as(u64, @intCast(time(null))) *% 1000;
 }
 const bncs = @import("bncs.zig");
+const chat = @import("chat.zig");
 const d2cs = @import("d2cs.zig");
 const fleet = @import("fleet.zig");
 const gameedge = @import("gameedge.zig");
@@ -192,6 +193,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // rather than by being told to be. The instance hash keeps their minted ids apart.
     state.shared = true;
     state.instance_hash = hashStr(cfg.instance_id);
+    chat.instance = state.instance_hash; // which inbox chat events for our members arrive on
     log.line("realmd", "instance {s} (hash 0x{x})", .{ cfg.instance_id, state.instance_hash });
     bncs.realm_name = cfg.realm_name;
     bncs.permissive_auth = cfg.permissive_auth;
@@ -250,6 +252,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // taken by exactly one of them.
     _ = std.Thread.spawn(.{}, fleet.consumeEvents, .{}) catch |e|
         log.line("realmd", "WARNING game-server event consumer did not start: {s} — the join list will not update", .{@errorName(e)});
+
+    // Chat that reaches members held by another instance, and keeps ours visible to them. Without
+    // it a channel is only as big as one replica, and nothing says so — talk just does not arrive.
+    _ = std.Thread.spawn(.{}, chat.runInbox, .{}) catch |e|
+        log.line("realmd", "WARNING chat inbox did not start: {s} — chat will not cross instances", .{@errorName(e)});
 
     // Optional embedded game edge: realmd fronts game traffic itself (in-process token
     // splice) instead of a standalone d2ingress — the lightweight single-binary path.

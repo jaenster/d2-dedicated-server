@@ -551,3 +551,48 @@ pub fn lookupTokenRoute(token: u16) ?TokenRoute {
 pub fn healthy() bool {
     return redis.healthy() and pg.healthy();
 }
+
+// ── chat (cross-instance) ────────────────────────────────────────────────────
+//
+// The room is shared; the sockets are not. An instance keeps its own members and publishes them
+// here, and anything that has to reach someone else's member goes to that instance's inbox.
+
+/// How long a published chat member survives without a refresh. Long enough that a healthy
+/// instance never blinks its users out of the room, short enough that one that died takes them
+/// with it before anyone tries to whisper a ghost.
+pub const chat_member_ttl_s: u32 = 90;
+/// A chat line nobody collected is worthless shortly afterwards, and an inbox for an instance
+/// that has gone must not grow without bound.
+pub const chat_inbox_ttl_s: u32 = 60;
+
+pub fn chatPutMember(channel: []const u8, name: []const u8, rec: []const u8) bool {
+    return redis.chatPutMember(channel, name, rec, chat_member_ttl_s);
+}
+
+pub fn chatPutIndex(name: []const u8, rec: []const u8) bool {
+    return redis.chatPutIndex(name, rec, chat_member_ttl_s);
+}
+
+pub fn chatDelMember(channel: []const u8, name: []const u8, drop_index: bool) void {
+    redis.chatDelMember(channel, name, drop_index);
+}
+
+pub fn chatRoster(channel: []const u8, ctx: anytype, cb: *const fn (@TypeOf(ctx), []const u8, []const u8) void) usize {
+    return redis.chatRoster(channel, ctx, cb);
+}
+
+pub fn chatChannelSize(channel: []const u8) usize {
+    return redis.chatChannelSize(channel);
+}
+
+pub fn chatFindMember(name: []const u8, out: []u8) ?usize {
+    return redis.chatFindMember(name, out);
+}
+
+pub fn chatPush(instance: u32, packet: []const u8) bool {
+    return redis.chatPush(instance, packet, chat_inbox_ttl_s);
+}
+
+pub fn chatPop(instance: u32, out: []u8) ?usize {
+    return redis.chatPop(instance, out);
+}

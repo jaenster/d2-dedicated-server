@@ -1843,6 +1843,105 @@ fn scFriendsPersist() Result {
 // in a shared store: a session minted on A's bnetd must resolve on B's d2cs.
 // Instance A: bnet 16112 / d2cs 16113 / d2dbs 16114 / gs 16115 / health 16118.
 // Instance B: 17112 / 17113 / 17114 / 17115 / 17118, SAME data dir, instance "B".
+/// Chat across two realmd instances: a channel is the union of what every instance holds, or it
+/// is not a channel. The failure this guards is silent — talk simply does not arrive, a whisper
+/// says "that user is not logged on" about someone plainly online, and the user list shows half
+/// the room with nothing to say it is half.
+fn scChatAcrossInstances() Result {
+    const name = "chat_across_instances";
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+    const channel = "Diablo II";
+
+    const envs_a = [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "ChatA" },
+        .{ .name = "REALMD_BNET_PORT", .value = "16112" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+    };
+    const a_pid = spawnRealmd(bin, &envs_a, 16112) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
+    const envs_b = [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "ChatB" },
+        .{ .name = "REALMD_BNET_PORT", .value = "17112" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "17118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+    };
+    const b_pid = spawnRealmd(bin, &envs_b, 17112) catch |e| {
+        _ = kill(a_pid, 15);
+        _ = waitpid(a_pid, null, 0);
+        return fail(name, "spawn B {s}", .{@errorName(e)});
+    };
+    defer {
+        _ = kill(a_pid, 15);
+        _ = kill(b_pid, 15);
+        _ = waitpid(a_pid, null, 0);
+        _ = waitpid(b_pid, null, 0);
+    }
+
+    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16112 };
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("CrossAlice") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChat() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.setBnetTimeout(3000);
+
+    // B joins second, on the OTHER instance, so its user list has to include someone it does not
+    // hold. This is the part that silently showed an empty room.
+    _ = net.usleep(200_000);
+    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17112 };
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.login("CrossBob") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChat() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.setBnetTimeout(3000);
+
+    var saw_alice = false;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const ev = b.readChatEvent() catch break;
+        if (ev.eid == rc.EID_SHOWUSER and std.mem.eql(u8, ev.username, "CrossAlice")) {
+            saw_alice = true;
+            break;
+        }
+    }
+    if (!saw_alice) return fail(name, "B's channel list did not include CrossAlice, who is on the other instance", .{});
+
+    // Talk has to cross.
+    _ = net.usleep(200_000);
+    a.chatCommand("hello from A") catch |e| return fail(name, "A talk {s}", .{@errorName(e)});
+    var heard = false;
+    i = 0;
+    while (i < 12) : (i += 1) {
+        const ev = b.readChatEvent() catch break;
+        if (ev.eid != rc.EID_TALK) continue;
+        if (!std.mem.eql(u8, ev.text, "hello from A")) continue;
+        heard = true;
+        break;
+    }
+    if (!heard) return fail(name, "B never heard A's channel talk from the other instance", .{});
+
+    // And a whisper has to find someone the sending instance has never seen.
+    b.chatCommand("/w CrossAlice psst") catch |e| return fail(name, "B whisper {s}", .{@errorName(e)});
+    var whispered = false;
+    i = 0;
+    while (i < 12) : (i += 1) {
+        const ev = a.readChatEvent() catch break;
+        if (ev.eid == rc.EID_ERROR) return fail(name, "whisper across instances refused: {s}", .{ev.text});
+        if (ev.eid != rc.EID_WHISPER) continue;
+        if (!std.mem.eql(u8, ev.text, "psst")) continue;
+        whispered = true;
+        break;
+    }
+    if (!whispered) return fail(name, "A never received the whisper B sent from the other instance", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("one channel across two instances: user list, talk and whisper all cross", .{}) };
+}
+
 fn scMultiInstance() Result {
     const name = "multi_instance";
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
@@ -2316,6 +2415,7 @@ pub fn main() !void {
         scGetFileTime(),
         scBannerAd(),
         scFriendsPersist(),
+        scChatAcrossInstances(),
         scMultiInstance(),
     };
 

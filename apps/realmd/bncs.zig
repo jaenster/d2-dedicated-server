@@ -533,10 +533,14 @@ fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
 // everyone else and still receiving talk they had walked away from.
 fn onLeaveChat(c: *Conn, tag: []const u8) void {
     if (!c.in_channel) return;
-    broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
+    // State first, announcement second. Anyone who reacts to the departure — a /whois, a friend
+    // list refresh — must find the player already gone, and a broadcast now reaches other
+    // instances, so the gap between the two is a store round trip wide rather than a few
+    // instructions.
     chat.setGame(c.fd, ""); // clears the game; the channel is cleared below
     chat.clearChannel(c.fd);
     c.in_channel = false;
+    broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
     log.line(tag, "{s} left chat", .{c.accountName()});
 }
 
@@ -550,9 +554,12 @@ fn onNotifyJoin(c: *Conn, tag: []const u8, body: []const u8) void {
     _ = r.getU32(); // product tag
     _ = r.getU32(); // 0x0e
     const game_name = r.getStr();
-    if (c.in_channel) broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
+    const was_in_channel = c.in_channel;
     c.in_channel = false;
+    // Recorded before announced, for the same reason as leaving chat: a watcher who reacts to
+    // the EID_LEAVE must find them already in the game, not still in the channel.
     chat.setGame(c.fd, game_name);
+    if (was_in_channel) broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
     log.line(tag, "{s} joined game '{s}'", .{ c.accountName(), game_name });
 }
 
@@ -608,10 +615,16 @@ fn bcastCb(ctx: *const BcastCtx, m: *chat.Member) void {
     chat.sendTo(m, bytes);
 }
 
-// Broadcast a CHATEVENT to every OTHER member in this connection's channel.
+// Broadcast a CHATEVENT to every OTHER member in this connection's channel — here and on every
+// other instance holding someone in it. The packet is built once and travels as bytes; the
+// receiving instance applies its own members' /ignore lists, because squelching is a fact about
+// the person receiving and only they know it.
 fn broadcastEvent(c: *Conn, eid: u32, flags: u32, username: []const u8, text: []const u8) void {
     const ctx = BcastCtx{ .eid = eid, .flags = flags, .username = username, .account = c.accountName(), .text = text };
     chat.forEachInChannel(c.channelName(), c.fd, &ctx, bcastCb);
+    var buf: [512]u8 = undefined;
+    const bytes = buildChatEvent(&buf, eid, flags, username, text);
+    chat.broadcastRemote(c.channelName(), c.accountName(), eid, bytes);
 }
 
 const ShowUserCtx = struct { c: *Conn };
@@ -620,6 +633,12 @@ const ShowUserCtx = struct { c: *Conn };
 // member's own flags, so ops/admins show with the right icon).
 fn showUserCb(ctx: *const ShowUserCtx, m: *chat.Member) void {
     sendEvent(ctx.c, EID_SHOWUSER, m.flags, m.displaySlice(), m.statSlice());
+}
+
+// The same, for members held by another instance. Without this the channel list shows only the
+// people who happened to land on the same realmd — half the room, with nothing to say it is half.
+fn showRemoteUserCb(ctx: *const ShowUserCtx, rm: chat.RemoteMember) void {
+    sendEvent(ctx.c, EID_SHOWUSER, rm.flags, rm.display, rm.stat);
 }
 
 fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -633,12 +652,14 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     // an otherwise-empty channel becomes its operator (typical Battle.net behaviour).
     var flags: u32 = 0;
     if (isAdmin(acct)) flags |= FLAG_ADMIN | FLAG_OPERATOR;
-    if (chat.countInChannel(channel, c.fd) == 0) flags |= FLAG_OPERATOR;
+    // Realm-wide, not per-instance: counting only our own members would hand the operator badge
+    // to the first person on every replica, so a busy channel would have as many ops as instances.
+    if (chat.countInChannelShared(channel) == 0) flags |= FLAG_OPERATOR;
     c.user_flags = flags;
     log.line(tag, "join channel '{s}' as {s} (flags=0x{x})", .{ channel, acct, flags });
 
     c.setChannel(channel);
-    _ = chat.join(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
+    _ = chat.joinShared(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
     chat.setGame(c.fd, ""); // back in the lobby: no longer in a game
 
     // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
@@ -646,6 +667,7 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), channel, "");
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
+    chat.forEachRemoteInChannel(channel, &ctx, showRemoteUserCb);
     broadcastEvent(c, EID_JOIN, flags, c.chatName(), c.statSlice());
 }
 
@@ -791,7 +813,11 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         log.line(tag, "{s} whispers {s}: {s}", .{ acct, w.target, w.msg });
         var buf: [512]u8 = undefined;
         const bytes = buildChatEvent(&buf, EID_WHISPER, c.user_flags, c.chatName(), w.msg);
-        const res = chat.whisperEx(w.target, bytes); // delivers unless target is in DND
+        // Local first — most whispers are between people on the same instance and cost nothing
+        // extra. Only when nobody here answers to that name do we ask the rest of the realm,
+        // which is the difference between "not logged on" and "not on THIS realmd".
+        var res = chat.whisperEx(w.target, bytes); // delivers unless target is in DND
+        if (!res.found) res = chat.whisperRemote(w.target, acct, bytes);
         if (!res.found) {
             sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
             return;
@@ -927,7 +953,7 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /whois <name>");
             return true;
         }
-        if (chat.presenceOf(cmd.arg)) |pres| {
+        if (chat.presenceOfAnywhere(cmd.arg)) |pres| {
             const where = pres.channelSlice();
             const line = if (where.len == 0)
                 std.fmt.bufPrint(&rb, "{s} is logged on.", .{cmd.arg}) catch return true
