@@ -1447,6 +1447,62 @@ pub fn removeGs(gsid: u32) void {
     }
 }
 
+/// Choose a game server for a new game and reserve a slot on it, in one indivisible step.
+///
+/// Selecting and then reserving as two operations is a read-modify-write across instances: two
+/// realmds both see the same least-loaded server, both pick it, and one of the two games has
+/// nowhere to go. A script cannot interleave, so the decision and the claim happen together.
+///
+/// Deliberately NOT a distributed lock. A lock would need a lease, an owner to verify, and an
+/// answer for a holder that dies mid-create; this needs none of those because it never spans two
+/// round trips.
+///
+/// Returns the chosen server's id, or null when every server is full — which is a real answer, not
+/// a failure, and the caller has a different thing to tell the player for each.
+pub fn pickAndReserveGs() ?u32 {
+    const script =
+        \\local best, bestload
+        \\for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+        \\  local rec = redis.call('GET', KEYS[2] .. id)
+        \\  if rec and #rec >= 15 then
+        \\    local function u32(o)
+        \\      return string.byte(rec,o) + string.byte(rec,o+1)*256
+        \\           + string.byte(rec,o+2)*65536 + string.byte(rec,o+3)*16777216
+        \\    end
+        \\    local maxgame, live, full = u32(7), u32(11), string.byte(rec,15)
+        \\    -- A server that said it is full knows something the count cannot see: a finished
+        \\    -- game holds its engine slot through the reap window.
+        \\    if full == 0 and (maxgame == 0 or live < maxgame) then
+        \\      if not bestload or live < bestload then best, bestload = id, live end
+        \\    end
+        \\  end
+        \\end
+        \\if not best then return false end
+        \\local key = KEYS[2] .. best
+        \\local rec = redis.call('GET', key)
+        \\local live = string.byte(rec,11) + string.byte(rec,12)*256
+        \\          + string.byte(rec,13)*65536 + string.byte(rec,14)*16777216
+        \\live = live + 1
+        \\local b = string.char(live % 256, math.floor(live/256) % 256,
+        \\                      math.floor(live/65536) % 256, math.floor(live/16777216) % 256)
+        \\-- Rewrite only the load field, and KEEPTTL so reserving does not extend the server's
+        \\-- own lease — that lease is how a dead server disappears, and it is not ours to renew.
+        \\redis.call('SET', key, string.sub(rec,1,10) .. b .. string.sub(rec,15), 'KEEPTTL')
+        \\return best
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:" }) orelse return null;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk null;
+            break :blk std.fmt.parseInt(u32, v, 16) catch null;
+        },
+        else => null,
+    };
+}
+
 /// Every game server the realm can currently see, from any instance. Members whose record has
 /// TTL'd out are pruned from the index as they are found, the same as `snapshotGames`.
 pub fn snapshotGs(out: []types.GsRec) usize {
