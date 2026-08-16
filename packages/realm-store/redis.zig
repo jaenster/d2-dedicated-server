@@ -1061,9 +1061,16 @@ fn charLockKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 
     return std.fmt.bufPrint(buf, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch buf[0..0];
 }
 
-/// Take the character for `owner`. False if somebody else already holds it.
-/// Re-taking a character this same owner already holds succeeds and refreshes the lease, so a
-/// client that reconnects into its own game is not locked out by its own previous session.
+/// Take the character for `owner`. False if it is held at all — including by the same game.
+///
+/// A seat, not a game. Two clients presenting one character to the SAME game are two seats, and
+/// the engine refuses the second outright; making the claim re-takeable by its own owner made
+/// those two indistinguishable and let the realm say yes to a join the engine would then drop in
+/// silence. So the claim is strict, and exactly one seat holds it.
+///
+/// Nothing is locked out by this: the claim is released when the player leaves, when the game
+/// ends, and by its own lease if the server holding it dies. A client whose session died has its
+/// seat reaped by the engine, which reports the departure and frees the character.
 pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32) bool {
     var kb: [96]u8 = undefined;
     const key = charLockKey(&kb, account, charname);
@@ -1076,20 +1083,11 @@ pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8, tt
     var r: Reader = undefined;
     // SET NX first; if it loses, take it anyway when the holder is already us.
     const rep = command(s, &r, &.{ "SET", key, owner, "NX", "PX", px }) orelse return false;
-    switch (rep) {
-        .status, .bulk => return true,
-        else => {},
-    }
-    const script =
-        \\if redis.call('GET', KEYS[1]) == ARGV[1] then
-        \\  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-        \\end
-        \\return 0
-    ;
-    var r2: Reader = undefined;
-    const rep2 = command(s, &r2, &.{ "EVAL", script, "1", key, owner, px }) orelse return false;
-    return switch (rep2) {
-        .int => |v| v == 1,
+    return switch (rep) {
+        .status => true,
+        // A nil bulk is SET NX declining: somebody holds it, and that somebody may be the same
+        // game. Still a refusal — see above.
+        .bulk => |b| b != null,
         else => false,
     };
 }

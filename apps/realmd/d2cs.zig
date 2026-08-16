@@ -121,6 +121,10 @@ const max_players_per_game: u16 = 8;
 /// looks. Bounded: a client that waits is better than one told the game does not exist, but not at
 /// the cost of pinning a connection thread on a create that never lands.
 const create_settle_ms: u32 = 750;
+/// How long a join waits for a character's previous seat to be freed. Longer than the create
+/// settle: the engine needs a moment per departing client to notice the socket is gone, and that
+/// is measured in hundreds of milliseconds rather than tens.
+const seat_release_ms: u32 = 1500;
 const create_poll_ms: u32 = 25;
 
 extern "c" fn usleep(usec: c_uint) c_int;
@@ -662,13 +666,10 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (rr.gsid != 0) _ = gslink.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName(), gtag1);
     // Mint a realm-global token and record {token -> GS addr + real gameid} so the
     // d2ingress can translate the client's token to the engine's gameid and splice.
-    // The creator is the game's first player, so it takes the character with it. A create cannot
-    // collide here — the game did not exist a moment ago — but recording it is what lets the
-    // close free everything the game held.
-    var cob: [32]u8 = undefined;
-    const cowner = store.gameOwnerId(&cob, rr.gameid);
-    _ = store.lockChar(c.accountName(), c.charName(), cowner);
-    _ = store.addGameChar(rr.gameid, c.accountName(), c.charName());
+    // The character is NOT claimed here. The client sends JOINGAME for the game it just made, and
+    // that is where the seat is actually taken — claiming it twice for one seat is what forced the
+    // claim to be re-takeable, and a re-takeable claim cannot tell a second client apart from the
+    // first one arriving again.
     const token = mintToken();
     _ = store.recordTokenRoute(token, rr.ip, rr.port, rr.gameid, route_ttl_s);
     log.line(tag, "create game '{s}' (account={s}) -> gameid={d} token=0x{x} gs=0x{x}@{d}.{d}.{d}.{d}:{d}", .{ name, c.accountName(), rr.gameid, token, rr.gsid, rr.ip[0], rr.ip[1], rr.ip[2], rr.ip[3], rr.port });
@@ -757,7 +758,22 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // previous session.
     var job: [32]u8 = undefined;
     const jowner = store.gameOwnerId(&job, g.gameid);
-    if (!store.lockChar(c.accountName(), c.charName(), jowner)) {
+    // A seat is released when the player leaves, and the engine takes a moment to notice a socket
+    // has gone — so the character a client is bringing to its NEXT game can still be held by the
+    // one it just left. Wait for that to clear before refusing. A genuine second login waits the
+    // same moment and is then turned away, which costs it nothing it can perceive.
+    var claimed = store.lockChar(c.accountName(), c.charName(), jowner);
+    if (!claimed) {
+        var waited: u32 = 0;
+        while (waited < seat_release_ms) : (waited += create_poll_ms) {
+            sleepMs(create_poll_ms);
+            claimed = store.lockChar(c.accountName(), c.charName(), jowner);
+            if (claimed) break;
+        }
+        if (claimed and waited > 0)
+            log.line(tag, "join game '{s}' -> waited {d}ms for '{s}' to leave its last game", .{ name, waited, c.charName() });
+    }
+    if (!claimed) {
         var whob: [64]u8 = undefined;
         const holder = store.charLockOwner(c.accountName(), c.charName(), &whob) orelse "another game";
         // There is NO result code for "that character is already in a game" — the client's
