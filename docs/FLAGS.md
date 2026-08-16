@@ -47,7 +47,6 @@ Off by default unless noted. See [`docs/MODDING.md`](MODDING.md).
 | `--eipprof` | sample every thread's program counter from inside the process and report the hot engine addresses. No host profiler can see them: the 32-bit guest runs translated under wine, so a host sampler only ever sees the translator. Not for a live realm |
 | `--memdiag` | report the engine's working set per bootstrap step |
 | `--test-enter` | drive the server into a game on its own, with no client (DRLG capture) |
-| `--fetch-char <acct:char>` / `--create-char` | exercise the d2dbs character fetch / creation paths |
 | `--d2bs` | inject D2BS after the game window exists (kolbot on a stock client) |
 | `--dump-cdkeys` | print the decoded classic/expansion CD-key globals |
 

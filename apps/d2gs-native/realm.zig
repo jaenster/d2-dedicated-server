@@ -958,9 +958,9 @@ fn note(comptime fmt: []const u8, args: anytype) void {
 test "host:port parses into octets and a port" {
     var ip: [4]u8 = undefined;
     var port: u16 = 0;
-    try parseAddr("10.1.2.3:6115", &ip, &port);
+    try parseAddr("10.1.2.3:6379", &ip, &port);
     try std.testing.expectEqual([4]u8{ 10, 1, 2, 3 }, ip);
-    try std.testing.expectEqual(@as(u16, 6115), port);
+    try std.testing.expectEqual(@as(u16, 6379), port);
     try std.testing.expectError(error.NoPort, parseAddr("10.1.2.3", &ip, &port));
     // Anything that is not a dotted quad — a name, or "10.1.2.3.4" — is handed to resolve() on
     // purpose, so there is no parse error left to assert and the outcome depends on DNS. Only

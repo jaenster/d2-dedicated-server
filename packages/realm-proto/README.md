@@ -16,8 +16,8 @@ deliberately never sees.
 
 The two ends it joins:
 
-- [`apps/realmd`](../../apps/realmd/README.md) — the realm server (bnetd / d2cs / d2dbs /
-  gs-link, persistence, health).
+- [`apps/realmd`](../../apps/realmd/README.md) — the realm server (bnetd + MCP realm,
+  persistence, health).
 - [`apps/d2gs/realmclient`](../../apps/d2gs/realmclient/README.md) — the injected game
   server's outbound links to it.
 

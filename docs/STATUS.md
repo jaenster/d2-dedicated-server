@@ -10,7 +10,7 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
 - `realmd`: real client logs in, passes the version check (BNFTP file integrity +
   CheckRevision), selects a realm, lists + loads characters.
 - Create + join a game dispatched to the headless GS.
-- **Character spawns in-world** (loaded from d2dbs, full life/mana, playable).
+- **Character spawns in-world** (loaded from the store, full life/mana, playable).
 - **Multiplayer**: two real clients in one game, visible to each other.
 - **A full party**: eight characters entering one game together, repeatedly, in lockstep.
   A ninth is turned away with the engine's own answer rather than silence.

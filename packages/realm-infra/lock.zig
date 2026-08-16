@@ -1,7 +1,7 @@
 //! A lock that waits by sleeping, not by burning a core. (0.16's Io migration took
 //! std.Thread.Mutex and Futex out of std.Thread, so this is hand-rolled.)
 //!
-//! Callers hold it across IO (redis round trips, disk writes, gslink's req_lock across a create/join
+//! Callers hold it across IO (redis round trips, disk writes, a create/join
 //! that can take seconds), where a pure spinner burns a full core for the whole wait. Back off in
 //! three stages: spin, yield, then sleep in doubling steps. Uncontended take is one atomic swap.
 const std = @import("std");

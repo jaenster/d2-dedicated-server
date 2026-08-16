@@ -42,7 +42,7 @@
 # server is not the one the realm placed the game on.
 #
 # NATIVE_GS=realm is the other shape, and the one that tests the real path: the native server has
-# registered over gs-link, so the realm places the game on it and the client is routed there like
+# published itself into redis, so the realm places the game on it and the client is routed there like
 # any other. Nothing is overridden.
 #
 # Either way the GS-process checks (alive, rss, fds, panics) go quiet: they read a local process,

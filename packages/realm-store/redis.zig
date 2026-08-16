@@ -1989,7 +1989,7 @@ pub fn snapshotGs(out: []types.GsRec) usize {
     return n;
 }
 
-/// Bound on one fleet snapshot — mirrors gslink's own `max_gs`.
+/// Bound on one fleet snapshot.
 const max_gs_snapshot = 64;
 
 pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {

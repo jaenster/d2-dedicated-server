@@ -84,7 +84,7 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
     const char_name = std.mem.sliceTo(sz_char, 0);
 
     // The engine never fills the account on this path, so resolve it from the
-    // join context realmd sent over the gs-link (keyed by the joining char name),
+    // join context the realm sent with JOINGAME (keyed by the joining char name),
     // and write it back into pClient->szAccName so the rest of the engine has it.
     const acct_name = joinctx.accountForChar(char_name) orelse
         std.mem.sliceTo(sz_acct, 0); // fall back to whatever the engine had

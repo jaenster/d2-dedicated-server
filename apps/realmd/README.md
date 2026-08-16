@@ -68,7 +68,7 @@ hears Bob from the other instance and does not hear Eva, who is in another chann
 
 ## Config (env)
 
-Core: `REALMD_BIND`, `REALMD_BNET_PORT`/`D2CS_PORT`/`D2DBS_PORT`/`GS_PORT`,
+Core: `REALMD_BIND`, `REALMD_BNET_PORT`,
 `REALMD_DATA_DIR`, `REALMD_REALM_NAME`, `REALMD_REALM_ADDR`, `REALMD_GS_ADDR`,
 `REALMD_INSTANCE`, `REALMD_SHARED`, `REALMD_CAPTURE` (hexdump mode).
 

@@ -25,7 +25,7 @@ reconstruction of retail `Game.exe`.
   [`../runtime/fastcall.zig`](../runtime)). Implemented so far:
   - `fpFindPlayerToken` (0x18) — validate the join token (engine `IsBadCodePtr`-checks it).
   - `fpGetDatabaseCharacter` (0x08) — resolve the account (via `joinctx`), fetch
-    the `.d2s` from d2dbs, and deliver it (deferred to the tick loop via
+    the `.d2s` from the store, and deliver it (deferred to the tick loop via
     `pumpDelivery` → `CLIENT_OnDatabaseCharacterReceived`).
   - `fpLeaveGame` (0x04) — stack-balancing no-op (CleanUpClient halts on a null here).
   - `fpGetDatabaseFileTime` (0x54) — zeroed-filetime stub (CalculateGetFlags calls

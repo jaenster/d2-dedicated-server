@@ -145,11 +145,11 @@ jobs:
           $COMPOSE logs --no-log-prefix gs-native  > /tmp/gs-native.log 2>&1 || true
           fatal=$(jq -Rc 'fromjson? | select(.msg? // "" | test("FATAL|panic"; "i"))' /tmp/realmd.log /tmp/gs-native.log)
           if [ -n "$fatal" ]; then echo "$fatal"; echo "FATAL/panic in a server log"; exit 1; fi
-          registered=$(jq -Rc 'fromjson? | select(.tag=="gs" and (.msg | test("registered")))' /tmp/realmd.log | wc -l)
+          registered=$(jq -Rc 'fromjson? | select(.tag=="fleet" and (.msg | test("game server .* started")))' /tmp/realmd.log | wc -l)
           logons_ok=$(jq -Rc 'fromjson? | select(.msg | test("char logon .* -> ok"))' /tmp/realmd.log | wc -l)
           games_ok=$(jq -Rc 'fromjson? | select(.msg | test("create game .* -> gameid="))' /tmp/realmd.log | wc -l)
           echo "realmd logged: gs registrations=$registered, successful char logons=$logons_ok, games created=$games_ok"
-          [ "$registered" -ge 1 ] || { echo "no GS ever registered over gs-link"; exit 1; }
+          [ "$registered" -ge 1 ] || { echo "no game server ever published itself into redis"; exit 1; }
           [ "$logons_ok"  -ge 1 ] || { echo "realmd never logged a successful char logon"; exit 1; }
           [ "$games_ok"   -ge 1 ] || { echo "realmd never logged a successful game create"; exit 1; }
       - name: tear down

@@ -2,7 +2,7 @@
 //! (forward-compatible with OTLP/Tempo: 128-bit trace id / 64-bit span id, hex-rendered).
 //!
 //! trace = one logical operation, possibly crossing components (e.g. realmd -> GS); its id
-//! PROPAGATES over the d2cs/gslink wire (see adopt()). span = a unit of work within a trace,
+//! PROPAGATES over the realm<->game-server wire (see adopt()). span = a unit of work within a trace,
 //! nested via enter()/exit(). Each THREAD owns its context (`threadlocal`) so games ticking on
 //! the server thread and realmd's one-thread-per-connection model never race. No allocation;
 //! `nowMsFn` supplies the ms clock so GS and realmd share this code target-agnostically.
@@ -62,7 +62,7 @@ pub fn setAccount(name: []const u8) void {
 }
 
 /// Mark the current work as not-about-a-user (GS control, health, internal). Multiplexed
-/// connections (d2dbs, gslink) default to this and switch to setAccount() per packet for
+/// connections default to this and switch to setAccount() per packet for
 /// the user that packet concerns.
 pub fn setSystem() void {
     setAccount("system");

@@ -1,11 +1,11 @@
 //! Join context — bridges the account gap in Game.exe's dedicated-server path.
 //!
-//! realmd's gs-link JOINGAME dispatch carries the account for the joining character, but the
+//! The realm's JOINGAME dispatch carries the account for the joining character, but the
 //! engine's join path (GAMELOGON -> SrvJoinGame -> fpGetDatabaseCharacter) only carries char name
 //! and token, never the account — so we stash realmd's mapping here and resolve it (by char name
 //! or token) when the engine asks for the character save.
 //!
-//! Writer: gs-link thread (realmclient/d2cs.zig handleJoinGame). Reader: engine network thread
+//! Writer: the queue thread (realmclient/d2cs.zig handleJoinGame). Reader: engine network thread
 //! (engine/realm.zig fpGetDatabaseCharacter). Entries publish via an atomic `ready` flag so the
 //! reader never sees a half-written slot; joins are rare so a small last-wins ring is plenty.
 

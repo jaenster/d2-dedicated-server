@@ -1,6 +1,6 @@
-//! Clientless wire-protocol clients for realmd: BNCS (bnetd), MCP (d2cs),
-//! d2dbs/gs-link control framing — raw TCP, no wine/Game.exe. Ported from
-//! tools/e2e/realmclient.py; the Python encodes the exact wire formats.
+//! Clientless wire-protocol clients for realmd: BNCS (bnetd) and MCP (d2cs) over raw TCP, no
+//! wine/Game.exe. The realm<->game-server packets live in fakegs.zig, which carries them over
+//! redis the way a real server does.
 const std = @import("std");
 const net = @import("net.zig");
 const gsstore = @import("gsstore.zig");
@@ -57,11 +57,6 @@ const MCP_CHARDELETE = 0x0a;
 const MCP_CHARLIST2 = 0x19;
 const MCP_CHARUPGRADE = 0x18;
 
-// d2dbs opcodes
-pub const DBS_SAVE = 0x30;
-pub const DBS_GET = 0x31;
-pub const DBS_DATATYPE_CHARSAVE = 0x01;
-
 // realm <-> game-server control opcodes. The same packets as before; they travel redis now.
 pub const GS_ADDRINFO = 0x24;
 pub const GS_CREATEGAME = 0x20;
@@ -117,7 +112,7 @@ fn mcpRecv(fd: Socket, buf: []u8) !struct { id: u8, body: []const u8 } {
     return .{ .id = id, .body = buf[0..blen] };
 }
 
-// --- gs-link / d2dbs control framing: <HHI size,type,seq> + body ---
+// --- realm <-> game-server control framing: <HHI size,type,seq> + body ---
 pub fn ctlSend(fd: Socket, typ: u16, body: []const u8) !void {
     var hdr: [8]u8 = undefined;
     var w = net.Writer.init(&hdr);
@@ -224,7 +219,6 @@ pub const RealmClient = struct {
     // instance sets these explicitly.
     bnet_port: u16 = 0,
     d2cs_port: u16 = 0,
-    d2dbs_port: u16 = 0,
     realm_name: []const u8 = "TypeGuru",
     account: []const u8 = "",
     server_token: u32 = 0,

@@ -191,11 +191,10 @@ if pgrep -f 'testgame' >/dev/null; then
 else
 install_dlls
 WINPATH="Z:$(printf '%s' "$TESTDIR/d2gs.dll" | tr '/' '\\')"
-# These flags and no others. --create-games, --gs-addr, --d2cs and --d2dbs all appear in older
-# notes, and on this build adding them crashes the engine during boot: an access violation at
-# 0x4fa680 dereferencing 0x16, exit 0xc0000005, before it ever reaches d2cs. The GS picks its own
-# game port without them and publishes the result to redis — which is what d2ingress reads, so
-# nothing downstream needs to be told the port either.
+# These flags and no others. --create-games and --gs-addr appear in older notes, and on this build
+# adding them crashes the engine during boot: an access violation at 0x4fa680 dereferencing 0x16,
+# exit 0xc0000005. The GS picks its own game port without them and publishes the result to redis —
+# which is what d2ingress reads, so nothing downstream needs to be told the port either.
   # The boot is racy: the same command that works takes an access violation at 0x4fa680 often
   # enough that one attempt is not a fair test. Retry rather than report a broken stack.
   for attempt in 1 2 3; do

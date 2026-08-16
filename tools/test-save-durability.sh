@@ -54,8 +54,8 @@ echo "==> a fresh realmd starts and should finish what the dead one did not"
 REALMD_BIND=127.0.0.1 REALMD_REALM_ADDR=127.0.0.1 REALMD_GAME_ADDR=127.0.0.1 \
   REALMD_PG_DSN="${PG_DSN:-postgres://realmd:realmd@127.0.0.1:55432/realmd}" \
   REALMD_REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6390}" REALMD_DATA_DIR="$DATA_DIR" \
-  REALMD_BNET_PORT=16112 REALMD_D2DBS_PORT=16114 \
-  REALMD_GS_PORT=16115 REALMD_HEALTH_PORT=18099 \
+  REALMD_BNET_PORT=16112 \
+  REALMD_HEALTH_PORT=18099 \
   ./zig-out/bin/realmd >/tmp/durability-realmd.log 2>&1 &
 REALMD_PID=$!
 # Its own ports, so this never disturbs a stack someone else is running.

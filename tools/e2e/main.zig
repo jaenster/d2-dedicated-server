@@ -131,7 +131,7 @@ fn scMcpOn6112() Result {
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 7); // 1 = Sorceress
     const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
 
     // MCP muxed onto the SAME port as BNCS — the point of the scenario, so it follows
     // the bnet port rather than the literal 6112.
@@ -163,7 +163,7 @@ fn scCharListStatstring() Result {
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 42); // 1 = Sorceress
     const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -200,7 +200,7 @@ fn scCharCopy() Result {
     var d2sbuf: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2sbuf, src, 1, 20); // Sorceress, level 20
     const sr = rc.storePutChar(acct, src, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
 
     // Clone Original -> CopyCat within the same account via the admin API.
     var jb: [160]u8 = undefined;
@@ -436,7 +436,7 @@ fn scCharDelete() Result {
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 10);
     const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -561,7 +561,7 @@ fn scGamePopulation() Result {
 }
 
 /// Poll the game list until 'popgame' reports `want` players. UPDATEGAMEINFO is fire-and-
-/// forget over the gs-link, so there is no reply to wait on — only the effect to observe.
+/// forget, so there is no reply to wait on — only the effect to observe.
 fn awaitPlayers(
     c: *rc.RealmClient,
     rows: []rc.GameEntry,
@@ -1810,7 +1810,7 @@ fn scFriendsPersist() Result {
 
 // Two realmd instances (A, B) sharing one data dir (REALMD_SHARED) keep sessions
 // in a shared store: a session minted on A's bnetd must resolve on B's d2cs.
-// Instance A: bnet 16112 / d2cs 16113 / d2dbs 16114 / gs 16115 / health 16118.
+// Instance A: bnet 16112 / health 16118.
 // Instance B: 17112 / 17113 / 17114 / 17115 / 17118, SAME data dir, instance "B".
 /// Chat across two realmd instances: a channel is the union of what every instance holds, or it
 /// is not a channel. The failure this guards is silent — talk simply does not arrive, a whisper
@@ -2254,7 +2254,7 @@ fn scEmbeddedGameEdge() Result {
     defer gs.stop();
     if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
 
-    var c = rc.RealmClient{ .bnet_port = 18112, .d2cs_port = 18112, .d2dbs_port = 18114 };
+    var c = rc.RealmClient{ .bnet_port = 18112, .d2cs_port = 18112 };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
