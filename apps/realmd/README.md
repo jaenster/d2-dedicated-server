@@ -53,9 +53,10 @@ fleet with no host ports — d2ingress splices to pod IPs):
 
 ## Testing it
 
-`zig build e2e` runs 33 clientless scenarios (it starts its own redis + postgres containers), and
-`../../tools/test-chat.sh` proves chat across two live instances with the real wire client: Alice
-hears Bob from the other instance and does not hear Eva, who is in another channel.
+`zig build e2e` runs 34 clientless scenarios against a real realmd, starting its own redis and
+postgres containers. Two of them cover what this file is mostly about: `chat_across_instances`
+(two instances, one channel — talk and whispers cross, another channel does not) and
+`save_durability` (a save only redis had reaches postgres and survives losing the cache).
 
 ## Protocol notes
 

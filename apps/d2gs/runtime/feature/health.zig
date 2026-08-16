@@ -4,7 +4,7 @@
 //!   /          — the original single-answer endpoint (200 ok / 503 down); the shipped k8s chart
 //!                probes it, so renaming breaks every running pod on the next config reload.
 //!   /healthz   — liveness, from the engine heartbeat ONLY: a wedged engine still accepts sockets
-//!                and replies 200, which is the failure this must catch (see run-stress.sh).
+//!                and replies 200, which is the failure this must catch.
 //!   /readyz    — published into the realm's shared store; a live-but-unpublished GS is not ready.
 //!   /stats     — counters as JSON (runtime/feature/stats.zig); /metrics is the same in Prometheus.
 //!

@@ -291,23 +291,18 @@ deliberately never handed to the DLL build. Each app and package has its own REA
 
 ## How it's verified
 
-Every claim above is something a command reproduces. None of them mock the realm or the engine:
-the e2e suite speaks the client's own wire protocol, and the stress and chat runs drive a real
-`Game.exe`.
+Every claim above is something a command reproduces, and none of it mocks the realm or the engine:
+the suites speak the client's own wire protocol against a real realmd and a real game server.
 
 | | what it proves |
 |-|-|
 | `zig build test` | unit tests: wire codecs, save integrity, the seeded generators |
-| `zig build e2e` | 33 clientless scenarios against a real realmd — login, characters, games, the fleet, chat, the ingress. Starts its own Redis + Postgres containers, so it needs Docker and nothing else |
-| `./run-stack.sh` | brings the whole stack up on one host and finishes with a real login, game create and join — "it's up" as a fact rather than a hope |
-| `./run-stress.sh` | plays rounds of real games through wine until something breaks, then says what broke: in-world confirmation per client, resident memory and descriptors per round, and every save re-validated at the end |
-| `./tools/test-chat.sh` | two realmd instances, three real clients: Alice hears Bob from the other instance and does not hear Eva, who is in another channel |
-| `./tools/test-save-durability.sh` | kills a realmd in the window where redis holds the only copy of a save, and proves the next instance finishes the job |
-| `./tools/check-saves.sh` | every character the realm holds is still a structurally valid `.d2s` |
+| `zig build e2e` | 34 clientless scenarios against a real realmd — login, characters, games, the fleet, chat, the ingress. Starts its own Redis + Postgres containers, so it needs Docker and nothing else |
+| `zig build stress-e2e` | rounds of real games against a real game server, decoding each client's world to confirm it actually arrived. Runs on the compose network in CI (`deploy/compose.e2e.yaml`) |
+| `./run-stack.sh` | brings the whole stack up on one host and finishes with a real login, game create and join |
 
-Two more that are utilities rather than tests: `tools/seed-pg.sh` moves characters from an older
-filesystem realm into Postgres, and `tools/symbolize.sh` turns a game-server panic back into
-`file:line`.
+Two utilities rather than tests: `tools/seed-pg.sh` moves characters from an older filesystem
+realm into Postgres, and `tools/symbolize.sh` turns a game-server panic back into `file:line`.
 
 ## Documentation
 
