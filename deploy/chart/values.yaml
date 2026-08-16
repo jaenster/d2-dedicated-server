@@ -20,11 +20,12 @@ realmAddr: ""
 #   floatingIPs: ["5.75.211.1", "78.47.225.57"]
 floatingIPs: []
 
-# Public address realmd advertises to clients for GAME traffic. Two modes:
-#   GATEWAY (set this, normally to the first floatingIP): realmd writes {token -> the real
-#     GS pod ip:port} to redis and hands the client this address + token; the qqserver
-#     gateway looks up the token and splices through to the right GS. The GS is internal.
-#   DIRECT (empty): realmd advertises the GS's own address — clients hit the GS directly.
+# REQUIRED. Public address realmd advertises to clients for GAME traffic — the qqserver
+# gateway, normally the first floatingIP (and defaulted to it when floatingIPs is set).
+# realmd writes {token -> the real GS pod ip:port} to redis and hands the client this address
+# plus the token; qqserver looks the token up and splices through to the right GS, which stays
+# internal. Clients never dial a game server: the token is realm-global and only the gateway
+# can translate it, so realmd refuses to start without this.
 gameAddr: ""
 
 # Don't take client traffic until a game server has registered over the gs-link.

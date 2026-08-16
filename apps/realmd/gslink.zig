@@ -121,6 +121,27 @@ const GsRegistry = struct {
         return best;
     }
 
+    /// The least-loaded registered GS, capacity ignored. Only for the last look before a create is
+    /// refused: the realm's count is a snapshot, and a server that has just watched its last player
+    /// leave is free before the realm has been told. Asking it costs one round trip and it answers
+    /// for itself — which on a server that hosts ONE game is the difference between the next game
+    /// starting and a player being told the realm is down.
+    fn pickAnyRegistered(self: *GsRegistry) ?*Gs {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var best: ?*Gs = null;
+        var best_load: u32 = std.math.maxInt(u32);
+        for (&self.entries) |*g| {
+            if (!g.in_use.load(.acquire) or !g.registered.load(.acquire)) continue;
+            const load = g.live_games.load(.acquire);
+            if (load < best_load) {
+                best = g;
+                best_load = load;
+            }
+        }
+        return best;
+    }
+
     fn byId(self: *GsRegistry, gsid: u32) ?*Gs {
         self.lock.lock();
         defer self.lock.unlock();
@@ -314,9 +335,15 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
         },
         TYPE_CLOSEGAME => {
             const gameid = if (body.len >= 8) std.mem.readInt(u32, body[4..8], .little) else 0;
-            state.global.removeGameById(gameid);
+            // Capacity first, store second. The slot is free the instant the GS says so, and it
+            // is what the very next create is routed on; dropping the game record is a round trip
+            // to the ephemeral store, and doing it first put a store's worth of latency between
+            // "a server has room" and this realm being willing to use it. On a one-game server
+            // that is the whole gap between two games — the create after every game was refused
+            // while the slot it wanted had already been given back.
             if (g.live_games.load(.acquire) > 0) _ = g.live_games.fetchSub(1, .monotonic);
             g.full.store(false, .release); // a slot came free — this GS can host again
+            state.global.removeGameById(gameid);
             log.line(tag, "GS CLOSEGAME gameid={d}", .{gameid});
         },
         else => log.line(tag, "GS unhandled control type 0x{x:0>2}", .{typ}),
@@ -374,9 +401,18 @@ pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, la
     // the registry for a moment before its handler deregisters it. If the send fails,
     // that GS is dead — unregister it (so we don't pick it again) and try the next.
     var attempts: usize = 0;
+    var asked_beyond_capacity = false;
     last_create_failure = .no_gs;
     while (attempts < max_gs) : (attempts += 1) {
-        const g = registry.pickForCreate() orelse return null;
+        const g = registry.pickForCreate() orelse blk: {
+            // Every server is at the capacity this realm has recorded for it. That is a snapshot,
+            // and the newest thing about it is already a round trip old; the server itself knows
+            // whether the game it is holding is over. Ask once, and only once, before saying no.
+            if (asked_beyond_capacity) return null;
+            asked_beyond_capacity = true;
+            last_create_failure = .all_full;
+            break :blk registry.pickAnyRegistered() orelse return null;
+        };
         g.req_lock.lock();
         g.reply_done.store(false, .release);
 
@@ -471,6 +507,30 @@ test "a GS that reported full is pickable again after one close, not after enoug
     _ = g.live_games.fetchSub(1, .monotonic);
     try std.testing.expect(reg.pickForCreate() != null);
     try std.testing.expectEqual(@as(u32, 2), g.live_games.load(.acquire));
+}
+
+test "a fleet with no recorded capacity still has one server asked before the create is refused" {
+    var reg: GsRegistry = .{};
+    const a = reg.alloc().?;
+    a.gsid = 1;
+    a.maxgame = 1;
+    a.live_games.store(1, .release);
+    a.registered.store(true, .release);
+    const b = reg.alloc().?;
+    b.gsid = 2;
+    b.maxgame = 1;
+    b.live_games.store(1, .release);
+    b.full.store(true, .release);
+    b.registered.store(true, .release);
+
+    try std.testing.expect(reg.pickForCreate() == null);
+    // Both are at capacity, so the least loaded of them is the one worth asking — and a server
+    // that is not registered at all is still never asked.
+    try std.testing.expectEqual(@as(u32, 1), reg.pickAnyRegistered().?.gsid);
+    a.registered.store(false, .release);
+    try std.testing.expectEqual(@as(u32, 2), reg.pickAnyRegistered().?.gsid);
+    b.registered.store(false, .release);
+    try std.testing.expect(reg.pickAnyRegistered() == null);
 }
 
 test "a GS at its advertised capacity is skipped, and a second GS takes the create" {

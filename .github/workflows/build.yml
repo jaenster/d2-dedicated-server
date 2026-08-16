@@ -5,6 +5,7 @@
 #   ghcr.io/jaenster/realmd    — clean-room Zig realm server (scratch, static musl)
 #   ghcr.io/jaenster/d2gs      — headless wine GS runtime (game files mounted at runtime)
 #   ghcr.io/jaenster/qqserver  — token-translating game-traffic gateway (scratch, musl)
+#   ghcr.io/jaenster/d2gs-native — wine-free GS: the Mac 1.14d image loaded in-process (scratch)
 #
 # The cluster pulls these anonymously (public packages) — flip a NEW package to public
 # once under github.com/users/jaenster/packages. The PRIVATE d2gs-deploy repo's ArgoCD
@@ -52,6 +53,11 @@ jobs:
             image: d2gs
           - target: qqserver
             image: qqserver
+          # The wine-free GS: one static i386 ELF in scratch. The image claims linux/amd64 like
+          # the rest — containerd matches an image's platform against the node's and refuses a
+          # linux/386 image outright, while that same node's kernel runs the i386 binary.
+          - target: gs-native
+            image: d2gs-native
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -67,8 +73,12 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: true
+          # `latest` follows main and the commit sha is the immutable handle a deploy pins; a
+          # vN.N.N push additionally publishes that version, so a chart can name a release rather
+          # than a hash. An empty line here is ignored, which is what the non-tag case produces.
           tags: |
             ghcr.io/jaenster/${{ matrix.image }}:latest
             ghcr.io/jaenster/${{ matrix.image }}:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('ghcr.io/jaenster/{0}:{1}', matrix.image, github.ref_name) || '' }}
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,scope=${{ matrix.target }},mode=max

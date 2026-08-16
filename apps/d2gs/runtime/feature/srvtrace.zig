@@ -24,6 +24,7 @@ const obs = @import("obs");
 const t = @import("../../engine/d2/types.zig");
 const fns = @import("../../engine/d2/functions.zig");
 const game = @import("../../engine/d2types.zig");
+const feature = @import("../../engine/feature.zig");
 
 extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
 extern "kernel32" fn EnterCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
@@ -92,6 +93,17 @@ fn leftSkillId(v: usize) i32 {
 
 fn gamePtr(v: usize) ?*game.D2GameStrc {
     return if (v == 0) null else @ptrFromInt(v);
+}
+
+/// Build the registry's per-game hook context for a raw D2GameStrc*, or null when the
+/// game has no FOG pool yet (the ctx allocator IS that pool, so there is nothing to hand
+/// a feature before it exists). srvtrace's detours are the only place on the server where
+/// a game pointer is in hand at a lifecycle moment, so they are what drives the registry's
+/// gameCreate/gameDestroy/playerJoin/playerLeave fan-outs.
+fn ctxFor(v: usize) ?feature.GameCtx {
+    const g = gamePtr(v) orelse return null;
+    const pool = g.pMemoryPool orelse return null;
+    return feature.gameCtx(g, pool);
 }
 
 fn putGame(e: *evlog.Event, v: usize) void {
@@ -231,6 +243,20 @@ fn onGameCreate(token_map: usize, _: usize, _: usize) callconv(.c) void {
     e.end();
 }
 
+/// EVENT_AllocTimerQueue(pGame) — the first point in game creation where the struct is
+/// finished: pMemoryPool, name, token and difficulty are all set by then, and it is
+/// reached exactly once per game (only GAME_CreateBattleNetGame and its single-player
+/// twin call it). CreateGame @0x451000, which `game_create` above hooks, is an entry
+/// detour on the allocator itself and so has no game to hand anyone yet — this is why
+/// the registry's gameCreate rides here instead.
+fn onGameAlloc(pgame: usize, _: usize, _: usize) callconv(.c) void {
+    trackGame(pgame);
+    var e = ev("game_alloc");
+    putGame(&e, pgame);
+    e.end();
+    if (ctxFor(pgame)) |ctx| feature.fanGameCreate(&ctx);
+}
+
 /// Optional observer fired when a game is destroyed, with the game's name (read
 /// from the engine game struct). The realm GS client subscribes to tell realmd to
 /// drop the game from the join list — without it, dead games linger until their
@@ -239,6 +265,9 @@ pub var on_game_destroy: ?*const fn (name: []const u8) void = null;
 
 fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
     untrackGame(pgame);
+    // Before the event, and before anything below can bail: this is an ENTRY detour, so
+    // the struct is still whole here and will not be once the original returns.
+    if (ctxFor(pgame)) |ctx| feature.fanGameDestroy(&ctx);
     var e = ev("game_destroy");
     e.int("token", trunc32(token));
     putGame(&e, pgame);
@@ -285,6 +314,7 @@ fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
     // CLIENT_AddToGame links the client and bumps nClientsCount before the join broadcast
     // (Clients.cpp @0x539... `pGame->nClientsCount++`), so by here the joiner is counted.
     notifyPlayers(pgame, pclient, readU32(pgame, GAME_CLIENTS), true);
+    if (ctxFor(pgame)) |ctx| feature.fanPlayerJoin(&ctx, if (pclient == 0) 0 else readU32(pclient, CL_SLOT));
 }
 
 fn onPlayerLeave(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
@@ -298,6 +328,7 @@ fn onPlayerLeave(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
     // rather than reporting a count we know is one stale.
     const now = readU32(pgame, GAME_CLIENTS);
     notifyPlayers(pgame, pclient, if (now > 0) now - 1 else 0, false);
+    if (ctxFor(pgame)) |ctx| feature.fanPlayerLeave(&ctx, if (pclient == 0) 0 else readU32(pclient, CL_SLOT));
 }
 
 fn onDamage(attacker: usize, victim: usize, pdamage: usize) callconv(.c) void {
@@ -1543,6 +1574,9 @@ fn TraceHook(comptime h: Hook) type {
 const hooks = [_]Hook{
     // -- game lifecycle --
     .{ .addr = 0x451000, .prologue = 6, .label = "game_create", .handler = &onGameCreate, .a1 = .{ .stack = 4 } },
+    // EVENT_AllocTimerQueue(pGame=ECX). Prologue = PUSH ESI (1) + MOV ESI,ECX (2) +
+    // CMP [ESI+0xb8],0 (7) = 10 bytes, all position-independent, no short branch.
+    .{ .addr = 0x541470, .prologue = 10, .label = "game_alloc", .handler = &onGameAlloc, .game = .ecx, .a1 = .ecx },
     .{ .addr = 0x52C7F0, .prologue = 7, .label = "game_destroy", .handler = &onGameDestroy, .a1 = .ecx, .a2 = .edx },
     .{ .addr = 0x52C410, .prologue = 6, .label = "player_join", .handler = &onPlayerJoin, .game = .ecx, .a1 = .ecx, .a2 = .edx },
     .{ .addr = 0x52C500, .prologue = 5, .label = "player_leave", .handler = &onPlayerLeave, .game = .ecx, .a1 = .ecx, .a2 = .edx },

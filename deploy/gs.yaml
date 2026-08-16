@@ -1,18 +1,19 @@
 # d2gs game-server fleet on Kubernetes.
 #
-# Clients connect DIRECTLY to a game server at <ip>:4000 for game traffic (the realm
-# only hands them the IP; the port is the fixed D2 game port 4000). So each GS pod
-# needs a client-routable address. The portable plain-k8s pattern: hostPort 4000 +
-# the node's own IP (downward API status.hostIP) reported to realmd as D2GS_GS_ADDR.
-# Pod anti-affinity keeps one GS per node so the hostPort never collides.
+# The fleet is INTERNAL: clients never dial a game server. They reach qqserver on the
+# public :4000 carrying a realm-global token, and it splices to the owning GS by pod IP
+# from the redis route. So a GS needs no client-routable address — it reports its own pod
+# IP (downward API status.podIP) to realmd as D2GS_GS_ADDR.
+#
+# That is also why the fleet can exceed the node count: without a hostPort node-level bind
+# there is nothing to collide, so anti-affinity is a preference (spread for fault
+# tolerance) rather than a requirement.
 #
 # Each GS dials the realmd Service by DNS (REALMD_HOST) — the d2gs.dll resolves it
 # (getaddrinfo) and registers over the gs-link, self-reporting D2GS_GS_ADDR.
 #
 # Game files are proprietary: populate the d2-gamefiles PVC with a real 1.14d install
-# (ReadOnlyMany) before scaling up. NOTE: a node must allow hostPort 4000 and be
-# reachable by clients on that port (firewall/NodePort range aside — hostPort is a
-# direct node bind).
+# (ReadOnlyMany) before scaling up.
 #
 #   docker build -f deploy/Dockerfile --target gs -t d2gs:latest .
 #   kubectl apply -f deploy/gs.yaml
@@ -43,30 +44,32 @@ spec:
     metadata:
       labels: { app: d2gs }
     spec:
-      # One GS per node: hostPort 4000 is a node-level bind, so two pods on a node
-      # would collide. This also gives each pod a distinct node IP to advertise.
+      # Spread replicas across nodes for fault tolerance, but do not require it: nothing
+      # binds a node-level port, so several game servers can share a node.
       affinity:
         podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels: { app: d2gs }
-              topologyKey: kubernetes.io/hostname
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: { app: d2gs }
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: d2gs
           image: d2gs:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - { containerPort: 4000, hostPort: 4000, name: game }
+            - { containerPort: 4000, name: game }
           env:
             # The realm server Service DNS (d2gs.dll resolves + dials gslink:6115/d2dbs:6114).
             - name: REALMD_HOST
               value: realmd.realmd.svc.cluster.local
             # Node IP → the public address clients dial for this pod's games.
-            - name: NODE_IP
+            - name: POD_IP
               valueFrom:
-                fieldRef: { fieldPath: status.hostIP }
+                fieldRef: { fieldPath: status.podIP }
             - name: D2GS_GS_ADDR
-              value: "$(NODE_IP):4000"
+              value: "$(POD_IP):4000"
             - name: D2GS_MAX_GAMES
               value: "50"
             # Optional: extra server-mod DLLs to load after d2gs.dll (space-separated;

@@ -4,10 +4,10 @@ This chart deploys a complete, fleet-shaped Diablo II 1.14d realm on Kubernetes:
 
 - **realmd** — the stateless protocol front (bnetd + d2cs + d2dbs + gs-link), fronted by
   a `LoadBalancer`. Scales freely because all state lives in backing services.
-- **game-server fleet (d2gs)** — headless `Game.exe` under wine. In GATEWAY mode it is
-  internal (pod-IP only); in DIRECT mode clients dial it for game traffic. See Topology.
-- **qqserver** — a token-translating splice gateway. In GATEWAY mode it is the single public
-  game entry on the floating IPs; otherwise it is internal-only (ClusterIP).
+- **game-server fleet (d2gs)** — headless `Game.exe` under wine. Internal (pod-IP only);
+  clients never dial it. See Topology.
+- **qqserver** — a token-translating splice gateway, the single public game entry on the
+  floating IPs.
 - **Postgres** — durable character saves.
 - **Redis** — ephemeral sessions/games (native TTL).
 
@@ -16,15 +16,16 @@ IPs and passwords replaced by generic, overridable defaults. Treat it as a worke
 
 ## Topology
 
-Game traffic runs in one of two modes, selected by `gameAddr` / `floatingIPs`:
+Game traffic always goes through the gateway; `gameAddr` is **required** and realmd refuses to
+start without it.
 
-- **DIRECT** (`gameAddr` empty, default): the GS keeps a client-routable address and clients
-  dial the GS directly for game traffic. realmd advertises the GS's own address.
-- **GATEWAY** (`floatingIPs` + `gameAddr` set): realmd advertises the qqserver entry point
-  (normally the first `floatingIP`). realmd writes `{token -> the real GS pod ip:port}` to
-  redis; the client connects to qqserver with that token and qqserver splices through to the
-  right GS. The GS is internal (pod-IP only, no hostPort), so the fleet can scale past the
-  node count and clients never hit a GS directly.
+realmd advertises the qqserver entry point (normally the first `floatingIP`) and writes
+`{token -> the real GS pod ip:port}` to redis; the client connects to qqserver with that token
+and qqserver splices through to the right GS. The GS is internal (pod-IP only, no hostPort), so
+the fleet can scale past the node count and clients never hit a GS directly.
+
+There is no mode where clients dial a game server themselves: the token realmd hands out is
+realm-global, and only the gateway can translate it to the id the engine knows.
 
 `floatingIPs` are stable public IPs (e.g. cloud floating IPs that fail over between nodes)
 set as `externalIPs` on the public realmd **and** qqserver Services. The cluster firewall
@@ -54,7 +55,7 @@ realmd (`templates/realmd-deployment.yaml`):
 | `REALMD_INSTANCE` | fieldRef `metadata.name` (unique per pod — session-id high bits) |
 | `REALMD_REALM_NAME` | `.Values.realmName` |
 | `REALMD_REALM_ADDR` | `.Values.realmAddr` (public IP clients dial; **required**) |
-| `REALMD_GAME_ADDR` | `.Values.gameAddr` (GATEWAY mode only — the qqserver entry advertised for game traffic) |
+| `REALMD_GAME_ADDR` | `.Values.gameAddr` (the qqserver entry advertised for game traffic; **required**) |
 | `REALMD_DURABLE_STORE` | `pg` |
 | `REALMD_EPHEMERAL_STORE` | `redis` |
 | `REALMD_REDIS_ADDR` | `realmd-redis:6379` |

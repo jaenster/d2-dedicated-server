@@ -30,6 +30,7 @@
 //!     pub fn gameServerLoop(ctx: *const GameCtx) void // per-game, per-tick
 //!     pub fn roomInit(ctx: *const GameCtx, room: *anyopaque) void
 //!     pub fn expAward(ctx: *const GameCtx, unit: *anyopaque, exp: u32) u32 // transform: return new exp
+//!     pub fn itemRoll(ctx: *const GameCtx, item: *anyopaque) void // an item finished generating
 //!     pub fn packetIn(bytes: []const u8) bool         // false = consume (stop dispatch)
 //!     pub fn packetOut(bytes: []const u8) void
 //!     pub fn playerJoin(ctx: *const GameCtx, client: u32) void
@@ -82,6 +83,7 @@ const registry = [_]Feature{
     .{ .mod = @import("../runtime/feature/nocompress.zig"), .name = "nocompress", .flag = "no-compress", .default = false },
     .{ .mod = @import("../runtime/feature/clientdiag.zig"), .name = "clientdiag", .flag = "clientdiag", .default = false },
     .{ .mod = @import("../runtime/feature/srvdiag.zig"), .name = "srvdiag", .server_only = true },
+    .{ .mod = @import("../runtime/feature/stats.zig"), .name = "stats", .server_only = true },
     .{ .mod = @import("../runtime/feature/srvtrace.zig"), .name = "srvtrace", .server_only = true },
     .{ .mod = @import("../runtime/feature/cainfix.zig"), .name = "cainfix", .server_only = true },
     // Off by default: the CompileTxt detour destabilizes engine bootstrap (flaky crash
@@ -236,6 +238,15 @@ pub fn fanExpAward(ctx: *const GameCtx, unit: *anyopaque, exp: u32) u32 {
         if (@hasDecl(f.mod, "expAward") and enabled[i]) out = f.mod.expAward(ctx, unit, out);
     }
     return out;
+}
+
+/// An item has finished generating: the unit exists and its quality and affixes are
+/// final. Driven by runtime/itemroll.zig. Observers only — the item is already built,
+/// so this is where you count/log it, not where you change what it rolled.
+pub fn fanItemRoll(ctx: *const GameCtx, item: *anyopaque) void {
+    inline for (registry, 0..) |f, i| {
+        if (@hasDecl(f.mod, "itemRoll") and enabled[i]) f.mod.itemRoll(ctx, item);
+    }
 }
 
 /// Inbound packet observers. Returns false if a feature consumed the packet

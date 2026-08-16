@@ -1,13 +1,16 @@
 .env
 deploy/compose.local.yaml
 deploy/compose.override.yaml
-testgame/
 zig-out/
 .zig-cache/
 zig-pkg/
 .claude/
 .idea/
-testgame-min/
+
+# Assembled game directories — Blizzard's bytes, never committed. A glob rather than a list:
+# make-minimal.sh and the runners have disagreed on the exact name before, and the cost of a
+# miss is game data staged into a public repo. See LEGAL.md.
+testgame*/
 
 # Vendored / moved-in tools — live here for convenience, not committed
 tools/ghidra2cpp/
@@ -42,6 +45,7 @@ bnftp-*.bin
 
 # compiled standalone tools (built manually, not via build.zig)
 tools/mpqcat/mpqcat
+tools/mpqmin/mpqmin
 
 # arena-mode design/worklist — local planning doc, not in VCS
 ARENA.md
@@ -56,6 +60,11 @@ probegame/
 # local launchers: they hardcode this machine's wine prefixes and install dirs
 /run.sh
 /run-*.sh
+# ...except the two that no longer do. They take every path from the environment or a gitignored
+# .env, the committed docs cite them by name, and the measurements in docs/native-vs-wine.md are
+# not reproducible without them.
+!/run-stack.sh
+!/run-stress.sh
 
 # a data dir named "=<port>" means something leaked an env assignment into a path
 /=*

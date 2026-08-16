@@ -25,6 +25,7 @@ const health = @import("runtime/feature/health.zig"); // hacky in-process HTTP h
 const gsport = @import("runtime/gsport.zig");
 const gamereap = @import("runtime/gamereap.zig");
 const roominit = @import("runtime/roominit.zig");
+const itemroll = @import("runtime/itemroll.zig");
 const gameloop = @import("runtime/gameloop.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const rejoin = @import("runtime/rejoin.zig");
@@ -417,6 +418,9 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // default server path stays byte-identical.
     // Always install the per-game RoomInit fan-out (cainfix/srvdiag/ubers all consume it).
     roominit.install();
+    // Same idea one level down: wrap the tail of the engine's item constructor so features
+    // see every item the server generates, with its quality and affixes already final.
+    itemroll.install();
     // Lift the engine's eight-pool-manager ceiling before anything creates a game, so this GS
     // is not stuck at seven concurrent. Redirects only the game create/destroy call sites; if
     // either patch fails it reports no capacity and the old seven-game guard stands.
