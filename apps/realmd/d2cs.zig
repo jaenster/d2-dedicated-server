@@ -117,6 +117,18 @@ fn difficultyError(difficulty: u8, progression: u8, expansion: bool) ?u32 {
 /// a join away here means a clear "Game is Full." instead of a silent failure at the GS.
 const max_players_per_game: u16 = 8;
 
+/// How long a join waits for a create that is still in flight for the same name, and how often it
+/// looks. Bounded: a client that waits is better than one told the game does not exist, but not at
+/// the cost of pinning a connection thread on a create that never lands.
+const create_settle_ms: u32 = 750;
+const create_poll_ms: u32 = 25;
+
+extern "c" fn usleep(usec: c_uint) c_int;
+
+fn sleepMs(ms: u32) void {
+    _ = usleep(ms * 1000);
+}
+
 // The game-traffic ingress clients are told to dial, set from main() and required there.
 // JOINGAME never advertises a game server's own address: the token handed to the client is
 // realm-global, and only an ingress (d2ingress, or the embedded edge) can translate it to the
@@ -589,7 +601,17 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // the same check and a code that says the true thing (0x73 / 0x74), so an ineligible
     // character is still turned away — with the right message, one packet later.
     log.line(tag, "create game '{s}' desc='{s}' diff={d} status=0x{x:0>2} (flags=0x{x})", .{ name, desc, difficulty, status, create_flags });
+    // Claim the name BEFORE dispatching. A game is only recorded once the server accepts the
+    // create, and in that gap a second client asking for the same name is told it is free, loses
+    // the race at the server, and is then left with nothing to join — the failure that fails
+    // stress rounds. Claiming first moves the refusal to where the loser can still be told.
+    if (!store.reserveGameName(name)) {
+        log.line(tag, "create game '{s}' (account={s}) -> name already claimed", .{ name, c.accountName() });
+        return fail(c, &w, CREATE_NAME_TAKEN);
+    }
     const routed = gslink.createGameRouted(name, pass, desc, ladder, expansion, difficulty, hardcore);
+    // A create that did not produce a game must not keep the name.
+    if (routed == null) store.releaseGameName(name);
     if (routed == null) {
         // The findGame() check above is not a guarantee: two clients can both pass it
         // before either has registered anything, and only the GS that would host the
@@ -622,9 +644,14 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // not exist" right after we reported success. Fail the create instead; the GS reaps the
     // orphaned empty game on its own idle timer.
     if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc)) {
+        store.releaseGameName(name);
         log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it", .{ name, rr.gameid });
         return fail(c, &w, CREATE_ERROR_GENERIC);
     }
+    // The game record now owns the name and is what a duplicate create is refused against, so the
+    // reservation has done its job. Holding it any longer would refuse a name for the rest of its
+    // TTL after the game it guarded had already ended.
+    store.releaseGameName(name);
     state.global.noteGameCreated(rr.gameid); // starts the clock the detail panel counts from
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
@@ -661,7 +688,21 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     var w = startPacket(&buf, MCP_JOINGAME);
     w.putU16(reqid);
 
-    const game = state.global.findGame(name);
+    // A create for this name may still be in flight — the client that lost the name race asks to
+    // join a moment later, and the game is not recorded until its server has accepted it. Saying
+    // "does not exist" there is a lie the client acts on. Wait briefly for the name's owner to
+    // finish, but only while a reservation says somebody is actually making it.
+    var game = state.global.findGame(name);
+    if (game == null and store.gameNameReserved(name)) {
+        var waited: u32 = 0;
+        while (waited < create_settle_ms) : (waited += create_poll_ms) {
+            sleepMs(create_poll_ms);
+            game = state.global.findGame(name);
+            if (game != null) break;
+            if (!store.gameNameReserved(name)) break; // the create finished or gave up
+        }
+        if (game != null) log.line(tag, "join game '{s}' -> waited {d}ms for its create", .{ name, waited });
+    }
     if (game == null) {
         log.line(tag, "join game '{s}' -> not found", .{name});
         return rejectJoin(c, &w, JOIN_NO_SUCH_GAME);

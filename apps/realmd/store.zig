@@ -460,6 +460,36 @@ pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) 
     };
 }
 
+/// How long an unfinished create may hold a name. A backstop for a create that dies in flight,
+/// comfortably longer than the server's own reply timeout.
+pub const game_name_ttl_s: u32 = 30;
+
+/// Claim a game name before dispatching the create, so two clients racing on one name resolve
+/// here — where the loser can still be told — instead of at the game server, after which it has
+/// nothing to join.
+pub fn reserveGameName(name: []const u8) bool {
+    return switch (ephemeral) {
+        .redis => redis.reserveGameName(name, game_name_ttl_s),
+        // One instance already serialises creates through its own game table.
+        .fs, .pg => true,
+    };
+}
+
+/// Whether a create is holding this name right now.
+pub fn gameNameReserved(name: []const u8) bool {
+    return switch (ephemeral) {
+        .redis => redis.gameNameReserved(name),
+        .fs, .pg => false,
+    };
+}
+
+pub fn releaseGameName(name: []const u8) void {
+    switch (ephemeral) {
+        .redis => redis.releaseGameName(name),
+        .fs, .pg => {},
+    }
+}
+
 /// The owner id a game uses for the characters it holds. Stable across instances, because any
 /// realmd may be the one that closes the game.
 pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {

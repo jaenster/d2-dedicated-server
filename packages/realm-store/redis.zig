@@ -1141,6 +1141,57 @@ pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) 
     };
 }
 
+/// Claim a game name before the game exists.
+///
+/// A game is only recorded once the server has accepted the create, and everything between those
+/// two moments is a window in which a second client can be told the name is free, lose the race at
+/// the server, and then fail to join what it was just told already exists. Claiming the name first
+/// closes it: the loser learns immediately, while the winner's game is still being made.
+///
+/// The TTL is a backstop for a create that dies mid-flight, not the lifetime of the claim — a
+/// successful create replaces it with the game record and releases this.
+pub fn reserveGameName(name: []const u8, ttl_s: u32) bool {
+    var kb: [96]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamename:{s}", .{name}) catch return false;
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "SET", key, "1", "NX", "PX", px }) orelse return false;
+    return switch (rep) {
+        .status => true,
+        .bulk => |b| b != null,
+        else => false,
+    };
+}
+
+/// Whether a create is currently holding this name. Lets a joiner tell "no such game" apart from
+/// "the game is being made right now", which are the same thing to a client and very different to
+/// the player.
+pub fn gameNameReserved(name: []const u8) bool {
+    var kb: [96]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamename:{s}", .{name}) catch return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EXISTS", key }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
+        else => false,
+    };
+}
+
+/// Give the name back — the create failed, or the game it named has ended.
+pub fn releaseGameName(name: []const u8) void {
+    var kb: [96]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamename:{s}", .{name}) catch return;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    _ = command(s, &r, &.{ "DEL", key });
+}
+
 /// Populate the cache from the store of record, but ONLY if nothing is cached yet.
 ///
 /// The unconditional write this replaces could destroy a save. A miss reads the durable copy, and
