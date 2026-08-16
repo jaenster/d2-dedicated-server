@@ -133,11 +133,8 @@ pub fn disconnect() void {
 /// A miss is a MISS, never a partial read — a short save written anywhere becomes a corrupt
 /// character, and this path feeds the engine directly.
 pub fn fetchCharSave(account: []const u8, charname: []const u8, out: []u8) usize {
-    if (gsredis.enabled()) {
-        const n = gsredis.getChar(account, charname, out);
-        if (n != 0) return n;
-    }
-    return fetchCharSaveOverLink(account, charname, out);
+    // No listener behind this any more; the store is the only source.
+    return gsredis.getChar(account, charname, out);
 }
 
 fn fetchCharSaveOverLink(account: []const u8, charname: []const u8, out: []u8) usize {
@@ -199,8 +196,7 @@ fn fetchCharSaveOverLink(account: []const u8, charname: []const u8, out: []u8) u
 /// durable once redis has it and postgres catches up behind. A failed write falls through to
 /// d2dbs rather than being dropped: losing a save is the one failure here with no repair.
 pub fn saveCharSave(account: []const u8, charname: []const u8, data: []const u8) bool {
-    if (gsredis.enabled() and gsredis.putChar(account, charname, data)) return true;
-    return saveCharSaveOverLink(account, charname, data);
+    return gsredis.putChar(account, charname, data);
 }
 
 fn saveCharSaveOverLink(account: []const u8, charname: []const u8, data: []const u8) bool {

@@ -138,11 +138,13 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
     };
 
     var save_len: usize = 0;
-    if (dbs_ready and d2dbs.connectTo(dbs_host, dbs_port)) {
-        var sp = obs.enter("char_fetch"); // timed span over the d2dbs round-trip
+    {
+        // No d2dbs connect to gate this any more: the character comes from the shared store, which
+        // holds its own connection. Dialling the realm first was what kept the old path alive even
+        // after the fetch itself moved — the fetch was never reached when the dial failed.
+        var sp = obs.enter("char_fetch");
         defer sp.exit();
         save_len = d2dbs.fetchCharSave(acct_name, char_name, &slot.save);
-        d2dbs.disconnect();
     }
 
     // Queue the delivery for the tick loop; do NOT call OnDatabaseCharacterReceived
@@ -212,17 +214,10 @@ fn saveDatabaseCharImpl(ecx: usize, edx: usize, s1: usize, s2: usize, s3: usize,
     log.cstr("realm:   char=", @intFromPtr(&d2s[0x14]));
     log.hex("realm:   bytes=0x", d2s.len);
 
-    if (!dbs_ready) {
-        log.print("realm:   no d2dbs source — save dropped");
-        return 1;
-    }
-    if (d2dbs.connectTo(dbs_host, dbs_port)) {
-        const ok = d2dbs.saveCharSave(account, char_name, d2s);
-        d2dbs.disconnect();
-        log.print(if (ok) "realm:   char saved to d2dbs" else "realm:   d2dbs save FAILED");
-    } else {
-        log.print("realm:   d2dbs connect failed — save dropped");
-    }
+    // Straight to the store, with no realm to dial first — it holds its own connection, and the
+    // save is durable the moment it lands there.
+    const ok = d2dbs.saveCharSave(account, char_name, d2s);
+    log.print(if (ok) "realm:   char saved" else "realm:   char save FAILED");
     return 1;
 }
 

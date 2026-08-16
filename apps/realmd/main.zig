@@ -148,9 +148,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     log.json = cfg.log_json;
     obs.nowMsFn = &nowMs; // span durations
     if (runSubcommand(cfg, init.args)) return;
-    log.line("realmd", "starting instance={s} bind={s} bnet={d} d2dbs={d} realm={s}@{s} capture={}", .{
-        cfg.instance_id, cfg.bind,       cfg.bnet_port,
-        cfg.d2dbs_port,  cfg.realm_name, cfg.realm_addr, cfg.capture,
+    log.line("realmd", "starting instance={s} bind={s} bnet={d} realm={s}@{s} capture={}", .{
+        cfg.instance_id, cfg.bind, cfg.bnet_port, cfg.realm_name, cfg.realm_addr, cfg.capture,
     });
     // Graceful shutdown for k8s rolling updates + readiness gating.
     health.require_gs = cfg.require_gs;
@@ -259,18 +258,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.ingress_port, cfg.route_ttl_s });
 
     const bnet_fd = try net.listenTcp(cfg.bind, cfg.bnet_port);
-    const d2dbs_fd = try net.listenTcp(cfg.bind, cfg.d2dbs_port);
     const gs_fd = try net.listenTcp(cfg.bind, cfg.gs_port);
     const health_fd = try net.listenTcp(cfg.bind, cfg.health_port);
-    log.line("realmd", "listening on {d}/{d} (gs link {d}, health {d})", .{ cfg.bnet_port, cfg.d2dbs_port, cfg.gs_port, cfg.health_port });
+    log.line("realmd", "listening on {d} (gs link {d}, health {d})", .{ cfg.bnet_port, cfg.gs_port, cfg.health_port });
 
     // Capture mode hexdumps raw bytes (protocol discovery); otherwise speak it.
     const bnet_handler: net.Handler = if (cfg.capture) net.captureHandler else bncs.handle;
-    const d2dbs_handler: net.Handler = if (cfg.capture) net.captureHandler else d2dbs.handle;
     const gs_handler: net.Handler = if (cfg.capture) net.captureHandler else gslink.handle;
 
     const t_bnet = try std.Thread.spawn(.{}, net.serve, .{ "bnet", bnet_fd, bnet_handler });
-    const t_dbs = try std.Thread.spawn(.{}, net.serve, .{ "d2dbs", d2dbs_fd, d2dbs_handler });
     const t_health = try std.Thread.spawn(.{}, net.serve, .{ "health", health_fd, health.handle });
 
     // Optional embedded game edge: realmd fronts game traffic itself (in-process token
@@ -293,7 +289,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     health.markStarted(); // all listeners bound → probes may go green
     net.serve("gs", gs_fd, gs_handler); // main thread runs the GS link listener
     t_bnet.join();
-    t_dbs.join();
     t_health.join();
     if (t_game) |t| t.join();
 }
