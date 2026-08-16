@@ -1,15 +1,20 @@
 # Legal / Disclaimer
 
-## No game content is distributed here
-This repository contains **no Diablo II game files and no Blizzard code**. The
-only binary fixture is `tools/stub.mpq` — an *empty* MPQ container (header +
-empty tables, no files inside), used as a placeholder for media archives the
-headless server doesn't need.
+## Game data
+This repository's source contains **no Diablo II game files and no Blizzard
+code**. The only binary fixture is `tools/stub.mpq` — an *empty* MPQ container
+(header + empty tables, no files inside), used as a placeholder for media
+archives the headless server doesn't need.
 
-To use this project you must supply your **own, legitimately obtained** copy of
-Diablo II: Lord of Destruction (1.14d). `tools/make-minimal.sh` copies files
-**from your local install** into a test directory; it does not download,
-contain, or redistribute any Blizzard data.
+`tools/make-minimal.sh` builds a minimal 1.14d install from a local copy: every
+MPQ member a headless server never opens is stripped, and graphics blocks are
+stripped out of the tilesets it keeps (`tools/mpqmin`) — no audio, no video, no
+CD keys. The published container images (`ghcr.io/jaenster/d2gs`,
+`d2gs-native`, `d2-gamedata`) bake in a copy of that stripped set, fetched at
+build time from a mirror at files.typeguru.nl, so the images run without a
+manual data-supply step. Diablo II 1.14d receives no further updates or
+enforcement from Blizzard and is treated here as abandonware; if that changes,
+this section will too.
 
 ## Reverse engineering
 The addresses, offsets, and struct layouts in this project describe the retail

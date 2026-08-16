@@ -117,8 +117,9 @@ docker compose -f deploy/compose.yaml up --build
 curl localhost:18080/readyz
 ```
 
-Then supply the proprietary game data (bring your own legit 1.14d copy) and point `realmAddr` at
-the realmd LoadBalancer. Compose, the raw manifests, and the native-process path are all in
+The Helm chart's `gs` pods come up with game data already baked in (a minimal 1.14d set the
+pipeline publishes, see `tools/make-minimal.sh`); Compose's `gs` profile still needs your own
+copy via `D2GS_GAME_SRC`. Point `realmAddr` at the realmd LoadBalancer. Compose, the raw manifests, and the native-process path are all in
 [`docs/DEPLOY.md`](docs/DEPLOY.md); the chart has its own reference in
 [`deploy/chart/README.md`](deploy/chart/README.md).
 
@@ -289,5 +290,6 @@ deliberately never handed to the DLL build. Each app and package has its own REA
 
 ## License & legal
 
-Code: [MIT](LICENSE). No Blizzard game files are distributed here -- bring your own legit copy of
-Diablo II. Unofficial, not affiliated with Blizzard. See [`LEGAL.md`](LEGAL.md).
+Code: [MIT](LICENSE). No Blizzard game files are in this repo's source; the published container
+images bake in a stripped, minimal 1.14d data set (see [`LEGAL.md`](LEGAL.md)). Unofficial, not
+affiliated with Blizzard.

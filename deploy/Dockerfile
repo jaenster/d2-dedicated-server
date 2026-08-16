@@ -4,11 +4,17 @@
 #   docker build -f deploy/Dockerfile --target realmd -t realmd:latest .
 #   docker build -f deploy/Dockerfile --target gs     -t d2gs:latest   .
 #
-#   realmd — clean-room Zig realm server (bnetd+d2cs+d2dbs+gs-link). Static musl
-#            binary shipped in scratch: a few-MB image, zero runtime deps.
-#   gs     — headless Diablo II 1.14d under wine, driven by our injected DLLs. Game
-#            files are proprietary and are NOT baked in — mount a real 1.14d install
-#            at /game at runtime.
+#   realmd     — clean-room Zig realm server (bnetd+d2cs+d2dbs+gs-link). Static musl
+#                binary shipped in scratch: a few-MB image, zero runtime deps.
+#   gs         — headless Diablo II 1.14d under wine, driven by our injected DLLs.
+#                Game data is NOT baked into this image — the chart's load-gamedata
+#                initContainer (or a mounted install) supplies /game at runtime.
+#   gamedata   — the minimal 1.14d data set alone, at /gamedata: what the chart's
+#                initContainer copies into the gs pod's /game. See tools/make-minimal.sh
+#                for how it's assembled; this stage fetches an already-assembled copy
+#                (windows) from files.typeguru.nl rather than rebuilding it in CI.
+#   gs-native  — the wine-free GS: game data IS baked in (the mac minimal set), since
+#                nothing wires an initContainer for it yet — see that target below.
 #
 # --target gs builds only the windows DLLs (pg is a lazy dep, never pulled there);
 # --target realmd builds only the realmd binary. Neither builds the other's artifacts.
@@ -52,15 +58,42 @@ RUN zig build dlls -Doptimize=ReleaseSafe
 FROM zig AS build-native
 RUN zig build d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
 
+# ── fetch: minimal 1.14d game data ────────────────────────────────────────────────
+# tools/make-minimal.sh assembles this from a legitimately owned install (stripped MPQs —
+# only what a headless server reads, media archives emptied): it's not committed to this
+# repo (see LEGAL.md), but a pre-built copy of it is mirrored at files.typeguru.nl so the
+# pipeline can fetch it rather than every image consumer having to run the script by hand.
+# Two independent stages (mac + windows) so a target only pulls the platform it runs.
+FROM alpine:3.20 AS gamedata-mac
+ARG D2_MINIMAL_MAC_URL=https://files.typeguru.nl/diablo/minimal/114d/mac/d2-1.14d-minimal-mac.tgz
+RUN apk add --no-cache curl && mkdir /gamedata && \
+    curl -fsSL "$D2_MINIMAL_MAC_URL" | tar -xz -C /gamedata
+
+FROM alpine:3.20 AS gamedata-windows
+ARG D2_MINIMAL_WINDOWS_URL=https://files.typeguru.nl/diablo/minimal/114d/windows/d2-1.14d-minimal-windows.tgz
+RUN apk add --no-cache curl && mkdir /gamedata && \
+    curl -fsSL "$D2_MINIMAL_WINDOWS_URL" | tar -xz -C /gamedata
+
+# ── gamedata: the windows minimal set alone, for the chart's load-gamedata initContainer ──
+# Nothing but data at /gamedata — `gameServer.dataImage.repository` in deploy/chart points
+# here by default, and the initContainer `cp -a /gamedata/. /game/`s it into each gs pod.
+FROM scratch AS gamedata
+COPY --from=gamedata-windows /gamedata /gamedata
+
 # ── gs-native: the same server without wine ──────────────────────────────────────
-# One statically linked file against the wine image's debian + wine32 + wine + Xvfb. The game
-# files are still proprietary and still mounted at /game.
+# One statically linked file against the wine image's debian + wine32 + wine + Xvfb.
 # Labelled amd64, not 386, even though the binary inside is a 32-bit ELF. containerd matches the
 # image platform against the node's and refuses a linux/386 image on an amd64 node outright ("no
 # match for platform in manifest") — while the kernel it would have run on executes the i386 binary
 # without help. The label is metadata; the ELF is what runs.
 FROM --platform=linux/amd64 scratch AS gs-native
 COPY --from=build-native /src/zig-out/bin/d2gs-native /d2gs-native
+# Baked in directly rather than via an initContainer (unlike gs/gamedata above): nothing
+# public wires up a native-GS deployment yet, so there's no chart step to copy it in.
+# A bind mount at /game (below) still overrides this with a different install if you need one.
+COPY --from=gamedata-mac /gamedata /game
+WORKDIR /game
+ENV D2MAC_BIN=/game/DiabloII_macho
 # The engine writes its resource file to the temporary-items folder during startup, and a scratch
 # image has no /tmp for it to land in. Declaring it as a volume is what creates the directory.
 VOLUME ["/game", "/tmp"]

@@ -40,8 +40,9 @@ helm install myrealm deploy/chart \
   --set postgres.auth.password=$(openssl rand -hex 16)
 ```
 
-Then supply the proprietary game data (a small private `dataImage`, or the `d2-gamefiles` PVC
-fallback) and point `realmAddr` at the realmd LoadBalancer's external IP.
+Game data ships baked into the default `gameServer.dataImage` (a public image this repo's
+pipeline builds from the minimal 1.14d set — see `tools/make-minimal.sh`); point `realmAddr`
+at the realmd LoadBalancer's external IP and there's no further data step.
 
 Useful toggles: `postgres.enabled` / `redis.enabled` (use external backends), `qqserver.enabled`,
 `gameServer.dataImage.repository` (ship data via an initContainer instead of a PVC),
