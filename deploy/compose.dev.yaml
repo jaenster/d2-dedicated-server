@@ -1,7 +1,12 @@
-# Local DEV backing store — just redis, on a fixed name+port so it never collides with
-# a stray redis container (a random one on :6379 once caused a connect flood + confusion).
-# In dev, realmd + d2ingress run NATIVELY on the host and the wine GS runs natively too;
-# only redis needs a container. The full containerized stack lives in compose.yaml.
+# Local DEV backing stores, on fixed names+ports so they never collide with a stray container
+# (a random redis on :6379 once caused a connect flood + confusion). In dev, realmd + d2ingress
+# run NATIVELY on the host and the wine GS runs natively too; only the stores are containers.
+# The full containerized stack lives in compose.yaml.
+#
+# Redis is REQUIRED — realmd refuses to start without it, because the realm coordinates through
+# it. Postgres is optional: the durable store can be `fs` instead, which is what run-stack.sh
+# uses. It is here so the pg path can be exercised locally rather than only in a deployment,
+# since a store of record that is never run in dev is one nobody notices has broken.
 #
 #   docker compose -f deploy/compose.dev.yaml up -d
 #   # then, natively:
@@ -18,3 +23,21 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
       retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: d2gs-dev-postgres
+    environment:
+      POSTGRES_USER: realmd
+      POSTGRES_PASSWORD: realmd
+      POSTGRES_DB: realmd
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U realmd"]
+      interval: 3s
+      retries: 10
+
+# Run realmd against postgres instead of the filesystem:
+#   REALMD_DURABLE_STORE=pg REALMD_PG_DSN=postgres://realmd:realmd@127.0.0.1:55432/realmd \
+#     DURABLE=pg ./run-stack.sh
