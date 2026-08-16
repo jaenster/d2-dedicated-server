@@ -21,6 +21,9 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   client actually does all evening, and what a test that spawns a process per game cannot
   reach. 450 games across 25 rounds with three characters, clean, with resident memory and
   descriptor count flat.
+- **A character is in one game at a time, and the realm says so.** The seat is claimed in the
+  shared store, so it holds across realmd instances, and a second client bringing the same
+  character is refused with the game that has it rather than left at a loading screen.
 - **A second login cannot take a live session's place.** The character is refused and the
   session already in the world keeps playing; a character whose client died re-enters
   immediately.
@@ -31,18 +34,6 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
 
 ## Rough edges / next
 
-- **The realm-side character lock is half done.** A character is now claimed in the shared
-  store by the game it enters and released when the player leaves or the game ends, so it
-  cannot be in **two games** at once -- enforced across instances, and refused upfront with a
-  message instead of the silent loading-screen wait.
-  What it does *not* yet stop is **two clients on one character in one game**: the claim is
-  owned by the game, and re-taking a character the same game already holds is allowed on
-  purpose, because that is what lets a client re-enter its own game after its previous session
-  died. Scoping the owner to the session would close the double login and reopen that, so the
-  two need separating before this is finished. The engine still refuses the second seat, so the
-  outcome is correct -- it is the *message* that is still missing in that one case.
-  There is also no client result code for "that character is already in a game"; the refusal
-  currently borrows "Game is Full.", which is visible but untrue.
 - Password-protected games are untested end to end.
 - Verbose join diagnostics compiled in by default; `pkttrace` gated.
 - Two headed clients in one wineprefix can trip the bnet gateway-list parser on the second

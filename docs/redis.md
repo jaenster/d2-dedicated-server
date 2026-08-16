@@ -89,12 +89,53 @@ is a lie the client acts on. The wait is bounded and stops as soon as the claim 
 
 The claim covers only the dispatch window; once the game is recorded, that record owns the name.
 
+## Redis is required
+
+realmd refuses to start without it, and refuses again if it is configured but does not answer,
+saying which. It stopped being one backend among several the moment the realm began coordinating
+through it, and every one of those things — characters, seats, tokens, the fleet — fails in a way
+that reads as a game bug rather than a missing dependency.
+
+The **durable** store stays a choice: pg for a deployment, fs for one host. Neither carries any
+coordination, so requiring postgres would only make local iteration slower for nothing.
+
+## A character belongs to one seat
+
+Two clients presenting the same character are two seats, and the engine refuses the second
+outright. The realm now refuses it first, naming the game that holds it, instead of issuing a join
+the engine drops in silence while the player watches a loading screen.
+
+The claim is strict — held by anyone, the same game included, is a refusal — which works because
+only the JOIN takes it. The creator does not claim its character at create; it sends JOINGAME for
+the game it just made, so one seat means one claim.
+
+Releases are the other half: leaving frees that character, the game ending frees whatever it still
+held, and the lease frees it if the server holding it dies. Because the engine takes a moment per
+departing client to notice a socket has gone, a join **waits briefly** for a character's previous
+seat to clear before refusing — otherwise a character carried straight into its next game is
+turned away by the one it just left.
+
+## What the game server does itself
+
+It reads and writes characters directly, and publishes its own presence — address, capacity, load —
+refreshing it on its own tick. The record belongs to the server rather than to whichever realmd
+happens to hold its control link, and its TTL is how a server that dies leaves without anyone
+having to notice.
+
+Its redis connection is a single socket and every command holds a lock over the whole
+request/reply cycle. Two threads sharing it without that desyncs the connection: the second caller
+reads the first one's reply, and afterwards reads come back empty while writes still appear to
+work. That failure looked exactly like a missing character.
+
 ## What has not moved yet
 
-Create and join **dispatch still travels each game server's control socket** (gs-link, 6115), and
-character fetches still use d2dbs (6114). That is what keeps realmd a single replica: an instance
-can see the whole fleet in redis but can only dispatch to servers whose socket it holds, and the
-join-context notify silently does nothing on an instance that does not hold it — so a second
-replica would not degrade, it would tell a client yes and let the game server refuse them.
+Create and join **dispatch still travels each game server's control socket** (gs-link, 6115). That
+is the last thing keeping realmd a single replica: an instance can see the whole fleet in redis but
+can only dispatch to servers whose socket it holds, and the join-context notify silently does
+nothing on an instance that does not — so a second replica would not degrade, it would tell a
+client yes and let the game server refuse them.
+
+The d2dbs listener (6114) is also still up, though nothing reaches it: the game server served zero
+fetches through it across a six-game run. Removing it is cleanup, not migration.
 
 Until dispatch moves, **run realmd as one replica.**

@@ -93,7 +93,9 @@ open); Redis + Postgres behind them; an internal GS fleet whose pods register th
 ```
 
 The client only ever uses two ports: **6112** (login + realm) and **4000** (game). Everything
-else (gs-link 6115, d2dbs 6114) is internal traffic between the fleet and realmd.
+else is internal traffic between the fleet and realmd: gs-link (6115) for create/join dispatch,
+and d2dbs (6114), which is legacy — the game server reads and writes characters straight from
+redis, and nothing reaches that listener any more.
 
 Game traffic always crosses an ingress -- the token realmd hands the client is realm-global, and
 only an ingress can translate it to the id the engine knows. On one host realmd can be that
@@ -150,7 +152,8 @@ check uses **BNFTP** on the same port.
 
 Behind that one client port, realmd also exposes two **internal** endpoints the fleet uses
 (never the client): a **gs-link** (`:6115`) the fleet registers over and that routes create/join
-to a server, and **d2dbs** (`:6114`) the server fetches/saves character bytes from.
+to a server, and **d2dbs** (`:6114`), now legacy: characters live in redis and the game server
+reads and writes them itself, so nothing reaches it. See [`docs/redis.md`](docs/redis.md).
 
 More: [`REALMD.md`](REALMD.md) (configuration, trust model) and
 [`apps/realmd/README.md`](apps/realmd/README.md) (internals).
