@@ -102,7 +102,16 @@ jobs:
             ghcr.io/jaenster/${{ matrix.image }}:${{ github.sha }}
             ${{ github.ref_type == 'tag' && format('ghcr.io/jaenster/{0}:{1}', matrix.image, github.ref_name) || '' }}
           cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,scope=${{ matrix.target }},mode=max
+          # WRITE only from main and tags; every branch READS the same entry. GitHub scopes a
+          # cache to the branch that wrote it, so writing on every push gave each PR its own
+          # copy of every layer — 150 entries and 2.7 GB before anyone looked. Reading is
+          # unaffected: a PR branch falls back to the default branch's scope, which is where the
+          # layers it wants actually are.
+          #
+          # Bounded beyond that by GitHub itself: 10 GB per repository, evicted least-recently-used,
+          # and any entry untouched for 7 days is deleted. So this cannot grow without limit — but
+          # it can crowd out everything else, which is what writing per-branch was doing.
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,scope={0},mode=max', matrix.target) || '' }}
 
   # Unit tests + the clientless scenario suite. Runs on the runner rather than in an image: the
   # harness starts its own redis and postgres containers, which is far simpler from the host than
