@@ -19,6 +19,9 @@ services:
     # FATAL GameAddrInvalid at boot), so it can't just be "realmd" the way D2GS_GS_ADDR can. Give
     # it a FIXED address on a dedicated subnet instead of the compose-assigned one, which isn't
     # known until the container exists.
+    build:
+      cache_from:
+        - type=gha,scope=realmd
     networks:
       default:
         ipv4_address: 172.28.238.10
@@ -32,6 +35,12 @@ services:
       REALMD_PERMISSIVE_AUTH: "1"
 
   gs-native:
+    # Read the layer cache the `build` job just wrote for this same target. Without it CI builds
+    # every image twice — once to publish, once to test — and the second is cold: two minutes of a
+    # three-minute job spent rebuilding what a parallel job had already finished.
+    build:
+      cache_from:
+        - type=gha,scope=gs-native
     environment:
       # The native server ships capped at ONE game, which a round of two clients exceeds before it
       # has played anything: the second create is refused with "game servers are down" and the
@@ -46,6 +55,10 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: e2e-runner
+      # No scope of its own — this stage is not in the publish matrix — but it shares the zig
+      # toolchain base with realmd, which is the expensive part.
+      cache_from:
+        - type=gha,scope=realmd
     depends_on:
       realmd: { condition: service_started }
       gs-native: { condition: service_started }
