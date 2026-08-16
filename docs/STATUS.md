@@ -49,6 +49,10 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   start at the first join, not at creation.
 - Least-loaded routing breaks ties toward whichever server the set enumerates first, so with
   equal load one server takes the work until its count rises.
+- **Some account state is still filesystem-only**, whatever the durable backend is: the admin
+  flag, password changes, the BNCS profile and guilds. Accounts themselves reach Postgres;
+  these do not, so across replicas they diverge silently — an admin flagged on one instance is
+  an ordinary user on the other.
 - **The native game server has not been ported off the retired control socket.** It still
   dials :6115 and fetches characters over d2dbs, neither of which exists; it boots and serves
   nothing until it joins the realm through redis the way the wine server does.

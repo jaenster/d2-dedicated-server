@@ -185,5 +185,14 @@ Verified, not assumed: two instances against one redis and one game server, a ga
 one and **joined through the other**, both players in the world together. Each instance sees the
 whole fleet, dispatches to all of it, and drains the same event stream.
 
-What still holds a realm to one instance is nothing in this file. The remaining single-instance
-piece is the **native** game server, which has not been ported off the retired control socket yet.
+What still holds a realm to one instance is nothing in this file — but two things outside it are
+worth knowing before running replicas in anger:
+
+- **Some account state is still filesystem-only**, whatever `REALMD_DURABLE_STORE` says: the admin
+  flag, password changes, the BNCS profile (`SID_READ/WRITEUSERDATA`) and guilds. Accounts
+  themselves reach pg; these do not. On separate pods they diverge silently — an admin flagged on
+  one is an ordinary user on the other. Either give the instances a shared RWX volume, or move
+  those to the durable backend. (BNFTP files are also read from disk, and are fine: they are
+  read-only image content, identical on every pod.)
+- The **native** game server has not been ported off the retired control socket, so it cannot join
+  a realm at all.

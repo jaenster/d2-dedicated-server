@@ -46,16 +46,17 @@ images:
     tag: latest
     pullPolicy: Always
 
-# ── realmd: the stateless protocol front (bnetd + d2cs + d2dbs + gs-link) ───────────
+# ── realmd: the stateless protocol front (bnetd + MCP realm) ───────────────────────
 realmd:
-  # replicas 1: the GS holds its gs-link control connection to ONE realmd pod, so only
-  # that pod can route game create/join. Extra replicas sit NotReady (REQUIRE_GS) and
-  # stall the rollout. HA needs the GS connecting to every pod (or redis-shared dispatch).
-  replicas: 1
-  # Recreate (not RollingUpdate): a surged new pod can't go Ready (no GS holds its
-  # gs-link to it) until the old pod is gone, so a rolling update deadlocks. Kill-then-
-  # start has a brief blip but always converges. Set false for a normal RollingUpdate.
-  recreate: true
+  # Replicas are interchangeable: game servers publish themselves into redis and take work
+  # from a queue there, so every pod sees the whole fleet and can dispatch to all of it.
+  # Each pod gets its own REALMD_INSTANCE from metadata.name, which is what keeps their
+  # session ids and request ids in disjoint ranges — do not pin it to a fixed value.
+  replicas: 2
+  # RollingUpdate: a surged pod goes Ready as soon as it can see a published game server,
+  # which does not depend on the old pod going away. (Recreate was needed only while a
+  # game server held a control connection to exactly one pod.)
+  recreate: false
   # GitOps rolls back via git, so keep only the active ReplicaSet (0 = no history).
   revisionHistoryLimit: 0
   # Drain window for the SIGTERM shutdown grace below.
