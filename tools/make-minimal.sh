@@ -57,7 +57,7 @@ shrink() { # shrink <name> [mpqmin flags...] — rebuild an archive with only wh
 }
 
 if [ "$MAC" = 1 ]; then
-    OUT="${MINIMAL_OUT:-$ROOT/testgame-mac-min}"
+    OUT="${MINIMAL_OUT:-$ROOT/testgame-min-mac}"
     mkdir -p "$OUT"
     # The i386 Mach-O, and the resource fork PreInitApplication expects to find beside it.
     take "DiabloII_macho"
