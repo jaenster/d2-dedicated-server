@@ -8,6 +8,7 @@
 //! (fpGetDatabaseCharacter), we fetch it here and hand the bytes to the engine.
 
 const std = @import("std");
+const gsredis = @import("redis.zig");
 const p = @import("realm_proto").protocol;
 const log = @import("../log.zig");
 
@@ -123,7 +124,23 @@ pub fn disconnect() void {
 
 /// Fetch a character's save bytes into `out`. Returns the number of bytes written
 /// (0 on failure). The reply also carries createtime / allowladder (logged).
+/// Read a character.
+///
+/// Redis first when it is configured: that is where the most recent save lives, and the realm's
+/// own copy may still be a flush behind it. Falling back to d2dbs keeps a realm that has not moved
+/// to the shared store working, and is what lets this change land before the listener is retired.
+///
+/// A miss is a MISS, never a partial read — a short save written anywhere becomes a corrupt
+/// character, and this path feeds the engine directly.
 pub fn fetchCharSave(account: []const u8, charname: []const u8, out: []u8) usize {
+    if (gsredis.enabled()) {
+        const n = gsredis.getChar(account, charname, out);
+        if (n != 0) return n;
+    }
+    return fetchCharSaveOverLink(account, charname, out);
+}
+
+fn fetchCharSaveOverLink(account: []const u8, charname: []const u8, out: []u8) usize {
     if (sock == INVALID_SOCKET) return 0;
     seqno +%= 1;
 
@@ -176,7 +193,17 @@ pub fn fetchCharSave(account: []const u8, charname: []const u8, out: []u8) usize
 /// Persist a character's .d2s bytes back to D2DBS. Mirrors realmd's onSave wire format:
 /// SAVE_DATA 0x30 req = datatype:u16, account\0, char\0, datalen:u16, <bytes>; reply = result:u32.
 /// Returns true on a result==0 ack.
+/// Write a character.
+///
+/// To redis when configured, which also marks it for the realm's flush worker — the save is
+/// durable once redis has it and postgres catches up behind. A failed write falls through to
+/// d2dbs rather than being dropped: losing a save is the one failure here with no repair.
 pub fn saveCharSave(account: []const u8, charname: []const u8, data: []const u8) bool {
+    if (gsredis.enabled() and gsredis.putChar(account, charname, data)) return true;
+    return saveCharSaveOverLink(account, charname, data);
+}
+
+fn saveCharSaveOverLink(account: []const u8, charname: []const u8, data: []const u8) bool {
     if (sock == INVALID_SOCKET) return false;
     if (data.len > 0xFFFF) return false;
     seqno +%= 1;
