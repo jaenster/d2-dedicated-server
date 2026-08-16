@@ -28,7 +28,7 @@ floatingIPs: []
 # can translate it, so realmd refuses to start without this.
 gameAddr: ""
 
-# Don't take client traffic until a game server has registered over the gs-link.
+# Don't take client traffic until a game server has published itself into redis.
 requireGS: true
 
 # Per-component container images.

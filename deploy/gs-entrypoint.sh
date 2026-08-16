@@ -106,7 +106,7 @@ case "${D2GS_GS_ADDR:-auto}" in
       case "$pubip" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) break;; *) pubip="";; esac
     done
     [ -n "$pubip" ] && export D2GS_GS_ADDR="$pubip:$port" \
-      || echo "WARN: could not resolve public IP; leaving D2GS_GS_ADDR unset (realmd will use the gs-link peer IP)"
+      || echo "WARN: could not resolve public IP; leaving D2GS_GS_ADDR unset (clients will be given 0.0.0.0)"
     ;;
 esac
 

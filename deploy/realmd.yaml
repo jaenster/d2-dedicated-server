@@ -1,4 +1,4 @@
-# realmd on Kubernetes — the realm server (bnetd + d2cs + d2dbs + gs-link), fronted
+# realmd on Kubernetes — the realm server (bnetd + MCP realm on one port), fronted
 # by a LoadBalancer, with the game-server fleet in deploy/gs.yaml.
 #
 # State lives behind realmd's persistence facade — Postgres for the record, Redis for what is
@@ -111,15 +111,12 @@ metadata:
   name: realmd
   namespace: realmd
 spec:
-  # ONE replica, and not for capacity reasons. Sessions and games live in the shared store,
-  # so any pod can serve login and the game list — but the GS fleet does NOT: a game server
-  # holds its gs-link control connection to exactly one pod, and create/join is a synchronous
-  # request over that socket. A join that lands on a pod which does not hold the owning GS's
-  # connection still succeeds at the realm, then fails quietly on the GS: notifyJoin's result
-  # is discarded, so joinctx is never populated and the character is fetched — and saved —
-  # under the wrong account. HA needs the GS dialling every pod, or dispatch relayed through
-  # the store. Until then this is one pod (see deploy/chart/values.yaml, which already says so).
-  replicas: 1
+  # Replicas are interchangeable. Nothing connects a realm server to a game server: servers
+  # publish themselves into redis and take create/join from a queue there, so every pod sees the
+  # whole fleet and can dispatch to all of it. Each pod needs its own REALMD_INSTANCE (below,
+  # from metadata.name) — it seeds session ids and dispatch request ids, and two pods sharing one
+  # would collect each other's replies.
+  replicas: 2
   selector:
     matchLabels: { app: realmd }
   template:
@@ -176,8 +173,6 @@ metadata:
   namespace: realmd
 spec:
   type: LoadBalancer
-  # Preserve the game server's source IP on the gs-link. (Less critical now that the
-  # GS self-reports its address via ADDRINFO, but still avoids surprises.)
   externalTrafficPolicy: Local
   selector: { app: realmd }
   ports:

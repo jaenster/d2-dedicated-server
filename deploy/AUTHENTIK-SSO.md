@@ -121,7 +121,7 @@ spec:
         - namespaceSelector:
             matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
       ports: [{ port: 8080 }]
-    - ports: [{ port: 6112 }, { port: 6113 }, { port: 6114 }, { port: 6115 }]
+    - ports: [{ port: 6112 }]
 ```
 
 ## 5. realmd env

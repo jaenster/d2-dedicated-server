@@ -209,7 +209,7 @@ model {
       }
       realmclient = component 'realm client' {
         #ours
-        description 'In-process d2cs/d2dbs client (realm/client/*.zig): session + character DB to the backend'
+        description 'In-process redis client: publishes the server record, blocks on its own queue for CREATE/JOIN, answers on the reply key, pushes enter/leave/closed events, and reads/writes characters directly. No socket to realmd — the d2cs and d2dbs clients are gone.'
       }
 
       // -- the Charon-style feature framework (engine/feature.zig) --
@@ -246,27 +246,31 @@ model {
 
     realmd = process 'realmd' {
       #ours
-      description 'Clean-room Zig pvpgn replacement — one binary, multi-instance'
+      description 'Clean-room Zig pvpgn replacement — one binary, multi-instance. Binds exactly two ports: 6112 (BNCS login + MCP realm, muxed the way real Battle.net does it) and 8080 (health/admin). The old 6113 (standalone d2cs), 6114 (d2dbs) and 6115 (game-server control link) listeners are gone — everything they carried travels through redis.'
 
       bncs = component 'bncs (bnetd)' {
         #ours
-        description 'Battle.net chat/login (BNCS)'
+        description 'apps/realmd/bncs.zig — Battle.net login, account/profile, and the chat protocol on :6112'
+      }
+      chat = component 'chat' {
+        #ours
+        description 'apps/realmd/chat.zig — channels across instances. A member is held by whichever instance owns its socket, so local delivery still goes straight down that socket; members are also published into a shared per-channel roster plus a by-name index, and talk, whispers and the user list reach members held elsewhere via that instance\'s inbox (realmd:chatin:<instance>). Getting this wrong fails silently: talk vanishes and a whisper claims a logged-on user is not there.'
       }
       bnftp = component 'bnftp' {
         #ours
-        description 'BNFTP MPQ / checkrev file transfer. Serves the version-check MPQ (ver-IX86-1.mpq) from <data_dir>/bnftp — on k8s populated by a load-vermpq initContainer from the d2-gamedata image.'
+        description 'BNFTP file transfer for the version check. The ONLY thing the realm reads from local disk (packages/realm-store/assets.zig): read-only image content — the version-check MPQ (ver-IX86-1.mpq) and the banner ad — identical on every instance, so there is nothing to keep in sync. On k8s <data_dir>/bnftp is populated by a load-vermpq initContainer from the d2-gamedata image.'
       }
       rd2cs = component 'd2cs' {
         #ours
-        description 'Realm: char select, game create/join sessions'
+        description 'Realm (MCP, muxed onto :6112): char select, game create/join sessions'
       }
       charflush = component 'charflush' {
         #ours
-        description 'Moves saved characters from the redis cache to the store of record. Every instance runs one; they need no coordination because a flush reads the current bytes.'
+        description 'Moves saved characters from the redis cache to Postgres. Every instance runs one; they need no coordination because a flush reads the current bytes and only clears the dirty flag if the save version has not moved.'
       }
-      gslink = component 'fleet' {
+      fleet = component 'fleet' {
         #ours
-        description 'The game servers as the whole realm sees them, through redis: pick-and-reserve the least loaded with room (one EVAL, so two instances cannot choose the same slot), dispatch CREATE/JOIN to that server\'s queue and collect the reply by seq, and drain the event stream servers report on.'
+        description 'apps/realmd/fleet.zig — the game servers as the whole realm sees them, through redis, with nothing connecting the two: pick-and-reserve the least loaded with room (one EVAL, so two instances cannot choose the same slot), dispatch CREATE/JOIN to that server\'s queue (realmd:gsq:<gsid>) and collect the reply by its packet seq (realmd:gsreply:<seq>), and drain the shared event list (realmd:gsev) servers report enter/leave/closed on.'
       }
 
       // 12-factor app surface for k8s.
@@ -279,35 +283,34 @@ model {
         description 'SIGTERM -> drain -> exit (graceful k8s termination)'
       }
 
-      // Persistence facade (DDD, no adapters): domain ops dispatch by switch to a
-      // backend. Two independent selections — durable (chars) + ephemeral (sessions+games).
+      // Persistence facade (DDD, no adapters): apps/realmd/store.zig names the operations in D2
+      // terms and each one has exactly one home. There is no backend selection any more — the
+      // filesystem backend is deleted, and both Postgres and redis are required.
       db = store 'store facade' {
         #ours
-        description 'Domain ops (getCharD2s/saveCharD2s, mintSession/accountForSession, registerGame/findGame, the fleet + its queues). Switch-dispatched: fs | redis | pg — redis is required, the durable half is a choice.'
+        description 'apps/realmd/store.zig — domain ops (getCharD2s/saveCharD2s, mintSession/accountForSession, registerGame/findGame, the chat roster, the fleet + its queues). No backend choice: each op has one home. Postgres is the store of record, redis is everything in flight, and realmd refuses to start without either.'
       }
-      store_fs = store 'fs backend' {
+      store_redis = store 'redis' {
         #ours
-        description 'Filesystem (default): chars/<account>/<char>.d2s + session/game records; shared dir for multi-instance'
+        description 'Everything in flight, and the realm\'s centre: sessions, games, seats, tokens, the d2ingress routes, the chat rosters + per-instance inboxes, the fleet and its queue/reply/event keys — plus the LIVE character, cached in front of Postgres so a save is acknowledged without waiting on it. Must run noeviction: it holds the only copy of a dirty save.'
       }
-      store_redis = store 'redis backend' {
+      store_pg = store 'postgres' {
         #ours
-        description 'The realm\'s centre: sessions, games, characters (cache), seats, tokens, the fleet and its request/reply/event channels'
-      }
-      store_pg = store 'pg backend' {
-        #ours
-        description 'Postgres: durable character saves'
+        description 'The store of record: characters, accounts, profiles, guilds. Shared by every instance — "the file on this pod" was a different answer per pod, which is what killed the filesystem backend.'
       }
 
       rd2cs -> db 'sessions / games'
-      gslink -> db 'fleet, queues, events'
-      charflush -> db 'redis -> store of record'
-      db -> store_fs 'durable+ephemeral (default)'
-      db -> store_redis 'ephemeral (sessions+games)'
-      db -> store_pg 'durable (chars)'
+      fleet -> db 'fleet, queues, events'
+      chat -> db 'roster + by-name index + per-instance inbox'
+      charflush -> db 'redis -> postgres'
+      db -> store_redis 'in flight + the live character'
+      db -> store_pg 'store of record'
+      bnftp -> db 'BNFTP assets (the only disk read)'
       health -> db 'readiness probe'
-      health -> gslink 'is any game server published'
-      shutdown -> gslink 'drain games'
-      gslink -> rd2cs 'announces games'
+      health -> fleet 'is any game server published'
+      shutdown -> fleet 'drain games'
+      fleet -> rd2cs 'announces games'
+      bncs -> chat 'channel join / talk / whisper'
     }
 
     // The headless game-server fleet. Nothing connects it to realmd: each publishes itself
@@ -342,9 +345,9 @@ model {
 
   // ---- realm wiring: through the store, never point to point ----
   realmclient -> db 'publishes itself; takes CREATE/JOIN from its queue; reads/writes characters'
-  gslink -> db 'picks + reserves a server, pushes the request, collects the reply by seq'
-  db -> gslink 'the events servers report: player enter/leave, game closed'
-  gslink -> dll 'drives game lifecycle'
+  fleet -> db 'picks + reserves a server, pushes the request, collects the reply by seq'
+  db -> fleet 'the events servers report: player enter/leave, game closed'
+  fleet -> dll 'drives game lifecycle'
   dll -> gameserver 'is one fleet member'
 
   // ---- d2ingress: the game-traffic gateway (separate binary) ----
@@ -399,7 +402,7 @@ views {
   // translates the token and splices through to the real GS behind it.
   view join_flow {
     title 'Player join flow'
-    include player, d2client, bncs, bnftp, rd2cs, gslink, d2ingress, gameserver, dll, engine, d2game, db
+    include player, d2client, bncs, chat, bnftp, rd2cs, fleet, d2ingress, gameserver, dll, engine, d2game, db
     autoLayout LeftRight
   }
 
@@ -407,7 +410,7 @@ views {
   // CREATE to the least-loaded with room, JOIN to the server that owns the game.
   view gs_fleet {
     title 'GS fleet — published in redis, dispatched through it'
-    include player, d2client, rd2cs, gslink, charflush, gameserver, dll, db, store_fs, store_redis, store_pg, health, shutdown
+    include player, d2client, rd2cs, fleet, charflush, gameserver, dll, realmclient, db, store_redis, store_pg, health, shutdown
     autoLayout LeftRight
   }
 }

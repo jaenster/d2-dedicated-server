@@ -98,9 +98,9 @@ spec:
             httpGet: { path: /healthz, port: 8086 }
             periodSeconds: 5
             failureThreshold: 60
-          # Ready means "the realm can place a game here": engine ticking AND gs-link
-          # registered. A pod whose control connection dropped keeps running and keeps its
-          # live games, but must leave the Service so no new game is routed into it.
+          # Ready means "the realm can place a game here": engine ticking AND published into
+          # redis. A pod that cannot reach the store keeps running and keeps its live games, but
+          # must leave the Service so no new game is routed into it.
           readinessProbe:
             httpGet: { path: /readyz, port: 8086 }
             periodSeconds: 10

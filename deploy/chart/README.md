@@ -2,7 +2,7 @@
 
 This chart deploys a complete, fleet-shaped Diablo II 1.14d realm on Kubernetes:
 
-- **realmd** — the stateless protocol front (bnetd + d2cs + d2dbs + gs-link), fronted by
+- **realmd** — the stateless protocol front (bnetd + MCP realm on one port), fronted by
   a `LoadBalancer`. Scales freely because all state lives in backing services.
 - **game-server fleet (d2gs)** — headless `Game.exe` under wine. Internal (pod-IP only);
   clients never dial it. See Topology.
@@ -77,9 +77,14 @@ is usually private — set `d2ingress.pullSecret` to a dockerconfigjson secret (
 
 Version check: the d2gs client bypasses it (`--bypass-checkrev`) and realmd accepts any auth-check, so no version MPQ is served.
 
-`realmd` runs `replicas: 1` with `strategy: Recreate` (`realmd.recreate`): the GS holds its
-gs-link to one realmd pod, so a surging rollout can't go Ready and deadlocks. All Deployments
-set `revisionHistoryLimit: {{ realmd.revisionHistoryLimit }}` (default 0 — GitOps rolls back via git).
+`realmd` runs `replicas: 2` with a normal RollingUpdate. Replicas are interchangeable: game
+servers meet the realm in redis rather than connecting to a pod, so a surged pod goes Ready as
+soon as it can see a published game server, without waiting for the old one to go. Each pod takes
+`REALMD_INSTANCE` from `metadata.name`, which keeps session ids, dispatch request ids and chat
+inboxes in disjoint ranges — do not pin it. (`realmd.recreate` still forces `strategy: Recreate`
+if you need it; it was required only while a game server held a control connection to one pod.)
+All Deployments set `revisionHistoryLimit: {{ realmd.revisionHistoryLimit }}` (default 0 — GitOps
+rolls back via git).
 
 ## Gotchas this chart bakes in (the point of the example)
 
@@ -101,7 +106,7 @@ set `revisionHistoryLimit: {{ realmd.revisionHistoryLimit }}` (default 0 — Git
   `dataImage.repository` to `""` to instead mount a real D2 1.14d install into the RWX
   `d2-gamefiles` PVC yourself (read-only into each pod). The entrypoint aborts if
   `/game/Game.exe` is missing.
-- **`REALMD_REQUIRE_GS` gates client traffic** until a GS registers over the gs-link, so
+- **`REALMD_REQUIRE_GS` gates client traffic** until a game server publishes itself, so
   clients never connect to a realm with no games behind it.
 
 ## Toggles
@@ -112,7 +117,7 @@ set `revisionHistoryLimit: {{ realmd.revisionHistoryLimit }}` (default 0 — Git
 | `redis.enabled=false` | skip in-cluster Redis (supply an external `realmd-redis:6379`) |
 | `d2ingress.enabled=false` | skip the gateway |
 | `gameServer.dataImage.repository=<img>` | ship game data via the load-gamedata initContainer + emptyDir (no PVC); defaults to `ghcr.io/jaenster/d2-gamedata`; empty = use the `d2-gamefiles` PVC fallback |
-| `realmd.recreate=false` | use a normal RollingUpdate instead of Recreate for realmd |
+| `realmd.recreate=true` | force `strategy: Recreate` (not needed any more; RollingUpdate is the default) |
 | `d2ingress.pullSecret=<name>` | imagePullSecret for the (usually private) d2ingress image |
 
 The deployment namespace is the Helm release namespace (the hardcoded `realmd`

@@ -10,7 +10,9 @@
 // traffic to the same floating IP on :4000 (d2ingress), which reads the realm-global
 // token, looks up {token -> GS pod ip:port,gameid} in redis, rewrites it and splices
 // to the owning INTERNAL GS pod. The GS pods are never public, and they never connect to
-// realmd at all — both sides meet in redis, so there is no internal Service between them.
+// realmd at all — both sides meet in redis, so there is no internal Service between them
+// (the old realmd-gslink ClusterIP is gone). That is also why realmd runs replicas: 2 with a
+// normal RollingUpdate rather than the single Recreate pod a control connection used to force.
 //
 // View it with:  npx likec4 start docs/architecture
 
@@ -43,13 +45,14 @@ deployment {
     service realmd_lb 'realmd Service (public)' {
       description 'externalIPs=FIP; exposes ONLY 6112 (bnet login + MCP realm, muxed); routes to ready realmd pods'
     }
-    workload realmd_deploy 'realmd Deployment' {
-      description 'Public 6112 (bnet + MCP realm, muxed); health/webui 8080. Nothing else is bound — game servers meet it in redis — so replicas are interchangeable and a rolling update needs no coordination. SIGTERM drain.'
+    workload realmd_deploy 'realmd Deployment (replicas: 2)' {
+      description 'Public 6112 (bnet + MCP realm, muxed); health/webui 8080. Nothing else is bound — game servers meet it in redis, so there is no internal Service and no realmd-gslink — which is what makes replicas interchangeable: replicas 2 with a normal RollingUpdate (a surged pod goes Ready as soon as it sees a published game server, without waiting for the old pod to go). Each pod takes REALMD_INSTANCE from metadata.name, keeping session ids, request seqs and chat inboxes in disjoint ranges. SIGTERM drain.'
       instanceOf d2gs.realmd.bncs
+      instanceOf d2gs.realmd.chat
       instanceOf d2gs.realmd.bnftp
       instanceOf d2gs.realmd.rd2cs
       instanceOf d2gs.realmd.charflush
-      instanceOf d2gs.realmd.gslink
+      instanceOf d2gs.realmd.fleet
       instanceOf d2gs.realmd.health
     }
     // initContainer: serves the version-check MPQ over BNFTP. Copies ver-IX86-1.mpq
@@ -68,13 +71,13 @@ deployment {
       instanceOf d2gs.d2ingress
     }
 
-    // Backing stores.
+    // Backing stores. Both are required — there is no filesystem backend to fall back to.
     service redis_svc 'Redis (Deployment)' {
-      description 'Ephemeral sessions + games + the d2ingress token routes (TTL)'
+      description 'Everything in flight: sessions, games, seats, the d2ingress token routes, the chat rosters + per-instance inboxes, the fleet and its queues, and the live character in front of Postgres. Must be noeviction — it holds the only copy of a dirty save.'
       instanceOf d2gs.realmd.store_redis
     }
     service pg_svc 'Postgres (StatefulSet)' {
-      description 'Durable character saves (PGDATA in a subdir)'
+      description 'The store of record: characters, accounts, profiles, guilds (PGDATA in a subdir)'
       instanceOf d2gs.realmd.store_pg
     }
 
@@ -112,10 +115,10 @@ deployment {
   realmd_lb -> realmd_deploy 'to ready pods'
   realmd_vermpq -> realmd_deploy 'populates bnftp emptyDir (ver-IX86-1.mpq)'
 
-  // realmd -> backing stores. Mints unique tokens via a shared redis counter and
-  // writes {token -> GS pod ip:port,gameid} there; the d2ingresss read it. PG = chars.
-  realmd_deploy -> redis_svc 'ephemeral (sessions+games); token counter + token->GS route'
-  realmd_deploy -> pg_svc 'durable (chars)'
+  // realmd -> backing stores. Both required. Mints unique tokens via a shared redis counter and
+  // writes {token -> GS pod ip:port,gameid} there; the d2ingresss read it. PG = store of record.
+  realmd_deploy -> redis_svc 'sessions+games, chat rosters+inboxes, fleet queues; token counter + token->GS route'
+  realmd_deploy -> pg_svc 'store of record (chars, accounts, profiles, guilds)'
 
   // GS pods never dial realmd. They publish themselves into redis, take create/join from
   // their own queue there, report events back, and read/write characters directly.
