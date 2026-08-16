@@ -290,7 +290,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var listen_sec: u32 = 0; // stay in chat reading events for N seconds (chat-session mode)
     var delay_sec: u32 = 0; // wait N seconds after joining before say/kick (2-client ordering)
     var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
-    var gs_port: u16 = 4000; // GS game port (qqserver public port)
+    var gs_port: u16 = 4000; // GS game port (d2ingress public port)
     var ver_byte: u8 = 0; // GAMELOGON version byte (GetGameVersion)
     var pos: usize = 0;
     while (args.next()) |a| {
@@ -656,7 +656,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("[MCP_JOINGAME] token=0x{x} gs={s}:{d} hash=0x{x} result=0x{x}\n", .{ gtoken, gsips, gs_port, ghash, jresult });
             if (jresult != 0) return;
 
-            // Connect to the GS game port (qqserver) and play the entry sequence.
+            // Connect to the GS game port (d2ingress) and play the entry sequence.
             const gsfd = connectResolved(gpa, gsips, gs_port) catch {
                 std.debug.print("[GS] connect to {s}:{d} failed\n", .{ gsips, gs_port });
                 return;
@@ -664,7 +664,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             defer _ = close(gsfd);
             setRecvTimeout(gsfd, 5000);
             // GAMELOGON_MULTI (0x68), 37 bytes (D2GSPacketClt0x68 — raw, no framing).
-            // Field layout (the qqserver/edge rewrites nGameToken@5 -> gameid):
+            // Field layout (the d2ingress/edge rewrites nGameToken@5 -> gameid):
             //   [0]=id [1..5]=nGameHash [5..7]=nGameToken [7]=nCharClass [8..12]=nVerByte
             //   [12..16]=nVersionConstant(0xED5DCC50) [16..20]=nConstant(0x91A519B6)
             //   [20]=nLanguageCode [21..37]=szCharName[16].

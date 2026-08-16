@@ -1,4 +1,4 @@
-# Stateless Deployment (fungible pods): qqserver routes to a pod by the IP recorded in
+# Stateless Deployment (fungible pods): d2ingress routes to a pod by the IP recorded in
 # the redis token route, not via a stable name, and in-memory game state dies with the
 # pod anyway — so no StatefulSet / persistent identity is needed.
 apiVersion: apps/v1
@@ -25,7 +25,7 @@ spec:
         prometheus.io/port: "8086"
         prometheus.io/path: /metrics
     spec:
-      # The GS is INTERNAL — no public hostPort. qqserver fronts the public :4000 and
+      # The GS is INTERNAL — no public hostPort. d2ingress fronts the public :4000 and
       # splices to each GS by its pod IP (from the redis token route). Without a hostPort
       # node-level bind the fleet can exceed the node count, so anti-affinity is soft:
       # preferred (not required) still spreads replicas across nodes for fault tolerance.
@@ -66,7 +66,7 @@ spec:
             # while realmd is NotReady — otherwise REQUIRE_GS deadlocks registration.
             - name: REALMD_HOST
               value: realmd-gslink.{{ .Release.Namespace }}.svc.cluster.local
-            # The GS registers its in-cluster POD IP — qqserver (also in-cluster) dials
+            # The GS registers its in-cluster POD IP — d2ingress (also in-cluster) dials
             # this to splice client game traffic through. No public exposure. POD_IP must
             # precede D2GS_GS_ADDR for the $(POD_IP) substitution to resolve.
             - name: POD_IP

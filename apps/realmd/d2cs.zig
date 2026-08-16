@@ -119,7 +119,7 @@ const max_players_per_game: u16 = 8;
 
 // The game-traffic ingress clients are told to dial, set from main() and required there.
 // JOINGAME never advertises a game server's own address: the token handed to the client is
-// realm-global, and only an ingress (qqserver, or the embedded edge) can translate it to the
+// realm-global, and only an ingress (d2ingress, or the embedded edge) can translate it to the
 // engine's gameid. `route_ttl_s` is how long the recorded route stays valid.
 pub var game_ip: [4]u8 = .{ 0, 0, 0, 0 };
 pub var route_ttl_s: u32 = 60;
@@ -634,11 +634,11 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const gtag1 = guilds.tagOf(c.accountName(), &gtagbuf1); // cut Guild Halls: tell the GS the creator's guild
     if (rr.gsid != 0) _ = gslink.notifyJoin(rr.gsid, rr.gameid, rr.gameid, c.charName(), c.accountName(), gtag1);
     // Mint a realm-global token and record {token -> GS addr + real gameid} so the
-    // qqserver can translate the client's token to the engine's gameid and splice.
+    // d2ingress can translate the client's token to the engine's gameid and splice.
     const token = mintToken();
     _ = store.recordTokenRoute(token, rr.ip, rr.port, rr.gameid, route_ttl_s);
     log.line(tag, "create game '{s}' (account={s}) -> gameid={d} token=0x{x} gs=0x{x}@{d}.{d}.{d}.{d}:{d}", .{ name, c.accountName(), rr.gameid, token, rr.gsid, rr.ip[0], rr.ip[1], rr.ip[2], rr.ip[3], rr.port });
-    w.putU16(token); // game token (client presents this to the qqserver)
+    w.putU16(token); // game token (client presents this to the d2ingress)
     w.putU16(0); // unknown
     w.putU32(0); // result: success
     finish(c, &w);
@@ -709,7 +709,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const gtag2 = guilds.tagOf(c.accountName(), &gtagbuf2); // cut Guild Halls: tell the GS the joiner's guild
     if (g.gsid != 0) _ = gslink.notifyJoin(g.gsid, g.gameid, g.gameid, c.charName(), c.accountName(), gtag2);
     // Mint a realm-global token for this joining client and record {token -> the real
-    // GS + engine gameid}. The qqserver reads the token from the client's first packet
+    // GS + engine gameid}. The d2ingress reads the token from the client's first packet
     // and translates it — NAT-proof, since the token is unique even when two clients
     // share one public IP. (Source-IP recordRoute is no longer used by the gateway.)
     const token = mintToken();
@@ -718,7 +718,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     log.line(tag, "join game '{s}' (account={s}) gameid={d} token=0x{x} gs={d}.{d}.{d}.{d} -> client dials {d}.{d}.{d}.{d}", .{ name, c.accountName(), g.gameid, token, g.gs_ip[0], g.gs_ip[1], g.gs_ip[2], g.gs_ip[3], advertised_ip[0], advertised_ip[1], advertised_ip[2], advertised_ip[3] });
     w.putU16(token); // game token
     w.putU16(0); // unknown
-    w.putBytes(&advertised_ip); // d2gs / qqserver IP (in_addr, network order)
+    w.putBytes(&advertised_ip); // d2gs / d2ingress IP (in_addr, network order)
     w.putU32(0); // game hash
     w.putU32(JOIN_OK); // result: success
     finish(c, &w);

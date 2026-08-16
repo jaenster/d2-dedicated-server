@@ -42,11 +42,11 @@ RUN apk add --no-cache nodejs npm
 COPY webui ./webui
 RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dwebui=true
 
-# ── build: qqserver (static musl) ────────────────────────────────────────────────
+# ── build: d2ingress (static musl) ────────────────────────────────────────────────
 # The game-traffic gateway: token-translating poll() splice proxy fronting the GS
 # fleet, with its own async redis client. No pg dep — never pulls it.
-FROM zig AS build-qqserver
-RUN zig build qqserver -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+FROM zig AS build-d2ingress
+RUN zig build d2ingress -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 
 # ── build: injected DLLs (x86-windows; dbghelp proxy + d2gs payload only) ─────────
 FROM zig AS build-dlls
@@ -133,9 +133,9 @@ COPY --from=build-realmd /src/zig-out/bin/realmd /realmd
 EXPOSE 6112 6113 6114 6115 8080
 ENTRYPOINT ["/realmd"]
 
-# ── qqserver: static binary in scratch ───────────────────────────────────────────
-FROM scratch AS qqserver
-COPY --from=build-qqserver /src/zig-out/bin/qqserver /qqserver
-# Client-facing game traffic (REALMD_QQ_PORT, default 4000).
+# ── d2ingress: static binary in scratch ───────────────────────────────────────────
+FROM scratch AS d2ingress
+COPY --from=build-d2ingress /src/zig-out/bin/d2ingress /d2ingress
+# Client-facing game traffic (REALMD_INGRESS_PORT, default 4000).
 EXPOSE 4000
-ENTRYPOINT ["/qqserver"]
+ENTRYPOINT ["/d2ingress"]

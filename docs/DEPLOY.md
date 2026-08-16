@@ -14,7 +14,7 @@ a game server would present a token that server has never heard of.
 So `REALMD_GAME_ADDR` is **required** — realmd refuses to start without it — and it names one of
 two ingresses. Both use the same builds and the same recorded routes:
 
-- **qqserver** (`floatingIPs` + `gameAddr`): a separate stateless process, routes in redis, so any
+- **d2ingress** (`floatingIPs` + `gameAddr`): a separate stateless process, routes in redis, so any
   gateway pod resolves any connection and the GS fleet stays on internal pod IPs. The Kubernetes
   path.
 - **realmd's embedded edge** (`REALMD_GAME_PORT`): realmd splices in-process, no redis hop and no
@@ -23,13 +23,13 @@ two ingresses. Both use the same builds and the same recorded routes:
 The client only ever uses two ports: **6112** (login + realm) and **4000** (game). Everything
 else (gs-link 6115, d2dbs 6114) is internal traffic between the game-server fleet and realmd.
 
-See [`apps/qqserver/README.md`](../apps/qqserver/README.md) for why the gateway exists
+See [`apps/d2ingress/README.md`](../apps/d2ingress/README.md) for why the gateway exists
 at all.
 
 ## Kubernetes (Helm)
 
 [`deploy/chart`](../deploy/chart/) deploys the whole fleet -- realmd, the d2gs game-server
-fleet, qqserver, Postgres, and Redis -- wired together. It is a publishable mirror of a real
+fleet, d2ingress, Postgres, and Redis -- wired together. It is a publishable mirror of a real
 running cluster, with the cluster-specific IPs/passwords replaced by generic overridable
 defaults. Full reference: [`deploy/chart/README.md`](../deploy/chart/README.md).
 
@@ -44,7 +44,7 @@ Game data ships baked into the default `gameServer.dataImage` (a public image th
 pipeline builds from the minimal 1.14d set — see `tools/make-minimal.sh`); point `realmAddr`
 at the realmd LoadBalancer's external IP and there's no further data step.
 
-Useful toggles: `postgres.enabled` / `redis.enabled` (use external backends), `qqserver.enabled`,
+Useful toggles: `postgres.enabled` / `redis.enabled` (use external backends), `d2ingress.enabled`,
 `gameServer.dataImage.repository` (ship data via an initContainer instead of a PVC),
 `gameServer.maxGames`. The raw manifests behind the chart are also in [`deploy/`](../deploy/)
 (`realmd.yaml`, `gs.yaml`).

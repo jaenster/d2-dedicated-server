@@ -21,7 +21,7 @@ const Entry = struct {
     consumed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     token: u32 = 0,
     /// The engine gameid realmd authorized this join for. Kept BESIDE the token because the
-    /// two are different namespaces and only the gameid reaches the engine: qqserver rewrites
+    /// two are different namespaces and only the gameid reaches the engine: d2ingress rewrites
     /// the client's realm token to it before the GS sees the packet, so fpFindPlayerToken is
     /// handed a gameid. See validateGame.
     gameid: u32 = 0,
@@ -132,7 +132,7 @@ pub fn accountForToken(token: u32) ?[]const u8 {
 ///
 /// Matches on the GAMEID, not the realm token. Three ids ride this path: realmd's realm-global
 /// join token, the engine gameid (`GAME_CreateBattleNetGame`'s out-param, the 1024-slot
-/// nToken), and qqserver REWRITES the token in the client's GAMELOGON to that gameid before
+/// nToken), and d2ingress REWRITES the token in the client's GAMELOGON to that gameid before
 /// the GS sees it. Matching a gameid against stored realm tokens compares two namespaces that
 /// only agree when two small counters happen to collide.
 pub fn validateGame(gameid: u32) bool {

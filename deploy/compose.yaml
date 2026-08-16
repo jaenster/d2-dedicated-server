@@ -43,7 +43,7 @@ services:
       # The address bnetd advertises to the client for d2cs. For a client on the host,
       # this must be reachable from the host — 127.0.0.1 works with the published ports.
       REALMD_REALM_ADDR: "127.0.0.1"
-      # Game traffic goes through realmd's own edge rather than a separate qqserver: one
+      # Game traffic goes through realmd's own edge rather than a separate d2ingress: one
       # host, one binary, no redis hop. Clients never dial the game server directly — the
       # token they carry is realm-global and only an edge can translate it.
       REALMD_GAME_PORT: "4000"

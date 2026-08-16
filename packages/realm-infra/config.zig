@@ -36,19 +36,19 @@ pub const Config = struct {
     gs_addr: []const u8 = "",
 
     /// REQUIRED (dotted-quad). Public address of the game-traffic ingress, advertised to
-    /// clients on JOINGAME — either a standalone qqserver or realmd's own edge (`game_port`).
+    /// clients on JOINGAME — either a standalone d2ingress or realmd's own edge (`game_port`).
     /// Never a game server's own address: the token clients are handed is realm-global, so
     /// only an ingress can translate it. realmd refuses to start without it.
     game_addr: []const u8 = "",
     /// TTL (seconds) for the {client-ip → GS} routes realmd records on JOINGAME for
-    /// the qqserver to consume.
+    /// the d2ingress to consume.
     route_ttl_s: u32 = 60,
-    /// Public port the qqserver listens on for game traffic (consumed by the qqserver
-    /// binary; parsed here so realmd and qqserver share one config surface).
-    qq_port: u16 = 4000,
+    /// Public port the d2ingress listens on for game traffic (consumed by the d2ingress
+    /// binary; parsed here so realmd and d2ingress share one config surface).
+    ingress_port: u16 = 4000,
     /// When non-zero, realmd runs the EMBEDDED game-traffic edge (gameedge.zig) on this
-    /// port itself — the lightweight, single-binary alternative to a standalone qqserver
-    /// (in-process token-route lookup, thread-per-conn splice). 0 = off (use qqserver).
+    /// port itself — the lightweight, single-binary alternative to a standalone d2ingress
+    /// (in-process token-route lookup, thread-per-conn splice). 0 = off (use d2ingress).
     game_port: u16 = 0,
 
     /// Directory for durable data (character saves). A shared volume here is
@@ -153,7 +153,7 @@ pub fn fromEnv() Config {
     if (env("REALMD_GS_ADDR")) |v| c.gs_addr = v;
     if (env("REALMD_GAME_ADDR")) |v| c.game_addr = v;
     if (env("REALMD_ROUTE_TTL_S")) |v| c.route_ttl_s = std.fmt.parseInt(u32, v, 10) catch c.route_ttl_s;
-    c.qq_port = envPort("REALMD_QQ_PORT", c.qq_port);
+    c.ingress_port = envPort("REALMD_INGRESS_PORT", c.ingress_port);
     c.game_port = envPort("REALMD_GAME_PORT", c.game_port);
     if (env("REALMD_REALM_NAME")) |v| c.realm_name = v;
     if (env("REALMD_ADMINS")) |v| c.admins = v;

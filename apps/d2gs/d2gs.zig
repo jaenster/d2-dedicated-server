@@ -317,12 +317,12 @@ fn parseEndpoints() void {
             d2dbs_port = 6114;
             d2dbs_enabled = true;
         }
-        // Topology. qqserver always owns the client-facing :4000 (the port the client
+        // Topology. d2ingress always owns the client-facing :4000 (the port the client
         // hardcodes) and splices game traffic to this GS's real QServer, which we relocate
-        // to :4100. qq swallows the GS's duplicate 0xAF00 greeting so the S->C stream matches
+        // to :4100. d2ingress swallows the GS's duplicate 0xAF00 greeting so the S->C stream matches
         // a --no-compress client; binding the engine directly on :4000 would hand the client
         // the engine's raw 0xAF01 and desync a compression-aware client. The GS self-reports
-        // :4100 via ADDRINFO; realmd records that as the per-game route so qq knows the backend.
+        // :4100 via ADDRINFO; realmd records that as the per-game route so d2ingress knows the backend.
         if (parseDottedQuad(rhost)) |oct| gs_public_ip = oct;
         gs_public_port = 4100;
     }
@@ -399,7 +399,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // we register the (currently all-null, safe) realm table to enable realm mode;
     // otherwise we run open (no D2CS), which the POC already proved listens on :4000.
     // Move the engine's QServer off :4000 to the port we advertise (gs_public_port), so the
-    // qqserver can own the client-facing :4000 and splice through to us. Must precede the
+    // d2ingress can own the client-facing :4000 and splice through to us. Must precede the
     // QSERVER_CreateAndInit inside bootstrapRealmServer. No-op when gs_public_port == 4000.
     gsport.apply(gs_public_port);
     // Reap empty games after a few seconds (default 5min) so abandoned games don't leak

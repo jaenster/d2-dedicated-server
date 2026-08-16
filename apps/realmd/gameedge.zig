@@ -1,4 +1,4 @@
-//! Embedded game-traffic edge — the lightweight, in-realmd version of qqserver.
+//! Embedded game-traffic edge — the lightweight, in-realmd version of d2ingress.
 //!
 //! Same trick: clients connect to ONE public :4000; we speak `0xAF00` on behalf of the
 //! not-yet-dialled GS, read the GAMELOGON (0x68) token, look up {gs_ip,gs_port,gameid}
@@ -7,10 +7,10 @@
 //! byte-splice both directions.
 //!
 //! Thread-per-connection (realmd's net model) keeps it tiny: no poll loop, no buffer
-//! pool, no async redis — unlike the standalone `qqserver`, which keeps that machinery
+//! pool, no async redis — unlike the standalone `d2ingress`, which keeps that machinery
 //! for scale-out. This is the single-binary / small-deploy path; enable with
 //! REALMD_GAME_PORT (0 = off). The token-route is recorded by d2cs on CREATE/JOIN, so
-//! the recording side is shared with qqserver — only the splice is duplicated here.
+//! the recording side is shared with d2ingress — only the splice is duplicated here.
 const std = @import("std");
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;

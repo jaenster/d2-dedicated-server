@@ -918,7 +918,7 @@ pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32
     var kb: [64]u8 = undefined;
     const key = tokenRouteKey(&kb, token);
     // Packed binary route: ip[4] ++ port(u16 LE) ++ gameid(u32 LE) = 10 bytes. Redis is
-    // binary-safe, so the qqserver reads these 10 bytes directly — no string parsing.
+    // binary-safe, so the d2ingress reads these 10 bytes directly — no string parsing.
     var vb: [10]u8 = undefined;
     @memcpy(vb[0..4], &gs_ip);
     std.mem.writeInt(u16, vb[4..6], gs_port, .little);

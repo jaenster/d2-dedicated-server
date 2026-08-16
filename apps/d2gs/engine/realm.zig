@@ -317,7 +317,7 @@ fn findPlayerTokenImpl(
     // authorized this join via joinctx.remember; the GS checks it here — known + unconsumed +
     // within the 120s TTL — and consumes it once so it can't be replayed.
     //
-    // s1 is the ENGINE GAMEID, not realmd's join token: qqserver rewrites the token in the
+    // s1 is the ENGINE GAMEID, not realmd's join token: d2ingress rewrites the token in the
     // client's GAMELOGON to the gameid before the GS sees the packet. Matching it against
     // stored realm tokens compares two different namespaces, hence validateGame.
     //

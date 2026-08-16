@@ -1,6 +1,6 @@
-# apps/qqserver — the ingress for game traffic
+# apps/d2ingress — the ingress for game traffic
 
-`qqserver` is a **pure-Zig, stateless ingress** for game traffic: one public address in front,
+`d2ingress` is a **pure-Zig, stateless ingress** for game traffic: one public address in front,
 the whole game-server fleet behind it, routed per connection. It is an ingress controller for
 the D2 game protocol.
 
@@ -10,15 +10,15 @@ The client gives you nothing to route on. The realm can tell it *which host* to 
 game port is fixed at `:4000`, so without a gateway every game server needs its own
 client-routable address and the fleet can never outgrow the IPs you own.
 
-An HTTP ingress reads the `Host` header to choose a backend. qqserver does the same job one
+An HTTP ingress reads the `Host` header to choose a backend. d2ingress does the same job one
 layer down, on the game's own protocol.
 
 ## How a connection is routed
 
 1. realmd mints a realm-globally-unique **token** per create/join and records
    `token -> {gs address, real engine game id}` in redis.
-2. The client dials `qqserver:4000` and sends `GAMELOGON` (`0x68`), which carries that token.
-3. qqserver reads it, looks up the route, **rewrites the token in the packet** to the game id
+2. The client dials `d2ingress:4000` and sends `GAMELOGON` (`0x68`), which carries that token.
+3. d2ingress reads it, looks up the route, **rewrites the token in the packet** to the game id
    the backend engine actually knows, dials that GS, replays the rewritten packet, and
    **splices**.
 
@@ -56,6 +56,6 @@ in-process instead (`REALMD_GAME_PORT`, `apps/realmd/gameedge.zig`): same token 
 recorded routes, but thread-per-connection against the in-process store rather than a poll loop
 against redis. One binary, no redis hop, fine for one host.
 
-Run qqserver when the fleet outgrows that: routes in redis mean any gateway pod resolves any
+Run d2ingress when the fleet outgrows that: routes in redis mean any gateway pod resolves any
 connection, so the game servers keep internal pod IPs and capacity stops being bounded by the
 client-routable addresses you own.

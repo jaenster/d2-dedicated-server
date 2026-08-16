@@ -8,7 +8,7 @@ Grafana dashboard: [`deploy/grafana/d2-realm.json`](../deploy/grafana/d2-realm.j
 ## The dashboard
 
 Its rows cover pod CPU/memory (Prometheus), **live state** (active games + players in-game,
-split per game server), **realm activity** (games created, joins, refusals, qqserver drops,
+split per game server), **realm activity** (games created, joins, refusals, d2ingress drops,
 events/min), a **GS fleet** view (games + load per `gsid`), a **health** row (engine
 halts/faults, pod restarts), and a live log tail -- with deploys annotated on the timelines.
 

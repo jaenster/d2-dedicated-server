@@ -232,14 +232,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // land — the failure would otherwise surface as a game the client connects to and falls out of.
     d2cs.route_ttl_s = cfg.route_ttl_s;
     if (cfg.game_addr.len == 0) {
-        log.line("realmd", "FATAL REALMD_GAME_ADDR is required: the address clients dial for game traffic (qqserver, or realmd's own edge via REALMD_GAME_PORT)", .{});
+        log.line("realmd", "FATAL REALMD_GAME_ADDR is required: the address clients dial for game traffic (d2ingress, or realmd's own edge via REALMD_GAME_PORT)", .{});
         return error.GameAddrRequired;
     }
     d2cs.game_ip = parseIp4(cfg.game_addr) orelse {
         log.line("realmd", "FATAL REALMD_GAME_ADDR '{s}' is not an IPv4", .{cfg.game_addr});
         return error.GameAddrInvalid;
     };
-    log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.qq_port, cfg.route_ttl_s });
+    log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.ingress_port, cfg.route_ttl_s });
 
     const bnet_fd = try net.listenTcp(cfg.bind, cfg.bnet_port);
     const d2cs_fd = try net.listenTcp(cfg.bind, cfg.d2cs_port);
@@ -260,11 +260,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const t_health = try std.Thread.spawn(.{}, net.serve, .{ "health", health_fd, health.handle });
 
     // Optional embedded game edge: realmd fronts game traffic itself (in-process token
-    // splice) instead of a standalone qqserver — the lightweight single-binary path.
+    // splice) instead of a standalone d2ingress — the lightweight single-binary path.
     var t_game: ?std.Thread = null;
     if (cfg.game_port != 0) {
         const game_fd = try net.listenTcp(cfg.bind, cfg.game_port);
-        log.line("realmd", "embedded game edge on {d} (in-process splice; no standalone qqserver needed)", .{cfg.game_port});
+        log.line("realmd", "embedded game edge on {d} (in-process splice; no standalone d2ingress needed)", .{cfg.game_port});
         t_game = try std.Thread.spawn(.{}, net.serve, .{ "game", game_fd, gameedge.handle });
     }
 

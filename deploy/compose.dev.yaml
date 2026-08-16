@@ -1,13 +1,13 @@
 # Local DEV backing store — just redis, on a fixed name+port so it never collides with
 # a stray redis container (a random one on :6379 once caused a connect flood + confusion).
-# In dev, realmd + qqserver run NATIVELY on the host and the wine GS runs natively too;
+# In dev, realmd + d2ingress run NATIVELY on the host and the wine GS runs natively too;
 # only redis needs a container. The full containerized stack lives in compose.yaml.
 #
 #   docker compose -f deploy/compose.dev.yaml up -d
 #   # then, natively:
 #   REALMD_EPHEMERAL_STORE=redis REALMD_REDIS_ADDR=127.0.0.1:6390 \
-#     REALMD_GAME_ADDR=127.0.0.1 REALMD_QQ_PORT=14000 ./zig-out/bin/realmd &
-#   REALMD_REDIS_ADDR=127.0.0.1:6390 REALMD_QQ_PORT=14000 ./zig-out/bin/qqserver &
+#     REALMD_GAME_ADDR=127.0.0.1 REALMD_INGRESS_PORT=14000 ./zig-out/bin/realmd &
+#   REALMD_REDIS_ADDR=127.0.0.1:6390 REALMD_INGRESS_PORT=14000 ./zig-out/bin/d2ingress &
 services:
   redis:
     image: redis:7-alpine

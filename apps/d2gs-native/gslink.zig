@@ -1064,8 +1064,12 @@ test "host:port parses into octets and a port" {
     try std.testing.expectEqual([4]u8{ 10, 1, 2, 3 }, ip);
     try std.testing.expectEqual(@as(u16, 6115), port);
     try std.testing.expectError(error.NoPort, parseAddr("10.1.2.3", &ip, &port));
-    try std.testing.expectError(error.InvalidCharacter, parseAddr("realm.example:6115", &ip, &port));
-    try std.testing.expectError(error.NotDotted, parseAddr("10.1.2.3.4:6115", &ip, &port));
+    // Anything that is not a dotted quad — a name, or "10.1.2.3.4" — is handed to resolve() on
+    // purpose, so there is no parse error left to assert and the outcome depends on DNS. Only
+    // `dottedQuad` can be checked without a resolver.
+    try std.testing.expectEqual(@as(?[4]u8, null), dottedQuad("realm.example"));
+    try std.testing.expectEqual(@as(?[4]u8, null), dottedQuad("10.1.2.3.4"));
+    try std.testing.expectEqual(@as(?[4]u8, .{ 10, 1, 2, 3 }), dottedQuad("10.1.2.3"));
 }
 
 test "game flags carry difficulty, the client-update gate and expansion" {

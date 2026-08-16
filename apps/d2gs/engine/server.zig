@@ -280,7 +280,7 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     log.hex2("pools: at DLL attach — in-use / handed-out:", poolstat.at_attach_in_use, poolstat.at_attach_handed);
     if (realm) |t| SetupAsBnetServer(t);
     QSERVER_CreateAndInit(.server, .bnet); // allocs pQServer, opens :4000 listener
-    // Every client reaches this GS through qqserver, so the engine sees ONE peer address for the
+    // Every client reaches this GS through d2ingress, so the engine sees ONE peer address for the
     // whole realm. Stock 8 therefore caps the entire server at eight concurrent connections and
     // bans its own gateway at twenty joins per fifteen seconds — and it refuses by closing the
     // socket straight after accepting it, with nothing written, so a client is left holding an

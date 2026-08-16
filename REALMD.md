@@ -45,7 +45,7 @@ Only **6112** is for the client. The rest are internal (the GS fleet talks to re
 | `REALMD_REDIS_ADDR` / `REALMD_PG_DSN` | -- | backend endpoints when not `fs` |
 | `REALMD_REALM_NAME` | `TypeGuru` | realm name shown to clients |
 | `REALMD_REALM_ADDR` | `127.0.0.1` | public IPv4 clients dial for the realm (advertised on login) |
-| `REALMD_GAME_ADDR` | -- | GATEWAY mode: the qqserver entry advertised for game traffic |
+| `REALMD_GAME_ADDR` | -- | GATEWAY mode: the d2ingress entry advertised for game traffic |
 | `REALMD_GS_ADDR` | (peer IP) | override the game-server IP given to clients (NAT) |
 | `REALMD_DATA_DIR` | `realmd-data` | durable data dir for the `fs` store |
 | `REALMD_SHARED` | off | multi-instance mode (also implied by a non-`fs` ephemeral store) |

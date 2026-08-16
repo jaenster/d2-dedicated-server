@@ -310,7 +310,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
 
 // ── routes (ephemeral) ───────────────────────────────────────────────────────
 // {client source IP → backend GS addr}, recorded by realmd on JOINGAME and looked
-// up by the qqserver per connection to splice game traffic to the right GS.
+// up by the d2ingress per connection to splice game traffic to the right GS.
 
 pub fn recordRoute(client_ip: [4]u8, gs_ip: [4]u8, gs_port: u16, ttl_s: u32) bool {
     return switch (ephemeral) {
@@ -330,7 +330,7 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 
 // ── token routes (ephemeral) ─────────────────────────────────────────────────
 // {realm-global token → backend GS addr + engine gameid}, recorded by realmd on
-// CREATE/JOIN and looked up by the qqserver from the token in the client's first
+// CREATE/JOIN and looked up by the d2ingress from the token in the client's first
 // GAMELOGON packet. NAT-proof: the token is unique across the realm so two clients
 // behind one public IP never collide (unlike the source-IP route map above).
 

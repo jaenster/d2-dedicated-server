@@ -4,10 +4,10 @@
 // ArgoCD from a PRIVATE d2gs-deploy repo with images on ghcr. Two Hetzner FLOATING
 // IPs (Cilium-routed, fail over between nodes) are set as Service externalIPs — the
 // realm's stable public front door. The firewall opens ONLY the client-facing ports:
-// 6112 (bnet login + MCP realm, muxed on one port like real bnet) and 4000 (qqserver game).
+// 6112 (bnet login + MCP realm, muxed on one port like real bnet) and 4000 (d2ingress game).
 //
 // The player logs in via the floating IP on realmd (6112), then talks all game
-// traffic to the same floating IP on :4000 (qqserver), which reads the realm-global
+// traffic to the same floating IP on :4000 (d2ingress), which reads the realm-global
 // token, looks up {token -> GS pod ip:port,gameid} in redis, rewrites it and splices
 // to the owning INTERNAL GS pod. The GS, d2dbs (6114) and gs-link (6115) are never
 // public — gs-link/d2dbs ride a separate realmd-gslink ClusterIP Service.
@@ -26,14 +26,14 @@ deployment {
     description 'GitOps: syncs the PRIVATE d2gs-deploy repo onto the cluster'
   }
   service ghcr 'ghcr (CI images)' {
-    description 'CI builds + pushes the realmd / d2gs / qqserver / d2-gamedata images'
+    description 'CI builds + pushes the realmd / d2gs / d2ingress / d2-gamedata images'
   }
 
   cluster prod 'Hetzner k3s cluster (Cilium, ns realmd)' {
 
     // The stable public front door: two Hetzner floating IPs set as Service
     // externalIPs (Cilium routes them, they fail over between nodes). Shared by the
-    // realmd and qqserver public Services; only 6112 + 4000 are firewalled open.
+    // realmd and d2ingress public Services; only 6112 + 4000 are firewalled open.
     service fip 'Floating IPs (Cilium-routed externalIPs)' {
       description 'The realm front door. Firewall opens only 6112 (login + MCP realm) + 4000 (game).'
     }
@@ -63,19 +63,19 @@ deployment {
       description 'initContainer from ghcr d2-gamedata: copies ver-IX86-1.mpq into <data_dir>/bnftp for BNFTP version-check'
     }
 
-    // qqserver public Service (LoadBalancer, externalIPs=FIP) — the one public :4000
+    // d2ingress public Service (LoadBalancer, externalIPs=FIP) — the one public :4000
     // for game traffic. Its image is private (cluster-standard ghcr pull secret).
-    service qqserver_lb 'qqserver Service (public)' {
+    service d2ingress_lb 'd2ingress Service (public)' {
       description 'externalIPs=FIP; the single public :4000 for game traffic'
     }
-    workload qqserver_deploy 'qqserver Deployment' {
+    workload d2ingress_deploy 'd2ingress Deployment' {
       description 'STATELESS gateway: reads the realm-global token from the client GAMELOGON (0x68), looks up token -> GS pod ip:port,gameid in redis, rewrites + splices. Any pod behind any FIP resolves any token (no affinity). Private image via the ghcr pull secret.'
-      instanceOf d2gs.qqserver
+      instanceOf d2gs.d2ingress
     }
 
     // Backing stores.
     service redis_svc 'Redis (Deployment)' {
-      description 'Ephemeral sessions + games + the qqserver token routes (TTL)'
+      description 'Ephemeral sessions + games + the d2ingress token routes (TTL)'
       instanceOf d2gs.realmd.store_redis
     }
     service pg_svc 'Postgres (StatefulSet)' {
@@ -85,7 +85,7 @@ deployment {
 
     // GS fleet as a stateless Deployment — INTERNAL pods, no hostPort / public
     // exposure. Each registers its POD IP (status.podIP:4000) over the gs-link; the
-    // qqserver dials that pod IP to splice. Game data from the d2-gamedata init image
+    // d2ingress dials that pod IP to splice. Game data from the d2-gamedata init image
     // into an emptyDir (no persistent volume); health probe on :8086.
     workload gs_set 'd2gs Deployment (fleet, stateless)' {
       description 'soft anti-affinity. INTERNAL only (no hostPort); registers status.podIP:4000 over gs-link; game data via a d2-gamedata initContainer into an emptyDir; health :8086.'
@@ -104,10 +104,10 @@ deployment {
   // GitOps + CI. ArgoCD reconciles the workloads from the private repo; CI publishes
   // the images the workloads (and the init image) pull.
   argocd -> realmd_deploy 'sync (GitOps)'
-  argocd -> qqserver_deploy 'sync (GitOps)'
+  argocd -> d2ingress_deploy 'sync (GitOps)'
   argocd -> gs_set 'sync (GitOps)'
   ghcr -> realmd_deploy 'realmd image'
-  ghcr -> qqserver_deploy 'qqserver image (private; ghcr pull secret)'
+  ghcr -> d2ingress_deploy 'd2ingress image (private; ghcr pull secret)'
   ghcr -> gs_set 'd2gs image'
   ghcr -> realmd_vermpq 'd2-gamedata image (ver-IX86-1.mpq)'
 
@@ -118,7 +118,7 @@ deployment {
   realmd_vermpq -> realmd_deploy 'populates bnftp emptyDir (ver-IX86-1.mpq)'
 
   // realmd -> backing stores. Mints unique tokens via a shared redis counter and
-  // writes {token -> GS pod ip:port,gameid} there; the qqservers read it. PG = chars.
+  // writes {token -> GS pod ip:port,gameid} there; the d2ingresss read it. PG = chars.
   realmd_deploy -> redis_svc 'ephemeral (sessions+games); token counter + token->GS route'
   realmd_deploy -> pg_svc 'durable (chars)'
 
@@ -130,11 +130,11 @@ deployment {
 
   // The player talks game traffic to the floating IP on :4000; the gateway looks up
   // the token route in redis and splices to the owning internal GS pod.
-  fip -> qqserver_lb ':4000'
-  qqserver_lb -> qqserver_deploy 'to any gateway pod (stateless)'
-  qqserver_deploy -> redis_svc 'lookup token -> GS pod ip:port, real gameid'
-  qqserver_deploy -> gs_pod_a 'rewrite token; splice to the pod IP (internal :4000)'
-  qqserver_deploy -> gs_pod_b 'rewrite token; splice to the pod IP (internal :4000)'
+  fip -> d2ingress_lb ':4000'
+  d2ingress_lb -> d2ingress_deploy 'to any gateway pod (stateless)'
+  d2ingress_deploy -> redis_svc 'lookup token -> GS pod ip:port, real gameid'
+  d2ingress_deploy -> gs_pod_a 'rewrite token; splice to the pod IP (internal :4000)'
+  d2ingress_deploy -> gs_pod_b 'rewrite token; splice to the pod IP (internal :4000)'
 }
 
 views {

@@ -317,10 +317,10 @@ model {
       description 'Headless Game.exe + d2gs.dll under wine+Xvfb. Connects out to gslink (:6115), ADDRINFO self-reports <ip>:4000 + gsid + maxgame; serves game traffic on :4000. On k8s it is INTERNAL (registers its status.podIP:4000, no hostPort) with an in-process health endpoint on :8086 for the k8s probes.'
     }
 
-    // qqserver — a SEPARATE binary (apps/qqserver/main.zig): the cloud-native
+    // d2ingress — a SEPARATE binary (apps/d2ingress/main.zig): the cloud-native
     // game-traffic gateway. A QServer-of-QServers — one public :4000 that splices each
     // client connection through to the owning GS, so GS pods stay internal.
-    qqserver = process 'qqserver (game gateway)' {
+    d2ingress = process 'd2ingress (game gateway)' {
       #ours
       description 'Stateless token-translation TCP proxy ("QServer-of-QServers"). One public :4000; reads the u16 token from the client GAMELOGON (0x68), looks up token -> (GS, real gameid) in the shared map realmd writes, rewrites the token to the GS gameid, and splices to the GS internal :4000. Token is realm-globally-unique (shared counter), so any front pod behind any LB IP resolves any token: fully stateless, no affinity. Write-once infra.'
     }
@@ -350,17 +350,17 @@ model {
   gslink -> gameserver 'routes CREATE (least-loaded) / JOIN (by gsid)'
   dll -> gameserver 'is one fleet member'
 
-  // ---- qqserver: the game-traffic gateway (separate binary) ----
+  // ---- d2ingress: the game-traffic gateway (separate binary) ----
   rd2cs -> db 'mints a unique token (shared counter); records token -> (GS, real gameid)'
-  qqserver -> db 'looks up token -> (GS, real gameid)'
-  qqserver -> gameserver 'rewrites token to the GS gameid; splices (internal :4000)'
+  d2ingress -> db 'looks up token -> (GS, real gameid)'
+  d2ingress -> gameserver 'rewrites token to the GS gameid; splices (internal :4000)'
 
   // ---- the player join flow ----
   player -> d2client 'plays via a normal D2 client'
   d2client -> bncs 'BNCS login'
   d2client -> bnftp 'version/MPQ gate'
   d2client -> rd2cs 'pick realm / join game'
-  d2client -> qqserver 'game traffic (:4000, D2Net) — gateway splices to the GS'
+  d2client -> d2ingress 'game traffic (:4000, D2Net) — gateway splices to the GS'
 }
 
 views {
@@ -398,11 +398,11 @@ views {
   }
 
   // End-to-end: a player getting into a hosted game. Login at realmd, then ALL game
-  // traffic goes to the qqserver — the only game endpoint the client ever sees — which
+  // traffic goes to the d2ingress — the only game endpoint the client ever sees — which
   // translates the token and splices through to the real GS behind it.
   view join_flow {
     title 'Player join flow'
-    include player, d2client, bncs, bnftp, rd2cs, rd2dbs, gslink, qqserver, gameserver, dll, engine, d2game, db
+    include player, d2client, bncs, bnftp, rd2cs, rd2dbs, gslink, d2ingress, gameserver, dll, engine, d2game, db
     autoLayout LeftRight
   }
 

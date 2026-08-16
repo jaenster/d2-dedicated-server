@@ -52,7 +52,7 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 [ -f "$ROOT/.env" ] && set -a && . "$ROOT/.env" && set +a
 
-QQ_PORT="${QQ_PORT:-4000}"
+INGRESS_PORT="${INGRESS_PORT:-4000}"
 BNET_PORT="${BNET_PORT:-6112}"
 LOG_DIR="${LOG_DIR:-$ROOT/.stack}"
 CLIENTLESS="${CLIENTLESS:-$ROOT/../clientless/zig-out/bin/clientless}"
@@ -129,7 +129,7 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 
 say "preflight"
 listening "127.0.0.1:$BNET_PORT" || die "realmd is not on :$BNET_PORT — ./run-stack.sh first"
-listening "127.0.0.1:$QQ_PORT"   || die "qqserver is not on :$QQ_PORT — ./run-stack.sh first"
+listening "127.0.0.1:$INGRESS_PORT"   || die "d2ingress is not on :$INGRESS_PORT — ./run-stack.sh first"
 [ -x "$CLIENTLESS" ] || die "no clientless at $CLIENTLESS (build it, or set CLIENTLESS=)"
 # wine leaves a start.exe wrapper matching the same pattern; the engine itself is the one
 # that grew a heap, so pick by resident size rather than by pid order.
@@ -138,15 +138,15 @@ GS_PID="$(ps -o pid=,rss=,command= -ax 2>/dev/null | grep 'testgame' | grep -v g
 gs_args=()
 if [ "$NATIVE_GS" = realm ]; then
   GS_PID=""
-  ok "realmd and qqserver are up; the game leg goes wherever the realm placed it (no local GS to watch)"
+  ok "realmd and d2ingress are up; the game leg goes wherever the realm placed it (no local GS to watch)"
 elif [ -n "$NATIVE_GS" ]; then
   listening "$NATIVE_GS" || die "nothing is listening on $NATIVE_GS (NATIVE_GS)"
   gs_args=(--gs-host "${NATIVE_GS%%:*}" --gs-port "${NATIVE_GS##*:}")
   GS_PID=""
-  ok "realmd and qqserver are up; the game leg goes to $NATIVE_GS (no local GS to watch)"
+  ok "realmd and d2ingress are up; the game leg goes to $NATIVE_GS (no local GS to watch)"
 else
   [ -n "$GS_PID" ] || die "no GS process — ./run-stack.sh first"
-  ok "realmd, qqserver and GS (pid $GS_PID) are up"
+  ok "realmd, d2ingress and GS (pid $GS_PID) are up"
 fi
 
 # Only the part of the log a round produced is evidence about that round. Remember how

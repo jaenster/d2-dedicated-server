@@ -1,6 +1,6 @@
 # d2gs game-server fleet on Kubernetes.
 #
-# The fleet is INTERNAL: clients never dial a game server. They reach qqserver on the
+# The fleet is INTERNAL: clients never dial a game server. They reach d2ingress on the
 # public :4000 carrying a realm-global token, and it splices to the owning GS by pod IP
 # from the redis route. So a GS needs no client-routable address — it reports its own pod
 # IP (downward API status.podIP) to realmd as D2GS_GS_ADDR.

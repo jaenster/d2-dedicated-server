@@ -489,7 +489,7 @@ fn scCreateJoinGame() Result {
     c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
-    // Tokens are now realm-global minted values (NOT the GS gameid) — the qqserver
+    // Tokens are now realm-global minted values (NOT the GS gameid) — the d2ingress
     // translates them back to the gameid. So assert non-zero + uniqueness, not == 42.
     const cg = c.createGame("mygame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
@@ -1521,8 +1521,8 @@ fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
 /// fork+execve realmd with REALMD_DATA_DIR/REALMD_HEALTH_PORT set in our env
 /// (inherited by the child). Returns the child pid, or null on existing realmd.
 // The realm runs ephemeral state (sessions + games + token routes) in redis, and the
-// qqserver reads token routes from it asynchronously — so the harness brings up a real
-// redis in docker, points realmd + qqserver at it, and flushes it for a clean slate.
+// d2ingress reads token routes from it asynchronously — so the harness brings up a real
+// redis in docker, points realmd + d2ingress at it, and flushes it for a clean slate.
 const REDIS_HOST_PORT: u16 = 6399;
 
 fn startRedis() void {
@@ -1952,8 +1952,8 @@ fn scMultiInstance() Result {
 
 // A tiny echo TCP server standing in for a real backend GS :4000 game port. Binds an
 // ephemeral port (read back via getsockname) and accepts connections in a loop, each on
-// its own thread, echoing whatever it reads. Looping (not one-shot) matters: the qqserver
-// port-probe opens a throwaway connection that the qqserver splices through to us, so the
+// its own thread, echoing whatever it reads. Looping (not one-shot) matters: the d2ingress
+// port-probe opens a throwaway connection that the d2ingress splices through to us, so the
 // real test connection must still get its own accept. `got`/`got_len` capture the first
 // non-empty payload so the scenario can assert bytes reached the backend.
 const c_read = @extern(*const fn (c_int, [*]u8, usize) callconv(.c) isize, .{ .name = "read" });
@@ -1967,7 +1967,7 @@ const EchoServer = struct {
     got_len: usize = 0,
     // When set, each accepted conn opens with a 2-byte 0xAF00 greeting BEFORE it starts
     // echoing — mimicking the real 1.14d engine's leading connection-established frame that
-    // qqserver must strip (stripGsGreeting). Lets a scenario prove the strip end-to-end.
+    // d2ingress must strip (stripGsGreeting). Lets a scenario prove the strip end-to-end.
     send_greeting: bool = false,
 
     fn start(self: *EchoServer) !void {
@@ -2007,7 +2007,7 @@ const EchoServer = struct {
     fn echoConn(self: *EchoServer, cfd: c_int) void {
         defer _ = cclose(cfd);
         if (self.send_greeting) {
-            const greeting = [2]u8{ 0xAF, 0x00 }; // the leading frame qq must strip
+            const greeting = [2]u8{ 0xAF, 0x00 }; // the leading frame d2ingress must strip
             _ = c_write(cfd, &greeting, greeting.len);
         }
         var buf: [256]u8 = undefined;
@@ -2040,17 +2040,17 @@ const EchoServer = struct {
     }
 };
 
-/// fork+execve the qqserver binary (REALMD_QQSERVER_BIN, default ./zig-out/bin/qqserver).
+/// fork+execve the d2ingress binary (REALMD_D2INGRESS_BIN, default ./zig-out/bin/d2ingress).
 /// It reads token routes from redis (REALMD_REDIS_ADDR, inherited from startRedis) — the
-/// same redis realmd writes them to — and listens on REALMD_QQ_PORT. Waits up to 10s for
+/// same redis realmd writes them to — and listens on REALMD_INGRESS_PORT. Waits up to 10s for
 /// the port; exits the harness if it never comes up. Mirrors spawnRealmd.
-fn spawnQqserver(qq_port: u16) !c_int {
-    const bin = envOr("REALMD_QQSERVER_BIN", "./zig-out/bin/qqserver");
+fn spawnD2ingress(ingress_port: u16) !c_int {
+    const bin = envOr("REALMD_D2INGRESS_BIN", "./zig-out/bin/d2ingress");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
     var pbuf: [8]u8 = undefined;
-    const portz = std.fmt.bufPrintZ(&pbuf, "{d}", .{qq_port}) catch return error.BadPort;
+    const portz = std.fmt.bufPrintZ(&pbuf, "{d}", .{ingress_port}) catch return error.BadPort;
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
-    _ = setenv("REALMD_QQ_PORT", portz.ptr, 1);
+    _ = setenv("REALMD_INGRESS_PORT", portz.ptr, 1);
     const pid = fork();
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
@@ -2058,37 +2058,37 @@ fn spawnQqserver(qq_port: u16) !c_int {
         _ = execve(bin.ptr, &argv, environ);
         std.process.exit(127);
     }
-    if (!waitPort(qq_port, 10_000)) {
+    if (!waitPort(ingress_port, 10_000)) {
         _ = kill(pid, 9);
-        std.debug.print("ERROR: qqserver did not start listening on {d} in time.\n", .{qq_port});
+        std.debug.print("ERROR: d2ingress did not start listening on {d} in time.\n", .{ingress_port});
         std.process.exit(2);
     }
     return pid;
 }
 
 // Token-offset of the u16 game token in the crafted GAMELOGON (0x68), matching the
-// qqserver's TOKEN_OFFSET: nId(u8) ++ nGameHash(u32) ++ nGameToken(u16) → byte 5.
-const QQ_TOKEN_OFFSET: usize = 5;
+// d2ingress's TOKEN_OFFSET: nId(u8) ++ nGameHash(u32) ++ nGameToken(u16) → byte 5.
+const INGRESS_TOKEN_OFFSET: usize = 5;
 
 // Prove the NAT-proof gateway path: realmd mints a globally-unique token on JOIN and the
-// qqserver translates it — rewriting the in-packet token to the GS's real gameid — then
+// d2ingress translates it — rewriting the in-packet token to the GS's real gameid — then
 // splices the client's game connection to the right backend.
 //   1. an echo server stands in for the backend GS game port (ephemeral port P), and
 //      captures the first packet it receives so we can assert the rewritten token.
 //   2. a FakeGS registers with ip=127.0.0.1 / gs_port=P and a known gameid=3.
 //   3. a client create+joins — realmd records {token T -> 127.0.0.1:P, gameid 3} and
 //      returns T in the join reply.
-//   4. spawn the qqserver on :14000, pointed at the same redis realmd wrote the route to.
+//   4. spawn the d2ingress on :14000, pointed at the same redis realmd wrote the route to.
 //   5. connect to :14000 and send a crafted GAMELOGON: buf[0]=0x68, token T at offset 5,
 //      tail "PAYLOAD". Assert the echo server received byte[0]==0x68, the u16 at offset 5
 //      == 3 (the GS gameid — proves the rewrite), and the tail matches (proves splice).
-fn scQqserverTokenTranslate() Result {
-    const name = "qqserver_token_translate";
-    const QQ_PORT: u16 = 14000;
+fn scD2ingressTokenTranslate() Result {
+    const name = "d2ingress_token_translate";
+    const INGRESS_PORT: u16 = 14000;
     const GS_GAMEID: u32 = 3;
 
     // Greeting ON: the echo backend opens with 0xAF00 (like the real engine), so this
-    // scenario also proves qqserver STRIPS the GS greeting — if it didn't, the client's
+    // scenario also proves d2ingress STRIPS the GS greeting — if it didn't, the client's
     // first post-handshake byte would be 0xAF, not the echoed 0x68 packet (assert below).
     var echo = EchoServer{ .send_greeting = true };
     echo.start() catch |e| return fail(name, "echo start {s}", .{@errorName(e)});
@@ -2103,37 +2103,37 @@ fn scQqserverTokenTranslate() Result {
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.login("QqGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("IngressGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
-    const cg = c.createGame("qqgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cg = c.createGame("ingressgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
     // The join mints a unique token and records {token -> 127.0.0.1:echo.port, gameid 3}.
-    const jg = c.joinGame("qqgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const jg = c.joinGame("ingressgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
-    const token = jg.token; // realm-global token the qqserver will translate
+    const token = jg.token; // realm-global token the d2ingress will translate
     if (token == 0) return fail(name, "join returned token=0 (expected a minted token)", .{});
 
-    const qq_pid = spawnQqserver(QQ_PORT) catch |e| return fail(name, "spawn qqserver {s}", .{@errorName(e)});
+    const ingress_pid = spawnD2ingress(INGRESS_PORT) catch |e| return fail(name, "spawn d2ingress {s}", .{@errorName(e)});
     defer {
-        _ = kill(qq_pid, 15);
-        _ = waitpid(qq_pid, null, 0);
+        _ = kill(ingress_pid, 15);
+        _ = waitpid(ingress_pid, null, 0);
     }
 
     // Craft a GAMELOGON: id 0x68, gameHash u32, the minted token at offset 5, tail PAYLOAD.
     const tail = "PAYLOAD";
-    var logon: [QQ_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
+    var logon: [INGRESS_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
     @memset(&logon, 0);
     logon[0] = 0x68;
-    std.mem.writeInt(u16, logon[QQ_TOKEN_OFFSET..][0..2], token, .little);
-    @memcpy(logon[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
+    std.mem.writeInt(u16, logon[INGRESS_TOKEN_OFFSET..][0..2], token, .little);
+    @memcpy(logon[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
 
-    const fd = net.connectLocal(QQ_PORT) catch |e| return fail(name, "connect qq {s}", .{@errorName(e)});
+    const fd = net.connectLocal(INGRESS_PORT) catch |e| return fail(name, "connect d2ingress {s}", .{@errorName(e)});
     defer net.closeSocket(fd);
 
-    // On accept the qqserver speaks for the not-yet-dialled GS and sends a 2-byte 0xAF00
+    // On accept the d2ingress speaks for the not-yet-dialled GS and sends a 2-byte 0xAF00
     // connection-established handshake (real D2GS setup; see main.zig accept loop). Consume
     // it before the echoed game packet, or it shifts every later byte by two.
     var hs: [2]u8 = undefined;
@@ -2142,11 +2142,11 @@ fn scQqserverTokenTranslate() Result {
 
     net.writeAll(fd, &logon) catch |e| return fail(name, "send {s}", .{@errorName(e)});
 
-    // The qqserver replays the (rewritten) packet to the echo backend, which echoes it —
-    // AFTER opening with a 0xAF00 greeting that qq must strip. So the first byte we read here
+    // The d2ingress replays the (rewritten) packet to the echo backend, which echoes it —
+    // AFTER opening with a 0xAF00 greeting that d2ingress must strip. So the first byte we read here
     // is the echoed 0x68 packet; a 0xAF would mean the GS-greeting strip failed to remove it.
     var back: [logon.len]u8 = undefined;
-    net.readFull(fd, &back) catch |e| return fail(name, "no echo back through qq ({s})", .{@errorName(e)});
+    net.readFull(fd, &back) catch |e| return fail(name, "no echo back through d2ingress ({s})", .{@errorName(e)});
     if (back[0] == 0xaf) return fail(name, "GS greeting NOT stripped — client got 0xAF as first game byte", .{});
 
     // Backend must have seen the rewritten packet: id 0x68, token now == GS gameid 3, tail intact.
@@ -2155,22 +2155,22 @@ fn scQqserverTokenTranslate() Result {
     const got = echo.received();
     if (got.len < logon.len) return fail(name, "backend saw {d} bytes, want {d}", .{ got.len, logon.len });
     if (got[0] != 0x68) return fail(name, "backend first byte 0x{x:0>2}, want 0x68", .{got[0]});
-    const got_token = std.mem.readInt(u16, got[QQ_TOKEN_OFFSET..][0..2], .little);
+    const got_token = std.mem.readInt(u16, got[INGRESS_TOKEN_OFFSET..][0..2], .little);
     if (got_token != @as(u16, @truncate(GS_GAMEID)))
         return fail(name, "rewritten token={d}, want {d} (GS gameid)", .{ got_token, GS_GAMEID });
-    if (!std.mem.eql(u8, got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
-        return fail(name, "tail '{s}', want '{s}'", .{ got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail });
-    if (back[0] != 0x68 or std.mem.readInt(u16, back[QQ_TOKEN_OFFSET..][0..2], .little) != @as(u16, @truncate(GS_GAMEID)))
+    if (!std.mem.eql(u8, got[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
+        return fail(name, "tail '{s}', want '{s}'", .{ got[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail });
+    if (back[0] != 0x68 or std.mem.readInt(u16, back[INGRESS_TOKEN_OFFSET..][0..2], .little) != @as(u16, @truncate(GS_GAMEID)))
         return fail(name, "echoed packet not the rewritten one", .{});
 
     return .{ .name = name, .status = .pass, .msg = msg("token 0x{x} translated to gameid {d}, packet rewritten + spliced to backend :{d}", .{ token, GS_GAMEID, echo.port }) };
 }
 
-// Same token-translate splice as the qqserver test, but through realmd's EMBEDDED game
-// edge (gameedge.zig) instead of a standalone qqserver — proves the lightweight single-
+// Same token-translate splice as the d2ingress test, but through realmd's EMBEDDED game
+// edge (gameedge.zig) instead of a standalone d2ingress — proves the lightweight single-
 // binary path: in-process route lookup + thread-per-conn splice. Runs in a DEDICATED
 // realmd instance (sharing the redis store) because the embedded edge and a standalone
-// qqserver are mutually-exclusive deploy modes — we don't want both in one process.
+// d2ingress are mutually-exclusive deploy modes — we don't want both in one process.
 fn scEmbeddedGameEdge() Result {
     const name = "embedded_game_edge";
     const EDGE_PORT: u16 = 14001;
@@ -2228,11 +2228,11 @@ fn scEmbeddedGameEdge() Result {
 
     // Craft a GAMELOGON with the minted token, then drive it through realmd's edge.
     const tail = "PAYLOAD";
-    var logon: [QQ_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
+    var logon: [INGRESS_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
     @memset(&logon, 0);
     logon[0] = 0x68;
-    std.mem.writeInt(u16, logon[QQ_TOKEN_OFFSET..][0..2], token, .little);
-    @memcpy(logon[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
+    std.mem.writeInt(u16, logon[INGRESS_TOKEN_OFFSET..][0..2], token, .little);
+    @memcpy(logon[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
 
     const fd = net.connectLocal(EDGE_PORT) catch |e| return fail(name, "connect edge {s}", .{@errorName(e)});
     defer net.closeSocket(fd);
@@ -2251,13 +2251,13 @@ fn scEmbeddedGameEdge() Result {
     const got = echo.received();
     if (got.len < logon.len) return fail(name, "backend saw {d} bytes, want {d}", .{ got.len, logon.len });
     if (got[0] != 0x68) return fail(name, "backend first byte 0x{x:0>2}, want 0x68", .{got[0]});
-    const got_token = std.mem.readInt(u16, got[QQ_TOKEN_OFFSET..][0..2], .little);
+    const got_token = std.mem.readInt(u16, got[INGRESS_TOKEN_OFFSET..][0..2], .little);
     if (got_token != @as(u16, @truncate(GS_GAMEID)))
         return fail(name, "rewritten token={d}, want {d} (GS gameid)", .{ got_token, GS_GAMEID });
-    if (!std.mem.eql(u8, got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
+    if (!std.mem.eql(u8, got[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
         return fail(name, "tail mismatch", .{});
 
-    return .{ .name = name, .status = .pass, .msg = msg("embedded edge: token 0x{x} -> gameid {d}, rewritten + spliced (no qqserver)", .{ token, GS_GAMEID }) };
+    return .{ .name = name, .status = .pass, .msg = msg("embedded edge: token 0x{x} -> gameid {d}, rewritten + spliced (no d2ingress)", .{ token, GS_GAMEID }) };
 }
 
 pub fn main() !void {
@@ -2283,7 +2283,7 @@ pub fn main() !void {
         scFleetCapacity(),
         scAdminApi(),
         scMultiGameOneGs(),
-        scQqserverTokenTranslate(),
+        scD2ingressTokenTranslate(),
         scEmbeddedGameEdge(),
         scCreateAccountRealAuth(),
         scCharCreate(),

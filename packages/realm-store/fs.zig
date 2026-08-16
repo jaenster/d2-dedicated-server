@@ -661,7 +661,7 @@ pub fn expireGamesByGs(gsid: u32) void {
 }
 
 // ── routes (ephemeral, TTL) ──────────────────────────────────────────────────
-// Keyed by the client's source IP (hex octets) → "a.b.c.d port". The qqserver
+// Keyed by the client's source IP (hex octets) → "a.b.c.d port". The d2ingress
 // looks this up by the connecting socket's peer IP to pick the backend GS.
 
 fn routeKey(buf: []u8, client_ip: [4]u8) []const u8 {
@@ -705,7 +705,7 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 }
 
 // ── token routes (ephemeral, TTL) ────────────────────────────────────────────
-// Keyed by the realm-global token (hex) → "a.b.c.d port gameid". The qqserver reads
+// Keyed by the realm-global token (hex) → "a.b.c.d port gameid". The d2ingress reads
 // the token from the client's first GAMELOGON packet, looks this up, and splices to
 // the GS — rewriting the in-packet token to `gameid` first. NAT-proof: globally unique
 // tokens never collide for two clients sharing a public IP.
