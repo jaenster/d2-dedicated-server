@@ -19,6 +19,7 @@ services:
     # FATAL GameAddrInvalid at boot), so it can't just be "realmd" the way D2GS_GS_ADDR can. Give
     # it a FIXED address on a dedicated subnet instead of the compose-assigned one, which isn't
     # known until the container exists.
+    image: e2e-realmd:ci
     networks:
       default:
         ipv4_address: 172.28.238.10
@@ -32,6 +33,9 @@ services:
       REALMD_PERMISSIVE_AUTH: "1"
 
   gs-native:
+    # Named so `up` uses the image the build job handed over (docker load) instead of building one.
+    # A service with only a `build:` gets a derived name compose will happily rebuild into.
+    image: e2e-gs-native:ci
     environment:
       # The native server ships capped at ONE game, which a round of two clients exceeds before it
       # has played anything: the second create is refused with "game servers are down" and the

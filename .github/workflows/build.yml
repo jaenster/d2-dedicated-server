@@ -101,17 +101,33 @@ jobs:
           tags: |
             ghcr.io/jaenster/${{ matrix.image }}:${{ github.sha }}
             ${{ github.ref_type == 'tag' && format('ghcr.io/jaenster/{0}:{1}', matrix.image, github.ref_name) || '' }}
-          cache-from: type=gha,scope=${{ matrix.target }}
-          # WRITE only from main and tags; every branch READS the same entry. GitHub scopes a
-          # cache to the branch that wrote it, so writing on every push gave each PR its own
-          # copy of every layer — 150 entries and 2.7 GB before anyone looked. Reading is
-          # unaffected: a PR branch falls back to the default branch's scope, which is where the
-          # layers it wants actually are.
-          #
-          # Bounded beyond that by GitHub itself: 10 GB per repository, evicted least-recently-used,
-          # and any entry untouched for 7 days is deleted. So this cannot grow without limit — but
-          # it can crowd out everything else, which is what writing per-branch was doing.
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,scope={0},mode=max', matrix.target) || '' }}
+
+      # Hand the two images the e2e job runs to it, rather than have it build them again. It was
+      # rebuilding both from cold — two minutes of a three-minute job, duplicating what this matrix
+      # had already finished in parallel seconds earlier.
+      #
+      # A second buildx call rather than one build with two outputs: this one costs seconds because
+      # the builder still holds the layers it just produced, and it keeps the publish path above
+      # exactly as it was rather than rewriting it to emit a tarball as well.
+      - name: hand the image to the e2e job
+        if: matrix.target == 'realmd' || matrix.target == 'gs-native'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          load: true
+          tags: e2e-${{ matrix.target }}:ci
+      - name: save it
+        if: matrix.target == 'realmd' || matrix.target == 'gs-native'
+        run: docker save e2e-${{ matrix.target }}:ci -o /tmp/${{ matrix.target }}.tar
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'realmd' || matrix.target == 'gs-native'
+        with:
+          name: image-${{ matrix.target }}
+          path: /tmp/${{ matrix.target }}.tar
+          retention-days: 1
 
   # Unit tests + the clientless scenario suite. Runs on the runner rather than in an image: the
   # harness starts its own redis and postgres containers, which is far simpler from the host than
@@ -156,10 +172,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: build the stack images
-        run: $COMPOSE build realmd gs-native stress-e2e
+      - name: take the images the build jobs made
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          merge-multiple: true
+          path: /tmp/images
+      - name: load them
+        run: |
+          docker load -i /tmp/images/realmd.tar
+          docker load -i /tmp/images/gs-native.tar
+      # Only the test client, which nothing else builds. realmd and gs-native came in above, and
+      # compose is told their image names in compose.e2e.yaml so it uses them instead of building.
+      - name: build the test client
+        run: $COMPOSE build stress-e2e
+      # --no-build: the images came from the build jobs and must be used as they are. Without it a
+      # name compose cannot find is quietly built instead, which is the duplicate work returning by
+      # the back door and looking like a slow day.
       - name: bring up realmd + gs-native
-        run: $COMPOSE up -d redis postgres realmd gs-native
+        run: $COMPOSE up -d --no-build redis postgres realmd gs-native
       - name: stress e2e
         # ONE client, two games per login. Not a throughput choice: the native server admits about
         # half a round's games when several are wanted at once and refuses the rest cleanly (see
