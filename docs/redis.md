@@ -194,5 +194,3 @@ something, not a reason not to share it.
 The one thing still read from disk is BNFTP, and that is correct: those files are read-only image
 content, identical on every instance.
 
-The remaining single-instance piece is outside this file entirely — the **native** game server has
-not been ported off the retired control socket, so it cannot join a realm at all.

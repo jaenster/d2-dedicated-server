@@ -4,7 +4,7 @@
 #   docker build -f deploy/Dockerfile --target realmd -t realmd:latest .
 #   docker build -f deploy/Dockerfile --target gs     -t d2gs:latest   .
 #
-#   realmd     — clean-room Zig realm server (bnetd+d2cs+d2dbs+gs-link). Static musl
+#   realmd     — clean-room Zig realm server (bnetd + MCP realm on one port). Static musl
 #                binary shipped in scratch: a few-MB image, zero runtime deps.
 #   gs         — headless Diablo II 1.14d under wine, driven by our injected DLLs.
 #                Game data is NOT baked into this image — the chart's load-gamedata
@@ -19,7 +19,7 @@
 # --target gs builds only the windows DLLs (pg is a lazy dep, never pulled there);
 # --target realmd builds only the realmd binary. Neither builds the other's artifacts.
 
-# ── shared toolchain base: zig + the source tree ─────────────────────────────────
+# shared toolchain base: zig + the source tree
 # Pinned to the BUILD platform, not the target: every stage below cross-compiles with -Dtarget, so
 # the toolchain never needs to match what it produces. On an arm64 developer machine that is the
 # difference between a native build and an emulated one.
@@ -34,7 +34,7 @@ COPY build.zig build.zig.zon ./
 COPY apps ./apps
 COPY packages ./packages
 
-# ── build: realmd (static musl) ──────────────────────────────────────────────────
+# build: realmd (static musl)
 # Node builds the admin web UI (webui/ → one self-contained index.html), which the
 # realmd binary embeds via -Dwebui=true. The UI is served on the health/admin port.
 FROM zig AS build-realmd
@@ -42,23 +42,23 @@ RUN apk add --no-cache nodejs npm
 COPY webui ./webui
 RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dwebui=true
 
-# ── build: d2ingress (static musl) ────────────────────────────────────────────────
+# build: d2ingress (static musl)
 # The game-traffic gateway: token-translating poll() splice proxy fronting the GS
 # fleet, with its own async redis client. No pg dep — never pulls it.
 FROM zig AS build-d2ingress
 RUN zig build d2ingress -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 
-# ── build: injected DLLs (x86-windows; dbghelp proxy + d2gs payload only) ─────────
+# build: injected DLLs (x86-windows; dbghelp proxy + d2gs payload only)
 FROM zig AS build-dlls
 RUN zig build dlls -Doptimize=ReleaseSafe
 
-# ── build: d2gs-native (static musl, i386) ───────────────────────────────────────
+# build: d2gs-native (static musl, i386)
 # The game is i386 code, so its host has to be i386 too — it is loaded into this process, not
 # launched as a child. Static musl because the runtime image below has nothing else in it.
 FROM zig AS build-native
 RUN zig build d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
 
-# ── fetch: minimal 1.14d game data ────────────────────────────────────────────────
+# fetch: minimal 1.14d game data
 # tools/make-minimal.sh assembles this from a legitimately owned install (stripped MPQs —
 # only what a headless server reads, media archives emptied): it's not committed to this
 # repo (see LEGAL.md), but a pre-built copy of it is mirrored at files.typeguru.nl so the
@@ -74,13 +74,13 @@ ARG D2_MINIMAL_WINDOWS_URL=https://files.typeguru.nl/diablo/minimal/114d/windows
 RUN apk add --no-cache curl && mkdir /gamedata && \
     curl -fsSL "$D2_MINIMAL_WINDOWS_URL" | tar -xz -C /gamedata
 
-# ── gamedata: the windows minimal set alone, for the chart's load-gamedata initContainer ──
+# gamedata: the windows minimal set alone, for the chart's load-gamedata initContainer
 # Nothing but data at /gamedata — `gameServer.dataImage.repository` in deploy/chart points
 # here by default, and the initContainer `cp -a /gamedata/. /game/`s it into each gs pod.
 FROM scratch AS gamedata
 COPY --from=gamedata-windows /gamedata /gamedata
 
-# ── gs-native: the same server without wine ──────────────────────────────────────
+# gs-native: the same server without wine
 # One statically linked file against the wine image's debian + wine32 + wine + Xvfb.
 # Labelled amd64, not 386, even though the binary inside is a 32-bit ELF. containerd matches the
 # image platform against the node's and refuses a linux/386 image on an amd64 node outright ("no
@@ -100,7 +100,7 @@ VOLUME ["/game", "/tmp"]
 EXPOSE 4000
 ENTRYPOINT ["/d2gs-native"]
 
-# ── gs: headless wine runtime (no X, no desktop) ─────────────────────────────────
+# gs: headless wine runtime (no X, no desktop)
 FROM debian:bookworm-slim AS gs
 # 32-bit wine for the 32-bit Game.exe, and nothing else: NO Xvfb / X server, NO
 # desktop. --no-install-recommends keeps Gecko/Mono/winetricks/desktop bits out; the
@@ -126,16 +126,30 @@ VOLUME ["/game", "/wine", "/work", "/mods", "/moddata"]
 EXPOSE 4000
 ENTRYPOINT ["/opt/d2gs/entrypoint.sh"]
 
-# ── realmd: static binary in scratch (default target) ────────────────────────────
+# realmd: static binary in scratch (default target)
 FROM scratch AS realmd
 COPY --from=build-realmd /src/zig-out/bin/realmd /realmd
-# bnetd / d2cs / d2dbs / gs-link / health
-EXPOSE 6112 6113 6114 6115 8080
+# bnetd + MCP realm (muxed, as real bnet does it) / health + admin
+EXPOSE 6112 8080
 ENTRYPOINT ["/realmd"]
 
-# ── d2ingress: static binary in scratch ───────────────────────────────────────────
+# d2ingress: static binary in scratch
 FROM scratch AS d2ingress
 COPY --from=build-d2ingress /src/zig-out/bin/d2ingress /d2ingress
 # Client-facing game traffic (REALMD_INGRESS_PORT, default 4000).
 EXPOSE 4000
 ENTRYPOINT ["/d2ingress"]
+
+# e2e-runner: tools/stress-e2e, built to run AS A CONTAINER on the compose network
+# (see deploy/compose.e2e.yaml) rather than against published host ports — no exposed ports,
+# no wait-for-host-port shell loop, it dials realmd/gs-native by their compose service names.
+# Not part of the realmd/gs/gs-native/gamedata deploy set; CI-only (and useful for local dev
+# without wine — see run-stress.sh for the bash equivalent this ports).
+FROM zig AS e2e-runner
+COPY tools/stress-e2e ./tools/stress-e2e
+# Forces the (lazy) clientless dependency to fetch and the binary to build now, at image-build
+# time, instead of on every container start. --rounds 0 --wait-ms 0 is a deliberate no-op run
+# (the round loop never executes and the readiness probe is skipped), so this needs no realm
+# to actually be up yet.
+RUN zig build stress-e2e -- --rounds 0 --wait-ms 0
+ENTRYPOINT ["/src/zig-out/bin/stress-e2e"]

@@ -98,9 +98,7 @@ services:
     depends_on:
       realmd: { condition: service_started }
     environment:
-      # NOT WIRED UP YET: the native server still speaks the retired control socket, so it does
-      # not join a realm at all until it is ported to the store. It boots and serves nothing.
-      D2GS_REDIS_ADDR: "redis:6379"
+      D2GS_REDIS_ADDR: "redis:6379"      # its only link to the realm; realmd places games on it
       D2GS_GS_ADDR: "gs-native:4000"
 
 volumes:

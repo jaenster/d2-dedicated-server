@@ -4,7 +4,7 @@
 //! `*0x396220` set -> read `client+0x17c`/`+0x180` (in memory, size 0 -> 0x0e); else
 //! fopen/fread `<save path><charname>.d2s` (disk, failure -> 0x0e). This build never sets
 //! 0x396220 and a fresh game has `game+0x6a` zero, so unmodified it reads a file — a needless
-//! round trip since realmd's d2dbs already handed us the bytes on JOINGAME.
+//! disk round trip for bytes we can read straight from the store.
 //!
 //! Fix: `CLIENT_LoadCharacterAndSendGameData`'s one call site, 0x001a8576, is redirected to
 //! put the bytes in the client, flip `game+0x6a` to in-memory for the call, then restore it.
@@ -16,11 +16,11 @@
 //! on success) and again by `CleanUpClient`. Bytes must go in through
 //! `CLIENT_AccumulateSaveData`, which allocates and memcpys — never store a pointer directly.
 //!
-//! `D2GS_CHAR_SOURCE=file` restores the old known-good disk route. Wire format matches
-//! `apps/d2gs/realmclient/d2dbs.zig` (Windows); only the socket layer (winsock vs Linux) differs.
+//! `D2GS_CHAR_SOURCE=file` restores the old known-good disk route.
 
 const std = @import("std");
 const macho = @import("macho");
+const store = @import("store.zig");
 
 extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
@@ -68,17 +68,9 @@ const max_save = 0x2000;
 const max_pending = 8;
 const name_max = 24;
 
-/// d2dbs, as `apps/realmd/d2dbs.zig` serves it.
-const TYPE_SAVE: u16 = 0x30;
-const TYPE_GET: u16 = 0x31;
-const DATATYPE_CHARSAVE: u16 = 0x01;
-const HEADER_LEN: usize = 8;
-
 var image: *const macho.load.Loaded = undefined;
-var dbs_ip: [4]u8 = .{ 127, 0, 0, 1 };
-var dbs_port: u16 = 0;
 
-/// Saves fetched but not yet claimed by a load, one per character name. Written on the gs-link
+/// Saves fetched but not yet claimed by a load, one per character name. Written on the queue
 /// thread as JOINGAMEREQs arrive and read on the engine's own thread when the client finally gets
 /// there, so both ends take `lock`; it is held across a memcpy and never across the network.
 const Pending = struct {
@@ -97,21 +89,12 @@ fn release() void {
     lock.store(false, .release);
 }
 
-/// `realm` is the gs-link address; d2dbs sits one port below it on the same host, which is how
-/// `apps/d2gs/d2gs.zig` derives it too. `D2GS_D2DBS=host:port` overrides.
-pub fn configure(loaded: *const macho.load.Loaded, realm_ip: [4]u8, realm_port: u16) void {
+pub fn configure(loaded: *const macho.load.Loaded) void {
     image = loaded;
-    dbs_ip = realm_ip;
-    dbs_port = realm_port - 1;
-}
-
-pub fn setAddress(ip: [4]u8, port: u16) void {
-    dbs_ip = ip;
-    dbs_port = port;
 }
 
 /// Redirect the image's one call to `CLIENT_LoadCharacterSave` at this file's thunk. Runs where
-/// `gslink.installTokenResolver` runs, and for the same two reasons: __TEXT is still writable, and
+/// `realm.installTokenResolver` runs, and for the same two reasons: __TEXT is still writable, and
 /// the relative call it writes only reaches our code while the image is mapped inside 32 bits.
 pub fn installLoadHook(loaded: *const macho.load.Loaded) void {
     image = loaded;
@@ -272,88 +255,19 @@ fn savePathFor(charname: []const u8, out: []u8) ?[:0]u8 {
     return std.fmt.bufPrintZ(out, "{s}{s}.d2s", .{ d, charname }) catch null;
 }
 
-// d2dbs
+// the store
 
 /// GET_DATA_REQUEST -> GET_DATA_REPLY, one connection per fetch. Returns the bytes written to
 /// `out`, or 0.
+/// Straight from the shared store. Nothing is dialled first: gating this on a connection to the
+/// realm is what kept the retired d2dbs path alive on the wine server after the fetch had moved,
+/// and it read as a broken store rather than a skipped fetch.
 fn fetch(account: []const u8, charname: []const u8, out: []u8) usize {
-    if (dbs_port == 0) return 0;
-    const s = dial() orelse return 0;
-    defer _ = close(s);
-
-    var req: [320]u8 = undefined;
-    var n: usize = HEADER_LEN;
-    if (n + 2 + account.len + 1 + charname.len + 1 > req.len) return 0;
-    std.mem.writeInt(u16, req[n..][0..2], DATATYPE_CHARSAVE, .little);
-    n += 2;
-    n += putCStr(req[n..], account);
-    n += putCStr(req[n..], charname);
-    std.mem.writeInt(u16, req[0..2], @intCast(n), .little);
-    std.mem.writeInt(u16, req[2..4], TYPE_GET, .little);
-    std.mem.writeInt(u32, req[4..8], 1, .little);
-    if (!sendAll(s, req[0..n])) return 0;
-
-    var head: [HEADER_LEN]u8 = undefined;
-    if (!recvAll(s, &head)) return 0;
-    const size = std.mem.readInt(u16, head[0..2], .little);
-    if (std.mem.readInt(u16, head[2..4], .little) != TYPE_GET or size < HEADER_LEN) return 0;
-
-    var body: [9000]u8 = undefined;
-    const blen: usize = size - HEADER_LEN;
-    if (blen > body.len) return 0;
-    if (blen > 0 and !recvAll(s, body[0..blen])) return 0;
-
-    // result(4) createtime(4) allowladder(4) datatype(2) datalen(2) charname\0 <bytes>
-    if (blen < 16) return 0;
-    if (std.mem.readInt(u32, body[0..4], .little) != 0) return 0;
-    const datalen = std.mem.readInt(u16, body[14..16], .little);
-    var off: usize = 16;
-    while (off < blen and body[off] != 0) : (off += 1) {}
-    off = @min(off + 1, blen);
-    const take = @min(@min(@as(usize, datalen), blen - off), out.len);
-    @memcpy(out[0..take], body[off..][0..take]);
-    return take;
+    return store.getChar(account, charname, out);
 }
 
-fn dial() ?c_int {
-    const s = socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (s < 0) return null;
-    const sa = std.posix.sockaddr.in{
-        .port = std.mem.nativeToBig(u16, dbs_port),
-        .addr = @bitCast(dbs_ip),
-    };
-    if (connect(s, &sa, @sizeOf(std.posix.sockaddr.in)) != 0) {
-        _ = close(s);
-        return null;
-    }
-    return s;
-}
 
-fn putCStr(dst: []u8, s: []const u8) usize {
-    @memcpy(dst[0..s.len], s);
-    dst[s.len] = 0;
-    return s.len + 1;
-}
 
-fn sendAll(s: c_int, bytes: []const u8) bool {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = send(s, bytes.ptr + off, bytes.len - off, 0);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
-
-fn recvAll(s: c_int, buf: []u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = recv(s, buf.ptr + off, buf.len - off, 0);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
 
 fn cstr(buf: []const u8) []const u8 {
     return buf[0 .. std.mem.indexOfScalar(u8, buf, 0) orelse buf.len];
@@ -377,24 +291,6 @@ fn note(comptime fmt: []const u8, args: anytype) void {
     var buf: [1280]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
     _ = std.c.write(2, s.ptr, s.len);
-}
-
-test "a GET_DATA reply is read past its variable-length name field" {
-    // The bytes realmd writes for a two-byte save belonging to "Hero": header, result, createtime,
-    // allowladder, datatype, datalen, name, data.
-    var body: [23]u8 = undefined;
-    @memset(&body, 0);
-    std.mem.writeInt(u16, body[12..14], DATATYPE_CHARSAVE, .little);
-    std.mem.writeInt(u16, body[14..16], 2, .little);
-    @memcpy(body[16..21], "Hero\x00");
-    body[21] = 0xaa;
-    body[22] = 0xbb;
-
-    var off: usize = 16;
-    while (off < body.len and body[off] != 0) : (off += 1) {}
-    off = @min(off + 1, body.len);
-    try std.testing.expectEqual(@as(usize, 21), off);
-    try std.testing.expectEqual(@as(u8, 0xaa), body[off]);
 }
 
 test "a second join by the same character replaces its save rather than taking another slot" {

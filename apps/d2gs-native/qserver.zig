@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const macho = @import("macho");
-const gslink = @import("gslink.zig");
+const realm = @import("realm.zig");
 
 var image: *const macho.load.Loaded = undefined;
 
@@ -149,7 +149,7 @@ fn bootstrap() void {
     reportJoinPreconditions();
     // Only now: the link answers a create by calling into the engine, so it must not be reachable
     // before the server state it creates games in exists.
-    gslink.start(image);
+    realm.start(image);
 }
 
 /// The two things the GAMELOGON handler consults before it will let anyone in, printed once so a
@@ -167,15 +167,15 @@ fn reportJoinPreconditions() void {
 fn tick() void {
     // Not gated on a realm being attached: the empty-game reap is a byte patch on the engine and
     // applies to a game a client made for itself just as much as to one the realm asked for.
-    gslink.holdGameForItsFirstPlayer();
+    realm.holdGameForItsFirstPlayer();
     // Before the packet drain, so a game the realm asked for exists before the client that was
     // told about it can send its join.
-    gslink.pump();
+    realm.pump();
     call(addr.net_d2gs_server_handle_any_incoming_packet, fn () callconv(.c) void)();
     const sleep = call(addr.mac_sleep, fn (u32) callconv(.c) void);
     // Not `QSERVER_TickAllGames`: it services the one game in `gpGameTable[1]` on a single global
     // budget, so calling it once per hosted game would advance the first and skip the rest.
-    if (gslink.tickGames()) sleep(30) else sleep(10);
+    if (realm.tickGames()) sleep(30) else sleep(10);
 }
 
 fn call(comptime static_addr: u32, comptime Fn: type) *const Fn {

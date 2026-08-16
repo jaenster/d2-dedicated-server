@@ -225,8 +225,7 @@ emulation and no format conversion.
 The result is one process in a **4.4 MB `scratch` image** (1.7 MB to pull) against wine's 1.04 GB
 and ten processes, at
 8-10 MiB resident against ~115 MiB, with latency indistinguishable from wine's on real hardware.
-It is not yet ported off the retired control socket, so it cannot currently join a realm — see
-[`docs/STATUS.md`](docs/STATUS.md).
+It meets the realm through redis exactly as the wine server does, so a fleet can mix both kinds.
 
 It hosts one game by default and up to seven with `D2GS_MAX_GAMES`; the same seven-game engine
 ceiling applies. Measurements, and two corrections to earlier conclusions in it, are in

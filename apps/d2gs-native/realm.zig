@@ -1,6 +1,8 @@
-//! The realm's control link, from the Mac image's side.
+//! The realm, from the Mac image's side. Nothing is connected: this server publishes its own
+//! record into redis, takes create/join from `realmd:gsq:<gsid>`, answers on `realmd:gsreply:<seq>`
+//! and reports enter/leave/closed on `realmd:gsev`.
 //!
-//! Same channel/wire types as `apps/d2gs/realmclient/d2cs.zig` on Windows, different engine: no
+//! Same wire types as `apps/d2gs/realmclient/d2cs.zig` on Windows, different engine: no
 //! `GAME_CreateBattleNetGame`/realm callback table here, so a game is made via `GAME_CreateGame`
 //! 0x001ac3f3 (the 0x67 packet's fn) with a null client — survivable because the only uses of the
 //! client are storing it in the player record and a null-client singleton map branch, where the new
@@ -9,15 +11,9 @@
 const std = @import("std");
 const macho = @import("macho");
 const chardb = @import("chardb.zig");
+const store = @import("store.zig");
 const p = @import("realm_proto").protocol;
 
-// 0.16's std.posix has no socket layer, so the four calls this needs come straight from libc —
-// the same shape `packages/realm-infra/net.zig` uses.
-extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
-extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
-extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
 extern "c" fn usleep(usec: c_uint) c_int;
 extern "c" fn time(t: ?*i64) i64;
 
@@ -31,7 +27,6 @@ fn nowMs() i64 {
 }
 
 var image: *const macho.load.Loaded = undefined;
-var sock: c_int = -1;
 var seqno: u32 = 0;
 var started = false;
 
@@ -400,14 +395,16 @@ var req_deadline_ms: i64 = 0;
 var req_armed_ms: i64 = 0;
 var req_slot_ms: i64 = 0;
 
-/// Two senders share the socket: the control thread answers requests, the tick thread reports a
-/// game closing.
-var send_lock = std.atomic.Value(bool).init(false);
-
 pub fn start(loaded: *const macho.load.Loaded) void {
     image = loaded;
-    const realm = env("D2GS_REALM") orelse {
-        note("d2gs-native: gslink off (set D2GS_REALM=host:port to register with a realm)\n", .{});
+    const addr_s = env("D2GS_REDIS_ADDR") orelse {
+        note("d2gs-native: no realm (set D2GS_REDIS_ADDR=host:port to join one)\n", .{});
+        return;
+    };
+    var rip: [4]u8 = undefined;
+    var rport: u16 = 6379;
+    parseAddr(addr_s, &rip, &rport) catch {
+        note("d2gs-native: D2GS_REDIS_ADDR=\"{s}\" is not host:port\n", .{addr_s});
         return;
     };
     const advertised = env("D2GS_GS_ADDR") orelse "127.0.0.1:4000";
@@ -415,11 +412,13 @@ pub fn start(loaded: *const macho.load.Loaded) void {
         note("d2gs-native: D2GS_GS_ADDR=\"{s}\" is not host:port\n", .{advertised});
         return;
     };
+    store.configure(rip, rport);
+    chardb.configure(image);
     gsid = identity();
     readGameCap();
     started = true;
-    _ = std.Thread.spawn(.{}, thread, .{realm}) catch |e| {
-        note("d2gs-native: gslink thread: {s}\n", .{@errorName(e)});
+    _ = std.Thread.spawn(.{}, thread, .{}) catch |e| {
+        note("d2gs-native: realm thread: {s}\n", .{@errorName(e)});
         started = false;
     };
 }
@@ -453,7 +452,7 @@ pub fn pump() void {
         if (s.gameid == 0) continue;
         if (s.phase != .released and gameIsAlive(s.gameid)) continue;
         sendCloseGame(s.join_id);
-        note("d2gs-native: gslink CLOSEGAME gameid={d} ({d} game(s) left)\n", .{ s.join_id, liveGames() - 1 });
+        note("d2gs-native: CLOSEGAME gameid={d} ({d} game(s) left)\n", .{ s.join_id, liveGames() - 1 });
         s.* = .{};
     }
 }
@@ -662,110 +661,78 @@ fn runCreate(slot: *Slot) void {
     req_result = p.CREATE_OK;
 }
 
-fn thread(realm: []const u8) void {
-    var ip: [4]u8 = undefined;
-    var port: u16 = 6115;
-    parseAddr(realm, &ip, &port) catch {
-        note("d2gs-native: D2GS_REALM=\"{s}\" is not host:port\n", .{realm});
-        return;
-    };
-    // The character store sits one port below the control link on the same host, as
-    // `apps/d2gs/d2gs.zig` derives it on Windows.
-    chardb.configure(image, ip, port);
-    if (env("D2GS_D2DBS")) |a| {
-        var dip: [4]u8 = undefined;
-        var dport: u16 = 0;
-        if (parseAddr(a, &dip, &dport)) chardb.setAddress(dip, dport) else |_| {
-            note("d2gs-native: D2GS_D2DBS=\"{s}\" is not host:port\n", .{a});
-        }
-    }
+/// Publish this server, then take create/join from its own queue. There is nothing to connect to:
+/// the realm is reached through the store, so an instance restarting is not an event here.
+fn thread() void {
+    var announced = false;
     var complained = false;
     while (true) {
-        if (connectOnce(ip, port)) {
-            complained = false;
-            serve();
-            _ = close(sock);
-            sock = -1;
-            note("d2gs-native: gslink disconnected\n", .{});
-        } else if (!complained) {
-            complained = true;
-            note("d2gs-native: gslink cannot reach {d}.{d}.{d}.{d}:{d} — retrying\n", .{ ip[0], ip[1], ip[2], ip[3], port });
+        if (!store.ping()) {
+            // Say it once. A store that is not up yet is the normal case at boot, but a server
+            // that can never reach it and never mentions it looks like a server the realm is
+            // ignoring — which is a much harder thing to go and look for.
+            if (!complained) {
+                complained = true;
+                note("d2gs-native: cannot reach the realm store — retrying\n", .{});
+            }
+            _ = usleep(2_000_000);
+            continue;
         }
-        // A realm that is not up yet is the normal case at boot; keep asking.
-        _ = usleep(2_000_000);
+        complained = false;
+        publish();
+        if (!announced) {
+            announceBoot();
+            announced = true;
+            note("d2gs-native: published to the realm store gsid=0x{x} {d}.{d}.{d}.{d}:{d} maxgame={d}\n", .{
+                gsid, public_ip[0], public_ip[1], public_ip[2], public_ip[3], public_port, game_cap,
+            });
+        }
+        var drained: usize = 0;
+        while (drained < 8) : (drained += 1) {
+            var buf: [1024]u8 = undefined;
+            const n = store.popRequest(gsid, &buf);
+            if (n < p.HEADER_LEN) break;
+            const size = std.mem.readInt(u16, buf[0..2], .little);
+            const typ = std.mem.readInt(u16, buf[2..4], .little);
+            const seq = std.mem.readInt(u32, buf[4..8], .little);
+            if (size > n or size < p.HEADER_LEN) continue;
+            onPacket(typ, seq, buf[p.HEADER_LEN..size]);
+        }
+        _ = usleep(20_000);
     }
 }
 
-fn connectOnce(ip: [4]u8, port: u16) bool {
-    const s = socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (s < 0) return false;
-    const sa = std.posix.sockaddr.in{
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = @bitCast(ip),
-    };
-    if (connect(s, &sa, @sizeOf(std.posix.sockaddr.in)) != 0) {
-        _ = close(s);
-        return false;
-    }
-    sock = s;
-    note("d2gs-native: gslink connected to {d}.{d}.{d}.{d}:{d} gsid=0x{x}\n", .{ ip[0], ip[1], ip[2], ip[3], port, gsid });
-    return true;
+const reply_ttl_s: u32 = 30;
+const heartbeat_ttl_s: u32 = 90;
+const event_cap: u32 = 4096;
+const event_ttl_s: u32 = 3600;
+
+/// Our record: address, capacity, load, and whether we are full. `full` answers what the count
+/// alone cannot — a finished game holds its slot until the engine collects it.
+fn publish() void {
+    _ = store.putHeartbeat(gsid, public_ip, public_port, game_cap, liveGames(), liveGames() >= game_cap, heartbeat_ttl_s);
 }
 
-fn serve() void {
-    var body: [1024]u8 = undefined;
-    while (true) {
-        var head: [p.HEADER_LEN]u8 = undefined;
-        if (!recvAll(&head)) return;
-        const size = std.mem.readInt(u16, head[0..2], .little);
-        const typ = std.mem.readInt(u16, head[2..4], .little);
-        if (size < p.HEADER_LEN or size - p.HEADER_LEN > body.len) return;
-        const n = size - p.HEADER_LEN;
-        if (!recvAll(body[0..n])) return;
-        onPacket(typ, body[0..n]);
-    }
-}
-
-fn onPacket(typ: u16, body: []const u8) void {
-    switch (typ) {
-        @intFromEnum(p.Type.authreq) => sendRegistration(),
-        @intFromEnum(p.Type.echo) => {
-            var h: [p.HEADER_LEN]u8 = undefined;
-            writeHeader(&h, p.HEADER_LEN, @intFromEnum(p.Type.echo));
-            _ = sendAll(&h);
-        },
-        @intFromEnum(p.Type.creategame) => onCreateGame(body),
-        @intFromEnum(p.Type.joingame) => onJoinGame(body),
-        else => {},
-    }
-}
-
-/// AUTHREPLY + SETGSINFO + ADDRINFO in one burst — the realm only counts a GS as able to host
-/// once the last of the three arrives.
-fn sendRegistration() void {
-    var auth = std.mem.zeroes(p.AuthReply);
-    auth.h = header(.authreply, @sizeOf(p.AuthReply));
-    auth.version = 1;
-    _ = sendAll(std.mem.asBytes(&auth));
-
-    var info = std.mem.zeroes(p.SetGsInfo);
-    info.h = header(.setgsinfo, @sizeOf(p.SetGsInfo));
-    info.maxgame = game_cap;
-    _ = sendAll(std.mem.asBytes(&info));
-
+/// A server that just started hosts nothing, so the realm must drop whatever still names it.
+fn announceBoot() void {
     var ai = std.mem.zeroes(p.AddrInfo);
     ai.h = header(.addrinfo, @sizeOf(p.AddrInfo));
     ai.maxgame = game_cap;
     ai.gsid = gsid;
     ai.ip = public_ip;
     ai.port = public_port;
-    _ = sendAll(std.mem.asBytes(&ai));
-    note("d2gs-native: gslink registered {d}.{d}.{d}.{d}:{d} maxgame={d}\n", .{
-        public_ip[0], public_ip[1], public_ip[2], public_ip[3], public_port, game_cap,
-    });
+    _ = store.pushEvent(std.mem.asBytes(&ai), event_cap, event_ttl_s);
 }
 
-fn onCreateGame(body: []const u8) void {
+fn onPacket(typ: u16, seq: u32, body: []const u8) void {
+    switch (typ) {
+        @intFromEnum(p.Type.creategame) => onCreateGame(seq, body),
+        @intFromEnum(p.Type.joingame) => onJoinGame(seq, body),
+        else => {},
+    }
+}
+
+fn onCreateGame(seq: u32, body: []const u8) void {
     var result: u32 = p.CREATE_FAILED;
     var gid: u32 = 0;
     if (body.len >= 4) {
@@ -792,10 +759,11 @@ fn onCreateGame(body: []const u8) void {
     }
     var r = std.mem.zeroes(p.CreateGameReply);
     r.h = header(.creategame, @sizeOf(p.CreateGameReply));
+    r.h.seqno = seq; // the reply is keyed by the request's seq, not by ours
     r.result = result;
     r.gameid = gid;
-    _ = sendAll(std.mem.asBytes(&r));
-    note("d2gs-native: gslink CREATEGAME \"{s}\" -> result={d} gameid={d} slot={d}ms total={d}ms\n", .{
+    _ = store.putReply(seq, std.mem.asBytes(&r), reply_ttl_s);
+    note("d2gs-native: CREATEGAME \"{s}\" -> result={d} gameid={d} slot={d}ms total={d}ms\n", .{
         cstr(&req_name), result, gid, req_slot_ms, nowMs() - req_armed_ms,
     });
 }
@@ -805,7 +773,7 @@ fn onCreateGame(body: []const u8) void {
 /// GAMELOGON that follows carries the name alone. That is what makes it the moment to fetch the
 /// save: `chardb.place` writes it where the engine's own loader looks, and without it every join
 /// ends in reason 0x0e, "no character".
-fn onJoinGame(body: []const u8) void {
+fn onJoinGame(seq: u32, body: []const u8) void {
     const gid = if (body.len >= 4) std.mem.readInt(u32, body[0..4], .little) else 0;
     var off: usize = 8;
     const charname = readCStr(body, &off);
@@ -821,15 +789,16 @@ fn onJoinGame(body: []const u8) void {
         // is still in the world rather than one who has left.
         if (slotByJoinId(@truncate(gid))) |s| vouchFor(charname, s.gameid);
     }
-    note("d2gs-native: gslink JOINGAMEREQ gameid={d} char=\"{s}\" seated={} known={}\n", .{
+    note("d2gs-native: JOINGAMEREQ gameid={d} char=\"{s}\" seated={} known={}\n", .{
         gid, charname, seated, slotByJoinId(@truncate(gid)) != null,
     });
 
     var r = std.mem.zeroes(p.JoinGameReply);
     r.h = header(.joingame, @sizeOf(p.JoinGameReply));
+    r.h.seqno = seq; // the reply is keyed by the request's seq, not by ours
     r.result = if (slotByJoinId(@truncate(gid)) != null and seated) 0 else 1;
     r.gameid = gid;
-    _ = sendAll(std.mem.asBytes(&r));
+    _ = store.putReply(seq, std.mem.asBytes(&r), reply_ttl_s);
 }
 
 /// Tell the realm how many players a game holds now.
@@ -849,14 +818,15 @@ fn sendPlayers(gid: u16, players: u32) void {
     r.players = players;
     @memcpy(buf[0..@sizeOf(p.UpdateGameInfo)], std.mem.asBytes(&r));
     buf[@sizeOf(p.UpdateGameInfo)] = 0; // the empty character name
-    _ = sendAll(&buf);
+    _ = store.pushEvent(&buf, event_cap, event_ttl_s);
 }
 
 fn sendCloseGame(gid: u32) void {
     var c = std.mem.zeroes(p.CloseGame);
     c.h = header(.closegame, @sizeOf(p.CloseGame));
     c.gameid = gid;
-    _ = sendAll(std.mem.asBytes(&c));
+    _ = store.pushEvent(std.mem.asBytes(&c), event_cap, event_ttl_s);
+    publish(); // a freed slot the realm learns about only at the next heartbeat is a slot it will not use
 }
 
 /// Bit 2 gates the per-frame client update and the engine asserts without it; bits 12-14 are the
@@ -881,28 +851,7 @@ fn writeHeader(buf: []u8, size: u16, typ: u16) void {
     std.mem.writeInt(u32, buf[4..8], seqno, .little);
 }
 
-fn sendAll(bytes: []const u8) bool {
-    while (send_lock.swap(true, .acquire)) _ = usleep(1000);
-    defer send_lock.store(false, .release);
-    if (sock < 0) return false;
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = send(sock, bytes.ptr + off, bytes.len - off, 0);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
 
-fn recvAll(buf: []u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = recv(sock, buf.ptr + off, buf.len - off, 0);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
 
 fn readCStr(body: []const u8, off: *usize) []const u8 {
     const from = off.*;

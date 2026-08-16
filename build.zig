@@ -284,19 +284,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
     d2gs_native.root_module.addImport("macho", macho);
+    // Same IO-free RESP codec the wine DLL and realmd use, so the three cannot drift on the wire.
+    d2gs_native.root_module.addImport("resp", resp);
     d2gs_native.root_module.addImport("darwin", darwin);
     d2gs_native.root_module.addImport("realm_proto", realm_proto);
-    const gslink_tests = b.addTest(.{
+    const native_realm_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/d2gs-native/gslink.zig"),
+            .root_source_file = b.path("apps/d2gs-native/realm.zig"),
             .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    gslink_tests.root_module.addImport("macho", macho);
-    gslink_tests.root_module.addImport("realm_proto", realm_proto);
-    test_step.dependOn(&b.addRunArtifact(gslink_tests).step);
+    native_realm_tests.root_module.addImport("macho", macho);
+    native_realm_tests.root_module.addImport("realm_proto", realm_proto);
+    test_step.dependOn(&b.addRunArtifact(native_realm_tests).step);
 
     b.step("d2gs-native", "Build the wine-free native game server").dependOn(
         &b.addInstallArtifact(d2gs_native, .{}).step,
@@ -377,10 +379,17 @@ pub fn build(b: *std.Build) void {
         });
         stress_e2e.root_module.addImport("d2-realm", clientless_dep.module("d2-realm"));
         stress_e2e.root_module.addImport("d2-session", clientless_dep.module("d2-session"));
-        b.installArtifact(stress_e2e);
+        // addInstallArtifact directly, not the installArtifact sugar: that attaches to the
+        // DEFAULT install step, which every other `zig build <target>` invocation also runs —
+        // this tool is lazy and CI-only, so it stays out of that. The e2e-runner Dockerfile
+        // stage execs zig-out/bin/stress-e2e directly, so "stress-e2e" has to actually install
+        // it (addRunArtifact alone runs from the build cache, never touching zig-out).
+        const install_stress_e2e = b.addInstallArtifact(stress_e2e, .{});
         const run_stress_e2e = b.addRunArtifact(stress_e2e);
         if (b.args) |args| run_stress_e2e.addArgs(args);
-        b.step("stress-e2e", "Round-loop real-GS stress test (see run-stress.sh for the bash original)").dependOn(&run_stress_e2e.step);
+        const stress_e2e_step = b.step("stress-e2e", "Round-loop real-GS stress test (see run-stress.sh for the bash original)");
+        stress_e2e_step.dependOn(&install_stress_e2e.step);
+        stress_e2e_step.dependOn(&run_stress_e2e.step);
     }
 
     // gamestress — create N games against a RUNNING realm/GS (manual: `zig build gamestress`).

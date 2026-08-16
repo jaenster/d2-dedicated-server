@@ -35,7 +35,8 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   read back from another that shares nothing but Postgres. See [`docs/redis.md`](redis.md).
 - **A game server with no wine at all.** 1.14d's macOS i386 build, mapped and run directly on
   i386 Linux, serving real clients through the same realm and gateway: one process in a 4.4 MB
-  image, and on real amd64 hardware as fast as the wine server. See
+  image, and on real amd64 hardware as fast as the wine server. It meets the realm through redis
+  exactly as the wine server does, so a fleet can mix both. See
   [`native-vs-wine.md`](native-vs-wine.md).
 
 ## Rough edges / next
@@ -50,9 +51,6 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   start at the first join, not at creation.
 - Least-loaded routing breaks ties toward whichever server the set enumerates first, so with
   equal load one server takes the work until its count rises.
-- **The native game server has not been ported off the retired control socket.** It still
-  dials :6115 and fetches characters over d2dbs, neither of which exists; it boots and serves
-  nothing until it joins the realm through redis the way the wine server does.
 - **The native server hosts several games, but ships capped at one.** With `D2GS_MAX_GAMES`
   raised, about half of a round's games are admitted and the rest are refused cleanly -- no
   crashes, no evictions, and the games that run are correct. The shortfall is not yet

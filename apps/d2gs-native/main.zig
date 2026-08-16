@@ -10,7 +10,7 @@ const macho = @import("macho");
 const darwin = @import("darwin");
 const crash = @import("crash.zig");
 const qserver = @import("qserver.zig");
-const gslink = @import("gslink.zig");
+const realm = @import("realm.zig");
 const chardb = @import("chardb.zig");
 
 /// `applyFixups` takes a plain function pointer with no context argument, so the resolver has to be
@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
         // pointers, and a rebase pass would slide our entry along with them. Same for the join
         // hook, which is a relative call to code of ours.
         qserver.install(&loaded);
-        gslink.installTokenResolver(&loaded);
+        realm.installTokenResolver(&loaded);
         chardb.installLoadHook(&loaded);
     }
 
@@ -204,7 +204,7 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // QSERVER_DispatchAndCleanup reaps an empty game only after `CMP ESI, 0x493e0` (five
         // minutes). Windows patches this too (`apps/d2gs/runtime/gamereap.zig`, there about not
         // exhausting the 8 Fog pool managers) but this engine has room for exactly one game, so the
-        // idle window IS the gap between games. Cut to one millisecond; `gslink.pump` guards against
+        // idle window IS the gap between games. Cut to one millisecond; `realm.pump` guards against
         // reaping a just-made game by holding its empty-since stamp at zero until someone joins.
         .{ .at = 0x001ae8f2, .bytes = &.{ 0x01, 0x00, 0x00, 0x00 }, .why = "collect an empty game at once, not in five minutes" },
         // GAMELOGON's no-realm branch serves one game and calls it token 1: it refuses any other
@@ -218,7 +218,7 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // ...and then translate it somewhere with room: SERVER_IsTokenValid's table has one usable
         // slot (index 0 aliases the server-running byte at 0x53756c, allocator clamps its counter to
         // 1) and indexes with an unchecked u16, so a realm token is unstorable/unsafe there.
-        // `gslink.installTokenResolver` replaces that function instead, since a GAMELOGON looks the
+        // `realm.installTokenResolver` replaces that function instead, since a GAMELOGON looks the
         // token up from three separate functions; the table itself is left as the engine keeps it.
         // NET_D2GS_SERVER_SendPacketToClient 0x002ddd78 already has a verbatim path (mode 2); this
         // build split the compiler's one gate into two legs, so both need `JE raw` -> `JMP raw`,
