@@ -1458,6 +1458,81 @@ pub fn removeGs(gsid: u32) void {
     }
 }
 
+// ── dispatch ─────────────────────────────────────────────────────────────────
+//
+// Create and join travel the store rather than a socket, so the instance that serves a client
+// need not be the one a game server happens to be connected to. The payload is the SAME control
+// packet the link already carried — one wire format, not two — and the `seq` already in its
+// header is the correlation id, so a reply can be matched to its request instead of assumed.
+//
+// Matching matters here in a way it did not over a socket. One connection with one request in
+// flight made "the next reply is mine" true by construction; with several instances dispatching
+// to one server it is simply false, and two realmds would take each other's answers.
+
+fn gsQueueKey(buf: []u8, gsid: u32) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "gsq:{x}", .{gsid}) catch buf[0..0];
+}
+
+fn gsReplyKey(buf: []u8, seq: u32) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "gsreply:{x}", .{seq}) catch buf[0..0];
+}
+
+/// Hand a request to a game server. The TTL is a floor under a server that never reads its queue:
+/// the request expires rather than being delivered to it minutes later, by which time the client
+/// has long gone.
+pub fn pushGsRequest(gsid: u32, packet: []const u8, ttl_s: u32) bool {
+    var kb: [64]u8 = undefined;
+    const key = gsQueueKey(&kb, gsid);
+    if (key.len == 0) return false;
+    var pb: [16]u8 = undefined;
+    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return false;
+    var c = CmdBuf{ .fd = fd };
+    c.add(&.{ "RPUSH", key, packet });
+    // Refreshed per push, so a queue nobody drains disappears instead of growing forever.
+    c.add(&.{ "EXPIRE", key, secs });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return false;
+    }
+    var r: Reader = .{ .fd = fd };
+    var ok = true;
+    for (0..2) |_| {
+        if (readReply(&r) == null) {
+            dropConn(s);
+            ok = false;
+            break;
+        }
+    }
+    return ok;
+}
+
+/// Collect the reply to `seq`, or null if it has not arrived. Consumed as it is read, so a reply
+/// is delivered exactly once and a stale one cannot be mistaken for a fresh answer.
+pub fn takeGsReply(seq: u32, out: []u8) ?usize {
+    var kb: [64]u8 = undefined;
+    const key = gsReplyKey(&kb, seq);
+    if (key.len == 0) return null;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    // GETDEL: reading and removing must not be two steps, or a retry could take it twice.
+    const rep = command(s, &r, &.{ "GETDEL", key }) orelse return null;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk null;
+            const n = @min(v.len, out.len);
+            @memcpy(out[0..n], v[0..n]);
+            break :blk n;
+        },
+        else => null,
+    };
+}
+
 /// Choose a game server for a new game and reserve a slot on it, in one indivisible step.
 ///
 /// Selecting and then reserving as two operations is a read-modify-write across instances: two

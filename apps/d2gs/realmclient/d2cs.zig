@@ -95,7 +95,18 @@ const Lock = struct {
 // interleave bytes on the shared socket.
 var send_lock: Lock = .{};
 
+/// Set while a request taken from the store is being serviced, to the seq that arrived in its
+/// header. A reply to a queued request goes back through the store keyed by that seq, not down a
+/// socket — which is what lets the realmd that dispatched it collect the answer even though it
+/// never held a connection to this server.
+var queued_seq: ?u32 = null;
+
+/// How long a reply is worth keeping. The realm is waiting on it right now; one nobody collected
+/// is of no use to anyone later.
+const reply_ttl_s: u32 = 30;
+
 fn sendPacket(bytes: []const u8) bool {
+    if (queued_seq) |seq| return redis.putReply(seq, bytes, reply_ttl_s);
     send_lock.lock();
     defer send_lock.unlock();
     var off: usize = 0;
@@ -210,6 +221,48 @@ var live_count = std.atomic.Value(u32).init(0);
 const heartbeat_ttl_s: u32 = 90;
 var last_heartbeat_ms: u32 = 0;
 extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
+
+/// Take one request from this server's queue and service it, if there is one.
+///
+/// Polled from the server tick rather than blocked on, so the connection stays free for the
+/// character fetches and heartbeats that share it. One per tick is deliberate: a create runs the
+/// engine's own game creation, and draining a backlog inside a single tick would stall the games
+/// already running.
+/// The queue is drained on its OWN thread, never from the server tick.
+///
+/// Creating a game hands work to the tick loop and waits for it, exactly as the socket path did
+/// from its receive thread. Calling it FROM the tick means the tick cannot advance to do that
+/// work, so every create returns 0 — which presents as the game server refusing perfectly good
+/// requests, with nothing in the log to say why.
+fn queueThreadMain(_: ?*anyopaque) callconv(.winapi) u32 {
+    while (true) {
+        pumpQueue();
+        Sleep(20);
+    }
+}
+
+var queue_thread_started = false;
+
+pub fn startQueueConsumer() void {
+    if (queue_thread_started or !redis.enabled()) return;
+    queue_thread_started = true;
+    _ = CreateThread(null, 0, queueThreadMain, null, 0, null);
+    log.print("d2cs: consuming create/join from the store");
+}
+
+pub fn pumpQueue() void {
+    if (!redis.enabled() or gsid == 0) return;
+    var buf: [1024]u8 = undefined;
+    const n = redis.popRequest(gsid, &buf);
+    if (n < p.HEADER_LEN) return;
+    const size = std.mem.readInt(u16, buf[0..2], .little);
+    const typ = std.mem.readInt(u16, buf[2..4], .little);
+    const seq = std.mem.readInt(u32, buf[4..8], .little);
+    if (size > n) return; // truncated; nothing sensible to answer
+    queued_seq = seq;
+    defer queued_seq = null;
+    dispatch(@enumFromInt(typ), buf[p.HEADER_LEN..size]);
+}
 
 pub fn heartbeat() void {
     if (!redis.enabled() or gsid == 0) return;

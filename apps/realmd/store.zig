@@ -398,6 +398,26 @@ pub fn ephemeralReachable() bool {
     };
 }
 
+// ── dispatch ─────────────────────────────────────────────────────────────────
+//
+// Create and join reach a game server through the store rather than down the socket one instance
+// happens to hold. Redis only, and not a gap: dispatch that is not shared is exactly what keeps
+// the realm to a single instance.
+
+pub fn pushGsRequest(gsid: u32, packet: []const u8, ttl_s: u32) bool {
+    return switch (ephemeral) {
+        .redis => redis.pushGsRequest(gsid, packet, ttl_s),
+        .fs, .pg => false,
+    };
+}
+
+pub fn takeGsReply(seq: u32, out: []u8) ?usize {
+    return switch (ephemeral) {
+        .redis => redis.takeGsReply(seq, out),
+        .fs, .pg => null,
+    };
+}
+
 // ── save durability ──────────────────────────────────────────────────────────
 //
 // Redis is the mem-cache holding the live character; Postgres is the store of record. A save is

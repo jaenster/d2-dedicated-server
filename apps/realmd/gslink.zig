@@ -399,6 +399,42 @@ const proto_create_server_full: u32 = p.CREATE_SERVER_FULL;
 
 const REPLY_TIMEOUT_US: u64 = 5_000_000;
 
+/// How long a queued request is worth delivering. Past this the client that asked for it has
+/// given up, and handing it to a server later would create a game nobody is waiting for.
+const request_ttl_s: u32 = 30;
+
+/// Send a request through the store and wait for the answer, correlating on the seq in its
+/// header.
+///
+/// This is what makes any instance able to serve any client: the request goes to the server's
+/// queue rather than down a socket, so the realmd holding that socket is no longer special. The
+/// seq was always in the header and was always ignored — over one connection with one request in
+/// flight, "the next reply is mine" was true by construction. Through a shared queue it is simply
+/// false, and matching is the difference between an answer and somebody else's answer.
+fn dispatchViaStore(gsid_to: u32, packet: []const u8, seq: u32) Result {
+    if (!store.pushGsRequest(gsid_to, packet, request_ttl_s)) return .{ .ok = false, .gameid = 0, .result = 1 };
+    var waited_us: u64 = 0;
+    var nap: c_uint = 200;
+    var buf: [256]u8 = undefined;
+    while (waited_us < REPLY_TIMEOUT_US) {
+        if (store.takeGsReply(seq, &buf)) |n| {
+            if (n >= p.HEADER_LEN + 8) {
+                const body = buf[p.HEADER_LEN..n];
+                return .{
+                    .ok = std.mem.readInt(u32, body[0..4], .little) == 0,
+                    .gameid = std.mem.readInt(u32, body[4..8], .little),
+                    .result = std.mem.readInt(u32, body[0..4], .little),
+                };
+            }
+            return .{ .ok = false, .gameid = 0, .result = 1 };
+        }
+        _ = usleep(nap);
+        waited_us += nap;
+        if (nap < 10_000) nap *= 2;
+    }
+    return .{ .ok = false, .gameid = 0, .result = 1 };
+}
+
 fn awaitReply(g: *Gs) Result {
     // Poll the reply flag the control thread sets — 0.16 has no condvar outside Io, and a
     // create/join is rare enough that polling is fine. The interval matters: this runs while

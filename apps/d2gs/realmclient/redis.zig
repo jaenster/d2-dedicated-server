@@ -275,6 +275,42 @@ pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32,
     return true;
 }
 
+/// Take the next request queued for this server, or 0 if there is none.
+///
+/// Polled from the server tick rather than blocked on: a blocking pop would hold the connection
+/// this server also uses to fetch characters and publish itself, and the tick is frequent enough
+/// that a poll costs a client nothing it can perceive.
+pub fn popRequest(gsid: u32, out: []u8) usize {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
+    const rep = command(&.{ "LPOP", key }) orelse return 0;
+    return switch (rep.value) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk 0;
+            if (v.len > out.len) break :blk 0;
+            @memcpy(out[0..v.len], v);
+            break :blk v.len;
+        },
+        else => 0,
+    };
+}
+
+/// Answer a request, keyed by the seq that came in its header. Short-lived: the realm is waiting
+/// on it right now, and a reply nobody collected is of no use to anyone later.
+pub fn putReply(seq: u32, packet: []const u8, ttl_s: u32) bool {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "realmd:gsreply:{x}", .{seq}) catch return false;
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const rep = commandBig(&.{ "SET", key }, packet) orelse return false;
+    _ = command(&.{ "PEXPIRE", key, px }) orelse return false;
+    return switch (rep.value) {
+        .status, .int => true,
+        .bulk => |b| b != null,
+        else => false,
+    };
+}
+
 /// True if redis answers. Used at boot to say so once, rather than discovering it per game.
 pub fn ping() bool {
     const rep = command(&.{"PING"}) orelse return false;

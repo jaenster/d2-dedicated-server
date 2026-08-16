@@ -320,4 +320,6 @@ pub fn tick() void {
     // The server publishes its own presence, rather than a realmd publishing it on the server's
     // behalf over a link only that one instance holds. Rate-limited inside; cheap when off.
     d2cs.heartbeat();
+    // Create/join arrive through the store on their own thread — see startQueueConsumer.
+    d2cs.startQueueConsumer();
 }
