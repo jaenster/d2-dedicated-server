@@ -10,7 +10,7 @@ const log = @import("../../log.zig");
 const patch = @import("../patch.zig");
 const GameCtx = @import("../../engine/ctx.zig").GameCtx;
 
-// ── lifecycle ────────────────────────────────────────────────────────────────
+// lifecycle
 
 /// Apply byte-patches / set up. Runs once at process attach if the feature is
 /// enabled. Use patch.MemoryPatch(addr).…commit() or the writeX helpers.
@@ -21,12 +21,12 @@ pub fn install() void {
 pub fn postInit() void {} // after engine init completes
 pub fn deinit() void {}
 
-// ── client frame loops (driven by runtime/gameloop.zig) ──────────────────────
+// client frame loops (driven by runtime/gameloop.zig)
 
 pub fn gameFrame() void {} // each in-game frame
 pub fn oogFrame() void {} // each out-of-game (menu) frame
 
-// ── dedicated-server domain (driven by engine/server.zig) ────────────────────
+// dedicated-server domain (driven by engine/server.zig)
 
 pub fn serverTick() void {} // each server tick
 

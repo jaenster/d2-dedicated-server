@@ -34,8 +34,6 @@ services:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }
     environment:
-      REALMD_DURABLE_STORE: pg
-      REALMD_EPHEMERAL_STORE: redis
       REALMD_DATA_DIR: /data
       REALMD_REDIS_ADDR: redis:6379
       REALMD_PG_DSN: postgres://realmd:realmd@postgres:5432/realmd
@@ -43,7 +41,7 @@ services:
       # The address bnetd advertises to the client for d2cs. For a client on the host,
       # this must be reachable from the host — 127.0.0.1 works with the published ports.
       REALMD_REALM_ADDR: "127.0.0.1"
-      # Game traffic goes through realmd's own edge rather than a separate qqserver: one
+      # Game traffic goes through realmd's own edge rather than a separate d2ingress: one
       # host, one binary, no redis hop. Clients never dial the game server directly — the
       # token they carry is realm-global and only an edge can translate it.
       REALMD_GAME_PORT: "4000"
@@ -52,9 +50,6 @@ services:
       - realmd-data:/data
     ports:
       - "6112:6112"  # bnetd
-      - "6113:6113"  # d2cs
-      - "6114:6114"  # d2dbs
-      - "6115:6115"  # gs-link (the wine GS connects here)
       - "4000:4000"  # game traffic (the embedded edge; clients dial this)
       - "18080:8080" # health (8080 is often taken on the host)
 
@@ -70,7 +65,7 @@ services:
     depends_on:
       realmd: { condition: service_started }
     environment:
-      REALMD_HOST: realmd                 # dials gslink:6115 + d2dbs:6114 over the network
+      D2GS_REDIS_ADDR: "redis:6379"       # its only link to the realm — no realmd address at all
       D2GS_GS_ADDR: "127.0.0.1:4000"      # what host clients dial for game traffic
       D2GS_MAX_GAMES: "50"
     volumes:
@@ -83,6 +78,28 @@ services:
       # - ./moddata:/moddata:ro
     ports:
       - "4000:4000"
+
+  # The wine-free GS. Unlike `gs` above, this one needs NO mounted install — the image bakes in
+  # its own minimal 1.14d data (deploy/Dockerfile's gs-native target) — so it's behind its own
+  # `native` profile rather than `gs`: no D2GS_GAME_SRC, no wine, no Xvfb. Useful for CI (see
+  # .github/workflows/build.yml's `e2e` job) and for local dev on a box without wine.
+  #
+  # No published port: clients never dial a game server directly (see the "always crosses an
+  # ingress" note above realmd) — only realmd's embedded edge (host 4000, published above) is
+  # ever dialled. D2GS_GS_ADDR is this container's DNS name on the compose network, which is
+  # what has to be reachable from realmd's container for the edge to splice to it; 127.0.0.1
+  # (the default) would be gs-native's own loopback, unreachable from anywhere else.
+  gs-native:
+    profiles: ["native"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: gs-native
+    depends_on:
+      realmd: { condition: service_started }
+    environment:
+      D2GS_REDIS_ADDR: "redis:6379"      # its only link to the realm; realmd places games on it
+      D2GS_GS_ADDR: "gs-native:4000"
 
 volumes:
   realmd-data:

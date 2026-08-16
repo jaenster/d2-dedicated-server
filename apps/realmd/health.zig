@@ -1,17 +1,13 @@
-//! Minimal HTTP health endpoint for k8s probes. The game protocols are raw TCP, so
-//! we expose liveness/readiness over a tiny separate HTTP listener instead.
+//! Minimal HTTP health endpoint for k8s probes. The game protocols are raw TCP, so this exposes
+//! liveness/readiness over a tiny separate HTTP listener instead.
 //!
-//!   GET /healthz  -> 200 once the listeners are up (liveness: don't restart me)
-//!   GET /readyz   -> 200 only when this pod can actually serve a client right now:
-//!                    started AND not draining AND the store backend is reachable
-//!                    AND (if REALMD_REQUIRE_GS) at least one game server registered.
-//!                    503 otherwise, so k8s keeps it out of the Service endpoints.
-//!
-//! Readiness reflects real dependencies (store + GS), not just "process alive", so a
-//! pod that can't reach its database or has no game server is not sent traffic.
+//!   GET /healthz -> 200 once the listeners are up (liveness: don't restart me)
+//!   GET /readyz  -> 200 only if started AND not draining AND store reachable AND (if
+//!                   REALMD_REQUIRE_GS) a game server is registered; 503 otherwise so k8s
+//!                   keeps the pod out of Service endpoints.
 const std = @import("std");
 const net = @import("realm_infra").net;
-const gslink = @import("gslink.zig");
+const fleet = @import("fleet.zig");
 const store = @import("store.zig");
 const shutdown = @import("shutdown.zig");
 const admin = @import("admin.zig");
@@ -57,7 +53,7 @@ fn readyReason() ?[]const u8 {
     if (!started.load(.acquire)) return "starting";
     if (shutdown.draining.load(.acquire)) return "draining";
     if (!store.healthy()) return "store unreachable";
-    if (require_gs and !gslink.ready()) return "no game server";
+    if (require_gs and !fleet.ready()) return "no game server";
     return null; // ready
 }
 

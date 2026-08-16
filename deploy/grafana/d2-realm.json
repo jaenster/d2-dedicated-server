@@ -595,7 +595,7 @@
     {
       "id": 14,
       "type": "stat",
-      "title": "qqserver non-D2 drops (scans)",
+      "title": "d2ingress non-D2 drops (scans)",
       "datasource": {
         "type": "loki",
         "uid": "${loki}"
@@ -632,7 +632,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(count_over_time({namespace=\"realmd\", app=\"qqserver\"} |= `dropping` [$__range]))",
+          "expr": "sum(count_over_time({namespace=\"realmd\", app=\"d2ingress\"} |= `dropping` [$__range]))",
           "queryType": "instant"
         }
       ]

@@ -1,28 +1,17 @@
 //! bnftp-probe — a clientless BNFTP discovery client.
 //!
-//! BNFTP (Battle.net File Transfer, protocol selector 0x02) is UNAUTHENTICATED:
-//! no CD-key, no SRP, no login. To discover what a real server serves we do two
-//! CD-key-free steps:
-//!
-//!   1. Connect 0x01 → SID_AUTH_INFO. The reply is unconditional and names the
-//!      version-check MPQ (filename + filetime) the server wants. Hexdump it.
-//!   2. Open a fresh 0x02 connection → BNFTP-request that filename. Hexdump the
-//!      raw reply and save the file bytes so we can diff the header layout (and
-//!      the MPQ contents) against our own apps/realmd/bnftp.zig.
-//!
-//! Egress can go through a SOCKS5 proxy (`--socks5 host:port`) so the probe
-//! reaches the target from a chosen IP — e.g. an `ssh -D 1080 hetzner` dynamic
-//! forward, or a standalone proxy on a Hetzner box. With SOCKS5 the proxy does
-//! the DNS, so the target host is sent as a domain name.
+//! BNFTP (Battle.net File Transfer, protocol selector 0x02) is UNAUTHENTICATED: no CD-key, no SRP,
+//! no login. (1) connect 0x01 -> SID_AUTH_INFO, whose unconditional reply names the version-check
+//! MPQ (filename + filetime); (2) a fresh 0x02 connection BNFTP-requests that filename, hexdumping
+//! the reply and saving it to diff against apps/realmd/bnftp.zig. `--socks5` makes the proxy do DNS.
 //!
 //!   zig build bnftp-probe -- [opts] <target-host> [product] [filename]
-//!   opts: --socks5 H:P  --socks5-auth U:P  --port N (default 6112)
-//!         --proto-ver 0xNNNN (BNFTP version, default 0x0100)
+//!   opts: --socks5 H:P  --socks5-auth U:P  --port N (default 6112)  --proto-ver 0xNNNN (default 0x0100)
 //!   product: 4CC, default D2XP (LoD). Use D2DV for classic.
 const std = @import("std");
 const wire = @import("libd2").bnet.bnftp;
 
-// ── libc sockets (native host target; std.posix socket wrappers are gone in 0.16) ──
+// libc sockets (native host target; std.posix socket wrappers are gone in 0.16)
 const Socket = c_int;
 extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
@@ -101,7 +90,7 @@ fn connectResolved(gpa: std.mem.Allocator, host: []const u8, port: u16) !Socket 
     return error.ConnectFailed;
 }
 
-// ── SOCKS5 client (RFC 1928 / 1929) ───────────────────────────────────────────
+// SOCKS5 client (RFC 1928 / 1929)
 const Proxy = struct { host: []const u8, port: u16, user: []const u8 = "", pass: []const u8 = "" };
 
 fn socks5Connect(fd: Socket, px: Proxy, target: []const u8, tport: u16) !void {
@@ -195,7 +184,7 @@ fn dial(gpa: std.mem.Allocator, target: []const u8, tport: u16, proxy: ?Proxy) !
     return connectResolved(gpa, target, tport);
 }
 
-// ── BNCS framing: <0xFF, id, u16 len> + body ──────────────────────────────────
+// BNCS framing: <0xFF, id, u16 len> + body
 fn bncsSend(fd: Socket, id: u8, body: []const u8) !void {
     var hdr: [4]u8 = .{ 0xFF, id, 0, 0 };
     std.mem.writeInt(u16, hdr[2..4], @intCast(4 + body.len), .little);
@@ -327,7 +316,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     std.debug.print("== target {s}:{d}  product={s}  protoVer=0x{x:0>4} ==\n", .{ host, port, product, proto_ver });
 
-    // ── Step 1: SID_AUTH_INFO to learn the MPQ filename (CD-key-free) ──
+    // Step 1: SID_AUTH_INFO to learn the MPQ filename (CD-key-free)
     // Skipped with --bnftp-only (BNFTP is unauthenticated; one conn per file).
     var rxbuf: [8192]u8 = undefined;
     var mpq_name_buf: [256]u8 = undefined;
@@ -379,7 +368,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("  (unexpected reply id / too short — server may have changed the handshake)\n", .{});
         }
 
-        // ── Optional: provoke the version gauntlet to reveal the forced patch ──
+        // Optional: provoke the version gauntlet to reveal the forced patch
         // SID_AUTH_CHECK with an OLD exe version → result 0x100/0x102 "old version"
         // whose additional-info string is the patch file to BNFTP-download. This
         // is checked before CD-key validation, so still no key needed.
@@ -421,7 +410,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const file_to_get = filename orelse (if (mpq_name_len > 0) mpq_name_buf[0..mpq_name_len] else return err("no filename: AUTH_INFO gave none and none passed on cmdline"));
 
-    // ── Step 2: BNFTP download (0x02 connection, unauthenticated) ──
+    // Step 2: BNFTP download (0x02 connection, unauthenticated)
     {
         const fd = try dial(gpa, host, port, proxy);
         defer _ = close(fd);

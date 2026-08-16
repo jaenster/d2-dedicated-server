@@ -64,15 +64,13 @@ pub fn countRebases(img: *const Image) !usize {
     return n;
 }
 
-/// Map the executable read-only. Deliberately raw POSIX rather than std.Io: this is the one file
-/// the loader reads, it reads it once at startup, and threading an Io through for it would be the
-/// only reason the package needed one.
+/// Map the executable read-only. Raw POSIX rather than std.Io: read once at startup, and
+/// threading an Io through would be the only reason the package needed one.
 ///
-/// Mapped rather than slurped because the bytes have to outlive the load either way — every import
-/// name a thunk reports, possibly hours later, points into them, as do the load commands. Held as a
-/// mapping they are file-backed and clean, so N server processes on one host share one copy and the
-/// kernel may evict it; slurped they were private dirty, duplicated per process, and the growing
-/// read left its abandoned generations behind in the arena as well.
+/// Mapped rather than slurped: the bytes must outlive the load (import names + load commands
+/// point into them, possibly hours later). Mapped they're file-backed/clean and shared across N
+/// server processes on one host; slurped they'd be private-dirty, duplicated per process, and
+/// growing reads would leave abandoned generations behind in the arena.
 pub fn mapFile(path: [*:0]const u8) ![]align(std.heap.page_size_min) const u8 {
     var f = try openImage(path);
     f.closeFd();

@@ -10,11 +10,9 @@ is what the container images and the Helm chart use.
 | `--loaddll <path>` | (proxy) LoadLibrary an injected DLL; repeatable |
 | `--d2gs` | attach + log; install crash/halt/multi-instance guards |
 | `--d2gs-boot` | run the engine bootstrap + tick loop (the dedicated server) |
-| `--realm` | bootstrap in realm mode (register the realm callback table) |
+| `--realm` | join a realm: publish this server into the shared store, take create/join from its queue there, and read/write characters there |
 | `--create-games` | load data tables so the engine can create games |
-| `--realmd <host>` | connect to one realm server, deriving gs-link (`:6115`) + d2dbs (`:6114`); DNS ok. Env: `REALMD_HOST` |
-| `--d2cs <ip:port>` | connect to realmd's gs-link for create/join dispatch (overrides `--realmd`) |
-| `--d2dbs <ip:port>` | fetch character saves from realmd's d2dbs (overrides `--realmd`) |
+| `--redis <host:port>` | the shared store — this server's only link to a realm. Env: `D2GS_REDIS_ADDR` |
 | `--gs-addr <ip:port>` | public address clients dial for this GS's games (self-reported to realmd). Env: `D2GS_GS_ADDR` |
 | `--max-games <n>` | capacity this GS advertises to realmd. Env: `D2GS_MAX_GAMES` |
 | `--reap-ms <n>` | how long an empty game is kept before it is destroyed (default 5000). Also this server's throughput ceiling -- see [How many games per server](PERFORMANCE.md#how-many-games-per-server). Env: `D2GS_REAP_MS` |
@@ -49,7 +47,6 @@ Off by default unless noted. See [`docs/MODDING.md`](MODDING.md).
 | `--eipprof` | sample every thread's program counter from inside the process and report the hot engine addresses. No host profiler can see them: the 32-bit guest runs translated under wine, so a host sampler only ever sees the translator. Not for a live realm |
 | `--memdiag` | report the engine's working set per bootstrap step |
 | `--test-enter` | drive the server into a game on its own, with no client (DRLG capture) |
-| `--fetch-char <acct:char>` / `--create-char` | exercise the d2dbs character fetch / creation paths |
 | `--d2bs` | inject D2BS after the game window exists (kolbot on a stock client) |
 | `--dump-cdkeys` | print the decoded classic/expansion CD-key globals |
 

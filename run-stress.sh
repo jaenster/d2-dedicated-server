@@ -42,7 +42,7 @@
 # server is not the one the realm placed the game on.
 #
 # NATIVE_GS=realm is the other shape, and the one that tests the real path: the native server has
-# registered over gs-link, so the realm places the game on it and the client is routed there like
+# published itself into redis, so the realm places the game on it and the client is routed there like
 # any other. Nothing is overridden.
 #
 # Either way the GS-process checks (alive, rss, fds, panics) go quiet: they read a local process,
@@ -52,7 +52,7 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 [ -f "$ROOT/.env" ] && set -a && . "$ROOT/.env" && set +a
 
-QQ_PORT="${QQ_PORT:-4000}"
+INGRESS_PORT="${INGRESS_PORT:-4000}"
 BNET_PORT="${BNET_PORT:-6112}"
 LOG_DIR="${LOG_DIR:-$ROOT/.stack}"
 CLIENTLESS="${CLIENTLESS:-$ROOT/../clientless/zig-out/bin/clientless}"
@@ -129,7 +129,7 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 
 say "preflight"
 listening "127.0.0.1:$BNET_PORT" || die "realmd is not on :$BNET_PORT — ./run-stack.sh first"
-listening "127.0.0.1:$QQ_PORT"   || die "qqserver is not on :$QQ_PORT — ./run-stack.sh first"
+listening "127.0.0.1:$INGRESS_PORT"   || die "d2ingress is not on :$INGRESS_PORT — ./run-stack.sh first"
 [ -x "$CLIENTLESS" ] || die "no clientless at $CLIENTLESS (build it, or set CLIENTLESS=)"
 # wine leaves a start.exe wrapper matching the same pattern; the engine itself is the one
 # that grew a heap, so pick by resident size rather than by pid order.
@@ -138,15 +138,15 @@ GS_PID="$(ps -o pid=,rss=,command= -ax 2>/dev/null | grep 'testgame' | grep -v g
 gs_args=()
 if [ "$NATIVE_GS" = realm ]; then
   GS_PID=""
-  ok "realmd and qqserver are up; the game leg goes wherever the realm placed it (no local GS to watch)"
+  ok "realmd and d2ingress are up; the game leg goes wherever the realm placed it (no local GS to watch)"
 elif [ -n "$NATIVE_GS" ]; then
   listening "$NATIVE_GS" || die "nothing is listening on $NATIVE_GS (NATIVE_GS)"
   gs_args=(--gs-host "${NATIVE_GS%%:*}" --gs-port "${NATIVE_GS##*:}")
   GS_PID=""
-  ok "realmd and qqserver are up; the game leg goes to $NATIVE_GS (no local GS to watch)"
+  ok "realmd and d2ingress are up; the game leg goes to $NATIVE_GS (no local GS to watch)"
 else
   [ -n "$GS_PID" ] || die "no GS process — ./run-stack.sh first"
-  ok "realmd, qqserver and GS (pid $GS_PID) are up"
+  ok "realmd, d2ingress and GS (pid $GS_PID) are up"
 fi
 
 # Only the part of the log a round produced is evidence about that round. Remember how
@@ -310,4 +310,19 @@ if [ -n "$rss" ]; then
 fi
 echo "  client logs in $OUT"
 if [ -n "$first_fail" ]; then bad "$first_fail"; exit 1; fi
+
+# Rounds only prove a client reached the world — not that what it loaded was intact. A cache that
+# truncated every character to 1024 bytes once passed this harness 5/5 while quietly corrupting
+# saves, so the saves themselves are checked before a run is called clean.
+if [ -x ./tools/check-saves.sh ]; then
+  say "save integrity"
+  if ./tools/check-saves.sh > "$OUT/saves.log" 2>&1; then
+    ok "$(grep -c '^ok ' "$OUT/saves.log" 2>/dev/null || echo 0) saves valid and consistent"
+  else
+    grep -E '^BAD ' "$OUT/saves.log" | head -5
+    bad "a character is corrupt or inconsistent — see $OUT/saves.log"
+    exit 1
+  fi
+fi
+
 ok "no failures"

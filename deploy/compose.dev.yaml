@@ -1,13 +1,19 @@
-# Local DEV backing store — just redis, on a fixed name+port so it never collides with
-# a stray redis container (a random one on :6379 once caused a connect flood + confusion).
-# In dev, realmd + qqserver run NATIVELY on the host and the wine GS runs natively too;
-# only redis needs a container. The full containerized stack lives in compose.yaml.
+# Local DEV backing stores, on fixed names+ports so they never collide with a stray container
+# (a random redis on :6379 once caused a connect flood + confusion). In dev, realmd + d2ingress
+# run NATIVELY on the host and the wine GS runs natively too; only the stores are containers.
+# The full containerized stack lives in compose.yaml.
+#
+# Both are REQUIRED — realmd refuses to start without either. Redis is where the realm
+# coordinates; Postgres is the store of record. There is no filesystem option to fall back to,
+# which is deliberate: the one that existed is what let account flags and profiles quietly land
+# on one instance's local disk while everything else was shared.
 #
 #   docker compose -f deploy/compose.dev.yaml up -d
 #   # then, natively:
-#   REALMD_EPHEMERAL_STORE=redis REALMD_REDIS_ADDR=127.0.0.1:6390 \
-#     REALMD_GAME_ADDR=127.0.0.1 REALMD_QQ_PORT=14000 ./zig-out/bin/realmd &
-#   REALMD_REDIS_ADDR=127.0.0.1:6390 REALMD_QQ_PORT=14000 ./zig-out/bin/qqserver &
+#   REALMD_REDIS_ADDR=127.0.0.1:6390 \
+#     REALMD_PG_DSN=postgres://realmd:realmd@127.0.0.1:55432/realmd \
+#     REALMD_GAME_ADDR=127.0.0.1 REALMD_INGRESS_PORT=14000 ./zig-out/bin/realmd &
+#   REALMD_REDIS_ADDR=127.0.0.1:6390 REALMD_INGRESS_PORT=14000 ./zig-out/bin/d2ingress &
 services:
   redis:
     image: redis:7-alpine
@@ -18,3 +24,19 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
       retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: d2gs-dev-postgres
+    environment:
+      POSTGRES_USER: realmd
+      POSTGRES_PASSWORD: realmd
+      POSTGRES_DB: realmd
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U realmd"]
+      interval: 3s
+      retries: 10
+
+# ./run-stack.sh brings both of these up itself and points realmd at them.

@@ -1,20 +1,12 @@
-//! `setjmp` and `longjmp`, in i386 assembly, because there is no other honest way to write them.
-//!
-//! These are the two imports a thunk cannot stand in for. A thunk returns 0, which reads as "this is
-//! the first return" and is exactly right — right up until the matching `longjmp` fires and jumps
-//! through a buffer nobody ever wrote. The decompressor behind `SFILE_Explode` reports every failure
-//! that way, so a stubbed pair turns a recoverable read error into a jump to whatever the callee's
-//! frame happened to hold.
-//!
-//! A Zig wrapper around the host's `setjmp` is the same bug wearing a hat: the host would save the
-//! WRAPPER's frame, and the wrapper has returned by the time `longjmp` restores it. The registers
-//! have to be taken in the caller's frame, which means naked code and no prologue.
-//!
-//! The buffer layout is ours, not Darwin's. That is safe in exactly one direction: the game only
-//! ever hands the same buffer back to us. Darwin's i386 `jmp_buf` is `int[18]` — 72 bytes — and the
-//! game allocates that, so the six words used here fit with room to spare. Darwin's own `setjmp`
-//! also saves the signal mask and the FP control word; nothing on the boot path changes either
-//! between the two calls, so they are not carried.
+//! `setjmp` and `longjmp`, in i386 assembly — no other honest way to write them. A thunk
+//! returning 0 works for the first return, but the matching `longjmp` (used by the
+//! `SFILE_Explode` decompressor on every failure) then jumps through a buffer nobody wrote. A
+//! Zig wrapper around the host's `setjmp` has the same bug: the host saves the WRAPPER's frame,
+//! which is gone by the time `longjmp` restores it — registers must be taken in the caller's
+//! frame, hence naked code, no prologue. The buffer layout is ours, not Darwin's: safe because
+//! the game only ever hands the same buffer back to us. Darwin's i386 `jmp_buf` is `int[18]` (72
+//! bytes), so our six words fit with room to spare; Darwin's `setjmp` also saves the signal mask
+//! and FP control word, but neither changes on the boot path so they aren't carried.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,13 +25,10 @@ pub const Slot = enum(usize) {
 pub const words = 6;
 
 const x86 = struct {
-    /// `int setjmp(jmp_buf env)` — cdecl, so `env` is at [esp+4] and the return address at [esp].
-    /// The saved ESP is the caller's, taken after the return address: what `longjmp` restores is the
-    /// stack as it stood at the call, with the frame already gone.
-    ///
-    /// EAX, ECX and EDX are caller-saved on i386, so clobbering them here is free and there is
-    /// nothing else worth saving: the callee-saved four plus SP and PC are the whole machine state a
-    /// C frame can depend on.
+    /// `int setjmp(jmp_buf env)` — cdecl: `env` at [esp+4], return address at [esp]. Saved ESP is
+    /// the caller's, taken after the return address, so `longjmp` restores the stack as it stood
+    /// at the call. EAX/ECX/EDX are caller-saved on i386 so clobbering them is free; the
+    /// callee-saved four plus SP and PC are the whole machine state a C frame can depend on.
     fn setjmp() callconv(.naked) void {
         asm volatile (
             \\ movl 4(%%esp), %%ecx

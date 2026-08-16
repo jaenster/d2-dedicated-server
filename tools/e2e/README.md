@@ -1,7 +1,7 @@
 # Clientless E2E test harness for `realmd`
 
 A pure-Zig, wire-protocol end-to-end test harness for the `realmd` realm
-server. It speaks the raw BNCS / MCP / d2dbs / gs-link framings directly over
+server. It speaks the raw BNCS / MCP framings directly over
 TCP — **no wine, no `Game.exe`**. Scenarios are assertion-rich and named.
 
 ## Files
@@ -10,9 +10,10 @@ TCP — **no wine, no `Game.exe`**. Scenarios are assertion-rich and named.
   - `RealmClient` — full bnetd handshake (`auth`, `login`, `enterRealm`) then
     d2cs (`connectD2cs`, `startup`, `charList`, `createGame`, `joinGame`).
     `charList()` decodes each statstring into `{name, class_id, level, flags}`.
-  - `d2dbsSave(acct, char, d2s)` — character-save store (SAVE_DATA 0x30).
+  - `storePutChar(acct, char, d2s)` — stage a character the way a game server saves one,
+    then wait for the flush worker to move it to the store of record.
 - `fakegs.zig` — `FakeGS`: a background-thread stand-in game server that
-  registers over the gs-link (AUTHREPLY + SETGSINFO + ADDRINFO) and answers
+  publishes itself into redis and answers
   CREATEGAME/JOINGAME with a configurable gameid; tracks `creates` / `joins`.
 - `net.zig` — libc TCP client + little-endian framing helpers (mirrors
   `apps/realmd/net.zig`; the 0.16 `std.posix` socket wrappers were removed).
@@ -43,7 +44,7 @@ Env (the auto-started realmd):
 
 Implemented (assert against live behaviour):
 - `login` — full bnet handshake, session minted.
-- `char_list_statstring` — SAVE a crafted Sorceress/level-42 via d2dbs, then
+- `char_list_statstring` — stage a crafted Sorceress/level-42, then
   login + startup + char_list, and assert the **decoded statstring** is
   class=Sorceress, level=42.
 - `create_join_game` — a FakeGS registers; create then join a game; assert both

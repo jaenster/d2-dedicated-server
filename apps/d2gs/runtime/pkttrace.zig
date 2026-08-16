@@ -97,7 +97,7 @@ fn systemShim() callconv(.naked) void {
     );
 }
 
-// ── outbound: SendPacket_Helper entry trampoline ─────────────────────────────
+// Outbound: SendPacket_Helper entry trampoline.
 // SendPacket_Helper @0x53b280 is the chokepoint for every server->client packet
 // (it queues into the client's packet list). Prologue (verified):
 //   55          push ebp

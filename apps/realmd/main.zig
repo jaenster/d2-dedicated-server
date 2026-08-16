@@ -1,12 +1,11 @@
 //! realmd — a clean-room Battle.net / D2 realm server in Zig.
 //!
-//! Replaces pvpgn (bnetd + d2cs + d2dbs) with a single binary: three TCP
-//! listeners over shared in-memory state, durable state behind a Store seam so
-//! it survives restarts and can scale to multiple instances on a shared backend.
+//! Replaces pvpgn (bnetd + d2cs + d2dbs) with a single binary. It serves clients on one port
+//! and keeps everything shared in redis, so instances are interchangeable rather than each
+//! owning a piece of the realm.
 //!
-//! It is the realm the unmodified 1.14d client connects to, and it dispatches
-//! games to our injected d2gs (Game.exe) over the same d2cs<->d2gs protocol the
-//! GS already speaks.
+//! It is the realm the unmodified 1.14d client connects to. Games reach a game server through
+//! the shared store rather than a connection this instance holds — see fleet.zig.
 const std = @import("std");
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const config = @import("realm_infra").config;
@@ -22,24 +21,17 @@ fn nowMs() u64 {
     return @as(u64, @intCast(time(null))) *% 1000;
 }
 const bncs = @import("bncs.zig");
+const chat = @import("chat.zig");
 const d2cs = @import("d2cs.zig");
-const d2dbs = @import("d2dbs.zig");
-const gslink = @import("gslink.zig");
+const fleet = @import("fleet.zig");
 const gameedge = @import("gameedge.zig");
+const charflush = @import("charflush.zig");
 const store = @import("store.zig");
 const state = @import("state.zig");
 const health = @import("health.zig");
 const admin = @import("admin.zig");
 const shutdown = @import("shutdown.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
-
-fn mapBackend(b: config.Backend) store.Backend {
-    return switch (b) {
-        .fs => .fs,
-        .redis => .redis,
-        .pg => .pg,
-    };
-}
 
 fn hashStr(s: []const u8) u32 {
     var h: u32 = 2166136261;
@@ -116,8 +108,6 @@ fn initStore(cfg: config.Config, io: anytype) void {
     store.init(.{
         .io = io,
         .data_dir = cfg.data_dir,
-        .durable = mapBackend(cfg.durable_store),
-        .ephemeral = mapBackend(cfg.ephemeral_store),
         .redis_addr = cfg.redis_addr,
         .pg_dsn = cfg.pg_dsn,
     });
@@ -147,9 +137,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     log.json = cfg.log_json;
     obs.nowMsFn = &nowMs; // span durations
     if (runSubcommand(cfg, init.args)) return;
-    log.line("realmd", "starting instance={s} bind={s} bnet={d} d2cs={d} d2dbs={d} realm={s}@{s} capture={}", .{
-        cfg.instance_id, cfg.bind,       cfg.bnet_port,  cfg.d2cs_port,
-        cfg.d2dbs_port,  cfg.realm_name, cfg.realm_addr, cfg.capture,
+    log.line("realmd", "starting instance={s} bind={s} bnet={d} realm={s}@{s} capture={}", .{
+        cfg.instance_id, cfg.bind, cfg.bnet_port, cfg.realm_name, cfg.realm_addr, cfg.capture,
     });
     // Graceful shutdown for k8s rolling updates + readiness gating.
     health.require_gs = cfg.require_gs;
@@ -157,8 +146,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // bearer token (scripts/break-glass), account login (REALMD_ADMINS), or SSO header.
     admin.token = cfg.admin_token;
     admin.instance = cfg.instance_id;
-    admin.durable = @tagName(cfg.durable_store);
-    admin.ephemeral = @tagName(cfg.ephemeral_store);
+    admin.durable = "pg";
+    admin.ephemeral = "redis";
     admin.admins = cfg.admins;
     admin.trusted_header = cfg.trusted_auth_header;
     admin.initSigning(cfg.admin_secret);
@@ -169,15 +158,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // bnetd advertises the d2cs address to the client. realm_addr must be an
     // IPv4 the client can dial (127.0.0.1 in dev, the public IP in prod).
     var threaded = std.Io.Threaded.init_single_threaded;
-    store.init(.{
-        .io = threaded.io(),
-        .data_dir = cfg.data_dir,
-        .durable = mapBackend(cfg.durable_store),
-        .ephemeral = mapBackend(cfg.ephemeral_store),
-        .redis_addr = cfg.redis_addr,
-        .pg_dsn = cfg.pg_dsn,
-    });
-    log.line("realmd", "store: durable={s} ephemeral={s}", .{ @tagName(cfg.durable_store), @tagName(cfg.ephemeral_store) });
+    initStore(cfg, threaded.io());
+    log.line("realmd", "store: postgres for the record, redis for what is in flight", .{});
+    // Both are required, and both are checked here rather than discovered per request. Every
+    // failure they cause reads as a game bug — a character that will not load, a game nobody can
+    // join — so a missing dependency has to announce itself as one, once, by name.
+    if (cfg.pg_dsn.len == 0) {
+        log.line("realmd", "FATAL REALMD_PG_DSN is required: it is the store of record for characters and accounts", .{});
+        return error.PostgresRequired;
+    }
+    if (!store.ephemeralReachable()) {
+        log.line("realmd", "FATAL redis at '{s}' did not answer", .{cfg.redis_addr});
+        return error.RedisUnreachable;
+    }
+    if (!store.durableReachable()) {
+        log.line("realmd", "FATAL postgres did not answer (REALMD_PG_DSN)", .{});
+        return error.PostgresUnreachable;
+    }
     // Seed a break-glass admin from REALMD_ADMIN_BOOTSTRAP=name[:password] (idempotent).
     if (cfg.admin_bootstrap.len > 0) {
         const sep = std.mem.indexOfScalar(u8, cfg.admin_bootstrap, ':');
@@ -192,11 +189,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     admin.any_db_admin = anyDbAdmin();
     if (admin.token.len > 0 or admin.admins.len > 0 or admin.trusted_header.len > 0 or admin.any_db_admin)
         log.line("realmd", "admin API + web UI enabled on health port {d} (token={} env-admins={} sso={} db-admins={})", .{ cfg.health_port, admin.token.len > 0, admin.admins.len > 0, admin.trusted_header.len > 0, admin.any_db_admin });
-    // A redis/pg ephemeral backend IS an external shared store — route sessions/games
-    // through it even without REALMD_SHARED (the in-memory table is fs-only).
-    state.shared = cfg.shared or cfg.ephemeral_store != .fs;
+    // Sessions and games always live in redis, so instances are interchangeable by construction
+    // rather than by being told to be. The instance hash keeps their minted ids apart.
+    state.shared = true;
     state.instance_hash = hashStr(cfg.instance_id);
-    if (cfg.shared) log.line("realmd", "multi-instance mode: sessions/games in shared store {s} (instance hash 0x{x})", .{ cfg.data_dir, state.instance_hash });
+    chat.instance = state.instance_hash; // which inbox chat events for our members arrive on
+    log.line("realmd", "instance {s} (hash 0x{x})", .{ cfg.instance_id, state.instance_hash });
     bncs.realm_name = cfg.realm_name;
     bncs.permissive_auth = cfg.permissive_auth;
     if (getenv("REALMD_TRACE") != null) {
@@ -209,11 +207,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     bncs.ad_url = cfg.ad_url;
     if (cfg.ad_file.len > 0 and cfg.ad_url.len > 0)
         log.line("realmd", "banner ad '{s}' -> {s} (served from {s}/bnftp/)", .{ cfg.ad_file, cfg.ad_url, cfg.data_dir });
-    // Advertise the realm/MCP address on the BNCS port: bncs.handle selector-muxes
-    // MCP (0x01 + non-0xFF) onto :6112, like real bnet. The standalone d2cs listener
-    // on cfg.d2cs_port stays up for back-compat / direct tests.
+    // The realm speaks MCP on the BNCS port: bncs.handle selector-muxes it (0x01 + non-0xFF)
+    // onto :6112, exactly as real bnet does. There is no second listener — the client was never
+    // told about one, so the only thing the old d2cs port ever served was our own test harness.
     bncs.d2cs_port = cfg.bnet_port;
-    gslink.realm_name = cfg.realm_name;
     if (parseIp4(cfg.realm_addr)) |ip| {
         bncs.d2cs_ip = ip;
     } else {
@@ -221,7 +218,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     if (cfg.gs_addr.len > 0) {
         if (parseIp4(cfg.gs_addr)) |ip| {
-            gslink.gs_ip_override = ip;
+            fleet.gs_ip_override = ip;
         } else {
             log.line("realmd", "WARNING gs_addr '{s}' is not an IPv4; ignoring", .{cfg.gs_addr});
         }
@@ -232,47 +229,52 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // land — the failure would otherwise surface as a game the client connects to and falls out of.
     d2cs.route_ttl_s = cfg.route_ttl_s;
     if (cfg.game_addr.len == 0) {
-        log.line("realmd", "FATAL REALMD_GAME_ADDR is required: the address clients dial for game traffic (qqserver, or realmd's own edge via REALMD_GAME_PORT)", .{});
+        log.line("realmd", "FATAL REALMD_GAME_ADDR is required: the address clients dial for game traffic (d2ingress, or realmd's own edge via REALMD_GAME_PORT)", .{});
         return error.GameAddrRequired;
     }
     d2cs.game_ip = parseIp4(cfg.game_addr) orelse {
         log.line("realmd", "FATAL REALMD_GAME_ADDR '{s}' is not an IPv4", .{cfg.game_addr});
         return error.GameAddrInvalid;
     };
-    log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.qq_port, cfg.route_ttl_s });
+    log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.ingress_port, cfg.route_ttl_s });
 
     const bnet_fd = try net.listenTcp(cfg.bind, cfg.bnet_port);
-    const d2cs_fd = try net.listenTcp(cfg.bind, cfg.d2cs_port);
-    const d2dbs_fd = try net.listenTcp(cfg.bind, cfg.d2dbs_port);
-    const gs_fd = try net.listenTcp(cfg.bind, cfg.gs_port);
     const health_fd = try net.listenTcp(cfg.bind, cfg.health_port);
-    log.line("realmd", "listening on {d}/{d}/{d} (gs link {d}, health {d})", .{ cfg.bnet_port, cfg.d2cs_port, cfg.d2dbs_port, cfg.gs_port, cfg.health_port });
+    log.line("realmd", "listening on {d} (health {d})", .{ cfg.bnet_port, cfg.health_port });
 
     // Capture mode hexdumps raw bytes (protocol discovery); otherwise speak it.
     const bnet_handler: net.Handler = if (cfg.capture) net.captureHandler else bncs.handle;
-    const d2cs_handler: net.Handler = if (cfg.capture) net.captureHandler else d2cs.handle;
-    const d2dbs_handler: net.Handler = if (cfg.capture) net.captureHandler else d2dbs.handle;
-    const gs_handler: net.Handler = if (cfg.capture) net.captureHandler else gslink.handle;
 
-    const t_bnet = try std.Thread.spawn(.{}, net.serve, .{ "bnet", bnet_fd, bnet_handler });
-    const t_d2cs = try std.Thread.spawn(.{}, net.serve, .{ "d2cs", d2cs_fd, d2cs_handler });
-    const t_dbs = try std.Thread.spawn(.{}, net.serve, .{ "d2dbs", d2dbs_fd, d2dbs_handler });
     const t_health = try std.Thread.spawn(.{}, net.serve, .{ "health", health_fd, health.handle });
 
+    // Game servers report what happens on them into the shared store rather than down a socket
+    // to whichever instance they connected to. Every instance drains that stream; each event is
+    // taken by exactly one of them.
+    _ = std.Thread.spawn(.{}, fleet.consumeEvents, .{}) catch |e|
+        log.line("realmd", "WARNING game-server event consumer did not start: {s} — the join list will not update", .{@errorName(e)});
+
+    // Chat that reaches members held by another instance, and keeps ours visible to them. Without
+    // it a channel is only as big as one replica, and nothing says so — talk just does not arrive.
+    _ = std.Thread.spawn(.{}, chat.runInbox, .{}) catch |e|
+        log.line("realmd", "WARNING chat inbox did not start: {s} — chat will not cross instances", .{@errorName(e)});
+
     // Optional embedded game edge: realmd fronts game traffic itself (in-process token
-    // splice) instead of a standalone qqserver — the lightweight single-binary path.
+    // splice) instead of a standalone d2ingress — the lightweight single-binary path.
     var t_game: ?std.Thread = null;
+    // Moves saved characters from the redis cache to the store of record. Every instance runs
+    // one; they need no coordination because a flush reads the current bytes, so duplicated work
+    // writes the same save twice rather than the wrong one.
+    _ = std.Thread.spawn(.{}, charflush.run, .{}) catch |e|
+        log.line("realmd", "WARNING character flush worker did not start: {s} — saves will stay in redis", .{@errorName(e)});
+
     if (cfg.game_port != 0) {
         const game_fd = try net.listenTcp(cfg.bind, cfg.game_port);
-        log.line("realmd", "embedded game edge on {d} (in-process splice; no standalone qqserver needed)", .{cfg.game_port});
+        log.line("realmd", "embedded game edge on {d} (in-process splice; no standalone d2ingress needed)", .{cfg.game_port});
         t_game = try std.Thread.spawn(.{}, net.serve, .{ "game", game_fd, gameedge.handle });
     }
 
     health.markStarted(); // all listeners bound → probes may go green
-    net.serve("gs", gs_fd, gs_handler); // main thread runs the GS link listener
-    t_bnet.join();
-    t_d2cs.join();
-    t_dbs.join();
+    net.serve("bnet", bnet_fd, bnet_handler); // main thread serves clients
     t_health.join();
     if (t_game) |t| t.join();
 }

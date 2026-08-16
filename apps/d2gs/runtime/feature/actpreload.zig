@@ -1,21 +1,12 @@
 //! Eager-load every act's DRLG at game start so a cross-act warp never races act allocation.
 //!
-//! On a headless GS (-d2gs-boot) a player can WAYPOINT straight across acts — e.g. kolbot's
-//! Mephisto run waypoints from Act 1 (Rogue Encampment) to Durance of Hate (Act 3). The engine
-//! activates the destination room and DRLGROOMTILE_SetupWarpTile @0x66e260 walks that room's
-//! warp-cache (pRoomEx->pTileGrid), which is built from pLevel->pDrlg->pWarpsInfo. pWarpsInfo
-//! only exists once the destination ACT's DRLG is allocated. Game-create allocates acts lazily,
-//! and the server warp path can activate the room before its act is loaded -> the cache is empty
-//! -> assert `!!pWarpCacheHead` @0x66e2ab and the GS exits ("no GS available" to the client).
-//!
-//! The real client's CLIENT_WarpToAct @0x53acc0 self-heals (InitDrlgAct before SpawnUnit), but a
-//! path under -d2gs-boot reaches room-activation outside that guard. Rather than chase every warp
-//! path, we allocate ALL acts up front the moment the game's first room inits (town gen), so any
-//! later warp finds pGame->pAct[n] (hence its pWarpsInfo) already populated.
-//!
-//! InitDrlgAct only ALLOCATES an act's DRLG (AllocAct + per-act quest state) — no unit spawns, no
-//! room activation, no live-game mutation — so pre-loading is side-effect-free. This is the exact
-//! act force-load srvtrace's DRLG oracle already performs safely mid-town-gen.
+//! DRLGROOMTILE_SetupWarpTile @0x66e260 walks the activated room's warp-cache (pRoomEx->pTileGrid),
+//! built from pLevel->pDrlg->pWarpsInfo, which only exists once that ACT's DRLG is allocated.
+//! Game-create allocates acts lazily and the -d2gs-boot warp path can activate the room first ->
+//! empty cache -> assert `!!pWarpCacheHead` @0x66e2ab, GS exits ("no GS available"). The client's
+//! CLIENT_WarpToAct @0x53acc0 self-heals (InitDrlgAct before SpawnUnit); this path does not, so
+//! allocate all acts at first room-init. InitDrlgAct only allocates (AllocAct + quest state) — no
+//! spawns, no mutation — so it is side-effect-free.
 const std = @import("std");
 const log = @import("../../log.zig");
 const feature = @import("../../engine/feature.zig");

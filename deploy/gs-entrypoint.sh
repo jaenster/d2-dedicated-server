@@ -82,7 +82,7 @@ for dll in $D2GS_EXTRA_DLLS; do
   set -- "$@" --loaddll "$win"
   echo "  + mod dll $win"
 done
-# --no-compress because qqserver owns the client-facing port and swallows the GS's duplicate 0xAF00
+# --no-compress because d2ingress owns the client-facing port and swallows the GS's duplicate 0xAF00
 # so the S->C stream matches a non-compressing client. Without it the local stack and a deployed
 # container disagree, and the join dies silently: the client never sends 0x6b.
 set -- "$@" --d2gs --d2gs-boot --realm --create-games --no-compress
@@ -106,7 +106,7 @@ case "${D2GS_GS_ADDR:-auto}" in
       case "$pubip" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) break;; *) pubip="";; esac
     done
     [ -n "$pubip" ] && export D2GS_GS_ADDR="$pubip:$port" \
-      || echo "WARN: could not resolve public IP; leaving D2GS_GS_ADDR unset (realmd will use the gs-link peer IP)"
+      || echo "WARN: could not resolve public IP; leaving D2GS_GS_ADDR unset (clients will be given 0.0.0.0)"
     ;;
 esac
 

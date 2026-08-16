@@ -1,16 +1,13 @@
 //! Join context — bridges the account gap in Game.exe's dedicated-server path.
 //!
-//! When realmd dispatches a join over the gs-link (JOINGAME), it tells us which
-//! account owns the joining character and the join token. The engine's join path
-//! (GAMELOGON -> SrvJoinGame -> fpGetDatabaseCharacter) only carries the char name
-//! and token, never the account — so we stash realmd's authoritative mapping here
-//! at dispatch time and resolve it (by char name or token) when the engine asks
-//! us for the character save.
+//! The realm's JOINGAME dispatch carries the account for the joining character, but the
+//! engine's join path (GAMELOGON -> SrvJoinGame -> fpGetDatabaseCharacter) only carries char name
+//! and token, never the account — so we stash realmd's mapping here and resolve it (by char name
+//! or token) when the engine asks for the character save.
 //!
-//! Writer: the gs-link thread (apps/d2gs/realmclient/d2cs.zig handleJoinGame).
-//! Reader: the engine network thread (apps/d2gs/engine/realm.zig fpGetDatabaseCharacter).
-//! Entries publish via an atomic `ready` flag so the reader never sees a half
-//! written slot; joins are rare so a small ring with last-wins is plenty.
+//! Writer: the queue thread (realmclient/d2cs.zig handleJoinGame). Reader: engine network thread
+//! (engine/realm.zig fpGetDatabaseCharacter). Entries publish via an atomic `ready` flag so the
+//! reader never sees a half-written slot; joins are rare so a small last-wins ring is plenty.
 
 const std = @import("std");
 
@@ -21,7 +18,7 @@ const Entry = struct {
     consumed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     token: u32 = 0,
     /// The engine gameid realmd authorized this join for. Kept BESIDE the token because the
-    /// two are different namespaces and only the gameid reaches the engine: qqserver rewrites
+    /// two are different namespaces and only the gameid reaches the engine: d2ingress rewrites
     /// the client's realm token to it before the GS sees the packet, so fpFindPlayerToken is
     /// handed a gameid. See validateGame.
     gameid: u32 = 0,
@@ -127,14 +124,13 @@ pub fn accountForToken(token: u32) ?[]const u8 {
 }
 
 /// Non-consuming validity check for what the ENGINE presents at join time. Ported from
-/// D2Server.dll 1.00 `PlayerToken_ValidateAndConsume` (minus the consume): the join must be
-/// one the realm issued (via `remember`), not already used, and within `TOKEN_TTL_MS`.
+/// D2Server.dll 1.00 `PlayerToken_ValidateAndConsume` (minus the consume): the join must be one
+/// the realm issued (via `remember`), not already used, and within `TOKEN_TTL_MS`.
 ///
-/// Matches on the GAMEID, not the realm token. Three ids ride this path: realmd's realm-global
-/// join token, the engine gameid (`GAME_CreateBattleNetGame`'s out-param, the 1024-slot
-/// nToken), and qqserver REWRITES the token in the client's GAMELOGON to that gameid before
-/// the GS sees it. Matching a gameid against stored realm tokens compares two namespaces that
-/// only agree when two small counters happen to collide.
+/// Matches on the GAMEID, not the realm token: d2ingress REWRITES the token in the client's
+/// GAMELOGON to the engine gameid (`GAME_CreateBattleNetGame`'s out-param, the 1024-slot nToken)
+/// before the GS sees it, so matching a gameid against stored realm tokens would compare two
+/// unrelated namespaces.
 pub fn validateGame(gameid: u32) bool {
     const now = GetTickCount();
     for (&entries) |*slot| {

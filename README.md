@@ -29,7 +29,7 @@ one running the Mac build of the same game directly on Linux with no wine at all
 |-|-|
 | **[`realmd`](#realmd-the-realm)** | The realm. One process doing every job PvPGN split across daemons: login/chat, character select, game create/join. To the client it *is* Battle.net, all on port 6112. |
 | **[`d2gs`](#d2gs-the-headless-game-server)** | The headless game server. An injected DLL that boots the real `Game.exe` with no display, drives its server tick, and hosts the games. |
-| **[`qqserver`](#qqserver-the-game-traffic-ingress)** | The ingress for game traffic. One public address in front of the whole game-server fleet, routed per connection on the game's own protocol. |
+| **[`d2ingress`](#d2ingress-the-game-traffic-ingress)** | The ingress for game traffic. One public address in front of the whole game-server fleet, routed per connection on the game's own protocol. |
 | **[`d2gs-native`](#d2gs-native-the-wine-free-game-server)** | The same game server without wine: 1.14d's macOS i386 binary mapped and run directly on Linux. One process in a 4.4 MB `scratch` image instead of a wine process tree. |
 
 Underpinning all three, `packages/realm-proto/` (the `realm_proto` module) is the realmd<->d2gs wire
@@ -39,16 +39,17 @@ protocol that both ends import, so they agree on the wire by construction.
 
 Not "it has a Dockerfile". The design decisions that matter:
 
-- **Stateless where it counts.** realmd keeps **no durable state of its own** -- persistence
-  dispatches to `fs`, `redis`, or `pg` behind one facade, so sessions and games live in the
-  backing services. qqserver keeps none at all: its route key is a realm-global token in redis,
+- **Stateless where it counts.** realmd keeps **no state of its own** -- everything goes to
+  Postgres (the record) or Redis (in flight), with no third option to get wrong. d2ingress keeps none at all: its route key is a realm-global token in redis,
   so **any** gateway pod resolves **any** connection. No session affinity, no warm-up.
 - **An ingress, not an IP per server.** The game port is fixed at `:4000`, so without a gateway
   every game server needs its own client-routable address and the fleet can never outgrow the
-  IPs you own. qqserver does what an HTTP ingress does with the `Host` header -- one layer down,
+  IPs you own. d2ingress does what an HTTP ingress does with the `Host` header -- one layer down,
   on the game protocol. The fleet lives on pod IPs.
-- **No shared disk.** On a join the game server **fetches the character over the network** from
-  realmd's d2dbs. No RWX volume, no shared game-data mount between pods.
+- **No shared disk, and no character through the realm.** realmd stages a character into redis on
+  join; the game server reads it from there, plays, and writes it back, and a flush worker in
+  whichever realmd notices moves it to the store of record. No RWX volume, no shared game-data
+  mount, and no save waiting on a database.
 - **Scale the thing that actually has a ceiling.** Seven concurrent games per `Game.exe` is a
   hard engine limit, so capacity comes from adding game-server pods, not tuning one --
   see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
@@ -59,12 +60,13 @@ Not "it has a Dockerfile". The design decisions that matter:
 - **Small.** Two of the three ship as `scratch` images with static musl binaries and sit at
   ~1--6 MiB resident. The realm costs about `1m` CPU.
 
-One honest exception: a game server holds its gs-link control connection to exactly **one**
-realmd, and create/join is a synchronous request over that socket. So **run realmd as a single
-replica** today; the chart does, and says why. Multi-instance HA needs the fleet dialling every
-pod, or dispatch relayed through the store.
+- **Interchangeable instances.** Nothing connects a realm server to a game server. Servers
+  publish themselves into redis, take create/join from a queue there, and report back on an
+  event stream any instance drains — so any realmd can serve any client and reach the whole
+  fleet. Verified with two instances: a game created through one, joined through the other,
+  both players in the world together ([`docs/redis.md`](docs/redis.md)).
 
-realmd and qqserver sit behind public LoadBalancers on stable floating IPs (only 6112 + 4000
+realmd and d2ingress sit behind public LoadBalancers on stable floating IPs (only 6112 + 4000
 open); Redis + Postgres behind them; an internal GS fleet whose pods register their own pod IP:
 
 ![Kubernetes topology](docs/architecture/img/k8s_deploy.png)
@@ -77,27 +79,37 @@ open); Redis + Postgres behind them; an internal GS fleet whose pods register th
    login + realm  |  (BNCS + MCP on ONE        |  game traffic
                   v   port, like real bnet)    v  (D2Net)
        +----------------------+        +----------------------+
-       |  realmd              |        |  qqserver            |
+       |  realmd              |        |  d2ingress           |
        |  :6112  login, realm |        |  :4000  public game  |
        |  :8080  health / UI  |        |         ingress      |
        +----------+-----------+        +-----------+----------+
-            ^   ^      writes token route (redis)  |
-  internal: |   +----------------------------------+
-  gs-link   |              splice to the owning GS |
-  :6115     |                                      v
-  d2dbs     |   register + fetch     +----------------------+
-  :6114     +------------------------|  Game.exe + d2gs.dll |
-                character bytes      |  fleet 1..N          |
-                                     |  internal :4000      |
-                                     +----------------------+
+            |     |                                |
+            |                                      |  splice to the owning GS
+            |                                      |
+            |                                      v
+            |                          +----------------------+
+            |                          |  Game.exe + d2gs.dll |
+            |                          |  fleet 1..N          |
+            v                          +----------+-----------+
+       +---------------------------+              | takes create/join from its queue,
+       |  redis                    |<-------------+ reports what happens, reads and
+       |  characters, seats,       |                writes characters, publishes itself
+       |  tokens, routes, fleet,   |
+       |  the game-server queues   |
+       +------------+--------------+
+                    | flush worker (any realmd)
+                    v
+            +----------------+
+            |  postgres / fs |   the store of record
+            +----------------+
 ```
 
-The client only ever uses two ports: **6112** (login + realm) and **4000** (game). Everything
-else (gs-link 6115, d2dbs 6114) is internal traffic between the fleet and realmd.
+The client only ever uses two ports: **6112** (login + realm) and **4000** (game). There is no
+third: realmd and the game servers never speak to each other directly, they meet in redis.
 
 Game traffic always crosses an ingress -- the token realmd hands the client is realm-global, and
 only an ingress can translate it to the id the engine knows. On one host realmd can be that
-ingress itself (`REALMD_GAME_PORT`, no second binary); in the cloud it advertises qqserver. Same
+ingress itself (`REALMD_GAME_PORT`, no second binary); in the cloud it advertises d2ingress. Same
 binaries either way -- see [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 The full model lives in [`docs/architecture/`](docs/architecture/) (LikeC4) and can be browsed
@@ -106,7 +118,7 @@ live with `npx likec4 start docs/architecture`.
 ## Quick start
 
 ```sh
-# Kubernetes: realmd + d2gs fleet + qqserver + pg + redis
+# Kubernetes: realmd + d2gs fleet + d2ingress + pg + redis
 helm install myrealm deploy/chart \
   --namespace realm --create-namespace \
   --set realmAddr=203.0.113.10 \
@@ -117,8 +129,9 @@ docker compose -f deploy/compose.yaml up --build
 curl localhost:18080/readyz
 ```
 
-Then supply the proprietary game data (bring your own legit 1.14d copy) and point `realmAddr` at
-the realmd LoadBalancer. Compose, the raw manifests, and the native-process path are all in
+The Helm chart's `gs` pods come up with game data already baked in (a minimal 1.14d set the
+pipeline publishes, see `tools/make-minimal.sh`); Compose's `gs` profile still needs your own
+copy via `D2GS_GAME_SRC`. Point `realmAddr` at the realmd LoadBalancer. Compose, the raw manifests, and the native-process path are all in
 [`docs/DEPLOY.md`](docs/DEPLOY.md); the chart has its own reference in
 [`deploy/chart/README.md`](deploy/chart/README.md).
 
@@ -126,7 +139,7 @@ the realmd LoadBalancer. Compose, the raw manifests, and the native-process path
 
 ```
 zig build     # -> zig-out/bin/{dbghelp.dll, d2gs.dll, ver-IX86-1.dll}  (x86-windows)
-              #    + zig-out/bin/{realmd, qqserver}  (native host binaries)
+              #    + zig-out/bin/{realmd, d2ingress}  (native host binaries)
 ```
 
 Nothing to check out beside it: the clean-room 1.14d core ([libd2](https://github.com/jaenster/libd2))
@@ -147,9 +160,10 @@ list/select characters, create/join a game) -- and, like real Battle.net, **both
 port, 6112**. There is no pvpgn-style fan of client ports. Game-file delivery for the version
 check uses **BNFTP** on the same port.
 
-Behind that one client port, realmd also exposes two **internal** endpoints the fleet uses
-(never the client): a **gs-link** (`:6115`) the fleet registers over and that routes create/join
-to a server, and **d2dbs** (`:6114`) the server fetches/saves character bytes from.
+That is the only port. realmd exposes nothing to the fleet, because the fleet does not connect
+to it: game servers publish themselves into redis and take create/join from a queue there.
+Characters do not pass through realmd either — it stages one into redis on join and the game
+server reads, plays and writes it back. See [`docs/redis.md`](docs/redis.md).
 
 More: [`REALMD.md`](REALMD.md) (configuration, trust model) and
 [`apps/realmd/README.md`](apps/realmd/README.md) (internals).
@@ -166,27 +180,28 @@ More: [`REALMD.md`](REALMD.md) (configuration, trust model) and
 - **A built-in mod framework** -- a registry of pure feature modules that hook the engine (exp
   scaling, ubers, an arena mode, client-side maphack, ...), each toggled on its own.
 
-On a join the server does not read a shared disk -- it fetches the character over the network
-from realmd's d2dbs, which serves it from whichever store backend is configured.
+On a join the server does not read a shared disk, and does not ask the realm -- it reads the
+character straight from redis and writes it back there when the game ends.
 
 More: [`docs/MODDING.md`](docs/MODDING.md) (injection + the feature framework),
 [`apps/d2gs/engine/README.md`](apps/d2gs/engine/README.md), [`apps/d2gs/runtime/README.md`](apps/d2gs/runtime/README.md).
 
-realmd's gs-link registers many game servers; `CREATE` routes to the least-loaded, `JOIN` to the
-one that owns the game, with persistence behind the `fs`/`redis`/`pg` facade:
+Game servers publish themselves into redis; `CREATE` is routed to the least-loaded with room
+(picked and reserved in one script, so two realmds cannot choose the same slot) and `JOIN` to the
+one that owns the game, with persistence behind the Postgres/Redis facade:
 
 ![GS fleet](docs/architecture/img/gs_fleet.png)
 
-### qqserver: the game-traffic ingress
+### d2ingress: the game-traffic ingress
 
-`apps/qqserver/` builds the `qqserver` binary: a stateless ingress for game traffic. It
+`apps/d2ingress/` builds the `d2ingress` binary: a stateless ingress for game traffic. It
 exists because the client gives you nothing to route on -- the realm can say *which host* to
 dial, but the game port is fixed at `:4000`.
 
 1. realmd mints a realm-globally-unique **token** per create/join and records
    `token -> {gs address, real engine game id}` in redis.
-2. The client dials `qqserver:4000` and sends `GAMELOGON` (`0x68`), which carries that token.
-3. qqserver looks up the route, **rewrites the token in the packet** to the game id the backend
+2. The client dials `d2ingress:4000` and sends `GAMELOGON` (`0x68`), which carries that token.
+3. d2ingress looks up the route, **rewrites the token in the packet** to the game id the backend
    engine actually knows, dials that GS, replays the packet, and **splices**.
 
 That is the entire extent of the protocol it understands: one field in the first packet, plus
@@ -197,7 +212,7 @@ stateless: the key is the token, not the source address.
 The implementation matches the job: **one thread, one `poll()` loop, zero heap, no globals**,
 all state in a single value on `main()`'s stack, and idle it sits in `poll(-1)` at 0% CPU.
 
-More: [`apps/qqserver/README.md`](apps/qqserver/README.md).
+More: [`apps/d2ingress/README.md`](apps/d2ingress/README.md).
 
 ### d2gs-native: the wine-free game server
 
@@ -210,7 +225,7 @@ emulation and no format conversion.
 The result is one process in a **4.4 MB `scratch` image** (1.7 MB to pull) against wine's 1.04 GB
 and ten processes, at
 8-10 MiB resident against ~115 MiB, with latency indistinguishable from wine's on real hardware.
-It speaks the same gs-link protocol to realmd, so a fleet can mix both kinds of server.
+It meets the realm through redis exactly as the wine server does, so a fleet can mix both kinds.
 
 It hosts one game by default and up to seven with `D2GS_MAX_GAMES`; the same seven-game engine
 ceiling applies. Measurements, and two corrections to earlier conclusions in it, are in
@@ -261,7 +276,7 @@ the authed ingress, never public. Full detail: [`webui/README.md`](webui/README.
 ## Layout
 
 ```
-apps/       one directory per deployed thing: d2gs (the injected DLL pair), d2gs-native, realmd, qqserver
+apps/       one directory per deployed thing: d2gs (the injected DLL pair), d2gs-native, realmd, d2ingress
 packages/   what more than one app needs: realm-proto, realm-infra, realm-store, bncs-auth, obs
 tools/      run by hand, never deployed: the e2e harness, the probes, ver-ix86, ghidra2cpp
 deploy/     Dockerfile, compose.yaml, k8s manifests, Helm chart, Grafana
@@ -282,6 +297,7 @@ deliberately never handed to the DLL build. Each app and package has its own REA
 | [`docs/MODDING.md`](docs/MODDING.md) | how injection works; writing a feature |
 | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) | logs, the dashboard, where `evt` comes from |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | measured footprint, the 7-games-per-server ceiling |
+| [`docs/redis.md`](docs/redis.md) | the realm's shared state: key schema, locks, save durability |
 | [`docs/native-vs-wine.md`](docs/native-vs-wine.md) | native vs wine game server, measured side by side |
 | [`docs/STATUS.md`](docs/STATUS.md) | what works, what doesn't yet |
 | [`REALMD.md`](REALMD.md) · [`REALM.md`](REALM.md) | the realm server; the engine-side realm bridge |
@@ -289,5 +305,6 @@ deliberately never handed to the DLL build. Each app and package has its own REA
 
 ## License & legal
 
-Code: [MIT](LICENSE). No Blizzard game files are distributed here -- bring your own legit copy of
-Diablo II. Unofficial, not affiliated with Blizzard. See [`LEGAL.md`](LEGAL.md).
+Code: [MIT](LICENSE). No Blizzard game files are in this repo's source; the published container
+images bake in a stripped, minimal 1.14d data set (see [`LEGAL.md`](LEGAL.md)). Unofficial, not
+affiliated with Blizzard.

@@ -11,12 +11,12 @@ server sits near-zero**. Measured on a real Hetzner k3s node with no players onl
 
 | service | CPU | memory | image |
 |-|-|-|-|
-| `realmd` (login + realm + d2dbs + gs-link) | ~1m | ~6 MiB | scratch, static musl |
-| `qqserver` (game-traffic ingress) | **~0m** | **~1 MiB** | scratch, static musl |
+| `realmd` (login + realm) | ~1m | ~6 MiB | scratch, static musl |
+| `d2ingress` (game-traffic ingress) | **~0m** | **~1 MiB** | scratch, static musl |
 | `d2gs` (wine, headless `Game.exe`) | ~15m | ~300 MiB | debian + wine32 |
 | `d2gs-native` (no wine, Mac i386 image) | ~0m | ~8-10 MiB | scratch, one static i386 ELF |
 
-Postgres/Redis are optional -- `fs` persistence drops them entirely.
+Postgres and Redis are both required -- there is no filesystem mode to drop them.
 
 The two game servers are interchangeable to the realm and, on real amd64 hardware, indistinguishable
 on latency -- the native one just costs an order of magnitude less to keep resident. Measured side
@@ -29,7 +29,7 @@ through a two-server fleet, both sitting at ~4 MiB resident:
 
 - **realmd: ~1.8 ms of CPU per game** -- one client's whole session, login through create and
   join.
-- **qqserver: ~0.6 ms of CPU per connection.** Per *connection*, not per game: its cost is the
+- **d2ingress: ~0.6 ms of CPU per connection.** Per *connection*, not per game: its cost is the
   route lookup and the splice setup, so a game that four players join costs four times a solo
   one. Byte copying did not register at this scale (620 KB across 119 connections, 99% of it
   the GS->client world-state push).
@@ -61,10 +61,10 @@ tries the next, and tells the client the realm is busy rather than dropping it.
 
 The engine has one -- eight concurrent connections from an address, then a ban past twenty in
 fifteen seconds -- and it is right for a server players dial directly and wrong for this one,
-because every client arrives through qqserver and the engine sees a single peer address for the
+because every client arrives through d2ingress and the engine sees a single peer address for the
 whole realm. Stock, that caps the server at eight connections and then bans its own gateway;
 worse, it refuses by accepting the connection and closing it without a byte, so the client waits
 at a loading screen with nothing to read. The dedicated bootstrap turns it off.
 
 Per-address abuse control belongs at the gateway, which is the only peer that can still tell
-clients apart. See [`apps/qqserver/README.md`](../apps/qqserver/README.md).
+clients apart. See [`apps/d2ingress/README.md`](../apps/d2ingress/README.md).

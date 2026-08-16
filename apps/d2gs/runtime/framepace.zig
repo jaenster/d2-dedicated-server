@@ -1,17 +1,12 @@
 //! Sleep until the engine's next frame is actually due, instead of polling at a rate we invented.
 //!
-//! Neither half of the server loop is driven by how often we call it. `QSERVER_TickAllGames`
-//! keeps an accumulator: it returns immediately unless `timeGetTime() - LastUpdateTick` has
-//! reached `Frames_TimeBetweenFrames` (40 ms at 25 fps), then advances the logical frame by
-//! exactly one period and CARRIES the remainder, so the average rate is 25 fps however often it
-//! is polled. `QSERVER_DispatchAndCleanup` self-gates the same way on its own 40 ms tick. Calling
-//! them at 100 Hz therefore does not make the game run faster or react sooner — the simulation
-//! only acts on queued commands at frame boundaries — it just burns three wakeups out of four.
-//!
-//! Retail's own loop slept 30 ms with games live (QSERVER_CooperativeThreadMain @0x44cf20). We do
-//! better than a fixed interval by reading the accumulator and sleeping exactly to the next due
-//! frame: one wakeup per frame, phase-locked, and no drift because the engine carries the
-//! remainder itself.
+//! `QSERVER_TickAllGames` and `QSERVER_DispatchAndCleanup` both self-gate on an accumulator:
+//! they return immediately unless `timeGetTime() - LastUpdateTick` has reached
+//! `Frames_TimeBetweenFrames` (40 ms at 25 fps), then advance one period and carry the
+//! remainder — polling faster just burns wakeups, it doesn't speed up the sim. Retail's own
+//! loop slept a fixed 30 ms (`QSERVER_CooperativeThreadMain` @0x44cf20); we do better by
+//! reading the accumulator and sleeping exactly to the next due frame — one wakeup per frame,
+//! phase-locked, no drift.
 
 const log = @import("../log.zig");
 

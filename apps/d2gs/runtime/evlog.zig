@@ -1,17 +1,11 @@
-//! Structured event log — emits one JSON object per line to the d2gs log, e.g.
+//! Structured event log — one JSON object per line into the d2gs log, e.g.
 //!   {"evt":"monster_spawn","name":"Mephisto","class":242,"x":17500,"y":8100}
-//! so a Grafana/Loki (or vector/promtail) pipeline can scrape d2gs_log.txt and
-//! treat every server event as a queryable structured record. No allocation: each
-//! event builds into a fixed stack buffer, then flushes through log.print (stdout +
-//! file). Designed to be called from the srvtrace entry-detour shims.
+//! so a Loki/vector pipeline can scrape d2gs_log.txt. No allocation: each event builds into a fixed
+//! stack buffer, then flushes through log.print. Called from the srvtrace entry-detour shims.
 //!
-//! All values are emitted as JSON. Strings are escaped; wide (UTF-16) engine names
-//! are down-converted (ASCII kept, non-ASCII → '?'). Truncation is silent but the
-//! line always stays valid JSON (we never cut mid-escape, and end() always closes).
-//!
-//! Event is generic over buffer capacity: `Event` (480) is the default for the
-//! compact per-action traces; a bigger cap (e.g. the DRLG room-layout dump) uses
-//! `EventN(N)`. Nested arrays/objects are supported via the array/obj primitives.
+//! Wide (UTF-16) engine names are down-converted (ASCII kept, non-ASCII → '?'). Truncation is silent
+//! but the line stays valid JSON (never cut mid-escape; end() always closes). `Event` caps at 480;
+//! bigger dumps (e.g. DRLG room layout) use `EventN(N)`.
 const std = @import("std");
 const log = @import("../log.zig");
 

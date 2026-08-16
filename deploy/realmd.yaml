@@ -1,7 +1,8 @@
-# realmd on Kubernetes — the realm server (bnetd + d2cs + d2dbs + gs-link), fronted
+# realmd on Kubernetes — the realm server (bnetd + MCP realm on one port), fronted
 # by a LoadBalancer, with the game-server fleet in deploy/gs.yaml.
 #
-# State lives in a backend behind realmd's persistence facade (REALMD_STORE):
+# State lives behind realmd's persistence facade — Postgres for the record, Redis for what is
+# in flight. There is no third option:
 #   fs     — a shared RWX volume (no extra services; set up the PVC below)
 #   redis  — ephemeral sessions/games in Redis (this file deploys one)
 #   pg     — durable character saves in Postgres (this file deploys one)
@@ -110,15 +111,12 @@ metadata:
   name: realmd
   namespace: realmd
 spec:
-  # ONE replica, and not for capacity reasons. Sessions and games live in the shared store,
-  # so any pod can serve login and the game list — but the GS fleet does NOT: a game server
-  # holds its gs-link control connection to exactly one pod, and create/join is a synchronous
-  # request over that socket. A join that lands on a pod which does not hold the owning GS's
-  # connection still succeeds at the realm, then fails quietly on the GS: notifyJoin's result
-  # is discarded, so joinctx is never populated and the character is fetched — and saved —
-  # under the wrong account. HA needs the GS dialling every pod, or dispatch relayed through
-  # the store. Until then this is one pod (see deploy/chart/values.yaml, which already says so).
-  replicas: 1
+  # Replicas are interchangeable. Nothing connects a realm server to a game server: servers
+  # publish themselves into redis and take create/join from a queue there, so every pod sees the
+  # whole fleet and can dispatch to all of it. Each pod needs its own REALMD_INSTANCE (below,
+  # from metadata.name) — it seeds session ids and dispatch request ids, and two pods sharing one
+  # would collect each other's replies.
+  replicas: 2
   selector:
     matchLabels: { app: realmd }
   template:
@@ -132,9 +130,6 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - { containerPort: 6112, name: bnetd }
-            - { containerPort: 6113, name: d2cs }
-            - { containerPort: 6114, name: d2dbs }
-            - { containerPort: 6115, name: gslink }
             - { containerPort: 8080, name: health }
           env:
             - name: REALMD_INSTANCE
@@ -146,16 +141,12 @@ spec:
             # external LoadBalancer IP.
             - name: REALMD_REALM_ADDR
               value: "127.0.0.1"
-            # Public IPv4 clients dial for GAME traffic — the qqserver gateway. Required:
+            # Public IPv4 clients dial for GAME traffic — the d2ingress gateway. Required:
             # clients never reach a game server directly, since the token they present is
             # realm-global and only the gateway can translate it to the engine's game id.
             - name: REALMD_GAME_ADDR
               value: "127.0.0.1"
             # Persistence: durable chars in Postgres, ephemeral sessions/games in Redis.
-            - name: REALMD_DURABLE_STORE
-              value: "pg"
-            - name: REALMD_EPHEMERAL_STORE
-              value: "redis"
             - name: REALMD_REDIS_ADDR
               value: "realmd-redis:6379"
             - name: REALMD_PG_DSN
@@ -182,12 +173,7 @@ metadata:
   namespace: realmd
 spec:
   type: LoadBalancer
-  # Preserve the game server's source IP on the gs-link. (Less critical now that the
-  # GS self-reports its address via ADDRINFO, but still avoids surprises.)
   externalTrafficPolicy: Local
   selector: { app: realmd }
   ports:
     - { port: 6112, targetPort: 6112, name: bnetd }
-    - { port: 6113, targetPort: 6113, name: d2cs }
-    - { port: 6114, targetPort: 6114, name: d2dbs }
-    - { port: 6115, targetPort: 6115, name: gslink }

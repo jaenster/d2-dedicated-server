@@ -1,10 +1,8 @@
 //! PvPGN D2CS <-> D2GS control protocol (pvpgn-server 1.99.x).
 //!
-//! The GS opens an outbound TCP connection to D2CS. All packets share an 8-byte
-//! little-endian header `{ size:u16, type:u16, seqno:u32 }` where `size` is the
-//! total packet length including the header. D2CS drives auth + game create/join;
-//! the GS replies and pushes game-info/close updates.
-//!
+//! The GS opens an outbound TCP connection to D2CS. All packets share an 8-byte little-endian
+//! header `{ size:u16, type:u16, seqno:u32 }` (size = total incl. header). D2CS drives auth +
+//! game create/join; the GS replies and pushes game-info/close updates.
 //! Source: pvpgn-server src/common/d2cs_d2gs_protocol.h.
 
 const std = @import("std");
@@ -34,7 +32,7 @@ pub const Type = enum(u16) {
     _,
 };
 
-// ── D2CS -> GS ──────────────────────────────────────────────────────────────
+// D2CS -> GS
 
 /// AUTHREQ (0x10): header + sessionnum + signlen, then realmname (cstr) + key checksum.
 pub const AuthReqFixed = extern struct {
@@ -69,7 +67,7 @@ pub const JoinGameReq = extern struct {
     token: u32,
 };
 
-// ── GS -> D2CS ──────────────────────────────────────────────────────────────
+// GS -> D2CS
 
 /// AUTHREPLY (0x11). `sign` is the realm-key signature; pvpgn can be configured
 /// to skip verification — we send zeros and rely on that (see PVPGN notes).
@@ -139,14 +137,10 @@ pub const CloseGame = extern struct {
 };
 
 /// UPDATEGAMEINFO (0x22). GS -> D2CS whenever a game's population changes, so the join
-/// screen's PLAYERS column tracks reality instead of the count realmd guessed at create
-/// time. `players` is the GS's own client count *after* the change — a level, not a delta,
-/// so a dropped message self-corrects on the next one and nothing can drift.
-///
-/// `flag` says which edge caused it (0=periodic update, 1=enter, 2=leave). The character
-/// it happened to follows the struct as a C-string, with the level and class the join
-/// screen's detail panel lists them by — realmd has no other way to learn who is in a
-/// game, since it only ever sees the request to join, never the arrival.
+/// screen's PLAYERS column tracks reality instead of the count realmd guessed at create time.
+/// `players` is the GS's own count *after* the change — a level not a delta, so a dropped
+/// message self-corrects. `flag`: 0=periodic, 1=enter, 2=leave. The character it happened to
+/// follows as a C-string (level+class) — realmd's only way to learn who is in a game.
 pub const UpdateGameInfo = extern struct {
     h: Header,
     flag: u32,

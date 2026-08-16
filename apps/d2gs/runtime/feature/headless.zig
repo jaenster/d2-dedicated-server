@@ -44,7 +44,8 @@ fn applyHeadlessRendering() void {
     // Char select without DC6 sprites.
     _ = MemoryPatch(0x005066C0).xorEaxEax().retImm(0x10).commit(); // AllocCharSelectComponent → NULL
     _ = MemoryPatch(0x00438D8B).jump(@intFromPtr(&parseSaveSkipAnimHandler)).commit();
-    _ = MemoryPatch(0x005041BC).bytes(&[_]u8{ 0x5E, 0x59, 0x5D, 0xC2, 0x08, 0x00 }).commit(); // D2COMP_DestroyCompositeUnit NULL → pop esi/ecx/ebp; ret 8
+    // D2COMP_DestroyCompositeUnit NULL → pop esi/ecx/ebp; ret 8
+    _ = MemoryPatch(0x005041BC).bytes(&[_]u8{ 0x5E, 0x59, 0x5D, 0xC2, 0x08, 0x00 }).commit();
     _ = MemoryPatch(0x00438560).ret().commit(); // DRAW_LocalCharsInSelectionScreen0
     _ = MemoryPatch(0x00439210).xorEaxEax().ret().commit(); // CHARSEL_UpdateSelectedCharDisplay
 
@@ -61,15 +62,12 @@ fn applyHeadlessRendering() void {
     _ = MemoryPatch(0x005136F0).ret().commit();
 }
 
-// ── ExitProcess interceptor ──────────────────────────────────────────────────
-// Set true by the d2gs server thread once it reaches its tick loop. Until then a
-// host exit(0) is PREMATURE: the headless engine-init returned (WinMain came back)
-// before the server came up. That clean exit IS the deterministic "init complete"
-// signal — so instead of letting it tear the process down (and kill the server
-// thread with it), we PARK the calling (main) thread forever. The process stays
-// alive, the server thread bootstraps + serves. A non-zero premature exit is a real
-// init failure and is still passed through (loud). Once server_ready, any exit is a
-// genuine shutdown and passes through normally.
+// ExitProcess interceptor
+// Set true by the d2gs server thread once it reaches its tick loop. Until then a host exit(0) is
+// PREMATURE (WinMain returned before the server came up) but IS the deterministic init-complete
+// signal, so instead of tearing the process down we PARK the main thread forever while the server
+// thread runs. Non-zero premature exits are real failures and pass through loud; once
+// server_ready, any exit passes through normally.
 pub var server_ready: bool = false;
 
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
@@ -104,7 +102,7 @@ fn exitProcessInterceptor(exit_code: u32) callconv(.winapi) noreturn {
     realExit(exit_code);
 }
 
-// ── naked handlers (AT&T, absolute targets) ──────────────────────────────────
+// naked handlers (AT&T, absolute targets)
 fn celcmpNullHandler() callconv(.naked) void {
     asm volatile (
         \\mov 0x0C(%%ebp), %%eax

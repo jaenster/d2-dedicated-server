@@ -1,15 +1,10 @@
-//! d2gs.dll — injected payload that boots 1.14d Game.exe as a headless dedicated
-//! game server by driving the engine's built-in QServer/D2Game code.
+//! d2gs.dll — injected payload that boots 1.14d Game.exe as a headless dedicated game server by
+//! driving the engine's built-in QServer/D2Game code.
 //!
-//! Loaded into the live Game.exe process by a dbghelp.dll proxy that
-//! LoadLibrary's it via `--loaddll <winpath>`. Flags:
-//!   --d2gs        attach + log (safe; proves injection)
-//!   --d2gs-boot   ALSO run the engine bootstrap + tick loop (calls into the
-//!                 real engine — only safe once init timing is confirmed; this
-//!                 is intentionally separate so the injection test can't crash
-//!                 the host)
-//!
-//! Run with `--headless` so no renderer/window is created.
+//! Loaded by a dbghelp.dll proxy via `--loaddll <winpath>`. `--d2gs` attaches + logs (safe, proves
+//! injection); `--d2gs-boot` also runs the engine bootstrap + tick loop (only safe once init timing
+//! is confirmed — kept separate so the injection test can't crash the host). Run with `--headless`
+//! so no renderer/window is created.
 
 const std = @import("std");
 const win = std.os.windows;
@@ -17,7 +12,7 @@ const server = @import("engine/server.zig");
 const command = @import("engine/command.zig");
 const realm = @import("engine/realm.zig");
 const d2cs = @import("realmclient/d2cs.zig");
-const d2dbs = @import("realmclient/d2dbs.zig");
+const gsredis = @import("realmclient/redis.zig");
 const feature = @import("engine/feature.zig");
 const halt_hook = @import("runtime/feature/halt_hook.zig"); // for enableSuppress (sub-mode, not a toggle)
 const headless = @import("runtime/feature/headless.zig"); // server_ready flag for the ExitProcess interceptor
@@ -53,15 +48,8 @@ const tickstat = @import("runtime/tickstat.zig");
 pub const panic = std.debug.FullPanic(crash.onPanic);
 
 var use_realm: bool = false;
-var d2cs_host: [64]u8 = undefined; // null-terminated IPv4
-var d2cs_port: u16 = 0;
-var d2cs_enabled: bool = false;
-var d2dbs_host: [64]u8 = undefined;
-var d2dbs_port: u16 = 0;
-var d2dbs_enabled: bool = false;
-var fetch_acct: [32]u8 = undefined;
-var fetch_char: [32]u8 = undefined;
-var fetch_enabled: bool = false;
+/// This server joins a realm: it publishes itself into the shared store and takes work from there.
+var join_realm: bool = false;
 // Public game address clients dial (self-reported to D2CS) + advertised capacity +
 // this GS's stable fleet id. Set from --gs-addr/--max-games (or env) in parseEndpoints.
 var gs_public_ip: [4]u8 = .{ 0, 0, 0, 0 };
@@ -252,77 +240,24 @@ fn setHost(dst: []u8, host: []const u8) void {
 
 fn parseEndpoints() void {
     var tmp: [96]u8 = undefined;
-    if (flagToken("d2cs", &tmp)) |len| {
-        var port: u16 = 0;
-        if (splitColon(tmp[0..len], &d2cs_host, &port)) {
-            d2cs_port = port;
-            d2cs_enabled = true;
-        }
-    }
-    if (flagToken("d2dbs", &tmp)) |len| {
-        var port: u16 = 0;
-        if (splitColon(tmp[0..len], &d2dbs_host, &port)) {
-            d2dbs_port = port;
-            d2dbs_enabled = true;
-        }
-    }
-    if (flagToken("fetch-char", &tmp)) |len| {
-        fetch_enabled = splitNames(tmp[0..len], &fetch_acct, &fetch_char);
-    }
 
-    // Single-host convenience: `--realmd <host>` (or REALMD_HOST) points the GS at one
-    // realm server, deriving the gslink control port (6115) and d2dbs port (6114).
-    // Explicit --d2cs/--d2dbs above still win. `<host>` may be a DNS name (resolved at
-    // connect) — e.g. a k8s Service like realmd.realmd.svc.cluster.local.
-    {
-        var hbuf: [80]u8 = undefined;
-        const got = flagToken("realmd", &hbuf) orelse envToken("REALMD_HOST", &hbuf);
-        if (got) |len| {
-            const host = hbuf[0..len];
-            if (!d2cs_enabled) {
-                setHost(&d2cs_host, host);
-                d2cs_port = 6115;
-                d2cs_enabled = true;
-            }
-            if (!d2dbs_enabled) {
-                setHost(&d2dbs_host, host);
-                d2dbs_port = 6114;
-                d2dbs_enabled = true;
-            }
-        }
-    }
-
-    // `--realm [ip]` (GS mode) implies pointing this GS's gslink at a realmd and
-    // advertising a client-dialable public address. If no explicit --realmd/--d2cs
-    // was given, default the realmd host + the public IP from the `--realm <ip>`
-    // token (numeric only; bare `--realm` → localhost). Without this the GS boots
-    // its tick loop but never opens the gslink control conn, so realmd reports
-    // "no GS available" on every create.
-    if (use_realm and !d2cs_enabled) {
+    // `--realm [ip]` (GS mode) is what makes this a realm server: it publishes itself into the
+    // shared store, takes create/join from there, and advertises a client-dialable address. The
+    // realm is never dialled — there is no address to point at, only a store both ends agree on.
+    if (use_realm) {
         var rip: [64]u8 = undefined;
         var riplen: usize = 0;
         if (flagToken("realm", &rip)) |len| {
             if (len > 0 and rip[0] >= '0' and rip[0] <= '9') riplen = len;
         }
         const rhost = if (riplen > 0) rip[0..riplen] else "127.0.0.1";
-        setHost(&d2cs_host, rhost);
-        d2cs_port = 6115;
-        d2cs_enabled = true;
-        // Also derive the d2dbs character store (:6114) from the same realm host. Without
-        // this the GS never calls realm.setDatabaseSource → dbs_ready stays false → the
-        // join-time fpGetDatabaseCharacter fetch is skipped → save_len=0 → the engine
-        // REFUSES the join ("char fetch FAILED"). This is the actual join-refusal bug.
-        if (!d2dbs_enabled) {
-            setHost(&d2dbs_host, rhost);
-            d2dbs_port = 6114;
-            d2dbs_enabled = true;
-        }
-        // Topology. qqserver always owns the client-facing :4000 (the port the client
+        join_realm = true;
+        // Topology. d2ingress always owns the client-facing :4000 (the port the client
         // hardcodes) and splices game traffic to this GS's real QServer, which we relocate
-        // to :4100. qq swallows the GS's duplicate 0xAF00 greeting so the S->C stream matches
+        // to :4100. d2ingress swallows the GS's duplicate 0xAF00 greeting so the S->C stream matches
         // a --no-compress client; binding the engine directly on :4000 would hand the client
         // the engine's raw 0xAF01 and desync a compression-aware client. The GS self-reports
-        // :4100 via ADDRINFO; realmd records that as the per-game route so qq knows the backend.
+        // :4100 in its own store record; realmd copies that into the per-game route d2ingress reads.
         if (parseDottedQuad(rhost)) |oct| gs_public_ip = oct;
         gs_public_port = 4100;
     }
@@ -339,6 +274,15 @@ fn parseEndpoints() void {
                     gs_public_port = port;
                 }
             }
+        }
+    }
+    // Where the shared store is, so the server can publish its own record and — once the
+    // character path moves — read and write saves without a realm in the middle.
+    {
+        const got = flagToken("redis", &tmp) orelse envToken("D2GS_REDIS_ADDR", &tmp);
+        if (got) |len| {
+            gsredis.configure(tmp[0..len]);
+            log.print("d2gs: redis configured");
         }
     }
     // Advertised capacity — flag, then env.
@@ -365,22 +309,6 @@ fn parseEndpoints() void {
     @import("runtime/feature/srvtrace.zig").gsid = gsid; // so the srvtrace tick line carries the GS id
 }
 
-/// One-shot D2DBS character fetch (test/demo for `--fetch-char`).
-fn fetchCharThread(_: ?*anyopaque) callconv(.winapi) DWORD {
-    if (!d2dbs.connectTo(@ptrCast(&d2dbs_host), d2dbs_port)) return 0;
-    const acct = std.mem.sliceTo(&fetch_acct, 0);
-    const name = std.mem.sliceTo(&fetch_char, 0);
-    log.print("d2dbs: fetching character...");
-    var save: [8192]u8 = undefined;
-    const got = d2dbs.fetchCharSave(acct, name, &save);
-    if (got > 0) {
-        log.hex("d2dbs: CHAR FETCHED ok, save bytes=0x", got);
-    } else {
-        log.print("d2dbs: char fetch returned no data");
-    }
-    return 0;
-}
-
 /// Server thread: bring the QServer up in dedicated mode, then pump forever.
 /// Runs on its own thread so DllMain returns promptly and the host finishes its
 /// (headless) init before we touch engine globals.
@@ -399,7 +327,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // we register the (currently all-null, safe) realm table to enable realm mode;
     // otherwise we run open (no D2CS), which the POC already proved listens on :4000.
     // Move the engine's QServer off :4000 to the port we advertise (gs_public_port), so the
-    // qqserver can own the client-facing :4000 and splice through to us. Must precede the
+    // d2ingress can own the client-facing :4000 and splice through to us. Must precede the
     // QSERVER_CreateAndInit inside bootstrapRealmServer. No-op when gs_public_port == 4000.
     gsport.apply(gs_public_port);
     // Reap empty games after a few seconds (default 5min) so abandoned games don't leak
@@ -438,7 +366,6 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // server with no menu UI.
     gameloop.installServerOogPacing();
     if (use_realm) {
-        if (d2dbs_enabled) realm.setDatabaseSource(@ptrCast(&d2dbs_host), d2dbs_port);
         joindiag.install(); // log nReason when the engine refuses a join
         rejoin.install(); // let a character re-enter without waiting for its old seat to clear
         if (hasFlag("pkttrace")) pkttrace.install(); // verbose :4000 packet trace
@@ -456,39 +383,28 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     log.print("d2gs: entering tick loop (listening on :4000)");
     headless.server_ready = true; // past init: a later host exit is a real shutdown, not premature
 
-    // Connect to PvPGN's D2CS so it can dispatch game create/join to us.
-    if (d2cs_enabled) {
-        // Tell realmd to drop a game from the join list when the engine destroys it
+    // Join the realm: publish ourselves into the shared store and take create/join from it.
+    if (join_realm) {
+        // Tell the realm to drop a game from the join list when the engine destroys it
         // (otherwise dead games linger until their redis TTL → "game name and password
-        // don't match" on join). srvtrace owns the game-destroy hook; d2cs sends CLOSEGAME.
+        // don't match" on join). srvtrace owns the game-destroy hook.
         const srvtrace = @import("runtime/feature/srvtrace.zig");
         srvtrace.on_game_destroy = &d2cs.onGameDestroyed;
-        // Same idea for population: realmd sees every join (they go through it) but never a
+        // Same idea for population: the realm sees every join (they go through it) but never a
         // leave, so its PLAYERS column only counts up. We hold the real number, so we send it.
         srvtrace.on_players_changed = &d2cs.onPlayersChanged;
-        d2cs.start(@ptrCast(&d2cs_host), d2cs_port, gs_public_ip, gs_public_port, gs_max_games, gsid);
+        d2cs.start(gs_public_ip, gs_public_port, gs_max_games, gsid);
     }
 
-    // One-shot D2DBS character fetch demo (--d2dbs <ip:port> --fetch-char acct:char).
-    if (d2dbs_enabled and fetch_enabled) {
-        _ = CreateThread(null, 0, fetchCharThread, null, 0, null);
-    }
-
-    // Idle fast-path: the engine's per-tick server work (packet handling + stepping
-    // every game) runs flat-out even with zero games — pure overhead that pegs ~0.7
-    // of a core on the cluster. When no game is live we skip it and the GS idles like
-    // a bare Sleep loop. The control path (command/realm) is still pumped every tick,
-    // so a realm CREATEGAME runs and bumps d2cs's live count (set at create, before
-    // the join) — we resume full ticking before the joining client ever connects.
+    // Idle fast-path: the engine's per-tick server work runs flat-out even with zero games (~0.7
+    // core of pure overhead), so we skip it when idle and idle like a bare Sleep loop. The
+    // control path (command/realm) still pumps every tick, so a realm CREATEGAME bumps d2cs's
+    // live count (set at create, before join) and full ticking resumes before the client connects.
     //
-    // d2cs's count covers the whole create→join→destroy span; a join-based count
-    // would deadlock (the join can't be serviced while we skip the network). Open
-    // mode has no d2cs control path (clients connect to QServer to host), so it can't
-    // be gated safely — keep full ticking there. A rare safety tick guards against a
-    // count that's ever wrong: the GS steps slowly rather than freezing.
-    // Idle pacing: retail's own loop (QSERVER_CooperativeThreadMain) sleeps 10 ms when nothing
-    // is running, so a client arriving at an empty GS is noticed promptly. The safety tick then
-    // lands at ~1 Hz, which is only there to accept and reap, not to simulate.
+    // d2cs's count spans create->join->destroy; a join-based count would deadlock (join can't be
+    // serviced while networking is skipped). Open mode has no d2cs control path, so it always
+    // ticks fully. A ~1 Hz safety tick (retail's QSERVER_CooperativeThreadMain sleeps 10ms idle)
+    // guards a count that's ever wrong by stepping slowly instead of freezing.
     const IDLE_SLEEP_MS: u32 = 10;
     const IDLE_TICKS_PER_SAFETY: u64 = 100;
     var idle_ticks: u64 = 0;

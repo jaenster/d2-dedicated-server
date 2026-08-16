@@ -74,12 +74,9 @@ fn d2sWithProgression(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8,
     return out;
 }
 
-/// A save with a real attribute section: the header, then the "gf" marker and a packed
-/// list holding level and experience. Experience is not a header field — it is an entry in
-/// that list — so a fixture without one cannot exercise ranking by it.
-///
-/// Widths are ItemStatCost.txt's CSvBits: id is 9 bits, level 7, experience 32, and the
-/// list ends with id 0x1FF.
+/// A save with a real attribute section: header, then "gf" marker + a packed list holding
+/// level and experience (not a header field; a fixture without this can't rank by it).
+/// Widths are ItemStatCost.txt's CSvBits: id 9 bits, level 7, experience 32, list ends id 0x1FF.
 fn d2sWithExperience(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, experience: u32) []const u8 {
     @memset(buf, 0);
     std.mem.writeInt(u32, buf[0..4], D2S_SIGNATURE, .little);
@@ -109,9 +106,7 @@ fn d2sWithExperience(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, 
     return buf[0 .. 0x32 + (bit + 7) / 8];
 }
 
-// ---------------------------------------------------------------------------
 // Scenarios
-// ---------------------------------------------------------------------------
 
 fn scLogin() Result {
     const name = "login";
@@ -135,8 +130,8 @@ fn scMcpOn6112() Result {
     const char = "MuxSorc";
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 7); // 1 = Sorceress
-    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+    const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
 
     // MCP muxed onto the SAME port as BNCS — the point of the scenario, so it follows
     // the bnet port rather than the literal 6112.
@@ -167,8 +162,8 @@ fn scCharListStatstring() Result {
     const char = "StatSorc";
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 42); // 1 = Sorceress
-    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+    const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -204,8 +199,8 @@ fn scCharCopy() Result {
     const dst = "CopyCat";
     var d2sbuf: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2sbuf, src, 1, 20); // Sorceress, level 20
-    const sr = rc.d2dbsSave(acct, src, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+    const sr = rc.storePutChar(acct, src, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
 
     // Clone Original -> CopyCat within the same account via the admin API.
     var jb: [160]u8 = undefined;
@@ -254,15 +249,15 @@ fn scClassicChar() Result {
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
     // A classic Barbarian (class 4, no expansion bit) must be allowed.
-    const barb = c.charCreate(4, 0, "ClassicBarb") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const barb = c.charCreateFresh(4, 0, "ClassicBarb") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (barb != 0) return fail(name, "classic Barbarian rejected (result=0x{x})", .{barb});
 
     // A classic Druid (class 5) must be REJECTED — Druid/Assassin are expansion-only.
-    const cdruid = c.charCreate(5, 0, "ClassicDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cdruid = c.charCreateFresh(5, 0, "ClassicDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (cdruid == 0) return fail(name, "classic Druid was allowed, want rejection", .{});
 
     // The same Druid WITH the expansion bit must be allowed.
-    const xdruid = c.charCreate(5, 0x20, "ExpacDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const xdruid = c.charCreateFresh(5, 0x20, "ExpacDruid") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (xdruid != 0) return fail(name, "expansion Druid rejected (result=0x{x})", .{xdruid});
 
     return .{ .name = name, .status = .pass, .msg = msg("classic Barbarian ok, classic Druid rejected (0x{x}), expansion Druid ok", .{cdruid}) };
@@ -272,9 +267,9 @@ fn scLadder() Result {
     const name = "ladder_list";
     const acct = "LadderAcct";
     var d2s: [0x40]u8 = undefined;
-    const king = rc.d2dbsSave(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const king = rc.storePutChar(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (king != 0) return fail(name, "save LadderKing result={d}", .{king});
-    const pawn = rc.d2dbsSave(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const pawn = rc.storePutChar(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (pawn != 0) return fail(name, "save LadderPawn result={d}", .{pawn});
 
     var c = rc.RealmClient{};
@@ -313,9 +308,9 @@ fn scLadderExperience() Result {
     const name = "ladder_experience";
     const acct = "ExpAcct";
     var buf: [0x80]u8 = undefined;
-    const ahead = rc.d2dbsSave(acct, "ExpAhead", d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const ahead = rc.storePutChar(acct, "ExpAhead", d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (ahead != 0) return fail(name, "save ExpAhead result={d}", .{ahead});
-    const behind = rc.d2dbsSave(acct, "ExpBehind", d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const behind = rc.storePutChar(acct, "ExpBehind", d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (behind != 0) return fail(name, "save ExpBehind result={d}", .{behind});
 
     var c = rc.RealmClient{};
@@ -362,7 +357,7 @@ fn scCharUpgrade() Result {
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
     // A classic character: status carries no expansion bit, so the list reports flags 0.
-    const created = c.charCreate(4, 0, "Classicus") catch |e| return fail(name, "{s}", .{@errorName(e)}); // Barbarian
+    const created = c.charCreateFresh(4, 0, "Classicus") catch |e| return fail(name, "{s}", .{@errorName(e)}); // Barbarian
     if (created != 0) return fail(name, "create result=0x{x}", .{created});
 
     const before = charFlags(&c, "Classicus") orelse return fail(name, "'Classicus' missing from the list before upgrade", .{});
@@ -412,7 +407,7 @@ fn scCharCreate() Result {
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
     // MCP_CHARCREATE a Sorceress (class 1) — realmd must build + persist a level-1 .d2s.
-    const res = c.charCreate(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const res = c.charCreateFresh(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (res != 0) return fail(name, "create result={d} want 0", .{res});
 
     // It must now appear in CHARLIST2 as a level-1 Sorceress.
@@ -440,8 +435,8 @@ fn scCharDelete() Result {
     const char = "DeleteMe";
     var d2s: [0x40]u8 = undefined;
     const blob = minimalD2s(&d2s, char, 1, 10);
-    const sr = rc.d2dbsSave(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "d2dbs save result={d}", .{sr});
+    const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -478,7 +473,7 @@ fn scCreateJoinGame() Result {
     var gs = FakeGS{ .gsid = 0xABCD, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 42 };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -489,7 +484,7 @@ fn scCreateJoinGame() Result {
     c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
-    // Tokens are now realm-global minted values (NOT the GS gameid) — the qqserver
+    // Tokens are now realm-global minted values (NOT the GS gameid) — the d2ingress
     // translates them back to the gameid. So assert non-zero + uniqueness, not == 42.
     const cg = c.createGame("mygame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
@@ -516,7 +511,7 @@ fn scGamePopulation() Result {
     var gs = FakeGS{ .gsid = 0xF00D, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 4242 };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -566,7 +561,7 @@ fn scGamePopulation() Result {
 }
 
 /// Poll the game list until 'popgame' reports `want` players. UPDATEGAMEINFO is fire-and-
-/// forget over the gs-link, so there is no reply to wait on — only the effect to observe.
+/// forget, so there is no reply to wait on — only the effect to observe.
 fn awaitPlayers(
     c: *rc.RealmClient,
     rows: []rc.GameEntry,
@@ -585,21 +580,17 @@ fn awaitPlayers(
     return false;
 }
 
-/// Every rejection the join screen can render, checked against the code the 1.14d client
-/// actually switches on (OOG_PollJoinCreatePump @0x441770). These were wrong in a way no
-/// existing test could catch: a swap between two plausible-looking codes shows the player
-/// "Game name and password don't match" for a game that was never there, and an unlisted
-/// code renders nothing at all.
-/// The join screen's detail panel. It used to answer token -1 unconditionally, which is
-/// the client's "no info" branch — it returns before reading anything else, so the panel
-/// stayed blank for every game. Now it carries the real thing, which means the packet has
-/// to be laid out the way Incoming0x06 scatters it.
+/// Every rejection code is checked against what the 1.14d client actually switches on
+/// (OOG_PollJoinCreatePump @0x441770) — a swap between two plausible codes used to show
+/// the wrong rejection message, or render nothing. The join screen's detail panel used to
+/// answer token -1 unconditionally (the client's "no info" branch), leaving it blank for
+/// every game; now it carries the real thing, laid out the way Incoming0x06 scatters it.
 fn scGameInfo() Result {
     const name = "game_info_panel";
     var gs = FakeGS{ .gsid = 0x1F0, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 909 };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -658,7 +649,7 @@ fn scJoinErrors() Result {
     var gs = FakeGS{ .gsid = 0xE770, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 777 };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register over gs-link", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     var c = rc.RealmClient{};
     defer c.close();
@@ -750,35 +741,6 @@ fn scFleetCapacity() Result {
 /// Nightmare and Hell are earned. The thresholds are the client's own: CharSel @0x4349b0
 /// offers a difficulty at all only above progression 3 (classic) / 4 (expansion), and
 /// UIMENU_SelectDifficultySinglePlayerOrTcpip @0x439780 reveals Hell above 7 / 9.
-/// The d2dbs GET_DATA reply carries a create time and a ladder flag next to the save. Both
-/// were hardcoded to zero, which told the GS every character was brand new and non-ladder.
-fn scCharFetchMeta() Result {
-    const name = "char_fetch_meta";
-    const acct = "MetaAcct";
-    var buf: [0x80]u8 = undefined;
-
-    // A ladder character (status bit 0x40) with a known create time in the header.
-    const blob = d2sWithProgression(&buf, "MetaLadder", 1, 50, 5);
-    buf[0x24] = 0x20 | 0x40; // expansion + ladder
-    std.mem.writeInt(u32, buf[0x2c..][0..4], 0x5A5A1234, .little);
-    const sr = rc.d2dbsSave(acct, "MetaLadder", blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
-    if (sr != 0) return fail(name, "save result={d}", .{sr});
-
-    const got = rc.d2dbsGet(acct, "MetaLadder") catch |e| return fail(name, "get {s}", .{@errorName(e)});
-    if (got.result != 0) return fail(name, "get result={d}", .{got.result});
-    if (got.createtime != 0x5A5A1234) return fail(name, "createtime 0x{x}, want the header's 0x5a5a1234", .{got.createtime});
-    if (got.allowladder != 1) return fail(name, "a ladder character reported allowladder={d}, want 1", .{got.allowladder});
-
-    // And a non-ladder one must not claim to be.
-    const plain = d2sWithProgression(&buf, "MetaPlain", 1, 50, 5);
-    buf[0x24] = 0x20; // expansion, no ladder
-    _ = rc.d2dbsSave(acct, "MetaPlain", plain) catch |e| return fail(name, "save {s}", .{@errorName(e)});
-    const got2 = rc.d2dbsGet(acct, "MetaPlain") catch |e| return fail(name, "get {s}", .{@errorName(e)});
-    if (got2.allowladder != 0) return fail(name, "a non-ladder character reported allowladder={d}, want 0", .{got2.allowladder});
-
-    return .{ .name = name, .status = .pass, .msg = msg("create time and ladder flag come from the save header, not zeros", .{}) };
-}
-
 fn scDifficultyGate() Result {
     const name = "difficulty_gate";
     const acct = "DiffAcct";
@@ -798,13 +760,13 @@ fn scDifficultyGate() Result {
     };
     for (chars) |ch| {
         const blob = d2sWithProgression(&buf, ch.name, 1, 80, ch.prog);
-        const r = rc.d2dbsSave(acct, ch.name, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+        const r = rc.storePutChar(acct, ch.name, blob) catch |e| return fail(name, "save {s}", .{@errorName(e)});
         if (r != 0) return fail(name, "save {s} result={d}", .{ ch.name, r });
     }
 
     // The games themselves are made by a character that has cleared everything.
     const maker = d2sWithProgression(&buf, "DiffMaker", 1, 99, 15);
-    _ = rc.d2dbsSave(acct, "DiffMaker", maker) catch |e| return fail(name, "save maker {s}", .{@errorName(e)});
+    _ = rc.storePutChar(acct, "DiffMaker", maker) catch |e| return fail(name, "save maker {s}", .{@errorName(e)});
 
     var owner = rc.RealmClient{};
     defer owner.close();
@@ -880,20 +842,13 @@ fn scGetFileTime() Result {
     return .{ .name = name, .status = .pass, .msg = msg("held file reports a real FILETIME ({d}); an absent one reports 0", .{held}) };
 }
 
-/// Since the channel list started showing characters, the name a player can SEE is not the
-/// account. Everything that takes a name — whisper, /whois, /ignore — has to accept it, or
-/// the one name in front of them is the one name that does not work.
-/// Load: a full friends list, every entry online and in a channel. The reply is built into
-/// a fixed stack buffer, and this is the shape that overflows it — 50 entries at the
-/// longest name and channel is ~2.8KB, against the 2048 it used to be given. Before the
-/// bounds-checked writer that was an out-of-bounds slice, i.e. the server going down
-/// because somebody had too many friends.
-/// Concurrency. Everything the realm keeps — the chat registry, the session table, the
-/// game table, the per-game rosters — sits behind spinlocks touched from one thread per
-/// connection, and every scenario up to here has been essentially single-file. This runs
-/// many clients at once through login, chat and disconnect, then checks the realm is still
-/// coherent rather than merely still running: a fresh client must log in, and the channel
-/// must not still be holding people who left.
+/// The channel list shows characters, not accounts, so whisper/whois/ignore must accept the
+/// name the player actually sees. Load test: a full friends list, every entry online/in a
+/// channel — 50 entries at max name+channel length is ~2.8KB against the 2048-byte buffer it
+/// used to get; before the bounds-checked writer that was an OOB slice (server down because
+/// someone had too many friends). Concurrency: everything the realm keeps (chat registry,
+/// session table, game table, rosters) sits behind per-connection spinlocks; this runs many
+/// clients at once and checks the realm stays coherent, not just running.
 const stress_clients = 64;
 
 const StressWorker = struct {
@@ -945,12 +900,10 @@ fn scConcurrentClients() Result {
     // serving rather than merely slowed down.
     if (succeeded * 4 < spawned * 3) return fail(name, "only {d}/{d} concurrent clients completed", .{ succeeded, spawned });
 
-    // They have all disconnected. The realm must still take a new client — the check that
-    // the listener and the tables survived the churn, not just that the process is up.
-    //
-    // The wait is for the server to NOTICE: each worker's socket close has to be observed
-    // by its own read loop before the member is gone, and joining them here only proves
-    // our side finished. Probing too early reads teardown-in-progress as a leak.
+    // All disconnected; the realm must still take a new client (listener + tables survived the
+    // churn). The wait is for the server to NOTICE: each socket close must be observed by its
+    // own read loop, and joining our workers only proves our side finished — probing too early
+    // reads teardown-in-progress as a leak.
     _ = net.usleep(1_500_000);
     var after = rc.RealmClient{};
     defer after.close();
@@ -1450,9 +1403,7 @@ fn skip(name: []const u8, m: []const u8) Result {
     return .{ .name = name, .status = .skip, .msg = m };
 }
 
-// ---------------------------------------------------------------------------
 // realmd child management
-// ---------------------------------------------------------------------------
 fn waitPort(port: u16, deadline_ms: u32) bool {
     var waited: u32 = 0;
     while (waited < deadline_ms) : (waited += 100) {
@@ -1465,17 +1416,10 @@ fn waitPort(port: u16, deadline_ms: u32) bool {
 /// A single REALMD_* env override (name/value) applied before fork+execve.
 const EnvVar = struct { name: [*:0]const u8, value: [*:0]const u8 };
 
-/// fork+execve a realmd child, applying `envs` to our environ first (the child
-/// inherits the augmented environ). Returns the child pid. Waits up to 10s for
-/// `wait_port` to listen; exits the harness if it never comes up.
-/// Spawn a realmd with `envs` set, WITHOUT leaving them set in this process afterwards.
-///
-/// The child inherits the environment across fork+execve, so the values have to be in our
-/// own environ at the moment we fork — but leaving them there reconfigures every scenario
-/// that runs later. That is not hypothetical: a scenario spawning an instance with its own
-/// REALMD_DATA_DIR silently redirected every subsequent scenario's idea of where the
-/// harness's data lives, so files staged for a test went to one directory while the realmd
-/// under test read another. Snapshot, fork, put it back.
+/// fork+execve a realmd child with `envs` applied (child inherits our environ, so the values
+/// must be set at fork time), then restored afterwards — a scenario spawning its own
+/// REALMD_DATA_DIR once silently redirected every later scenario's idea of where data lives.
+/// Returns the child pid; waits up to 10s for `wait_port` to listen, exits the harness if not.
 fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
     // COPY the old values: getenv returns a pointer into the environ block, and the
     // setenv below overwrites that very entry, so keeping the pointer would restore
@@ -1521,38 +1465,56 @@ fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
 /// fork+execve realmd with REALMD_DATA_DIR/REALMD_HEALTH_PORT set in our env
 /// (inherited by the child). Returns the child pid, or null on existing realmd.
 // The realm runs ephemeral state (sessions + games + token routes) in redis, and the
-// qqserver reads token routes from it asynchronously — so the harness brings up a real
-// redis in docker, points realmd + qqserver at it, and flushes it for a clean slate.
+// d2ingress reads token routes from it asynchronously — so the harness brings up a real
+// redis in docker, points realmd + d2ingress at it, and flushes it for a clean slate.
 const REDIS_HOST_PORT: u16 = 6399;
+const PG_HOST_PORT: u16 = 55499;
 
-fn startRedis() void {
-    _ = system("docker rm -f e2e-redis >/dev/null 2>&1"); // clear any stale container
+/// Bring up the two stores realmd needs. Both, always: there is no filesystem fallback to fall
+/// back to, which is the point — a harness that could run without them would be testing a
+/// configuration that does not exist.
+fn startStores() void {
+    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1"); // clear stale containers
     if (system("docker run -d --rm --name e2e-redis -p 6399:6379 redis:7-alpine >/dev/null 2>&1") != 0) {
-        std.debug.print("ERROR: could not start redis container (docker is required for ephemeral=redis).\n", .{});
+        std.debug.print("ERROR: could not start the redis container (docker is required).\n", .{});
         std.process.exit(2);
     }
-    if (!waitPort(REDIS_HOST_PORT, 10_000)) {
-        std.debug.print("ERROR: redis container did not come up on :{d}\n", .{REDIS_HOST_PORT});
-        _ = system("docker rm -f e2e-redis >/dev/null 2>&1");
+    if (system("docker run -d --rm --name e2e-postgres -p 55499:5432 " ++
+        "-e POSTGRES_USER=realmd -e POSTGRES_PASSWORD=realmd -e POSTGRES_DB=realmd " ++
+        "postgres:16-alpine >/dev/null 2>&1") != 0)
+    {
+        std.debug.print("ERROR: could not start the postgres container (docker is required).\n", .{});
+        stopStores();
+        std.process.exit(2);
+    }
+    if (!waitPort(REDIS_HOST_PORT, 10_000) or !waitPort(PG_HOST_PORT, 30_000)) {
+        std.debug.print("ERROR: a store container did not come up (redis :{d}, postgres :{d})\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
+        stopStores();
         std.process.exit(2);
     }
     _ = system("docker exec e2e-redis redis-cli FLUSHALL >/dev/null 2>&1"); // clean slate
-    _ = setenv("REALMD_EPHEMERAL_STORE", "redis", 1);
     _ = setenv("REALMD_REDIS_ADDR", "127.0.0.1:6399", 1);
-    std.debug.print("started redis container e2e-redis on :{d} (ephemeral=redis)\n", .{REDIS_HOST_PORT});
+    _ = setenv("REALMD_PG_DSN", "postgres://realmd:realmd@127.0.0.1:55499/realmd", 1);
+    // The port being open is not the same as the server accepting connections; postgres listens
+    // briefly before it will talk. Wait for a query to actually succeed rather than for realmd to
+    // discover it the hard way.
+    var waited: u32 = 0;
+    while (waited < 30_000) : (waited += 250) {
+        if (system("docker exec e2e-postgres pg_isready -q -U realmd >/dev/null 2>&1") == 0) break;
+        _ = net.usleep(250_000);
+    }
+    std.debug.print("started e2e-redis :{d} and e2e-postgres :{d}\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
 }
 
-fn stopRedis() void {
-    _ = system("docker rm -f e2e-redis >/dev/null 2>&1");
+fn stopStores() void {
+    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1");
 }
 
 fn maybeStartRealmd() !?c_int {
     if (net.portOpen(rc.HOST_BNET)) {
-        // Reusing whatever answers on the port is convenient when you are iterating
-        // against a realm you already have up — and a trap the rest of the time. That
-        // server is not the binary that was just built, was not given this harness's
-        // data dir, admin token or permissive-auth setting, and carries state from
-        // whatever else has been talking to it. Failures then look like code bugs.
+        // Reusing whatever answers on the port is convenient when iterating against a realm
+        // already up, and a trap otherwise: that server isn't the binary just built, wasn't
+        // given this harness's data dir/admin token/permissive-auth, and carries other state.
         // Set E2E_NO_REUSE=1 to refuse instead of guessing.
         std.debug.print(
             \\
@@ -1590,15 +1552,16 @@ fn maybeStartRealmd() !?c_int {
     var pbuf: [6][8]u8 = undefined;
     const ports = [_]struct { name: [*:0]const u8, port: u16 }{
         .{ .name = "REALMD_BNET_PORT", .port = rc.HOST_BNET },
-        .{ .name = "REALMD_D2CS_PORT", .port = rc.HOST_D2CS },
-        .{ .name = "REALMD_D2DBS_PORT", .port = rc.HOST_D2DBS },
-        .{ .name = "REALMD_GS_PORT", .port = rc.HOST_GS },
     };
     for (ports, 0..) |pp, i| {
         if (std.fmt.bufPrintZ(&pbuf[i], "{d}", .{pp.port})) |v| {
             _ = setenv(pp.name, v.ptr, 1);
         } else |_| {}
     }
+    // Mandatory: the address clients are told to dial for game traffic. realmd refuses to start
+    // without it, because a client sent straight at a game server presents a realm-global token
+    // that server has never heard of.
+    _ = setenv("REALMD_GAME_ADDR", "127.0.0.1", 1);
     _ = setenv("REALMD_ADMIN_TOKEN", ADMIN_TOKEN, 1); // enable the admin API (admin_api scenario)
     _ = setenv("REALMD_PERMISSIVE_AUTH", "1", 1); // legacy auth (auto-register + verify) for the synthetic xsha1 client
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
@@ -1690,11 +1653,9 @@ fn scBannerAd() Result {
         .{ .name = "REALMD_AD_FILE", .value = "banner.pcx" },
         .{ .name = "REALMD_AD_URL", .value = "https://example.invalid/promo" },
         .{ .name = "REALMD_BNET_PORT", .value = "20112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "20113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "20114" },
-        .{ .name = "REALMD_GS_PORT", .value = "20115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "20118" },
         .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const pid = spawnRealmd(bin, &envs, 20112) catch |e| return fail(name, "spawn {s}", .{@errorName(e)});
     defer {
@@ -1702,7 +1663,7 @@ fn scBannerAd() Result {
         _ = waitpid(pid, null, 0);
     }
 
-    var c = rc.RealmClient{ .bnet_port = 20112, .d2cs_port = 20113 };
+    var c = rc.RealmClient{ .bnet_port = 20112, .d2cs_port = 20112 };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1736,13 +1697,11 @@ fn scBannerAd() Result {
     return .{ .name = name, .status = .pass, .msg = msg("ad 0x{x} '{s}' ({d}B body, stable id) clicks through to {s}", .{ ad.id, ad.filename, ad.body_len, click.url }) };
 }
 
-/// Friends have to outlive the process that heard about them. The list used to be an
-/// in-memory table, so every restart silently emptied everyone's friends.
-///
-/// A second realmd over the same data dir is a stronger test than a restart: it has an
-/// empty table AND never saw the /f add, so the only way it can list the friend is by
-/// reading it back from the store. Presence is deliberately NOT asserted — who is online
-/// is a fact about live connections, and the friend has none on that instance.
+/// Friends must outlive the process that heard about them (the list used to be in-memory,
+/// so restarts silently emptied it). A second realmd over the same data dir is a stronger
+/// test than a restart: its table is empty and it never saw the /f add, so it can only list
+/// the friend by reading the store. Presence is deliberately NOT asserted — that's a fact
+/// about live connections, and the friend has none on that instance.
 fn scFriendsPersist() Result {
     const name = "friends_persist";
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
@@ -1759,13 +1718,11 @@ fn scFriendsPersist() Result {
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_PERMISSIVE_AUTH", .value = "1" },
         .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const envs_w = base ++ [_]EnvVar{
         .{ .name = "REALMD_INSTANCE", .value = "FW" },
         .{ .name = "REALMD_BNET_PORT", .value = "21112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "21113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "21114" },
-        .{ .name = "REALMD_GS_PORT", .value = "21115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "21118" },
     };
     const writer_pid = spawnRealmd(bin, &envs_w, 21112) catch |e| return fail(name, "spawn writer {s}", .{@errorName(e)});
@@ -1774,7 +1731,7 @@ fn scFriendsPersist() Result {
         _ = waitpid(writer_pid, null, 0);
     }
 
-    var c = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21113 };
+    var c = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21112 };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1794,9 +1751,6 @@ fn scFriendsPersist() Result {
     const envs_r = base ++ [_]EnvVar{
         .{ .name = "REALMD_INSTANCE", .value = "FR" },
         .{ .name = "REALMD_BNET_PORT", .value = "22112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "22113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "22114" },
-        .{ .name = "REALMD_GS_PORT", .value = "22115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "22118" },
     };
     const cold_pid = spawnRealmd(bin, &envs_r, 22112) catch |e| return fail(name, "spawn cold {s}", .{@errorName(e)});
@@ -1805,7 +1759,7 @@ fn scFriendsPersist() Result {
         _ = waitpid(cold_pid, null, 0);
     }
 
-    var cold = rc.RealmClient{ .bnet_port = 22112, .d2cs_port = 22113 };
+    var cold = rc.RealmClient{ .bnet_port = 22112, .d2cs_port = 22112 };
     defer cold.close();
     cold.connectBnet() catch |e| return fail(name, "cold {s}", .{@errorName(e)});
     cold.auth() catch |e| return fail(name, "cold {s}", .{@errorName(e)});
@@ -1826,7 +1780,7 @@ fn scFriendsPersist() Result {
     // A friend who is actually in a channel should be reported as being there. This is the
     // only part of the friends feature a real 1.14d client can see, since it arrives as
     // chat text — the structured 0x65 reply is dropped by the client outright.
-    var pal = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21113 };
+    var pal = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21112 };
     defer pal.close();
     pal.connectBnet() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
     pal.auth() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
@@ -1856,8 +1810,107 @@ fn scFriendsPersist() Result {
 
 // Two realmd instances (A, B) sharing one data dir (REALMD_SHARED) keep sessions
 // in a shared store: a session minted on A's bnetd must resolve on B's d2cs.
-// Instance A: bnet 16112 / d2cs 16113 / d2dbs 16114 / gs 16115 / health 16118.
+// Instance A: bnet 16112 / health 16118.
 // Instance B: 17112 / 17113 / 17114 / 17115 / 17118, SAME data dir, instance "B".
+/// Chat across two realmd instances: a channel is the union of what every instance holds, or it
+/// is not a channel. The failure this guards is silent — talk simply does not arrive, a whisper
+/// says "that user is not logged on" about someone plainly online, and the user list shows half
+/// the room with nothing to say it is half.
+fn scChatAcrossInstances() Result {
+    const name = "chat_across_instances";
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+    const channel = "Diablo II";
+
+    const envs_a = [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "ChatA" },
+        .{ .name = "REALMD_BNET_PORT", .value = "16112" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+    };
+    const a_pid = spawnRealmd(bin, &envs_a, 16112) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
+    const envs_b = [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "ChatB" },
+        .{ .name = "REALMD_BNET_PORT", .value = "17112" },
+        .{ .name = "REALMD_HEALTH_PORT", .value = "17118" },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+    };
+    const b_pid = spawnRealmd(bin, &envs_b, 17112) catch |e| {
+        _ = kill(a_pid, 15);
+        _ = waitpid(a_pid, null, 0);
+        return fail(name, "spawn B {s}", .{@errorName(e)});
+    };
+    defer {
+        _ = kill(a_pid, 15);
+        _ = kill(b_pid, 15);
+        _ = waitpid(a_pid, null, 0);
+        _ = waitpid(b_pid, null, 0);
+    }
+
+    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16112 };
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("CrossAlice") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChat() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.setBnetTimeout(3000);
+
+    // B joins second, on the OTHER instance, so its user list has to include someone it does not
+    // hold. This is the part that silently showed an empty room.
+    _ = net.usleep(200_000);
+    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17112 };
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.login("CrossBob") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChat() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.setBnetTimeout(3000);
+
+    var saw_alice = false;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const ev = b.readChatEvent() catch break;
+        if (ev.eid == rc.EID_SHOWUSER and std.mem.eql(u8, ev.username, "CrossAlice")) {
+            saw_alice = true;
+            break;
+        }
+    }
+    if (!saw_alice) return fail(name, "B's channel list did not include CrossAlice, who is on the other instance", .{});
+
+    // Talk has to cross.
+    _ = net.usleep(200_000);
+    a.chatCommand("hello from A") catch |e| return fail(name, "A talk {s}", .{@errorName(e)});
+    var heard = false;
+    i = 0;
+    while (i < 12) : (i += 1) {
+        const ev = b.readChatEvent() catch break;
+        if (ev.eid != rc.EID_TALK) continue;
+        if (!std.mem.eql(u8, ev.text, "hello from A")) continue;
+        heard = true;
+        break;
+    }
+    if (!heard) return fail(name, "B never heard A's channel talk from the other instance", .{});
+
+    // And a whisper has to find someone the sending instance has never seen.
+    b.chatCommand("/w CrossAlice psst") catch |e| return fail(name, "B whisper {s}", .{@errorName(e)});
+    var whispered = false;
+    i = 0;
+    while (i < 12) : (i += 1) {
+        const ev = a.readChatEvent() catch break;
+        if (ev.eid == rc.EID_ERROR) return fail(name, "whisper across instances refused: {s}", .{ev.text});
+        if (ev.eid != rc.EID_WHISPER) continue;
+        if (!std.mem.eql(u8, ev.text, "psst")) continue;
+        whispered = true;
+        break;
+    }
+    if (!whispered) return fail(name, "A never received the whisper B sent from the other instance", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("one channel across two instances: user list, talk and whisper all cross", .{}) };
+}
+
 fn scMultiInstance() Result {
     const name = "multi_instance";
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
@@ -1875,11 +1928,9 @@ fn scMultiInstance() Result {
         .{ .name = "REALMD_INSTANCE", .value = "A" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_BNET_PORT", .value = "16112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "16113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "16114" },
-        .{ .name = "REALMD_GS_PORT", .value = "16115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
         .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (avoid 14001 clash)
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const a_pid = spawnRealmd(bin, &envs_a, 16112) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
 
@@ -1888,11 +1939,9 @@ fn scMultiInstance() Result {
         .{ .name = "REALMD_INSTANCE", .value = "B" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_BNET_PORT", .value = "17112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "17113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "17114" },
-        .{ .name = "REALMD_GS_PORT", .value = "17115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "17118" },
         .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (avoid 14001 clash)
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const b_pid = spawnRealmd(bin, &envs_b, 17112) catch |e| {
         _ = kill(a_pid, 15);
@@ -1906,14 +1955,15 @@ fn scMultiInstance() Result {
         _ = waitpid(b_pid, null, 0);
     }
 
-    // A fake GS registers with instance A's gs-link so A can actually host a game.
-    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gameid = 77, .connect_port = 16115 };
+    // One fake GS, published into the shared store. It belongs to neither instance — that is the
+    // point: both see it, and either can place a game on it.
+    var gs = FakeGS{ .gsid = 0x9999, .ip = .{ 127, 0, 0, 1 }, .gameid = 77 };
     gs.start(2000) catch |e| return fail(name, "FakeGS {s}", .{@errorName(e)});
     defer gs.stop();
-    if (!gs.isRegistered()) return fail(name, "FakeGS did not register with instance A", .{});
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
     // Mint a session on instance A (bnetd 16112 -> d2cs handoff lives in shared store).
-    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16113 };
+    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16112 };
     defer a.close();
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
@@ -1923,7 +1973,7 @@ fn scMultiInstance() Result {
 
     // Resolve A's session on instance B's d2cs (17113). Copy A's session fields
     // into B's client so its STARTUP carries A's cookie/status/lo/hi/account.
-    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17113 };
+    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17112 };
     defer b.close();
     b.cookie = a.cookie;
     b.status = a.status;
@@ -1951,11 +2001,10 @@ fn scMultiInstance() Result {
 }
 
 // A tiny echo TCP server standing in for a real backend GS :4000 game port. Binds an
-// ephemeral port (read back via getsockname) and accepts connections in a loop, each on
-// its own thread, echoing whatever it reads. Looping (not one-shot) matters: the qqserver
-// port-probe opens a throwaway connection that the qqserver splices through to us, so the
-// real test connection must still get its own accept. `got`/`got_len` capture the first
-// non-empty payload so the scenario can assert bytes reached the backend.
+// ephemeral port (read via getsockname), accepts in a loop, one thread per connection,
+// echoing what it reads. Looping (not one-shot) matters: d2ingress opens a throwaway
+// port-probe connection first, so the real test connection still needs its own accept.
+// `got`/`got_len` capture the first non-empty payload so the scenario can assert delivery.
 const c_read = @extern(*const fn (c_int, [*]u8, usize) callconv(.c) isize, .{ .name = "read" });
 const c_write = @extern(*const fn (c_int, [*]const u8, usize) callconv(.c) isize, .{ .name = "write" });
 
@@ -1967,7 +2016,7 @@ const EchoServer = struct {
     got_len: usize = 0,
     // When set, each accepted conn opens with a 2-byte 0xAF00 greeting BEFORE it starts
     // echoing — mimicking the real 1.14d engine's leading connection-established frame that
-    // qqserver must strip (stripGsGreeting). Lets a scenario prove the strip end-to-end.
+    // d2ingress must strip (stripGsGreeting). Lets a scenario prove the strip end-to-end.
     send_greeting: bool = false,
 
     fn start(self: *EchoServer) !void {
@@ -2007,7 +2056,7 @@ const EchoServer = struct {
     fn echoConn(self: *EchoServer, cfd: c_int) void {
         defer _ = cclose(cfd);
         if (self.send_greeting) {
-            const greeting = [2]u8{ 0xAF, 0x00 }; // the leading frame qq must strip
+            const greeting = [2]u8{ 0xAF, 0x00 }; // the leading frame d2ingress must strip
             _ = c_write(cfd, &greeting, greeting.len);
         }
         var buf: [256]u8 = undefined;
@@ -2040,17 +2089,17 @@ const EchoServer = struct {
     }
 };
 
-/// fork+execve the qqserver binary (REALMD_QQSERVER_BIN, default ./zig-out/bin/qqserver).
-/// It reads token routes from redis (REALMD_REDIS_ADDR, inherited from startRedis) — the
-/// same redis realmd writes them to — and listens on REALMD_QQ_PORT. Waits up to 10s for
+/// fork+execve the d2ingress binary (REALMD_D2INGRESS_BIN, default ./zig-out/bin/d2ingress).
+/// It reads token routes from redis (REALMD_REDIS_ADDR, inherited from startStores) — the
+/// same redis realmd writes them to — and listens on REALMD_INGRESS_PORT. Waits up to 10s for
 /// the port; exits the harness if it never comes up. Mirrors spawnRealmd.
-fn spawnQqserver(qq_port: u16) !c_int {
-    const bin = envOr("REALMD_QQSERVER_BIN", "./zig-out/bin/qqserver");
+fn spawnD2ingress(ingress_port: u16) !c_int {
+    const bin = envOr("REALMD_D2INGRESS_BIN", "./zig-out/bin/d2ingress");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
     var pbuf: [8]u8 = undefined;
-    const portz = std.fmt.bufPrintZ(&pbuf, "{d}", .{qq_port}) catch return error.BadPort;
+    const portz = std.fmt.bufPrintZ(&pbuf, "{d}", .{ingress_port}) catch return error.BadPort;
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
-    _ = setenv("REALMD_QQ_PORT", portz.ptr, 1);
+    _ = setenv("REALMD_INGRESS_PORT", portz.ptr, 1);
     const pid = fork();
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
@@ -2058,37 +2107,34 @@ fn spawnQqserver(qq_port: u16) !c_int {
         _ = execve(bin.ptr, &argv, environ);
         std.process.exit(127);
     }
-    if (!waitPort(qq_port, 10_000)) {
+    if (!waitPort(ingress_port, 10_000)) {
         _ = kill(pid, 9);
-        std.debug.print("ERROR: qqserver did not start listening on {d} in time.\n", .{qq_port});
+        std.debug.print("ERROR: d2ingress did not start listening on {d} in time.\n", .{ingress_port});
         std.process.exit(2);
     }
     return pid;
 }
 
 // Token-offset of the u16 game token in the crafted GAMELOGON (0x68), matching the
-// qqserver's TOKEN_OFFSET: nId(u8) ++ nGameHash(u32) ++ nGameToken(u16) → byte 5.
-const QQ_TOKEN_OFFSET: usize = 5;
+// d2ingress's TOKEN_OFFSET: nId(u8) ++ nGameHash(u32) ++ nGameToken(u16) → byte 5.
+const INGRESS_TOKEN_OFFSET: usize = 5;
 
-// Prove the NAT-proof gateway path: realmd mints a globally-unique token on JOIN and the
-// qqserver translates it — rewriting the in-packet token to the GS's real gameid — then
-// splices the client's game connection to the right backend.
-//   1. an echo server stands in for the backend GS game port (ephemeral port P), and
-//      captures the first packet it receives so we can assert the rewritten token.
-//   2. a FakeGS registers with ip=127.0.0.1 / gs_port=P and a known gameid=3.
-//   3. a client create+joins — realmd records {token T -> 127.0.0.1:P, gameid 3} and
-//      returns T in the join reply.
-//   4. spawn the qqserver on :14000, pointed at the same redis realmd wrote the route to.
-//   5. connect to :14000 and send a crafted GAMELOGON: buf[0]=0x68, token T at offset 5,
-//      tail "PAYLOAD". Assert the echo server received byte[0]==0x68, the u16 at offset 5
-//      == 3 (the GS gameid — proves the rewrite), and the tail matches (proves splice).
-fn scQqserverTokenTranslate() Result {
-    const name = "qqserver_token_translate";
-    const QQ_PORT: u16 = 14000;
+// Prove the NAT-proof gateway path: realmd mints a globally-unique token on JOIN, d2ingress
+// rewrites the in-packet token to the GS's real gameid, then splices to the right backend.
+//   1. echo server stands in for the backend GS game port (ephemeral port P), captures the
+//      first packet so we can assert the rewritten token.
+//   2. FakeGS registers with ip=127.0.0.1 / gs_port=P and a known gameid=3.
+//   3. client create+joins — realmd records {token T -> 127.0.0.1:P, gameid 3}, returns T.
+//   4. spawn d2ingress on :14000, pointed at the same redis realmd wrote the route to.
+//   5. connect to :14000, send GAMELOGON buf[0]=0x68, token T @offset 5, tail "PAYLOAD".
+//      Assert echo got byte[0]==0x68, u16@5==3 (rewrite proof), tail matches (splice proof).
+fn scD2ingressTokenTranslate() Result {
+    const name = "d2ingress_token_translate";
+    const INGRESS_PORT: u16 = 14000;
     const GS_GAMEID: u32 = 3;
 
     // Greeting ON: the echo backend opens with 0xAF00 (like the real engine), so this
-    // scenario also proves qqserver STRIPS the GS greeting — if it didn't, the client's
+    // scenario also proves d2ingress STRIPS the GS greeting — if it didn't, the client's
     // first post-handshake byte would be 0xAF, not the echoed 0x68 packet (assert below).
     var echo = EchoServer{ .send_greeting = true };
     echo.start() catch |e| return fail(name, "echo start {s}", .{@errorName(e)});
@@ -2103,37 +2149,37 @@ fn scQqserverTokenTranslate() Result {
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.login("QqGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("IngressGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
     if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
 
-    const cg = c.createGame("qqgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cg = c.createGame("ingressgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
     // The join mints a unique token and records {token -> 127.0.0.1:echo.port, gameid 3}.
-    const jg = c.joinGame("qqgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const jg = c.joinGame("ingressgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
-    const token = jg.token; // realm-global token the qqserver will translate
+    const token = jg.token; // realm-global token the d2ingress will translate
     if (token == 0) return fail(name, "join returned token=0 (expected a minted token)", .{});
 
-    const qq_pid = spawnQqserver(QQ_PORT) catch |e| return fail(name, "spawn qqserver {s}", .{@errorName(e)});
+    const ingress_pid = spawnD2ingress(INGRESS_PORT) catch |e| return fail(name, "spawn d2ingress {s}", .{@errorName(e)});
     defer {
-        _ = kill(qq_pid, 15);
-        _ = waitpid(qq_pid, null, 0);
+        _ = kill(ingress_pid, 15);
+        _ = waitpid(ingress_pid, null, 0);
     }
 
     // Craft a GAMELOGON: id 0x68, gameHash u32, the minted token at offset 5, tail PAYLOAD.
     const tail = "PAYLOAD";
-    var logon: [QQ_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
+    var logon: [INGRESS_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
     @memset(&logon, 0);
     logon[0] = 0x68;
-    std.mem.writeInt(u16, logon[QQ_TOKEN_OFFSET..][0..2], token, .little);
-    @memcpy(logon[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
+    std.mem.writeInt(u16, logon[INGRESS_TOKEN_OFFSET..][0..2], token, .little);
+    @memcpy(logon[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
 
-    const fd = net.connectLocal(QQ_PORT) catch |e| return fail(name, "connect qq {s}", .{@errorName(e)});
+    const fd = net.connectLocal(INGRESS_PORT) catch |e| return fail(name, "connect d2ingress {s}", .{@errorName(e)});
     defer net.closeSocket(fd);
 
-    // On accept the qqserver speaks for the not-yet-dialled GS and sends a 2-byte 0xAF00
+    // On accept the d2ingress speaks for the not-yet-dialled GS and sends a 2-byte 0xAF00
     // connection-established handshake (real D2GS setup; see main.zig accept loop). Consume
     // it before the echoed game packet, or it shifts every later byte by two.
     var hs: [2]u8 = undefined;
@@ -2142,11 +2188,11 @@ fn scQqserverTokenTranslate() Result {
 
     net.writeAll(fd, &logon) catch |e| return fail(name, "send {s}", .{@errorName(e)});
 
-    // The qqserver replays the (rewritten) packet to the echo backend, which echoes it —
-    // AFTER opening with a 0xAF00 greeting that qq must strip. So the first byte we read here
+    // The d2ingress replays the (rewritten) packet to the echo backend, which echoes it —
+    // AFTER opening with a 0xAF00 greeting that d2ingress must strip. So the first byte we read here
     // is the echoed 0x68 packet; a 0xAF would mean the GS-greeting strip failed to remove it.
     var back: [logon.len]u8 = undefined;
-    net.readFull(fd, &back) catch |e| return fail(name, "no echo back through qq ({s})", .{@errorName(e)});
+    net.readFull(fd, &back) catch |e| return fail(name, "no echo back through d2ingress ({s})", .{@errorName(e)});
     if (back[0] == 0xaf) return fail(name, "GS greeting NOT stripped — client got 0xAF as first game byte", .{});
 
     // Backend must have seen the rewritten packet: id 0x68, token now == GS gameid 3, tail intact.
@@ -2155,22 +2201,22 @@ fn scQqserverTokenTranslate() Result {
     const got = echo.received();
     if (got.len < logon.len) return fail(name, "backend saw {d} bytes, want {d}", .{ got.len, logon.len });
     if (got[0] != 0x68) return fail(name, "backend first byte 0x{x:0>2}, want 0x68", .{got[0]});
-    const got_token = std.mem.readInt(u16, got[QQ_TOKEN_OFFSET..][0..2], .little);
+    const got_token = std.mem.readInt(u16, got[INGRESS_TOKEN_OFFSET..][0..2], .little);
     if (got_token != @as(u16, @truncate(GS_GAMEID)))
         return fail(name, "rewritten token={d}, want {d} (GS gameid)", .{ got_token, GS_GAMEID });
-    if (!std.mem.eql(u8, got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
-        return fail(name, "tail '{s}', want '{s}'", .{ got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail });
-    if (back[0] != 0x68 or std.mem.readInt(u16, back[QQ_TOKEN_OFFSET..][0..2], .little) != @as(u16, @truncate(GS_GAMEID)))
+    if (!std.mem.eql(u8, got[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
+        return fail(name, "tail '{s}', want '{s}'", .{ got[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail });
+    if (back[0] != 0x68 or std.mem.readInt(u16, back[INGRESS_TOKEN_OFFSET..][0..2], .little) != @as(u16, @truncate(GS_GAMEID)))
         return fail(name, "echoed packet not the rewritten one", .{});
 
     return .{ .name = name, .status = .pass, .msg = msg("token 0x{x} translated to gameid {d}, packet rewritten + spliced to backend :{d}", .{ token, GS_GAMEID, echo.port }) };
 }
 
-// Same token-translate splice as the qqserver test, but through realmd's EMBEDDED game
-// edge (gameedge.zig) instead of a standalone qqserver — proves the lightweight single-
+// Same token-translate splice as the d2ingress test, but through realmd's EMBEDDED game
+// edge (gameedge.zig) instead of a standalone d2ingress — proves the lightweight single-
 // binary path: in-process route lookup + thread-per-conn splice. Runs in a DEDICATED
 // realmd instance (sharing the redis store) because the embedded edge and a standalone
-// qqserver are mutually-exclusive deploy modes — we don't want both in one process.
+// d2ingress are mutually-exclusive deploy modes — we don't want both in one process.
 fn scEmbeddedGameEdge() Result {
     const name = "embedded_game_edge";
     const EDGE_PORT: u16 = 14001;
@@ -2188,11 +2234,9 @@ fn scEmbeddedGameEdge() Result {
         .{ .name = "REALMD_INSTANCE", .value = "E" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_BNET_PORT", .value = "18112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "18113" },
-        .{ .name = "REALMD_D2DBS_PORT", .value = "18114" },
-        .{ .name = "REALMD_GS_PORT", .value = "18115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "18118" },
         .{ .name = "REALMD_GAME_PORT", .value = "14001" }, // the embedded edge under test
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
     const pid = spawnRealmd(bin, &envs, 18112) catch |e| return fail(name, "spawn edge realmd {s}", .{@errorName(e)});
     defer {
@@ -2205,12 +2249,12 @@ fn scEmbeddedGameEdge() Result {
     echo.start() catch |e| return fail(name, "echo start {s}", .{@errorName(e)});
     defer echo.stop();
 
-    var gs = FakeGS{ .gsid = 0x8888, .ip = .{ 127, 0, 0, 1 }, .gs_port = echo.port, .connect_port = 18115, .maxgame = 10, .gameid = GS_GAMEID };
+    var gs = FakeGS{ .gsid = 0x8888, .ip = .{ 127, 0, 0, 1 }, .gs_port = echo.port, .maxgame = 10, .gameid = GS_GAMEID };
     gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
     defer gs.stop();
     if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
 
-    var c = rc.RealmClient{ .bnet_port = 18112, .d2cs_port = 18113, .d2dbs_port = 18114 };
+    var c = rc.RealmClient{ .bnet_port = 18112, .d2cs_port = 18112 };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -2228,11 +2272,11 @@ fn scEmbeddedGameEdge() Result {
 
     // Craft a GAMELOGON with the minted token, then drive it through realmd's edge.
     const tail = "PAYLOAD";
-    var logon: [QQ_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
+    var logon: [INGRESS_TOKEN_OFFSET + 2 + tail.len]u8 = undefined;
     @memset(&logon, 0);
     logon[0] = 0x68;
-    std.mem.writeInt(u16, logon[QQ_TOKEN_OFFSET..][0..2], token, .little);
-    @memcpy(logon[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
+    std.mem.writeInt(u16, logon[INGRESS_TOKEN_OFFSET..][0..2], token, .little);
+    @memcpy(logon[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail);
 
     const fd = net.connectLocal(EDGE_PORT) catch |e| return fail(name, "connect edge {s}", .{@errorName(e)});
     defer net.closeSocket(fd);
@@ -2251,13 +2295,44 @@ fn scEmbeddedGameEdge() Result {
     const got = echo.received();
     if (got.len < logon.len) return fail(name, "backend saw {d} bytes, want {d}", .{ got.len, logon.len });
     if (got[0] != 0x68) return fail(name, "backend first byte 0x{x:0>2}, want 0x68", .{got[0]});
-    const got_token = std.mem.readInt(u16, got[QQ_TOKEN_OFFSET..][0..2], .little);
+    const got_token = std.mem.readInt(u16, got[INGRESS_TOKEN_OFFSET..][0..2], .little);
     if (got_token != @as(u16, @truncate(GS_GAMEID)))
         return fail(name, "rewritten token={d}, want {d} (GS gameid)", .{ got_token, GS_GAMEID });
-    if (!std.mem.eql(u8, got[QQ_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
+    if (!std.mem.eql(u8, got[INGRESS_TOKEN_OFFSET + 2 ..][0..tail.len], tail))
         return fail(name, "tail mismatch", .{});
 
-    return .{ .name = name, .status = .pass, .msg = msg("embedded edge: token 0x{x} -> gameid {d}, rewritten + spliced (no qqserver)", .{ token, GS_GAMEID }) };
+    return .{ .name = name, .status = .pass, .msg = msg("embedded edge: token 0x{x} -> gameid {d}, rewritten + spliced (no d2ingress)", .{ token, GS_GAMEID }) };
+}
+
+/// Accounts these scenarios create, and therefore have to be able to create.
+///
+/// The suite used to be re-runnable only because the filesystem data dir was wiped between runs.
+/// Against a store that actually persists — Postgres — the second run met its own accounts and
+/// every create failed as "exists". Clearing them here makes a run independent of what the last
+/// one left, whatever the store is.
+const fixture_accounts = [_][]const u8{
+    "AdminMade", "AuthUser", "CopyAcct",
+};
+
+/// Characters a scenario expects to create, so a leftover must not be there to collide with.
+/// Named separately from the accounts because these belong to accounts the suite never creates —
+/// they are staged straight into the store.
+const fixture_chars = [_]struct { account: []const u8, char: []const u8 }{
+    .{ .account = "CopyAcct", .char = "CopyCat" },
+};
+
+fn resetFixtures() void {
+    var rxbuf: [4096]u8 = undefined;
+    for (fixture_accounts) |acct| {
+        var json: [128]u8 = undefined;
+        const body = std.fmt.bufPrint(&json, "{{\"name\":\"{s}\"}}", .{acct}) catch continue;
+        _ = net.httpRequest(HEALTH_PORT, "POST", "/admin/accounts/delete", ADMIN_TOKEN, body, &rxbuf) catch continue;
+    }
+    for (fixture_chars) |fc| {
+        var json: [160]u8 = undefined;
+        const body = std.fmt.bufPrint(&json, "{{\"account\":\"{s}\",\"char\":\"{s}\"}}", .{ fc.account, fc.char }) catch continue;
+        _ = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/delete", ADMIN_TOKEN, body, &rxbuf) catch continue;
+    }
 }
 
 pub fn main() !void {
@@ -2269,8 +2344,9 @@ pub fn main() !void {
         HEALTH_PORT = port_base + 1968; // keeps the usual 6112 -> 18080 relationship
         std.debug.print("port base overridden: bnet={d} health={d}\n", .{ rc.HOST_BNET, HEALTH_PORT });
     }
-    startRedis();
+    startStores();
     const child = try maybeStartRealmd();
+    resetFixtures();
 
     const results = [_]Result{
         scLogin(),
@@ -2283,7 +2359,7 @@ pub fn main() !void {
         scFleetCapacity(),
         scAdminApi(),
         scMultiGameOneGs(),
-        scQqserverTokenTranslate(),
+        scD2ingressTokenTranslate(),
         scEmbeddedGameEdge(),
         scCreateAccountRealAuth(),
         scCharCreate(),
@@ -2300,11 +2376,11 @@ pub fn main() !void {
         scFriendsListLoad(),
         scNameResolution(),
         scLeaveChannel(),
-        scCharFetchMeta(),
         scDifficultyGate(),
         scGetFileTime(),
         scBannerAd(),
         scFriendsPersist(),
+        scChatAcrossInstances(),
         scMultiInstance(),
     };
 
@@ -2312,7 +2388,7 @@ pub fn main() !void {
         _ = kill(pid, 15); // SIGTERM
         _ = waitpid(pid, null, 0);
     }
-    stopRedis();
+    stopStores();
 
     var npass: u32 = 0;
     var nfail: u32 = 0;

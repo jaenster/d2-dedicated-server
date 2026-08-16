@@ -11,7 +11,7 @@ const fastcall = @import("../runtime/fastcall.zig");
 const log = @import("../log.zig");
 const srvtrace = @import("../runtime/feature/srvtrace.zig");
 
-// ── game addresses / globals (retail 1.14d) ─────────────────────────────────
+// game addresses / globals (retail 1.14d)
 const OogCurrentCharSelectionMode: *u32 = @ptrFromInt(0x007795ec);
 const D2CharSelStrcFirst: *?*const D2CharSelStrc = @ptrFromInt(0x00779dbc);
 const TotalCurrentChars: *u32 = @ptrFromInt(0x00779dc4);

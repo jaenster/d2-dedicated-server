@@ -1,17 +1,12 @@
 //! The imports the host libc can answer as-is.
 //!
-//! i386 Darwin and i386 Linux agree on cdecl, on the integer types, and on `char *`, so for a call
-//! whose whole interface is scalars and bytes `_strlen` is simply `strlen` and there is nothing to
-//! translate. That agreement is the decision this list encodes — and the reason it is a list rather
-//! than "forward everything in libc": the moment a struct crosses the boundary the two platforms
-//! disagree (`struct stat`, `sockaddr`, `sigaction`, `jmp_buf`, `struct tm`) and a forward is silent
-//! corruption. Those names are absent on purpose, so they fall through to a naming thunk instead.
-//!
-//! Absent for the same reason, less obviously: `pthread_cond_*` (Darwin's `pthread_cond_t` is 28
-//! bytes on i386, glibc's is 48, so glibc would write past the game's buffer) and
-//! `pthread_mutexattr_settype` (PTHREAD_MUTEX_RECURSIVE is 2 on Darwin and 1 on Linux, so a
-//! recursive mutex would come back as an errorcheck one and deadlock). Both want a translating shim,
-//! not a forward.
+//! i386 Darwin and i386 Linux agree on cdecl, integer types and `char *`, so scalar/bytes-only
+//! calls need no translation (`_strlen` is just `strlen`). This is a list, not "forward all of
+//! libc": any struct crossing the boundary disagrees (`struct stat`, `sockaddr`, `sigaction`,
+//! `jmp_buf`, `struct tm`) and forwarding is silent corruption, so those names fall through to a
+//! naming thunk instead. Also absent: `pthread_cond_*` (Darwin's `pthread_cond_t` is 28 bytes on
+//! i386, glibc's is 48 — glibc would write past the game's buffer) and
+//! `pthread_mutexattr_settype` (PTHREAD_MUTEX_RECURSIVE is 2 on Darwin, 1 on Linux).
 
 const std = @import("std");
 const builtin = @import("builtin");

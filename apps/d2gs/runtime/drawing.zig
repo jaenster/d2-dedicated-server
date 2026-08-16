@@ -1,15 +1,9 @@
-//! Client draw driver — the client-side analog of runtime/gameloop.zig. Hooks the
-//! engine's render path so features can draw. Ported from Charon's Drawing.cpp.
-//!
-//! Minimal so far: only the AUTOMAP draw site. DRAW_UI calls `DrawAutomap` at
-//! 0x456fa5 (`call 0x45ad60`, verified in recon 9df5e900); we replace that call
-//! with our hook, which fans out gameAutomapPreDraw → runs the real DrawAutomap →
-//! fans out gameAutomapPostDraw. That post hook is where maphack features draw
-//! reveal cells / unit dots / labels. The rest of Charon's draw hooks are added
-//! here when a feature needs them.
-//!
-//! Client-only — these render functions never run in the headless GS, so the patch
-//! is idle there. Installed when a draw consumer (maphack) is enabled.
+//! Client draw driver — client-side analog of runtime/gameloop.zig. Hooks the engine's render path
+//! so features can draw. Ported from Charon's Drawing.cpp. Minimal so far: only the AUTOMAP draw
+//! site — DRAW_UI calls `DrawAutomap` at 0x456fa5 (`call 0x45ad60`, verified in recon 9df5e900),
+//! replaced with our hook fanning gameAutomapPreDraw -> real DrawAutomap -> gameAutomapPostDraw
+//! (where maphack draws reveal cells/unit dots/labels). More of Charon's draw hooks added as needed.
+//! Client-only: these render functions never run in the headless GS, so the patch is idle there.
 const patch = @import("patch.zig");
 const log = @import("../log.zig");
 const feature = @import("../engine/feature.zig");

@@ -1,17 +1,13 @@
-//! Server RoomInit driver — fans out the per-game `roomInit` hook with a real
-//! per-game GameCtx (the game's own FOG pool). Ported from Charon's RoomInit.cpp.
+//! Server RoomInit driver — fans out the per-game `roomInit` hook with a real per-game GameCtx (the
+//! game's own FOG pool). Ported from Charon's RoomInit.cpp. Not a registry feature (like
+//! runtime/gameloop.zig): fires in-game, installed from the GS boot path.
 //!
-//! Hooks SUNITINACTIVE_RoomInit @0x542b40 (__fastcall(D2GameStrc* ECX,
-//! D2RoomStrc* EDX), verified in recon session 9df5e900). We JMP the entry to our
-//! hook; the hook runs the original via a relocated-prologue stub, then fans out.
-//! The original's first 6 bytes are position-independent:
+//! Hooks SUNITINACTIVE_RoomInit @0x542b40 (__fastcall(D2GameStrc* ECX, D2RoomStrc* EDX), verified in
+//! recon session 9df5e900) via JMP; a relocated-prologue stub re-emits the original's first 6
+//! position-independent bytes, then continues at +6:
 //!   55        push ebp
 //!   8b ec     mov ebp, esp
 //!   83 ec 18  sub esp, 0x18
-//! so the relocated stub just re-emits them and continues the original at +6.
-//!
-//! This is a driver (like runtime/gameloop.zig), not a registry feature. It fires
-//! in-game on the server, so it's installed from the GS boot path.
 const patch = @import("patch.zig");
 const log = @import("../log.zig");
 const feature = @import("../engine/feature.zig");

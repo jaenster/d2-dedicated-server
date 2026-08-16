@@ -1,12 +1,10 @@
-//! PvP arena mode — a server-side last-man-standing arena that runs entirely
-//! inside one persistent game. Players join a game named "arena" (the lobby town);
-//! when enough have gathered the feature warps them all into a bounded combat
-//! level, forces mutual hostility, and runs timed rounds, warping survivors back
-//! to the lobby and keeping score. The stock 1.14d client is untouched.
+//! PvP arena mode — a server-side last-man-standing arena inside one persistent game. Players
+//! join a game named "arena" (the lobby town); when enough gather the feature warps them into a
+//! bounded combat level, forces mutual hostility, runs timed rounds, warps survivors back to the
+//! lobby and keeps score. Stock 1.14d client is untouched. See ARENA.md.
 //!
-//! See ARENA.md. The whole feature is driven from three entry hooks (player
-//! join/leave + death, addresses proven by srvtrace) plus the already-wired
-//! per-tick serverTick() fan-out — no per-game engine patch is needed because the
+//! Driven from three entry hooks (player join/leave + death, addresses proven by srvtrace) plus
+//! the already-wired per-tick serverTick() fan-out — no per-game engine patch needed since the
 //! arena is a single tracked game.
 const std = @import("std");
 const patch = @import("../patch.zig");
@@ -20,7 +18,7 @@ const round = @import("arena_round.zig");
 const D2GameStrc = d2types.D2GameStrc;
 const UnitAny = d2.UnitAny;
 
-// ── configuration ────────────────────────────────────────────────────────────
+// configuration
 // Hybrid venue (ARENA.md): the floor is a configurable existing 1.14d level Id,
 // so a restored classic arena map can drop in later by changing one constant.
 const ARENA_GAME_PREFIX = "arena"; // games whose name starts with this are arenas
@@ -38,7 +36,7 @@ const round_cfg = round.Config{
     .fight_timeout_ticks = 25 * 60 * 4, // 4min safety cap per round
 };
 
-// ── state ────────────────────────────────────────────────────────────────────
+// state
 const Participant = struct {
     unit: *UnitAny,
     alive: bool = true,
@@ -86,7 +84,7 @@ const Arena = struct {
 
 var arena: Arena = .{};
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// helpers
 fn isArenaGame(game: *D2GameStrc) bool {
     const nm = game.name();
     if (nm.len < ARENA_GAME_PREFIX.len) return false;
@@ -132,7 +130,7 @@ fn awardSurvivor() void {
     }
 }
 
-// ── round driver (per server tick) ───────────────────────────────────────────
+// round driver (per server tick)
 // Pure policy decides the transition; we just apply the engine effect it asks for.
 pub fn serverTick() void {
     if (arena.game == null) return;
@@ -145,7 +143,7 @@ pub fn serverTick() void {
     }
 }
 
-// ── engine event handlers (called from the entry hooks below) ─────────────────
+// engine event handlers (called from the entry hooks below)
 fn onJoin(pGame: usize, pClient: usize, _: usize) callconv(.c) void {
     const game: *D2GameStrc = @ptrFromInt(pGame);
     if (!isArenaGame(game)) return;
@@ -172,9 +170,9 @@ fn onDeath(pGame: usize, pVictim: usize, _: usize) callconv(.c) void {
     if (arena.find(victim)) |p| p.alive = false;
 }
 
-// ── entry-hook machinery (modeled on srvtrace.zig: relocate the prologue into a
+// entry-hook machinery (modeled on srvtrace.zig: relocate the prologue into a
 //    trampoline, JMP the entry to a naked shim that captures args, calls our
-//    cdecl handler, then resumes the original) ─────────────────────────────────
+// cdecl handler, then resumes the original)
 const Src = union(enum) { none, ecx, edx, stack: usize };
 
 fn pushAsm(comptime s: Src, comptime pushed: usize) []const u8 {

@@ -1,32 +1,12 @@
-//! qqserver — the cloud-native game-traffic gateway, a "QServer of QServers" fronting
-//! the GS fleet. Clients connect to ONE public address for game traffic (:4000); the
-//! qqserver reads the realm-global game TOKEN from the client's first packet (the D2GS
-//! GAMELOGON 0x68), looks up which backend GS owns that token, REWRITES the token in the
-//! packet to the GS's real engine gameid, dials the GS, replays the rewritten first
-//! packet, and splices the rest of the connection byte-for-byte.
-//!
-//! Routing is TOKEN-based, not source-IP based. realmd mints a realm-globally-unique
-//! token per CREATE/JOIN and records {token -> gs_ip,gs_port,real_gameid} in redis (a
-//! packed 10-byte value); because the token is unique across the realm, two clients behind
-//! ONE public IP never collide. NAT-proof, and any front pod resolves any token.
-//!
-//! ZERO HEAP, BARE SOCKETS, ONE THREAD, ON THE STACK, FULLY NON-BLOCKING. The entire
-//! gateway state lives in one `Gateway` value in main()'s frame — no globals, no allocator.
-//! A single `poll()` loop drives everything, and NOTHING blocks it: not the splice, and not
-//! the route lookup. The route store is redis, reached over a persistent NON-BLOCKING
-//! connection that sits in the same poll set. A new connection's lookup is an async,
-//! pipelined `GET`: we fire it and park the connection in `.awaiting_route` (it occupies no
-//! poll slots) — the loop keeps serving everyone else. Redis replies come back in send
-//! order on the one connection, so a FIFO of {slot, generation} matches each reply to its
-//! waiting connection (the generation guards against a slot being recycled before its
-//! answer arrives). The lookup "can take a second" and only that one connection waits.
-//!
-//! Splice uses the proxy buffer-pool model: read then TRY TO WRITE IMMEDIATELY (a packet
-//! usually leaves in the same event — low latency, no buffer retained); only a partial /
-//! EAGAIN write parks its remainder in a pooled buffer for a later POLLOUT, so buffers are
-//! held only by stalled connections and a small pool serves far more connections. Pool
-//! exhaustion just defers the read (TCP backpressure), never drops data. The active table
-//! swap-removes on close; idle sleeps in poll(-1) at 0% CPU.
+//! d2ingress — game-traffic gateway fronting the GS fleet. Reads the realm-global game TOKEN
+//! from the client's first packet (D2GS GAMELOGON 0x68), looks up which backend GS owns it,
+//! rewrites the token to the GS's real engine gameid, dials the GS, replays the rewritten first
+//! packet, then splices the rest byte-for-byte. TOKEN-based (not source-IP) routing via redis
+//! {token -> gs_ip,gs_port,real_gameid} is NAT-proof; any front pod resolves any token. Zero
+//! heap, bare sockets, one thread, fully non-blocking: one `Gateway` value drives one `poll()`
+//! loop. Route lookups are async pipelined redis `GET`s matched back via a {slot, generation}
+//! FIFO. Splice writes immediately when possible; a partial/EAGAIN write parks its remainder in
+//! a pooled buffer for later POLLOUT, and pool exhaustion just defers the read (backpressure).
 const std = @import("std");
 const builtin = @import("builtin");
 const infra = @import("realm_infra");
@@ -39,7 +19,7 @@ const TOKEN_OFFSET: usize = 5;
 const GAMELOGON_ID: u8 = 0x68;
 const MIN_LOGON_BYTES: usize = TOKEN_OFFSET + 2;
 
-/// How many leading bytes of a GS→client buffer are the engine's 0xAF greeting frame that qq
+/// How many leading bytes of a GS→client buffer are the engine's 0xAF greeting frame that d2ingress
 /// must strip (see stripGsGreeting). Returns 0 when `buf` does not begin with a COMPLETE 0xAF
 /// frame — not 0xAF, too short to read the flag byte, or a declared frame longer than what's
 /// buffered — so the caller forwards those bytes verbatim rather than eating payload. The 0xAF
@@ -92,7 +72,7 @@ const BUF_SZ: usize = 4 * 1024;
 const REDIS_OUT_SZ: usize = 64 * 1024; // pipelined GET commands awaiting send
 const REDIS_IN_SZ: usize = 64 * 1024; // reply bytes awaiting parse
 
-// ── bare libc: sockets, fcntl, poll, getaddrinfo (no net.zig — the gateway is bare) ──
+// bare libc: sockets, fcntl, poll, getaddrinfo (no net.zig — the gateway is bare)
 const posix = std.posix;
 const is_linux = builtin.target.os.tag == .linux;
 const O_NONBLOCK: c_int = if (is_linux) 0o4000 else 0x0004; // linux 0x800, darwin 0x4
@@ -124,7 +104,7 @@ const EAGAIN: c_int = @intFromEnum(posix.E.AGAIN);
 const EINPROGRESS: c_int = @intFromEnum(posix.E.INPROGRESS);
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-// REALMD_QQ_TRACE=1 → hexdump every spliced chunk both directions (debug; verbose).
+// REALMD_INGRESS_TRACE=1 → hexdump every spliced chunk both directions (debug; verbose).
 var trace: bool = false;
 
 // Monotonic milliseconds — used to back off redis reconnect attempts so an unreachable
@@ -324,7 +304,7 @@ const Gateway = struct {
         g.n_active = 0;
     }
 
-    // ── buffer pool ────────────────────────────────────────────────────────────────────
+    // buffer pool
     fn poolAcquire(g: *Gateway) ?u16 {
         if (g.pool_top == 0) return null;
         g.pool_top -= 1;
@@ -335,7 +315,7 @@ const Gateway = struct {
         g.pool_top += 1;
     }
 
-    // ── connection table ───────────────────────────────────────────────────────────────
+    // connection table
     fn allocConn(g: *Gateway) ?*Conn {
         if (g.n_active >= MAX_CONN) return null;
         const idx = g.active[g.n_active];
@@ -363,13 +343,10 @@ const Gateway = struct {
 
     fn closeConn(g: *Gateway, c: *Conn) void {
         if (c.c2g_bytes != 0 or c.g2c_bytes != 0 or c.gs >= 0)
-            // `greeted` is what makes a failed join readable. A join that dies leaves zero bytes
-            // going back to the client whether the GS never accepted the connection, accepted it
-            // and died, or greeted us and then refused the GAMELOGON in silence — three different
-            // faults in three different processes that print the same line without it. The engine
-            // greets unprompted the moment it accepts, so seeing the greeting places the failure
-            // after the accept and nowhere else.
-            log.line("qq", "conn closed: client->GS={d}B GS->client={d}B (cli_eof={} gs_eof={} greeted={})", .{
+            // `greeted` disambiguates three faults that all leave zero bytes to the client: the GS
+            // never accepted, accepted and died, or greeted then silently refused GAMELOGON. The
+            // engine greets unprompted on accept, so `greeted` places the failure after that point.
+            log.line("d2ingress", "conn closed: client->GS={d}B GS->client={d}B (cli_eof={} gs_eof={} greeted={})", .{
                 c.c2g_bytes, c.g2c_bytes, c.cli_eof, c.gs_eof, c.gs_greeted,
             });
         if (c.cli >= 0) _ = close(c.cli);
@@ -379,7 +356,7 @@ const Gateway = struct {
         c.* = .{}; // state = .free, gen = 0
     }
 
-    // ── redis: pending FIFO ─────────────────────────────────────────────────────────────
+    // redis: pending FIFO
     fn pendPush(g: *Gateway, slot: u32, gen: u32) bool {
         if (g.pend_count >= MAX_CONN) return false;
         g.pending[(g.pend_head + g.pend_count) % MAX_CONN] = .{ .slot = slot, .gen = gen };
@@ -394,7 +371,7 @@ const Gateway = struct {
         return p;
     }
 
-    // ── redis: connection lifecycle ─────────────────────────────────────────────────────
+    // redis: connection lifecycle
     fn redisConnect(g: *Gateway) void {
         if (g.redis_fd >= 0) { // never leak a prior (failed/half-open) socket
             _ = close(g.redis_fd);
@@ -492,7 +469,7 @@ const Gateway = struct {
         const c = &g.conns[p.slot];
         if (c.gen != p.gen or c.state != .awaiting_route) return; // connection gone / recycled
         if (!pr.found) {
-            log.line("qq", "no route for waiting connection — dropping", .{});
+            log.line("d2ingress", "no route for waiting connection — dropping", .{});
             g.closeConn(c);
             return;
         }
@@ -504,13 +481,13 @@ const Gateway = struct {
         const client_token = std.mem.readInt(u16, g.pool[bi][TOKEN_OFFSET..][0..2], .little);
         std.mem.writeInt(u16, g.pool[bi][TOKEN_OFFSET..][0..2], @truncate(pr.gameid), .little);
         const d = dialNonBlock(pr.ip, pr.port) orelse {
-            log.line("qq", "GS {d}.{d}.{d}.{d}:{d} dial failed", .{ pr.ip[0], pr.ip[1], pr.ip[2], pr.ip[3], pr.port });
+            log.line("d2ingress", "GS {d}.{d}.{d}.{d}:{d} dial failed", .{ pr.ip[0], pr.ip[1], pr.ip[2], pr.ip[3], pr.port });
             g.closeConn(c);
             return;
         };
         c.gs = d.fd;
         c.state = if (d.connected) .open else .connecting;
-        log.line("qq", "route client_token={d} -> GS {d}.{d}.{d}.{d}:{d} token={d}{s}", .{ client_token, pr.ip[0], pr.ip[1], pr.ip[2], pr.ip[3], pr.port, pr.gameid, if (d.connected) "" else " [connecting]" });
+        log.line("d2ingress", "route client_token={d} -> GS {d}.{d}.{d}.{d}:{d} token={d}{s}", .{ client_token, pr.ip[0], pr.ip[1], pr.ip[2], pr.ip[3], pr.port, pr.gameid, if (d.connected) "" else " [connecting]" });
     }
 
     /// Service the redis fd this turn (connect-complete, flush sends, read replies).
@@ -533,7 +510,7 @@ const Gateway = struct {
         }
     }
 
-    // ── the event loop ──────────────────────────────────────────────────────────────────
+    // the event loop
     fn run(g: *Gateway, listen_fd: c_int) void {
         var pfds: [MAX_CONN * 2 + 2]posix.pollfd = undefined;
         var owner: [MAX_CONN * 2 + 2]*Conn = undefined;
@@ -661,31 +638,23 @@ const Gateway = struct {
                 continue;
             }
             const c = g.allocConn() orelse {
-                log.line("qq", "connection table full ({d}) — dropping", .{MAX_CONN});
+                log.line("d2ingress", "connection table full ({d}) — dropping", .{MAX_CONN});
                 _ = close(cfd);
                 continue;
             };
             c.state = .handshake;
             c.cli = cfd;
-            // The real client's setup waits for a connection-established (0xAF) packet promptly
-            // after connect — without it it never advances into connecting-mode. The gateway
-            // can't reach the GS yet (it needs the GAMELOGON token to route), so it speaks for
-            // the GS and sends one now.
-            //
-            // We send 0xAF00. The client's receive demux reads 0xAF's SECOND byte as a phase
-            // flag, and the two phases are disjoint receive paths in ThreadClientToServer
-            // @0x52ab30 (gated on the flag ParseRecvBufferIntoPacketQueues @0x52a8d0 returns):
-            //   `af 00` -> recv straight into the packet buffer and parse. No length framing,
-            //              and DecompressPacket is never called on this path at all.
-            //   `af 01` -> the length-framed loop that Huffman-decodes every frame.
-            // We pick 0x00 and have the GS send with the engine's own raw mode (nMode==2 in
-            // SendPacketToClient @0x52b330, the same exemption the 0xAF greeting itself uses), so
-            // a STOCK client reads the stream natively with nothing patched on its side. Every
-            // backend must agree on this byte, because we have to greet before we know which one
-            // we'll route to.
+            // The client waits for a connection-established (0xAF) packet promptly after connect
+            // or it never advances; the gateway can't reach the GS yet (needs the GAMELOGON token
+            // to route), so it speaks for the GS and sends one now. We send 0xAF00: the client's
+            // demux reads 0xAF's 2nd byte as a phase flag, two disjoint paths in
+            // ThreadClientToServer @0x52ab30 (gated on ParseRecvBufferIntoPacketQueues @0x52a8d0):
+            // `af 00` = raw recv+parse, no framing, no DecompressPacket; `af 01` = length-framed
+            // Huffman loop. We pick 0x00 and have the GS send in nMode==2 (SendPacketToClient
+            // @0x52b330, same exemption the greeting uses) so a stock client needs no patch.
             const af00 = [2]u8{ 0xaf, 0x00 };
             _ = write(cfd, &af00, af00.len);
-            log.line("qq", "accepted game connection (fd={d}) — sent 0xAF00, awaiting GAMELOGON", .{cfd});
+            log.line("d2ingress", "accepted game connection (fd={d}) — sent 0xAF00, awaiting GAMELOGON", .{cfd});
         }
     }
 
@@ -721,11 +690,11 @@ const Gateway = struct {
         const before: u32 = c.c2g_len;
         c.c2g_len += @intCast(got);
         c.c2g_bytes += @intCast(got);
-        if (trace) log.hexdump("qq C->GS (logon)", g.pool[bi][before..c.c2g_len]);
+        if (trace) log.hexdump("d2ingress C->GS (logon)", g.pool[bi][before..c.c2g_len]);
         if (c.c2g_len < MIN_LOGON_BYTES) return;
 
         if (g.pool[bi][0] != GAMELOGON_ID) {
-            log.line("qq", "first packet id 0x{x:0>2} != GAMELOGON 0x68 — dropping", .{g.pool[bi][0]});
+            log.line("d2ingress", "first packet id 0x{x:0>2} != GAMELOGON 0x68 — dropping", .{g.pool[bi][0]});
             g.closeConn(c);
             return;
         }
@@ -744,14 +713,14 @@ const Gateway = struct {
         // cannot see any other way — it is answered by nothing at all, exactly like a game that
         // was never created, and blaming it on the realm costs an afternoon.
         if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
-            log.line("qq", "the GS refused the connection (errno {d}) — the client is dropped", .{connectResult(c.gs)});
+            log.line("d2ingress", "the GS refused the connection (errno {d}) — the client is dropped", .{connectResult(c.gs)});
             g.closeConn(c);
             return;
         }
         if (re & posix.POLL.OUT == 0) return;
         const err = connectResult(c.gs);
         if (err != 0) {
-            log.line("qq", "could not connect to the GS: errno {d} — the client is dropped", .{err});
+            log.line("d2ingress", "could not connect to the GS: errno {d} — the client is dropped", .{err});
             g.closeConn(c);
             return;
         }
@@ -761,18 +730,18 @@ const Gateway = struct {
     fn serviceOpen(g: *Gateway, c: *Conn, gs_side: bool, re: i16) void {
         if (gs_side) {
             if (re & posix.POLL.OUT != 0) g.flush(c.gs, &c.c2g, &c.c2g_off, &c.c2g_len, &c.gs_eof);
-            // First GS read carries the leading 0xAF greeting that qq must strip (see
+            // First GS read carries the leading 0xAF greeting that d2ingress must strip (see
             // stripGsGreeting); every read after that is a verbatim splice.
             if (re & posix.POLL.IN != 0) {
                 if (c.gs_greeted)
-                    g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "qq GS->C", &c.g2c_bytes)
+                    g.pump(c.gs, &c.g2c, &c.g2c_off, &c.g2c_len, c.cli, &c.gs_eof, &c.cli_eof, "d2ingress GS->C", &c.g2c_bytes)
                 else
                     g.stripGsGreeting(c);
             }
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.gs_eof = true;
         } else {
             if (re & posix.POLL.OUT != 0) g.flush(c.cli, &c.g2c, &c.g2c_off, &c.g2c_len, &c.cli_eof);
-            if (re & posix.POLL.IN != 0) g.pump(c.cli, &c.c2g, &c.c2g_off, &c.c2g_len, c.gs, &c.cli_eof, &c.gs_eof, "qq C->GS", &c.c2g_bytes);
+            if (re & posix.POLL.IN != 0) g.pump(c.cli, &c.c2g, &c.c2g_off, &c.c2g_len, c.gs, &c.cli_eof, &c.gs_eof, "d2ingress C->GS", &c.c2g_bytes);
             if (re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) c.cli_eof = true;
         }
         g.propagateEofAndMaybeClose(c);
@@ -814,7 +783,7 @@ const Gateway = struct {
     }
 
     /// Pre-splice phase: the real 1.14d engine opens the game stream with one leading 0xAF
-    /// greeting (nocompress forces 0xAF00). qq already sent the client its OWN 0xAF00 to prompt
+    /// greeting (nocompress forces 0xAF00). d2ingress already sent the client its OWN 0xAF00 to prompt
     /// GAMELOGON, so the GS's copy MUST be dropped — forwarding it leaves the client reading a
     /// stray 0xAF as a bogus opcode, desyncing before ENTERGAME (the classic ~49-byte stall).
     /// We strip ONE validated 0xAF frame (see greetingStripLen) on the first GS read, forward
@@ -838,14 +807,14 @@ const Gateway = struct {
         const un: u32 = @intCast(got);
         const start = greetingStripLen(g.pool[bi][0..un]);
         if (start == 0 and g.pool[bi][0] != 0xAF)
-            log.line("qq", "GS's first byte is 0x{x:0>2}, not a 0xAF greeting — forwarding as-is", .{g.pool[bi][0]});
+            log.line("d2ingress", "GS's first byte is 0x{x:0>2}, not a 0xAF greeting — forwarding as-is", .{g.pool[bi][0]});
         const payload = g.pool[bi][start..un];
         if (payload.len == 0) { // greeting only; splice the rest on the next read
             g.poolRelease(bi);
             return;
         }
         c.g2c_bytes += payload.len;
-        if (trace) log.hexdump("qq GS->C", payload);
+        if (trace) log.hexdump("d2ingress GS->C", payload);
         const w = write(c.cli, payload.ptr, payload.len);
         if (w == @as(isize, @intCast(payload.len))) {
             g.poolRelease(bi);
@@ -956,8 +925,8 @@ test "parseReply: returns null until a full reply has arrived" {
 pub fn main() !void {
     const cfg = config.fromEnv();
     log.json = cfg.log_json;
-    trace = getenv("REALMD_QQ_TRACE") != null;
-    if (trace) log.line("qq", "REALMD_QQ_TRACE on — hexdumping spliced traffic", .{});
+    trace = getenv("REALMD_INGRESS_TRACE") != null;
+    if (trace) log.line("d2ingress", "REALMD_INGRESS_TRACE on — hexdumping spliced traffic", .{});
 
     // Resolve the redis host once (blocking, startup only). cfg.redis_addr is "host:port".
     var host_buf: [256]u8 = undefined;
@@ -972,12 +941,12 @@ pub fn main() !void {
     host_buf[host.len] = 0;
     const host_z = host_buf[0..host.len :0];
     const redis_ip = resolveHost(host_z) orelse {
-        log.line("qq", "cannot resolve redis host '{s}'", .{host});
+        log.line("d2ingress", "cannot resolve redis host '{s}'", .{host});
         return error.RedisResolveFailed;
     };
 
-    const listen_fd = try listenTcp(cfg.bind, cfg.qq_port);
-    log.line("qq", "qqserver listening on {s}:{d} (poll loop, redis {d}.{d}.{d}.{d}:{d}, conns={d}, pool={d}x{d})", .{ cfg.bind, cfg.qq_port, redis_ip[0], redis_ip[1], redis_ip[2], redis_ip[3], rport, MAX_CONN, POOL_N, BUF_SZ });
+    const listen_fd = try listenTcp(cfg.bind, cfg.ingress_port);
+    log.line("d2ingress", "d2ingress listening on {s}:{d} (poll loop, redis {d}.{d}.{d}.{d}:{d}, conns={d}, pool={d}x{d})", .{ cfg.bind, cfg.ingress_port, redis_ip[0], redis_ip[1], redis_ip[2], redis_ip[3], rport, MAX_CONN, POOL_N, BUF_SZ });
 
     // The whole gateway lives here, in main()'s frame — no globals, no heap. `.{}` applies
     // the field defaults (redis_fd=-1, redis_state=.disconnected, all counters 0; the big

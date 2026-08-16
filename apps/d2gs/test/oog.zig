@@ -1,16 +1,12 @@
-//! Out-of-game (menu) control-scripting layer — a Zig port of d2bs's Control.cpp.
+//! Out-of-game (menu) control-scripting layer — a Zig port of d2bs's Control.cpp. Drives the
+//! bnet/realm menus by querying which screen is CURRENTLY up (`getLocation`) and acting on it,
+//! instead of blind `Sleep()`s that race screen transitions — act only when expected, detect a
+//! transition finished when location changes.
 //!
-//! The point: drive the bnet/realm menus by querying which screen is CURRENTLY up
-//! (`getLocation`) and acting on it, instead of blind `Sleep()`s that race screen
-//! transitions. You act only when the expected screen exists, and you know a transition
-//! finished when the location changes — no timing guesses. This is how d2bs scripts the
-//! menus, and it's a reusable primitive for any "drive the client" automation.
-//!
-//! Screens are identified by probing for distinctive controls at known positions (the
-//! coords come straight from d2bs OOG_GetLocation). d2bs additionally matches controls by
-//! locale-string-id; the positions alone are unique for the screens we drive, so we match
-//! by type + position. Char-select is gated on a char slot that actually HAS text, which
-//! is the robust fix for the old "act before the realm char list loaded" race.
+//! Screens are identified by probing distinctive controls at known positions (coords from d2bs
+//! OOG_GetLocation); unlike d2bs we skip locale-string-id matching since position alone is
+//! unique for the screens we drive. Char-select gates on a char slot that actually HAS text —
+//! the fix for the old "act before the realm char list loaded" race.
 
 const std = @import("std");
 const fastcall = @import("../runtime/fastcall.zig");
@@ -186,7 +182,7 @@ pub fn getLocation() Location {
     return .none;
 }
 
-// ── script driver (charon-style: hand it a `fn() void` task) ─────────────────────────
+// script driver (charon-style: hand it a `fn() void` task)
 // A "script" is just an async task that composes the primitives below and yields each
 // frame. `run(task)` drives it off the OOG game loop — spawn once, tick every frame. This
 // is the foundation for any menu/botting automation: write a fn, hand it here.
@@ -212,7 +208,7 @@ pub fn run(task: *const fn () void) void {
     gameloop.install();
 }
 
-// ── frame-driven waits (run inside an async_.spawn task; each yield = one menu frame) ──
+// frame-driven waits (run inside an async_.spawn task; each yield = one menu frame)
 
 /// Yield menu frames until getLocation() == target. NO time-sleep — we advance exactly
 /// in step with the OOG game loop and stop the frame the screen appears.
@@ -245,7 +241,7 @@ pub fn awaitControl(ctype: u32, x: i32, y: i32, w: i32, h: i32, max: u32) ?*Cont
     return null;
 }
 
-// ── high-level menu ops (call when getLocation() is the matching screen) ──
+// high-level menu ops (call when getLocation() is the matching screen)
 
 /// Fill the account/password edit-boxes (ordered by Y: account above password) and click LOGON.
 pub fn doLogin(account: [*:0]const u16, password: [*:0]const u16) void {

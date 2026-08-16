@@ -1,15 +1,11 @@
 //! The parts of the Itanium C++ ABI that no libc ships.
 //!
-//! `__cxa_atexit` is in the forwarded list because musl means the same thing by it. These do not
-//! exist on Linux under any name: they live in libstdc++ or libc++abi, and this process links
-//! neither, so the function-local static guards the image's constructors run through have to be
-//! written out here.
-//!
-//! The exception half of the ABI — `__cxa_begin_catch`, `__cxa_rethrow`, `__gxx_personality_v0`,
-//! `_Unwind_Resume` and the two `__cxxabiv1` vtables — is deliberately not here. Unwinding through
-//! i386 Mach-O frames with a personality routine this process does not have is not something a shim
-//! can fake, and a headless server that throws is a fact worth learning by name rather than by
-//! corruption.
+//! `__cxa_atexit` is forwarded because musl means the same thing by it. The rest (function-local
+//! static guards for the image's constructors) live in libstdc++/libc++abi, which this process
+//! links neither of, so they're written out here. The exception half — `__cxa_begin_catch`,
+//! `__cxa_rethrow`, `__gxx_personality_v0`, `_Unwind_Resume`, the two `__cxxabiv1` vtables — is
+//! deliberately absent: a shim can't fake unwinding i386 Mach-O frames without the real personality
+//! routine, and a throw should fail loudly rather than corrupt.
 
 const std = @import("std");
 
@@ -28,7 +24,7 @@ pub fn address(name: []const u8) ?usize {
     return null;
 }
 
-// ── function-local static guards ──
+// function-local static guards
 
 /// The ABI's guard object is eight bytes on x86 and only the first is the ABI's business: non-zero
 /// means the static behind it is already constructed. The rest belongs to the runtime, and this one
@@ -88,7 +84,7 @@ pub fn guardAbort(g: *Guard) callconv(.c) void {
     unlock();
 }
 
-// ── the rest ──
+// the rest
 
 /// A call through a vtable slot that has no implementation. There is no correct return, and
 /// returning at all resumes a program that has already lost.

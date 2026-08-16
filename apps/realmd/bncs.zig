@@ -34,7 +34,9 @@ const xsha1 = @import("libd2").bnet.xsha1;
 pub var realm_name: []const u8 = "TypeGuru";
 pub var realm_desc: []const u8 = "D2 Closed Realm";
 pub var d2cs_ip: [4]u8 = .{ 127, 0, 0, 1 };
-pub var d2cs_port: u16 = 6113;
+/// The port the realm tells clients to reach MCP on. Muxed onto BNCS, so it is the BNCS port;
+/// main() sets it from the configured one.
+pub var d2cs_port: u16 = 6112;
 
 // Comma-separated account names that get Battle.net-admin + operator flags in chat
 // (the "@"/Blizzard-rep style ops). Set from REALMD_ADMINS. Case-insensitive.
@@ -531,10 +533,14 @@ fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
 // everyone else and still receiving talk they had walked away from.
 fn onLeaveChat(c: *Conn, tag: []const u8) void {
     if (!c.in_channel) return;
-    broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
+    // State first, announcement second. Anyone who reacts to the departure — a /whois, a friend
+    // list refresh — must find the player already gone, and a broadcast now reaches other
+    // instances, so the gap between the two is a store round trip wide rather than a few
+    // instructions.
     chat.setGame(c.fd, ""); // clears the game; the channel is cleared below
     chat.clearChannel(c.fd);
     c.in_channel = false;
+    broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
     log.line(tag, "{s} left chat", .{c.accountName()});
 }
 
@@ -548,9 +554,12 @@ fn onNotifyJoin(c: *Conn, tag: []const u8, body: []const u8) void {
     _ = r.getU32(); // product tag
     _ = r.getU32(); // 0x0e
     const game_name = r.getStr();
-    if (c.in_channel) broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
+    const was_in_channel = c.in_channel;
     c.in_channel = false;
+    // Recorded before announced, for the same reason as leaving chat: a watcher who reacts to
+    // the EID_LEAVE must find them already in the game, not still in the channel.
     chat.setGame(c.fd, game_name);
+    if (was_in_channel) broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
     log.line(tag, "{s} joined game '{s}'", .{ c.accountName(), game_name });
 }
 
@@ -606,10 +615,16 @@ fn bcastCb(ctx: *const BcastCtx, m: *chat.Member) void {
     chat.sendTo(m, bytes);
 }
 
-// Broadcast a CHATEVENT to every OTHER member in this connection's channel.
+// Broadcast a CHATEVENT to every OTHER member in this connection's channel — here and on every
+// other instance holding someone in it. The packet is built once and travels as bytes; the
+// receiving instance applies its own members' /ignore lists, because squelching is a fact about
+// the person receiving and only they know it.
 fn broadcastEvent(c: *Conn, eid: u32, flags: u32, username: []const u8, text: []const u8) void {
     const ctx = BcastCtx{ .eid = eid, .flags = flags, .username = username, .account = c.accountName(), .text = text };
     chat.forEachInChannel(c.channelName(), c.fd, &ctx, bcastCb);
+    var buf: [512]u8 = undefined;
+    const bytes = buildChatEvent(&buf, eid, flags, username, text);
+    chat.broadcastRemote(c.channelName(), c.accountName(), eid, bytes);
 }
 
 const ShowUserCtx = struct { c: *Conn };
@@ -618,6 +633,12 @@ const ShowUserCtx = struct { c: *Conn };
 // member's own flags, so ops/admins show with the right icon).
 fn showUserCb(ctx: *const ShowUserCtx, m: *chat.Member) void {
     sendEvent(ctx.c, EID_SHOWUSER, m.flags, m.displaySlice(), m.statSlice());
+}
+
+// The same, for members held by another instance. Without this the channel list shows only the
+// people who happened to land on the same realmd — half the room, with nothing to say it is half.
+fn showRemoteUserCb(ctx: *const ShowUserCtx, rm: chat.RemoteMember) void {
+    sendEvent(ctx.c, EID_SHOWUSER, rm.flags, rm.display, rm.stat);
 }
 
 fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -631,12 +652,14 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     // an otherwise-empty channel becomes its operator (typical Battle.net behaviour).
     var flags: u32 = 0;
     if (isAdmin(acct)) flags |= FLAG_ADMIN | FLAG_OPERATOR;
-    if (chat.countInChannel(channel, c.fd) == 0) flags |= FLAG_OPERATOR;
+    // Realm-wide, not per-instance: counting only our own members would hand the operator badge
+    // to the first person on every replica, so a busy channel would have as many ops as instances.
+    if (chat.countInChannelShared(channel) == 0) flags |= FLAG_OPERATOR;
     c.user_flags = flags;
     log.line(tag, "join channel '{s}' as {s} (flags=0x{x})", .{ channel, acct, flags });
 
     c.setChannel(channel);
-    _ = chat.join(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
+    _ = chat.joinShared(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
     chat.setGame(c.fd, ""); // back in the lobby: no longer in a game
 
     // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
@@ -644,6 +667,7 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), channel, "");
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
+    chat.forEachRemoteInChannel(channel, &ctx, showRemoteUserCb);
     broadcastEvent(c, EID_JOIN, flags, c.chatName(), c.statSlice());
 }
 
@@ -789,7 +813,11 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         log.line(tag, "{s} whispers {s}: {s}", .{ acct, w.target, w.msg });
         var buf: [512]u8 = undefined;
         const bytes = buildChatEvent(&buf, EID_WHISPER, c.user_flags, c.chatName(), w.msg);
-        const res = chat.whisperEx(w.target, bytes); // delivers unless target is in DND
+        // Local first — most whispers are between people on the same instance and cost nothing
+        // extra. Only when nobody here answers to that name do we ask the rest of the realm,
+        // which is the difference between "not logged on" and "not on THIS realmd".
+        var res = chat.whisperEx(w.target, bytes); // delivers unless target is in DND
+        if (!res.found) res = chat.whisperRemote(w.target, acct, bytes);
         if (!res.found) {
             sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
             return;
@@ -925,7 +953,7 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /whois <name>");
             return true;
         }
-        if (chat.presenceOf(cmd.arg)) |pres| {
+        if (chat.presenceOfAnywhere(cmd.arg)) |pres| {
             const where = pres.channelSlice();
             const line = if (where.len == 0)
                 std.fmt.bufPrint(&rb, "{s} is logged on.", .{cmd.arg}) catch return true
@@ -1081,18 +1109,10 @@ fn onLogonRealm(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// SID_GETFILETIME (0x33): the client asking how old a server file is (bnserver-D2DV.ini,
-// the terms-of-service text, ...) before deciding whether to fetch it over BNFTP.
-//
-// The timestamp is the whole answer. NET_SID_CLIENT_Incoming_GetFileTime @0x521110 hands
-// it straight to the download layer, which compares it against whatever the client already
-// has cached — so a zero means "older than anything you own" and the file never transfers.
-// This used to reply zero unconditionally, which denied every file, INCLUDING the ones
-// realmd is sitting on and happily serves the moment it is asked. So a file dropped into
-// <data_dir>/bnftp/ could only ever be fetched by a client that already knew to ask.
-//
-// Now: the real modification time when we have the file, and zero only when we genuinely
-// do not.
+// SID_GETFILETIME (0x33): client asks how old a server file is (bnserver-D2DV.ini, ToS, ...)
+// before fetching via BNFTP. NET_SID_CLIENT_Incoming_GetFileTime @0x521110 compares the
+// timestamp against its cache; zero means "older than anything owned" -> never fetched.
+// Reply with the real mtime when we have the file, zero only when we genuinely don't.
 fn onGetFileTime(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU32();
@@ -1223,23 +1243,20 @@ fn onClientId2(c: *Conn, tag: []const u8) void {
 
 // SID_QUERYADURL (0x41): the client asks for an ad URL { u32 adType }. We serve no
 // ads: reply ad-id 0 + an empty URL string.
-// ── banner ads ───────────────────────────────────────────────────────────────
-// The banner above the chat window. The client drives the whole thing:
 //
+// Banner ad flow:
 //   C->S SID_CHECKAD (0x15)  { platform "IX86", product, last-ad-id, unix time }
 //   S->C SID_CHECKAD (0x15)  { u32 adId, u32 fileExtension, FILETIME fileTime,
 //                              cstr filename, cstr url }
-//   ...client downloads `filename` over BNFTP, then reports SID_DISPLAYAD (0x21),
-//   and on a click sends SID_CLICKAD (0x16) followed by SID_QUERYADURL (0x41) to
-//   ask where to point the browser.
+//   client downloads `filename` over BNFTP, reports SID_DISPLAYAD (0x21), and on a
+//   click sends SID_CLICKAD (0x16) then SID_QUERYADURL (0x41) for the browser target.
 //
-// NET_SID_CLIENT_Incoming_CheckAd @0x521150 only acts when the packet is longer than
-// 0x10 bytes, the ad id differs from the one it already has, and BOTH strings are
-// non-empty — any of those unmet and it silently keeps the current banner. That is why
-// the old empty reply was indistinguishable from having no ads at all.
+// NET_SID_CLIENT_Incoming_CheckAd @0x521150 only redraws when the packet is > 0x10
+// bytes, the ad id differs, and both strings are non-empty — else the empty reply
+// looked indistinguishable from having no ads.
 //
-// Set by main() from REALMD_AD_FILE / REALMD_AD_URL. The file is served by the same
-// BNFTP listener that serves the version-check MPQ, so it lives in <data_dir>/bnftp/.
+// Set by main() from REALMD_AD_FILE / REALMD_AD_URL; served from <data_dir>/bnftp/
+// by the same BNFTP listener as the version-check MPQ.
 pub var ad_file: []const u8 = "";
 pub var ad_url: []const u8 = "";
 
@@ -1360,14 +1377,10 @@ fn onChangeEmail(c: *Conn, tag: []const u8, body: []const u8) void {
     log.line(tag, "changeemail '{s}'", .{acct});
 }
 
-// SID_AUTHACCOUNTLOGON (0x53): the NLS/SRP secure-logon path. The 1.14d client
-// only sends this when its g_nBNetClientToken == 1 (a client-side config, not the
-// default) — RE-confirmed reachable via BNCLIENT_SendLogonRequest. Standard D2
-// closed-realm uses OLS (LOGONRESPONSE2 0x3a), which we implement; realmd does NOT
-// implement NLS/SRP. So instead of leaving an NLS-mode client hanging on its logon
-// reply, fail it cleanly: SID_AUTHACCOUNTLOGON reply = u32 status, 1 = "account
-// does not exist" (on failure no salt/serverKey follows). The user gets a defined
-// error, not a hang. (Full NLS/SRP would be a separate feature.)
+// SID_AUTHACCOUNTLOGON (0x53): NLS/SRP secure-logon path, sent only when the client's
+// g_nBNetClientToken == 1 (non-default; RE-confirmed via BNCLIENT_SendLogonRequest).
+// realmd implements OLS (LOGONRESPONSE2 0x3a) only, not NLS/SRP, so fail cleanly instead
+// of hanging: reply = u32 status, 1 = "account does not exist" (no salt/serverKey follows).
 fn onAuthAccountLogon(c: *Conn, tag: []const u8) void {
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, SID_AUTHACCOUNTLOGON);
@@ -1382,12 +1395,10 @@ const PRODUCT_D2XP: u32 = @bitCast([4]u8{ 'D', '2', 'X', 'P' });
 // SID_FRIENDSLIST (0x65): this account's friends. Per entry: cstr name, u8 status flags,
 // u8 location (0=offline, 1=online), u32 product, cstr location string.
 //
-// A 1.14d client CANNOT RECEIVE THIS. Its incoming dispatch
-// (NET_SID_CLIENT_IncomingPacketHandler @0x521b00) drops anything with an id >= 0x5e
-// before looking at the table, and 0x65 is past that — so nothing we put here reaches the
-// game's UI. The friends feature reaches a real player only as chat text, which is what
-// handleFriendCmd sends. This is kept because it is correct, cheap, and the clientless
-// tooling and other Battle.net clients do speak it; it is not the D2 path.
+// A 1.14d client CANNOT RECEIVE THIS: NET_SID_CLIENT_IncomingPacketHandler @0x521b00
+// drops any id >= 0x5e before the table lookup. Kept because clientless tooling and other
+// Battle.net clients do speak it; real D2 players get friend status via handleFriendCmd
+// chat text instead.
 const FRIEND_STATUS_DND: u8 = 0x01;
 const FRIEND_STATUS_AWAY: u8 = 0x02;
 

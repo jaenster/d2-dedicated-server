@@ -1,22 +1,11 @@
-//! Observability core — per-thread trace/span context for structured, correlatable
-//! logs (and forward-compatible with OTLP/Tempo: ids are 128-bit trace / 64-bit span,
-//! rendered as hex like the W3C/OTLP wire form).
+//! Observability core — per-thread trace/span context for structured, correlatable logs
+//! (forward-compatible with OTLP/Tempo: 128-bit trace id / 64-bit span id, hex-rendered).
 //!
-//! Model (distributed-tracing semantics):
-//!   trace  — one logical operation, possibly spanning components (e.g. a client
-//!            connection, or a game-join that crosses realmd → GS). Identified by a
-//!            128-bit id that PROPAGATES across the d2cs/gslink wire (see adopt()).
-//!   span   — a unit of work within a trace (fetch char, load player, place in room).
-//!            Has its own 64-bit id and a parent; spans nest via enter()/exit().
-//!
-//! Each THREAD owns its context (`threadlocal`) — the engine ticks games on the server
-//! thread, realmd serves one thread per connection, so a thread maps to a trace/work
-//! unit naturally and there's no cross-thread races (unlike a single global). Loggers
-//! read `current()` and stamp `trace`/`span` (+ domain fields) on every line.
-//!
-//! No allocation; portable across the GS (wine/x86) and realmd (musl/x86_64). The host
-//! supplies a millisecond clock via `nowMsFn` (Windows vs libc differ) so this stays
-//! target-agnostic.
+//! trace = one logical operation, possibly crossing components (e.g. realmd -> GS); its id
+//! PROPAGATES over the realm<->game-server wire (see adopt()). span = a unit of work within a trace,
+//! nested via enter()/exit(). Each THREAD owns its context (`threadlocal`) so games ticking on
+//! the server thread and realmd's one-thread-per-connection model never race. No allocation;
+//! `nowMsFn` supplies the ms clock so GS and realmd share this code target-agnostically.
 const std = @import("std");
 
 /// Host clock (unix milliseconds). Set once at startup by each binary; until then
@@ -37,12 +26,10 @@ fn nextId() u64 {
     return @as(u64, seq.fetchAdd(1, .monotonic)) +% 1;
 }
 
-/// The per-thread context. Empty (all-zero) = no active trace; loggers then stamp
-/// nothing trace-related. Domain fields are a small fixed set the whole stack agrees
-/// on; extend deliberately (every field is on every log line in that scope).
-/// Process-stable GS id (hash of the pod/host name). Set once at boot; the SAME on
-/// every thread, so it lives here (not in the per-thread Ctx — else only the boot
-/// thread's lines would carry it).
+/// The per-thread context: empty (all-zero) = no active trace, so loggers stamp nothing
+/// trace-related. Domain fields are a small fixed set the whole stack agrees on — extend
+/// deliberately. Process-stable GS id (hash of pod/host name), set once at boot and the SAME
+/// on every thread, so it lives here rather than in the per-thread Ctx.
 pub var gsid: u32 = 0;
 
 pub const Ctx = struct {
@@ -50,7 +37,7 @@ pub const Ctx = struct {
     trace_lo: u64 = 0,
     span: u64 = 0,
     parent: u64 = 0,
-    // ── domain context (0 / empty = absent) ──
+    // domain context (0 / empty = absent)
     token: u32 = 0, // per-game trace token of the in-flight game on this thread
     acct_buf: [16]u8 = undefined, // the user this thread/connection is acting for
     acct_len: u8 = 0,
@@ -75,7 +62,7 @@ pub fn setAccount(name: []const u8) void {
 }
 
 /// Mark the current work as not-about-a-user (GS control, health, internal). Multiplexed
-/// connections (d2dbs, gslink) default to this and switch to setAccount() per packet for
+/// connections default to this and switch to setAccount() per packet for
 /// the user that packet concerns.
 pub fn setSystem() void {
     setAccount("system");

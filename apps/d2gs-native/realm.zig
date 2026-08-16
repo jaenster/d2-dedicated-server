@@ -1,27 +1,19 @@
-//! The realm's control link, from the Mac image's side.
+//! The realm, from the Mac image's side. Nothing is connected: this server publishes its own
+//! record into redis, takes create/join from `realmd:gsq:<gsid>`, answers on `realmd:gsreply:<seq>`
+//! and reports enter/leave/closed on `realmd:gsev`.
 //!
-//! Same channel `apps/d2gs/realmclient/d2cs.zig` speaks on Windows and the same wire types, but a
-//! different engine underneath: this build has no `GAME_CreateBattleNetGame` and no realm callback
-//! table, so a game is made by calling `GAME_CreateGame` 0x001ac3f3 — the one the 0x67 packet uses
-//! — with a null client. That is survivable: the only two things it does with the client are store
-//! it in the new player record and hand it to a map that has a null-client singleton branch, which
-//! is also where the new game's id ends up (0x00552568).
-//!
-//! Several games at once, which the engine's own scheduler does not do — see `max_games` for what
-//! that takes.
+//! Same wire types as `apps/d2gs/realmclient/d2cs.zig` on Windows, different engine: no
+//! `GAME_CreateBattleNetGame`/realm callback table here, so a game is made via `GAME_CreateGame`
+//! 0x001ac3f3 (the 0x67 packet's fn) with a null client — survivable because the only uses of the
+//! client are storing it in the player record and a null-client singleton map branch, where the new
+//! game's id also lands (0x00552568). Runs several games at once; see `max_games`.
 
 const std = @import("std");
 const macho = @import("macho");
 const chardb = @import("chardb.zig");
+const store = @import("store.zig");
 const p = @import("realm_proto").protocol;
 
-// 0.16's std.posix has no socket layer, so the four calls this needs come straight from libc —
-// the same shape `packages/realm-infra/net.zig` uses.
-extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
-extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
-extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
 extern "c" fn usleep(usec: c_uint) c_int;
 extern "c" fn time(t: ?*i64) i64;
 
@@ -35,7 +27,6 @@ fn nowMs() i64 {
 }
 
 var image: *const macho.load.Loaded = undefined;
-var sock: c_int = -1;
 var seqno: u32 = 0;
 var started = false;
 
@@ -110,50 +101,31 @@ const game_empty_since: u32 = 0x1dc0;
 /// hold the server's only game slot forever either.
 const unjoined_grace_s: i64 = 30;
 
-/// How long a create will wait for the one slot to be freed by a game that is already over. It
-/// covers a dispatch pass, not a game — the alternative is refusing a realm that was told a moment
-/// ago that this server had room, and it is bounded well inside the control thread's own wait.
-///
-/// It has to outlast the gap between a client's socket closing and the engine counting it gone,
-/// which is up to three seconds, not the one the disconnect path suggests. In milliseconds because
-/// `time()` counts whole seconds: a deadline of `time() + 3` elapses anywhere from two seconds to
-/// three depending on where in the second it was set, and the create that lost this race lost it
-/// by less than that truncation.
+/// How long a create waits for the one slot to be freed by a game already over, rather than refuse
+/// a realm just told this server had room. Must outlast the gap between a client's socket closing
+/// and the engine noticing (up to 3s) — kept in ms because `time()`'s whole-second truncation alone
+/// could cost a create the race.
 const create_wait_ms: i64 = 4000;
 
 /// The engine's token table has three entries and no bounds check, so a lookup past the end is a
 /// wild read. Nothing above this may be handed to SERVER_IsTokenValid.
 const engine_token_max: u32 = 2;
 
-/// How many games this engine hosts at once as it stands, which is one — because of what the
-/// engine's own scheduler does, not because a game is expensive:
-///
-///   * `QSERVER_TickAllGames` 0x001ae778 services `gpGameTable[1]` (0x00537570) and nothing else.
-///     Its argument is a catch-up flag for the 40 ms budget, not a token, so a game anywhere else
-///     in the table exists and never ticks.
-///   * `QSERVER_GenerateGameToken` 0x001ac1d9 walks the table from a counter its own arithmetic
-///     pins at 1, so after the first two calls it always reports the table full.
-///   * `GAME_DestroyGame` 0x001acf33 clears that same word when the game it is destroying is the
-///     one in it.
-///
-/// None of that stops the engine running several, and this server does. `ServerGameLoop` is passed
-/// the game, and `0x00537570` has ten references in the whole image — all of them in QSERVER/GAME
-/// management, none inside a game's own tick. So a created game is taken straight back out of that
-/// word and kept here (`runCreate`), and `tickGames` points the word at each game in turn and runs
-/// the per-game body itself.
-///
-/// The ceiling is Fog's, not QSERVER's: the pool allocator hands out eight managers and the Global
-/// Pool System keeps one, which is where the Windows build's seven comes from.
+/// The engine's own scheduler only ever runs one game (not because a game is expensive):
+/// `QSERVER_TickAllGames` 0x001ae778 services just `gpGameTable[1]` (0x00537570);
+/// `QSERVER_GenerateGameToken` 0x001ac1d9 walks from a counter pinned at 1 so the table reports full
+/// after two calls; `GAME_DestroyGame` 0x001acf33 clears that same word. Nothing stops running more:
+/// `ServerGameLoop` just takes the game struct, so `runCreate` pulls each created game back out of
+/// that word and `tickGames` points it at each game in turn to run the per-game body itself. The
+/// real ceiling is Fog's pool allocator (8 managers, Global Pool System keeps 1) — the Windows
+/// build's 7.
 const max_games: u32 = 7;
 
-/// How many of those slots this server actually uses, from `D2GS_MAX_GAMES`.
-///
-/// One, until the crash below is fixed. Concurrent games SIGSEGV inside the engine's own
-/// `CleanUpClient` at 0x001a8ee1, within a round or two of `--spread`, always just after a game's
-/// last client leaves — measured on real amd64 hardware, where one game at a time ran 60/60 clean.
-/// `listedById` guards the one call this file makes into that function, but the fault has not been
-/// reproduced against the guard yet, and a default that crashes is worse than a default that
-/// serialises. Raise it with D2GS_MAX_GAMES to test.
+/// How many of those slots are actually used, from `D2GS_MAX_GAMES`. Defaults to 1: concurrent
+/// games SIGSEGV inside the engine's own `CleanUpClient` at 0x001a8ee1 shortly after a game's last
+/// client leaves (measured with `--spread`; one game at a time ran 60/60 clean). `listedById` guards
+/// this file's one call into that function but hasn't been proven against the fault. Raise via
+/// D2GS_MAX_GAMES to test.
 var game_cap: u32 = 1;
 
 fn readGameCap() void {
@@ -218,17 +190,13 @@ fn setEngineSlot(id: u32) void {
 
 /// Answers "what game is this token", for realm join ids as well as engine ones.
 ///
-/// One GAMELOGON asks this THREE times, from three different functions — 0x001a7a36 in the handler
-/// itself, 0x001aca92 in the name check and 0x001acda1 in the seating — and every one of them is
-/// handed the u16 the client sent. Translating only the first is what made the second game per
-/// process go silent rather than refused: the handler resolved the game and took its success path,
-/// then the name check asked the engine's table for token 2, got nothing, and returned 0. Its
-/// caller answers a 0 by falling straight out of the switch — no seat, no 0xB4, no anything.
-///
-/// So the translation belongs in the function, not at a call site. For an id the realm issued the
-/// live game is the answer; for anything else this is the engine's own lookup, lock and all, which
-/// is what keeps the no-realm path working — and it declines to index the table with a realm id,
-/// which the engine would have done unchecked.
+/// One GAMELOGON asks this three times (0x001a7a36 handler, 0x001aca92 name check, 0x001acda1
+/// seating), each handed the client's u16. Translating only the first made the second game per
+/// process go silent instead of refused: name check asked the engine's table for token 2, got
+/// nothing, returned 0, and its caller falls straight out of the switch on 0 — no seat, no 0xB4.
+/// So translation lives here, not at a call site: a realm-issued id resolves to its live game;
+/// anything else goes through the engine's own locked lookup (and refuses to index the table with a
+/// realm id unchecked).
 fn serverIsTokenValid(id: u32) callconv(.c) u32 {
     const token: u16 = @truncate(id);
     const mine = slotByJoinId(token);
@@ -279,13 +247,11 @@ fn jmpTo(site: usize, target: usize) void {
     std.mem.writeInt(i32, at[1..5], rel, .little);
 }
 
-/// What the realm last told us about a character, which is the only thing that makes throwing it
-/// out of a game legitimate. Only realmd writes it, so a client cannot name somebody else's
-/// character to have them evicted.
-/// It also names the game the realm placed the character in, and that is what makes it safe. A
-/// seat held inside THAT game is the character arriving, and the engine is right to call the name
-/// taken; a seat anywhere else is the game it has just left and has not been cleaned out of yet.
-/// Without the distinction the release fires on the join it is meant to let through.
+/// What the realm last told us about a character; only realmd writes it, so a client cannot name
+/// someone else's character to evict them. Also names the game the realm placed the character in: a
+/// seat in THAT game is the character arriving (name rightly taken); a seat elsewhere is the game it
+/// just left, not yet cleaned up. Without the distinction the release fires on the join it should
+/// let through.
 const Vouch = struct {
     name: [16]u8 = @splat(0),
     game: u32 = 0,
@@ -347,20 +313,12 @@ fn eqlName(a: []const u8, b: []const u8) bool {
 
 /// Let a character come straight back after the game it was in.
 ///
-/// The engine refuses a GAMELOGON whose character still holds a seat, and refuses it with SILENCE —
-/// the caller answers a 0 by falling out of its switch, so nothing goes back on the wire and the
-/// client sits at the loading screen until its own timeout. The seat outlives the game because it
-/// belongs to the CLIENT: `GAME_DestroyGame` frees the game and never calls `CleanUpClient`, and the
-/// client's own teardown lands a second or so after its socket died. While games were made one at a
-/// time the create waited long enough to hide it; overlapping games do not, and one player going
-/// straight into the next game is refused about half the time.
-///
-/// So the seat is released rather than the check bypassed: find the client in the by-name table,
-/// take its game off its own `pGame`, and hand both to the engine's own `CleanUpClient`, which
-/// unlinks it from the game and from both tables and saves the character on the way out. The realm
-/// having issued a join is the authorization; without one this answers exactly as the engine would.
-///
-/// This is `apps/d2gs/runtime/rejoin.zig` for the Mac build, and the same reasoning.
+/// The engine refuses a GAMELOGON whose character still holds a seat, silently (caller falls out of
+/// its switch on 0). The seat outlives the game because it belongs to the CLIENT — `GAME_DestroyGame`
+/// never calls `CleanUpClient`, whose own teardown lands ~1s after the socket died. So the seat is
+/// released, not the check bypassed: find the client in the by-name table, take its game off its own
+/// `pGame`, hand both to the engine's own `CleanUpClient` (unlinks + saves the character). Realm
+/// having issued a join is the authorization. Mac-build twin of `apps/d2gs/runtime/rejoin.zig`.
 fn gameFindPlayerByName(name_ptr: [*:0]const u8, out: ?[*]u8) callconv(.c) u32 {
     const name = std.mem.span(name_ptr);
 
@@ -437,14 +395,16 @@ var req_deadline_ms: i64 = 0;
 var req_armed_ms: i64 = 0;
 var req_slot_ms: i64 = 0;
 
-/// Two senders share the socket: the control thread answers requests, the tick thread reports a
-/// game closing.
-var send_lock = std.atomic.Value(bool).init(false);
-
 pub fn start(loaded: *const macho.load.Loaded) void {
     image = loaded;
-    const realm = env("D2GS_REALM") orelse {
-        note("d2gs-native: gslink off (set D2GS_REALM=host:port to register with a realm)\n", .{});
+    const addr_s = env("D2GS_REDIS_ADDR") orelse {
+        note("d2gs-native: no realm (set D2GS_REDIS_ADDR=host:port to join one)\n", .{});
+        return;
+    };
+    var rip: [4]u8 = undefined;
+    var rport: u16 = 6379;
+    parseAddr(addr_s, &rip, &rport) catch {
+        note("d2gs-native: D2GS_REDIS_ADDR=\"{s}\" is not host:port\n", .{addr_s});
         return;
     };
     const advertised = env("D2GS_GS_ADDR") orelse "127.0.0.1:4000";
@@ -452,11 +412,13 @@ pub fn start(loaded: *const macho.load.Loaded) void {
         note("d2gs-native: D2GS_GS_ADDR=\"{s}\" is not host:port\n", .{advertised});
         return;
     };
+    store.configure(rip, rport);
+    chardb.configure(image);
     gsid = identity();
     readGameCap();
     started = true;
-    _ = std.Thread.spawn(.{}, thread, .{realm}) catch |e| {
-        note("d2gs-native: gslink thread: {s}\n", .{@errorName(e)});
+    _ = std.Thread.spawn(.{}, thread, .{}) catch |e| {
+        note("d2gs-native: realm thread: {s}\n", .{@errorName(e)});
         started = false;
     };
 }
@@ -490,21 +452,18 @@ pub fn pump() void {
         if (s.gameid == 0) continue;
         if (s.phase != .released and gameIsAlive(s.gameid)) continue;
         sendCloseGame(s.join_id);
-        note("d2gs-native: gslink CLOSEGAME gameid={d} ({d} game(s) left)\n", .{ s.join_id, liveGames() - 1 });
+        note("d2gs-native: CLOSEGAME gameid={d} ({d} game(s) left)\n", .{ s.join_id, liveGames() - 1 });
         s.* = .{};
     }
 }
 
 /// The slot a create should be answered into, or null to keep waiting for one.
 ///
-/// The engine is about a second behind a client that walks out: the connection is gone, and the
-/// game still counts it until the engine gets round to the disconnect. A create that arrives in
-/// that second on a server with nothing free must wait rather than be refused — a refusal reaches
-/// the player as "the realm is down" for a server that is about to be idle.
-///
-/// What must NOT wait is the other client of a game already here: it lost the race to create a game
-/// its partner made, and a refusal is the answer it wants, because the realm turns that into a
-/// join. The name tells them apart — same name is the race, a different name is a new game.
+/// The engine is ~1s behind a client that walks out, so a create arriving on a server with nothing
+/// free must wait rather than be refused (a refusal reads to the player as "realm is down"). But the
+/// other client of a game already here must NOT wait — it lost the create race to its partner, and
+/// a refusal is what it wants, since the realm turns that into a join. Same name = the race,
+/// different name = a new game.
 const Admission = union(enum) {
     /// Make the game here.
     take: *Slot,
@@ -580,7 +539,6 @@ var last_tick_ms: i64 = 0;
 /// The engine's own budget between passes over a game, in `QSERVER_TickAllGames`.
 const tick_period_ms: i64 = 40;
 
-// ── engine ───────────────────────────────────────────────────────────────────
 var last_clients: u32 = 0;
 /// When the game was seen with nobody in it, and whether the engine still has to free the slot.
 var empty_ms: i64 = 0;
@@ -589,13 +547,11 @@ var freeing = false;
 /// cannot answer that on its own — see `holdGameForItsFirstPlayer`.
 var join_resolved = false;
 
-/// The engine's empty-game reap is a stopwatch, and `applyPatches` has shortened it to a
-/// millisecond so a finished game frees the one slot this build has immediately. That leaves the
-/// other end exposed: a game the realm has just created is also empty, and would be collected
-/// before the client it was made for could connect. So while it has never had a player, its
-/// empty-since stamp is put back to zero every pass, which is the engine's own "not empty yet" —
-/// it re-stamps it to now, and the window never elapses. Once someone has been in, the stopwatch is
-/// left alone and the engine collects the game on its own, through its own locked destroy path.
+/// `applyPatches` shortens the engine's empty-game reap stopwatch to a millisecond so a finished
+/// game frees its slot immediately — but that also reaps a just-created, still-playerless game
+/// before its client can connect. So until a game has had a player, its empty-since stamp is
+/// re-zeroed every pass (the engine's own "not empty yet"), and the window never elapses. Once
+/// someone has been in, the stopwatch runs and the engine reaps it through its own locked destroy.
 pub fn holdGameForItsFirstPlayer() void {
     for (&slots) |*s| {
         if (s.gameid != 0) holdOne(s);
@@ -705,112 +661,78 @@ fn runCreate(slot: *Slot) void {
     req_result = p.CREATE_OK;
 }
 
-// ── control connection ───────────────────────────────────────────────────────
-
-fn thread(realm: []const u8) void {
-    var ip: [4]u8 = undefined;
-    var port: u16 = 6115;
-    parseAddr(realm, &ip, &port) catch {
-        note("d2gs-native: D2GS_REALM=\"{s}\" is not host:port\n", .{realm});
-        return;
-    };
-    // The character store sits one port below the control link on the same host, as
-    // `apps/d2gs/d2gs.zig` derives it on Windows.
-    chardb.configure(image, ip, port);
-    if (env("D2GS_D2DBS")) |a| {
-        var dip: [4]u8 = undefined;
-        var dport: u16 = 0;
-        if (parseAddr(a, &dip, &dport)) chardb.setAddress(dip, dport) else |_| {
-            note("d2gs-native: D2GS_D2DBS=\"{s}\" is not host:port\n", .{a});
-        }
-    }
+/// Publish this server, then take create/join from its own queue. There is nothing to connect to:
+/// the realm is reached through the store, so an instance restarting is not an event here.
+fn thread() void {
+    var announced = false;
     var complained = false;
     while (true) {
-        if (connectOnce(ip, port)) {
-            complained = false;
-            serve();
-            _ = close(sock);
-            sock = -1;
-            note("d2gs-native: gslink disconnected\n", .{});
-        } else if (!complained) {
-            complained = true;
-            note("d2gs-native: gslink cannot reach {d}.{d}.{d}.{d}:{d} — retrying\n", .{ ip[0], ip[1], ip[2], ip[3], port });
+        if (!store.ping()) {
+            // Say it once. A store that is not up yet is the normal case at boot, but a server
+            // that can never reach it and never mentions it looks like a server the realm is
+            // ignoring — which is a much harder thing to go and look for.
+            if (!complained) {
+                complained = true;
+                note("d2gs-native: cannot reach the realm store — retrying\n", .{});
+            }
+            _ = usleep(2_000_000);
+            continue;
         }
-        // A realm that is not up yet is the normal case at boot; keep asking.
-        _ = usleep(2_000_000);
+        complained = false;
+        publish();
+        if (!announced) {
+            announceBoot();
+            announced = true;
+            note("d2gs-native: published to the realm store gsid=0x{x} {d}.{d}.{d}.{d}:{d} maxgame={d}\n", .{
+                gsid, public_ip[0], public_ip[1], public_ip[2], public_ip[3], public_port, game_cap,
+            });
+        }
+        var drained: usize = 0;
+        while (drained < 8) : (drained += 1) {
+            var buf: [1024]u8 = undefined;
+            const n = store.popRequest(gsid, &buf);
+            if (n < p.HEADER_LEN) break;
+            const size = std.mem.readInt(u16, buf[0..2], .little);
+            const typ = std.mem.readInt(u16, buf[2..4], .little);
+            const seq = std.mem.readInt(u32, buf[4..8], .little);
+            if (size > n or size < p.HEADER_LEN) continue;
+            onPacket(typ, seq, buf[p.HEADER_LEN..size]);
+        }
+        _ = usleep(20_000);
     }
 }
 
-fn connectOnce(ip: [4]u8, port: u16) bool {
-    const s = socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (s < 0) return false;
-    const sa = std.posix.sockaddr.in{
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = @bitCast(ip),
-    };
-    if (connect(s, &sa, @sizeOf(std.posix.sockaddr.in)) != 0) {
-        _ = close(s);
-        return false;
-    }
-    sock = s;
-    note("d2gs-native: gslink connected to {d}.{d}.{d}.{d}:{d} gsid=0x{x}\n", .{ ip[0], ip[1], ip[2], ip[3], port, gsid });
-    return true;
+const reply_ttl_s: u32 = 30;
+const heartbeat_ttl_s: u32 = 90;
+const event_cap: u32 = 4096;
+const event_ttl_s: u32 = 3600;
+
+/// Our record: address, capacity, load, and whether we are full. `full` answers what the count
+/// alone cannot — a finished game holds its slot until the engine collects it.
+fn publish() void {
+    _ = store.putHeartbeat(gsid, public_ip, public_port, game_cap, liveGames(), liveGames() >= game_cap, heartbeat_ttl_s);
 }
 
-fn serve() void {
-    var body: [1024]u8 = undefined;
-    while (true) {
-        var head: [p.HEADER_LEN]u8 = undefined;
-        if (!recvAll(&head)) return;
-        const size = std.mem.readInt(u16, head[0..2], .little);
-        const typ = std.mem.readInt(u16, head[2..4], .little);
-        if (size < p.HEADER_LEN or size - p.HEADER_LEN > body.len) return;
-        const n = size - p.HEADER_LEN;
-        if (!recvAll(body[0..n])) return;
-        onPacket(typ, body[0..n]);
-    }
-}
-
-fn onPacket(typ: u16, body: []const u8) void {
-    switch (typ) {
-        @intFromEnum(p.Type.authreq) => sendRegistration(),
-        @intFromEnum(p.Type.echo) => {
-            var h: [p.HEADER_LEN]u8 = undefined;
-            writeHeader(&h, p.HEADER_LEN, @intFromEnum(p.Type.echo));
-            _ = sendAll(&h);
-        },
-        @intFromEnum(p.Type.creategame) => onCreateGame(body),
-        @intFromEnum(p.Type.joingame) => onJoinGame(body),
-        else => {},
-    }
-}
-
-/// AUTHREPLY + SETGSINFO + ADDRINFO in one burst — the realm only counts a GS as able to host
-/// once the last of the three arrives.
-fn sendRegistration() void {
-    var auth = std.mem.zeroes(p.AuthReply);
-    auth.h = header(.authreply, @sizeOf(p.AuthReply));
-    auth.version = 1;
-    _ = sendAll(std.mem.asBytes(&auth));
-
-    var info = std.mem.zeroes(p.SetGsInfo);
-    info.h = header(.setgsinfo, @sizeOf(p.SetGsInfo));
-    info.maxgame = game_cap;
-    _ = sendAll(std.mem.asBytes(&info));
-
+/// A server that just started hosts nothing, so the realm must drop whatever still names it.
+fn announceBoot() void {
     var ai = std.mem.zeroes(p.AddrInfo);
     ai.h = header(.addrinfo, @sizeOf(p.AddrInfo));
     ai.maxgame = game_cap;
     ai.gsid = gsid;
     ai.ip = public_ip;
     ai.port = public_port;
-    _ = sendAll(std.mem.asBytes(&ai));
-    note("d2gs-native: gslink registered {d}.{d}.{d}.{d}:{d} maxgame={d}\n", .{
-        public_ip[0], public_ip[1], public_ip[2], public_ip[3], public_port, game_cap,
-    });
+    _ = store.pushEvent(std.mem.asBytes(&ai), event_cap, event_ttl_s);
 }
 
-fn onCreateGame(body: []const u8) void {
+fn onPacket(typ: u16, seq: u32, body: []const u8) void {
+    switch (typ) {
+        @intFromEnum(p.Type.creategame) => onCreateGame(seq, body),
+        @intFromEnum(p.Type.joingame) => onJoinGame(seq, body),
+        else => {},
+    }
+}
+
+fn onCreateGame(seq: u32, body: []const u8) void {
     var result: u32 = p.CREATE_FAILED;
     var gid: u32 = 0;
     if (body.len >= 4) {
@@ -837,10 +759,11 @@ fn onCreateGame(body: []const u8) void {
     }
     var r = std.mem.zeroes(p.CreateGameReply);
     r.h = header(.creategame, @sizeOf(p.CreateGameReply));
+    r.h.seqno = seq; // the reply is keyed by the request's seq, not by ours
     r.result = result;
     r.gameid = gid;
-    _ = sendAll(std.mem.asBytes(&r));
-    note("d2gs-native: gslink CREATEGAME \"{s}\" -> result={d} gameid={d} slot={d}ms total={d}ms\n", .{
+    _ = store.putReply(seq, std.mem.asBytes(&r), reply_ttl_s);
+    note("d2gs-native: CREATEGAME \"{s}\" -> result={d} gameid={d} slot={d}ms total={d}ms\n", .{
         cstr(&req_name), result, gid, req_slot_ms, nowMs() - req_armed_ms,
     });
 }
@@ -850,7 +773,7 @@ fn onCreateGame(body: []const u8) void {
 /// GAMELOGON that follows carries the name alone. That is what makes it the moment to fetch the
 /// save: `chardb.place` writes it where the engine's own loader looks, and without it every join
 /// ends in reason 0x0e, "no character".
-fn onJoinGame(body: []const u8) void {
+fn onJoinGame(seq: u32, body: []const u8) void {
     const gid = if (body.len >= 4) std.mem.readInt(u32, body[0..4], .little) else 0;
     var off: usize = 8;
     const charname = readCStr(body, &off);
@@ -866,29 +789,26 @@ fn onJoinGame(body: []const u8) void {
         // is still in the world rather than one who has left.
         if (slotByJoinId(@truncate(gid))) |s| vouchFor(charname, s.gameid);
     }
-    note("d2gs-native: gslink JOINGAMEREQ gameid={d} char=\"{s}\" seated={} known={}\n", .{
+    note("d2gs-native: JOINGAMEREQ gameid={d} char=\"{s}\" seated={} known={}\n", .{
         gid, charname, seated, slotByJoinId(@truncate(gid)) != null,
     });
 
     var r = std.mem.zeroes(p.JoinGameReply);
     r.h = header(.joingame, @sizeOf(p.JoinGameReply));
+    r.h.seqno = seq; // the reply is keyed by the request's seq, not by ours
     r.result = if (slotByJoinId(@truncate(gid)) != null and seated) 0 else 1;
     r.gameid = gid;
-    _ = sendAll(std.mem.asBytes(&r));
+    _ = store.putReply(seq, std.mem.asBytes(&r), reply_ttl_s);
 }
 
 /// Tell the realm how many players a game holds now.
 ///
-/// realmd increments its own count on every join it authorises (`d2cs.zig` `g.players + 1`) and
-/// never decrements: it cannot, because it only ever sees the request to join, never the arrival or
-/// the departure. The count comes back down solely because the server that hosts the game reports
-/// an absolute figure — which this one did not do at all, so a game's count only ever went up. A
-/// game whose name is reused across sessions therefore reached the engine's eight-player ceiling
-/// and every further join was refused `0x2b`, "game is full", with nobody in it.
-///
-/// Absolute, never a delta, so a lost message cannot make it drift. The name is left empty: the
-/// count is what is wrong, and realmd's roster ignores an empty one rather than filing a blank
-/// member. A GS that knows who arrived should send the name and `GAMEINFO_ENTER`/`_LEAVE` instead.
+/// realmd increments its count on every join it authorises (`d2cs.zig` `g.players + 1`) and never
+/// decrements — it only ever sees the join request, not arrival/departure. Without this, a reused
+/// game name hit the engine's 8-player ceiling and every join was refused `0x2b` "game is full" with
+/// nobody in it. Sent as an absolute figure, never a delta, so a lost message can't drift it. Name
+/// left empty: realmd's roster ignores a blank one rather than filing a member. A GS that knows who
+/// arrived should send name + `GAMEINFO_ENTER`/`_LEAVE` instead.
 fn sendPlayers(gid: u16, players: u32) void {
     var buf: [@sizeOf(p.UpdateGameInfo) + 1]u8 = undefined;
     var r = std.mem.zeroes(p.UpdateGameInfo);
@@ -898,14 +818,15 @@ fn sendPlayers(gid: u16, players: u32) void {
     r.players = players;
     @memcpy(buf[0..@sizeOf(p.UpdateGameInfo)], std.mem.asBytes(&r));
     buf[@sizeOf(p.UpdateGameInfo)] = 0; // the empty character name
-    _ = sendAll(&buf);
+    _ = store.pushEvent(&buf, event_cap, event_ttl_s);
 }
 
 fn sendCloseGame(gid: u32) void {
     var c = std.mem.zeroes(p.CloseGame);
     c.h = header(.closegame, @sizeOf(p.CloseGame));
     c.gameid = gid;
-    _ = sendAll(std.mem.asBytes(&c));
+    _ = store.pushEvent(std.mem.asBytes(&c), event_cap, event_ttl_s);
+    publish(); // a freed slot the realm learns about only at the next heartbeat is a slot it will not use
 }
 
 /// Bit 2 gates the per-frame client update and the engine asserts without it; bits 12-14 are the
@@ -917,8 +838,6 @@ fn gameFlags(difficulty: u8, expansion: bool, hardcore: bool) u32 {
     if (hardcore) f |= 0x800;
     return f;
 }
-
-// ── plumbing ─────────────────────────────────────────────────────────────────
 
 fn header(t: p.Type, size: u16) p.Header {
     seqno +%= 1;
@@ -932,28 +851,7 @@ fn writeHeader(buf: []u8, size: u16, typ: u16) void {
     std.mem.writeInt(u32, buf[4..8], seqno, .little);
 }
 
-fn sendAll(bytes: []const u8) bool {
-    while (send_lock.swap(true, .acquire)) _ = usleep(1000);
-    defer send_lock.store(false, .release);
-    if (sock < 0) return false;
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = send(sock, bytes.ptr + off, bytes.len - off, 0);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
 
-fn recvAll(buf: []u8) bool {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = recv(sock, buf.ptr + off, buf.len - off, 0);
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
 
 fn readCStr(body: []const u8, off: *usize) []const u8 {
     const from = off.*;
@@ -1060,12 +958,16 @@ fn note(comptime fmt: []const u8, args: anytype) void {
 test "host:port parses into octets and a port" {
     var ip: [4]u8 = undefined;
     var port: u16 = 0;
-    try parseAddr("10.1.2.3:6115", &ip, &port);
+    try parseAddr("10.1.2.3:6379", &ip, &port);
     try std.testing.expectEqual([4]u8{ 10, 1, 2, 3 }, ip);
-    try std.testing.expectEqual(@as(u16, 6115), port);
+    try std.testing.expectEqual(@as(u16, 6379), port);
     try std.testing.expectError(error.NoPort, parseAddr("10.1.2.3", &ip, &port));
-    try std.testing.expectError(error.InvalidCharacter, parseAddr("realm.example:6115", &ip, &port));
-    try std.testing.expectError(error.NotDotted, parseAddr("10.1.2.3.4:6115", &ip, &port));
+    // Anything that is not a dotted quad — a name, or "10.1.2.3.4" — is handed to resolve() on
+    // purpose, so there is no parse error left to assert and the outcome depends on DNS. Only
+    // `dottedQuad` can be checked without a resolver.
+    try std.testing.expectEqual(@as(?[4]u8, null), dottedQuad("realm.example"));
+    try std.testing.expectEqual(@as(?[4]u8, null), dottedQuad("10.1.2.3.4"));
+    try std.testing.expectEqual(@as(?[4]u8, .{ 10, 1, 2, 3 }), dottedQuad("10.1.2.3"));
 }
 
 test "game flags carry difficulty, the client-update gate and expansion" {

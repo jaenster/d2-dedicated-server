@@ -42,18 +42,12 @@ fn inList(offsets: []const usize, off: usize) bool {
     return false;
 }
 
-/// Build a trampoline for a detour hook.
-///
-/// Copies `hook_size` bytes from `target_addr` into an executable buffer, fixes
-/// up any relative E8 (CALL) / E9 (JMP) within them, expands the rel8 short
-/// branches listed in `rel8_offsets` (Jcc 0x70-0x7F / JMP 0xEB) to their rel32
-/// forms so they still reach their absolute targets from the trampoline's new
-/// location, then appends a JMP back to `target_addr + hook_size`. `hook_size`
-/// must be >= 5 (room for the 5-byte JMP we overwrite the prologue with) and
-/// land on an instruction boundary. `rel8_offsets` are the byte offsets WITHIN
-/// the prologue of any rel8 branch first byte (the maintainer verifies the
-/// prologue by hand; we never byte-scan for these because a modrm/disp byte can
-/// alias a Jcc opcode). Returns null on allocation failure.
+/// Build a trampoline for a detour hook: copy `hook_size` bytes from `target_addr` into an
+/// executable buffer, fix up relative E8 (CALL) / E9 (JMP) within them, expand `rel8_offsets`
+/// (Jcc 0x70-0x7F / JMP 0xEB) to rel32 so they still reach their targets from the new location,
+/// then append a JMP back to `target_addr + hook_size`. `hook_size` must be >= 5 and land on an
+/// instruction boundary. `rel8_offsets` are hand-verified prologue offsets — never byte-scanned,
+/// since a modrm/disp byte can alias a Jcc opcode. Returns null on allocation failure.
 pub fn build(target_addr: usize, hook_size: usize, rel8_offsets: []const usize) ?Trampoline {
     // Each expanded rel8 grows by at most 4 bytes (rel8 -> rel32); + JMP back.
     const alloc_size = hook_size + 5 + 4 * rel8_offsets.len;

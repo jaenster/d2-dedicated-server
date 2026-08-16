@@ -1,17 +1,10 @@
-//! Omnivision (client-side maphack) — see monsters/players through walls and
-//! light the whole map. Ported from Charon's Omnivision.cpp (jaenster). Two
-//! patches; the dark-debug branch and the light-radius patch (which only matter
-//! for DebugMode::DARK) are intentionally dropped — this is plain omnivision.
-//!
-//! 1. GetRoomColors @0x66bfd0 — the engine's per-room gamma/r/g/b lookup. We
-//!    JMP the entry to a stub that forces all four output bytes to 0xFF (full
-//!    bright), so no room is ever darkened by fog of war.
-//! 2. PLAYER_CanSee call @0x4dc864 — replace the `call` with a hook that runs
-//!    the original line-of-sight check and then forces the result to 1, so units
-//!    behind walls are still considered visible.
-//!
-//! All addresses are 1.14d (base 0x00400000), sourced from Charon. Effect is only
-//! visible on a rendered client — verify on the real client, not the headless GS.
+//! Omnivision (client-side maphack) — see monsters/players through walls and light the whole map.
+//! Ported from Charon's Omnivision.cpp (jaenster); the dark-debug branch and light-radius patch
+//! (DebugMode::DARK only) are dropped — this is plain omnivision. Two patches: (1) GetRoomColors
+//! @0x66bfd0, the per-room gamma/r/g/b lookup, JMP'd to a stub forcing all four bytes to 0xFF so
+//! no room is darkened; (2) PLAYER_CanSee call @0x4dc864, replaced with a hook that runs the
+//! original line-of-sight check then forces the result to 1. Addresses are 1.14d (base 0x400000),
+//! from Charon. Visible only on a rendered client — verify there, not the headless GS.
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");
 

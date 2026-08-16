@@ -4,7 +4,7 @@ const std = @import("std");
 //
 //   apps/d2gs      -> dbghelp.dll + d2gs.dll, the injected pair (x86-windows, run under wine)
 //   apps/realmd    -> realmd, the realm server (bnetd + d2cs + d2dbs in one binary)
-//   apps/qqserver  -> qqserver, the stateless ingress for game traffic
+//   apps/d2ingress  -> d2ingress, the stateless ingress for game traffic
 //   packages/*     -> what more than one of those needs, each one its own module
 //   tools/*        -> everything that is built to be run by hand, not deployed
 //
@@ -32,6 +32,13 @@ pub fn build(b: *std.Build) void {
     // ends of the realm link so the two agree on the wire by construction.
     const realm_proto = b.addModule("realm_proto", .{
         .root_source_file = b.path("packages/realm-proto/realm_proto.zig"),
+    });
+
+    // The Redis wire format as a pure codec — no sockets, no libc — so the x86-windows DLL can
+    // speak it with its own Winsock while the native binaries use realm_infra's. One
+    // implementation rather than a second one growing inside the DLL.
+    const resp = b.addModule("resp", .{
+        .root_source_file = b.path("packages/resp/resp.zig"),
     });
 
     // Per-thread trace/span context. Shared by the DLL and the host binaries because a trace
@@ -74,12 +81,13 @@ pub fn build(b: *std.Build) void {
 
     // The concrete persistence backends (fs/redis/pg) behind the store facade, imported by
     // realmd. Includes the Postgres client, so the pg dependency lives here (lazy, only fetched
-    // when a step builds realmd). The qqserver does NOT use this: it talks to redis directly
+    // when a step builds realmd). The d2ingress does NOT use this: it talks to redis directly
     // with its own async client, so it never pulls pg.
     const realm_store = b.addModule("realm_store", .{
         .root_source_file = b.path("packages/realm-store/realm_store.zig"),
     });
     realm_store.addImport("realm_infra", realm_infra);
+    realm_store.addImport("resp", resp);
     if (b.lazyDependency("pg", .{ .target = host, .optimize = optimize })) |pg_dep| {
         realm_store.addImport("pg", pg_dep.module("pg"));
     }
@@ -109,6 +117,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     d2gs.root_module.addImport("realm_proto", realm_proto);
+    d2gs.root_module.addImport("resp", resp);
     d2gs.root_module.addImport("obs", obs);
     b.installArtifact(d2gs);
 
@@ -152,27 +161,27 @@ pub fn build(b: *std.Build) void {
     const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
     realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
 
-    // ── apps/qqserver ────────────────────────────────────────────────────────────
+    // ── apps/d2ingress ────────────────────────────────────────────────────────────
     //
     // The cloud-native game-traffic gateway: a token-translating, fully non-blocking poll()
     // splice proxy fronting the GS fleet. ZERO heap, bare libc sockets, and its OWN async redis
     // client (route lookups over a non-blocking redis connection in the same poll loop) — so it
     // imports neither the store package nor the pg dependency.
-    const qqserver = b.addExecutable(.{
-        .name = "qqserver",
+    const d2ingress = b.addExecutable(.{
+        .name = "d2ingress",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/qqserver/main.zig"),
+            .root_source_file = b.path("apps/d2ingress/main.zig"),
             .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    qqserver.root_module.addImport("realm_infra", realm_infra);
-    b.installArtifact(qqserver);
+    d2ingress.root_module.addImport("realm_infra", realm_infra);
+    b.installArtifact(d2ingress);
 
-    // `zig build qqserver` — build + install ONLY the qqserver binary.
-    const qqserver_step = b.step("qqserver", "Build the qqserver game-traffic gateway");
-    qqserver_step.dependOn(&b.addInstallArtifact(qqserver, .{}).step);
+    // `zig build d2ingress` — build + install ONLY the d2ingress binary.
+    const d2ingress_step = b.step("d2ingress", "Build the d2ingress game-traffic gateway");
+    d2ingress_step.dependOn(&b.addInstallArtifact(d2ingress, .{}).step);
 
     // ── tests ────────────────────────────────────────────────────────────────────
     //
@@ -195,18 +204,31 @@ pub fn build(b: *std.Build) void {
     realm_tests.root_module.addImport("libd2", libd2);
     test_step.dependOn(&b.addRunArtifact(realm_tests).step);
 
-    // qqserver's pure wire logic (the 0xAF greeting strip it applies to the GS→client splice),
-    // rooted at the binary itself with its infra import.
-    const qq_tests = b.addTest(.{
+    // The RESP codec. Worth its own test binary rather than riding along with realmd's: it is
+    // IO-free by design, so it is the one piece of the store path that can be tested exhaustively
+    // without a server — and it is about to be compiled into the DLL, where a framing bug is far
+    // harder to see.
+    const resp_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/qqserver/main.zig"),
+            .root_source_file = b.path("packages/resp/resp.zig"),
+            .target = host,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(resp_tests).step);
+
+    // d2ingress's pure wire logic (the 0xAF greeting strip it applies to the GS→client splice),
+    // rooted at the binary itself with its infra import.
+    const ingress_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/d2ingress/main.zig"),
             .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    qq_tests.root_module.addImport("realm_infra", realm_infra);
-    test_step.dependOn(&b.addRunArtifact(qq_tests).step);
+    ingress_tests.root_module.addImport("realm_infra", realm_infra);
+    test_step.dependOn(&b.addRunArtifact(ingress_tests).step);
 
     // The packages: realm_infra's lock/logger/config, realm_store's RESP codec and fs backend,
     // and realm_proto's wire types.
@@ -229,6 +251,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         mod_tests.root_module.addImport("obs", obs);
+        mod_tests.root_module.addImport("resp", resp);
         if (spec[1]) mod_tests.root_module.addImport("realm_infra", realm_infra);
         if (spec[2]) {
             if (b.lazyDependency("pg", .{ .target = host, .optimize = optimize })) |pg_dep| {
@@ -261,19 +284,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
     d2gs_native.root_module.addImport("macho", macho);
+    // Same IO-free RESP codec the wine DLL and realmd use, so the three cannot drift on the wire.
+    d2gs_native.root_module.addImport("resp", resp);
     d2gs_native.root_module.addImport("darwin", darwin);
     d2gs_native.root_module.addImport("realm_proto", realm_proto);
-    const gslink_tests = b.addTest(.{
+    const native_realm_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/d2gs-native/gslink.zig"),
+            .root_source_file = b.path("apps/d2gs-native/realm.zig"),
             .target = host,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    gslink_tests.root_module.addImport("macho", macho);
-    gslink_tests.root_module.addImport("realm_proto", realm_proto);
-    test_step.dependOn(&b.addRunArtifact(gslink_tests).step);
+    native_realm_tests.root_module.addImport("macho", macho);
+    native_realm_tests.root_module.addImport("realm_proto", realm_proto);
+    test_step.dependOn(&b.addRunArtifact(native_realm_tests).step);
 
     b.step("d2gs-native", "Build the wine-free native game server").dependOn(
         &b.addInstallArtifact(d2gs_native, .{}).step,
@@ -328,11 +353,44 @@ pub fn build(b: *std.Build) void {
         }),
     });
     e2e.root_module.addImport("libd2", libd2);
+    // The harness's stand-in game server meets realmd in redis like a real one, so it needs the
+    // same IO-free RESP codec both real ends use — sharing it is what keeps the harness from
+    // drifting away from the thing it tests.
+    e2e.root_module.addImport("resp", resp);
     const run_e2e = b.addRunArtifact(e2e);
     run_e2e.step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
-    run_e2e.step.dependOn(&b.addInstallArtifact(qqserver, .{}).step); // qqserver_routing spawns it
+    run_e2e.step.dependOn(&b.addInstallArtifact(d2ingress, .{}).step); // d2ingress_routing spawns it
     const e2e_step = b.step("e2e", "Build + run the clientless realmd E2E test harness");
     e2e_step.dependOn(&run_e2e.step);
+
+    // stress-e2e — run-stress.sh's round loop against a REAL GS (clientless's d2-realm/d2-session,
+    // not FakeGS): each round spawns --clients threads that log in once and play --runs games.
+    // Manual: `zig build stress-e2e -- --rounds N --clients N` against a running realm+GS.
+    // Lazy: only fetches/builds clientless when this step is actually requested.
+    if (b.lazyDependency("clientless", .{ .target = host, .optimize = optimize })) |clientless_dep| {
+        const stress_e2e = b.addExecutable(.{
+            .name = "stress-e2e",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/stress-e2e/main.zig"),
+                .target = host,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        stress_e2e.root_module.addImport("d2-realm", clientless_dep.module("d2-realm"));
+        stress_e2e.root_module.addImport("d2-session", clientless_dep.module("d2-session"));
+        // addInstallArtifact directly, not the installArtifact sugar: that attaches to the
+        // DEFAULT install step, which every other `zig build <target>` invocation also runs —
+        // this tool is lazy and CI-only, so it stays out of that. The e2e-runner Dockerfile
+        // stage execs zig-out/bin/stress-e2e directly, so "stress-e2e" has to actually install
+        // it (addRunArtifact alone runs from the build cache, never touching zig-out).
+        const install_stress_e2e = b.addInstallArtifact(stress_e2e, .{});
+        const run_stress_e2e = b.addRunArtifact(stress_e2e);
+        if (b.args) |args| run_stress_e2e.addArgs(args);
+        const stress_e2e_step = b.step("stress-e2e", "Round-loop real-GS stress test (see run-stress.sh for the bash original)");
+        stress_e2e_step.dependOn(&install_stress_e2e.step);
+        stress_e2e_step.dependOn(&run_stress_e2e.step);
+    }
 
     // gamestress — create N games against a RUNNING realm/GS (manual: `zig build gamestress`).
     // Used to verify the empty-game reaper fix (the GS shouldn't OOM past ~8 games).

@@ -1,14 +1,8 @@
-//! dbghelp.dll proxy — the injection foothold.
-//!
-//! Game.exe loads `dbghelp.dll` dynamically for its crash handler. With
-//! `WINEDLLOVERRIDES="dbghelp=n"` (or this DLL sitting next to Game.exe on real
-//! Windows), our build loads instead of the system one. On attach we:
-//!   1. resolve the real system dbghelp and forward the handful of exports the
-//!      game's crash handler calls (each exported name tail-jumps to the real fn),
-//!   2. parse `--loaddll <winpath>` from the command line and LoadLibrary each —
-//!      this is how `d2gs.dll` (and any extra mod DLLs) get into the process.
-//!
-//! Builds to `dbghelp.dll` (see build.zig). No external dependencies.
+//! dbghelp.dll proxy — the injection foothold. Game.exe dynamically loads `dbghelp.dll` for its
+//! crash handler; with `WINEDLLOVERRIDES="dbghelp=n"` (or sitting next to Game.exe on real
+//! Windows), our build loads instead. On attach: (1) resolve the real system dbghelp and forward
+//! the exports the crash handler calls (tail-jump per name), (2) parse `--loaddll <winpath>` and
+//! LoadLibrary each — this is how `d2gs.dll` and mod DLLs get into the process.
 
 const std = @import("std");
 const win = std.os.windows;
@@ -123,14 +117,10 @@ fn eqlW(a: [*:0]const u16, comptime lit: []const u8) bool {
     }
 }
 
-// Deferred D2BS injection (--d2bs <winpath>). D2BS's DllMain startup thread calls
-// FindWindow and reads engine globals the instant it attaches, so LoadLibrary'ing it
-// pre-WinMain (via --loaddll, before the window exists) makes it throw 0xe06d7363 and
-// kill Game.exe. We mirror D2BS's own `--inject <pid>` loader: a thread waits for the
-// game window, THEN LoadLibrary's it. This lets a STOCK client run kolbot with only
-// D2BS.dll injected — no d2gs.dll (its gateway/checkrev/no-compress patches aren't
-// needed: point the client at realmd via the registry gateway; realmd passes checkrev
-// natively and the client obeys the server's 0xAF greeting for compression).
+// Deferred D2BS injection (--d2bs <winpath>). D2BS's DllMain reads engine globals the instant
+// it attaches, so LoadLibrary'ing it pre-WinMain (via --loaddll) throws 0xe06d7363 and kills
+// Game.exe. Mirrors D2BS's own `--inject <pid>` loader: a thread waits for the game window, THEN
+// LoadLibrary's it — lets a STOCK client run kolbot with only D2BS.dll injected, no d2gs.dll.
 var d2bs_path: [512]u16 = undefined;
 
 fn d2bsLoaderThread(_: ?*anyopaque) callconv(.winapi) u32 {
@@ -162,13 +152,10 @@ fn armD2bs(win_path: LPCWSTR) void {
 }
 
 // Work around WineHQ bug 44360: D2 1.14 hits Fog's unrecoverable-internal-error Halt
-// (@0x408a60) right after Battle.net login (realm/char-select transition) under wine —
-// reproduces against real Battle.net too, so it's a wine bug in D2's post-login path, not
-// the server. ERROR_Halt is cdecl (caller cleans args), so overwriting its entry with a
-// bare RET (0xC3) makes every assert a no-op return and lets the engine continue — the same
-// survive-the-assert behaviour d2gs.dll's halt_hook provides. Opt-in via --suppress-halt so
-// a stock client needs NO d2gs.dll. (The Game.exe image is mapped by the time dbghelp
-// attaches, so patching its code here is safe.)
+// (@0x408a60) right after Battle.net login, under wine and real Battle.net alike — a wine bug
+// in D2's post-login path, not the server. ERROR_Halt is cdecl, so overwriting its entry with a
+// bare RET (0xC3) makes every assert a no-op, same as d2gs.dll's halt_hook. Opt-in via
+// --suppress-halt so a stock client needs no d2gs.dll.
 const HALT_ADDR: usize = 0x00408a60;
 
 /// Overwrite `bytes` at code address `addr` (RWX during the write, restored after).
@@ -191,13 +178,11 @@ fn suppressHalt() void {
     }
 }
 
-// Client-side CheckRevision bypass — the real WineHQ bug 44360 workaround. D2's version-check
-// path (BNDOWNLOAD @0x51xxxx) does a patch-download that DIVIDES BY ZERO on wine's size-0 reply,
-// halting right after Battle.net login. Ported verbatim from d2gs.dll's checkrev_patch feature:
-// (1) stub BNDOWNLOAD_PerformCheckRevision @0x51e6d0 to write dummy version/checksum + return
-//     success (realmd accepts any SID_AUTH_CHECK), so the real MPQ computation never runs;
-// (2) force BNDOWNLOAD_GetProgress @0x51ea70 -> 0x66 ("no patch needed") so the launcher proceeds
-//     into the game instead of starting the divide-by-zero patch download.
+// Client-side CheckRevision bypass. D2's version-check (BNDOWNLOAD @0x51xxxx) does a
+// patch-download that DIVIDES BY ZERO on wine's size-0 reply, right after Battle.net login.
+// Ported from d2gs.dll's checkrev_patch: (1) stub BNDOWNLOAD_PerformCheckRevision @0x51e6d0 to
+// write dummy version/checksum + succeed (realmd accepts any SID_AUTH_CHECK); (2) force
+// BNDOWNLOAD_GetProgress @0x51ea70 -> 0x66 ("no patch needed") to skip the divide-by-zero path.
 const CHECKREV_ADDR: usize = 0x0051e6d0;
 const GETPROGRESS_ADDR: usize = 0x0051ea70;
 const checkrev_stub = [_]u8{

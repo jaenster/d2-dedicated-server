@@ -1,13 +1,12 @@
 //! What a Darwin import name resolves to in this process.
 //!
-//! There are only two answers, and that is the decision here: either the host libc means the same
-//! thing by the name and the binding gets the real function, or it does not and the binding gets ten
-//! bytes that say the name out loud when the game finally calls them. Nothing is stubbed to a
-//! `return 0` in between, because a stub that lies is indistinguishable from one that works until
-//! the frame it corrupts is three seconds downstream.
+//! Only two answers: either the host libc means the same thing by the name and the binding gets
+//! the real function, or it gets a thunk that names itself out loud when finally called. Nothing
+//! is stubbed to `return 0` in between — a stub that lies is indistinguishable from one that works
+//! until the frame it corrupts is three seconds downstream.
 //!
-//! Only 626 names come out of the image and most are windows, menus and sound. Which of them a
-//! headless server actually touches is a question the game answers, not this file.
+//! 626 names come out of the image, mostly windows/menus/sound; which a headless server actually
+//! touches is for the game to decide, not this file.
 
 const std = @import("std");
 
@@ -59,12 +58,9 @@ pub const Resolver = struct {
     }
 
     /// `name` must be NUL-terminated at `name.ptr[name.len]` and must outlive the process: an
-    /// unresolved name is handed to a thunk that prints it whenever the game gets round to calling
-    /// it, possibly hours later. Names sliced out of the mapped image satisfy both, which is why the
-    /// bind walker can pass its `[]const u8` straight in.
-    ///
-    /// Null means the slab is full, not that the name is unknown — an unknown name is what a thunk
-    /// is for.
+    /// unresolved name is handed to a thunk that prints it whenever the game finally calls it.
+    /// Names sliced out of the mapped image satisfy both, so the bind walker can pass its
+    /// `[]const u8` straight in. Null means the slab is full, not that the name is unknown.
     pub fn resolve(self: *Resolver, name: []const u8) ?usize {
         std.debug.assert(!self.sealed);
         std.debug.assert(name.ptr[name.len] == 0);

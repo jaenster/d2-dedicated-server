@@ -10,7 +10,7 @@ const macho = @import("macho");
 const darwin = @import("darwin");
 const crash = @import("crash.zig");
 const qserver = @import("qserver.zig");
-const gslink = @import("gslink.zig");
+const realm = @import("realm.zig");
 const chardb = @import("chardb.zig");
 
 /// `applyFixups` takes a plain function pointer with no context argument, so the resolver has to be
@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
         // pointers, and a rebase pass would slide our entry along with them. Same for the join
         // hook, which is a relative call to code of ours.
         qserver.install(&loaded);
-        gslink.installTokenResolver(&loaded);
+        realm.installTokenResolver(&loaded);
         chardb.installLoadHook(&loaded);
     }
 
@@ -149,17 +149,11 @@ const pre_init_application: u32 = 0x0019d582;
 const default_app_mode: u32 = 0x005c8a30;
 
 /// The mode to boot into — client, NOT server. The bootstrap table at 0x3e0eb8 is six 8-byte slots
-/// and slot 2 is {0, 0}, so ApplicationMain fatals out on server by construction: the Mac build has
-/// no dedicated-server mode compiled in.
-///
-///   0 modstate0  {0, 0}              3 multiplayer  UIMENU_SetLobbyLoopParamAndGetPtr
-///   1 client     AppModeClientInit   4 launcher     fAPPMODE_launcher_SetAppMode
-///   2 server     {0, 0}              5 expand       AppModeClientInit
-///
-/// That costs nothing, because the Windows build is driven the same way: d2gs boots the client
-/// there too and calls the engine's own QSERVER entry points itself. Client is the mode that
-/// initialises the memory managers and loads the game tables, and `qserver.install` cuts in at the
-/// first state of the client state machine, before any of the client proper runs.
+/// (0 modstate0, 1 client=AppModeClientInit, 2 server={0,0}, 3 multiplayer, 4 launcher, 5 expand),
+/// and slot 2 is {0, 0} — the Mac build has no dedicated-server mode compiled in, so ApplicationMain
+/// fatals on server by construction. Costs nothing: the Windows build boots the client too and calls
+/// QSERVER entry points itself. Client init sets up the memory managers and game tables;
+/// `qserver.install` cuts in at the client state machine's first state, before the client proper.
 const appmode_client: u32 = 1;
 
 /// The two gates between a loaded image and a running game. Both are conditional jumps taken on a
@@ -202,22 +196,16 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // D2GFX_CreateWindow above — so with no window the pointer is null and presenting a frame is
         // a null vtable dereference. Returns 1, as the real one does.
         .{ .at = 0x002df9b9, .bytes = &.{ 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 }, .why = "no context to present a frame to" },
-        // UI_DISPLAY_RenderFrame's draw block, which the menu loop enters every 40 ms once the event
-        // pump stops spinning. Everything between BeginScene and EndScene needs the window that is
-        // not there. This is not a branch being broken open but one being held shut: the game skips
-        // exactly this block itself whenever the display flag at 0x554e94 is set, so the state is
-        // one it already supports. The panel-update callbacks above it are outside the block and
-        // still run, which is what keeps the UI advancing. `JNZ rel32` -> `JMP rel32`, same target.
+        // UI_DISPLAY_RenderFrame's draw block (BeginScene..EndScene needs the missing window). Not
+        // breaking a branch open but holding one shut: the game already skips this block itself
+        // when the display flag at 0x554e94 is set. Panel-update callbacks outside the block still
+        // run. `JNZ rel32` -> `JMP rel32`, same target.
         .{ .at = 0x0004a7c2, .bytes = &.{ 0xe9, 0xc9, 0x01, 0x00, 0x00, 0x90 }, .why = "no surface to draw the frame on" },
-        // QSERVER_DispatchAndCleanup destroys a game with nobody in it only once it has been empty
-        // for `CMP ESI, 0x493e0` — five minutes. The Windows build is patched the same way for the
-        // same reason (`apps/d2gs/runtime/gamereap.zig`), but there it is about not exhausting the
-        // eight Fog pool managers; here it is sharper than that. This engine has room for exactly
-        // one game, so the idle window IS the wait between games, and five minutes of it makes the
-        // server useless the moment anyone finishes a game. One millisecond, so a finished game is
-        // collected on the next dispatch pass. What stops that reaping a game the realm has only
-        // just made, before its client has had time to connect, is `gslink.pump`: it holds the
-        // engine's empty-since stamp at zero until the game has actually had someone in it.
+        // QSERVER_DispatchAndCleanup reaps an empty game only after `CMP ESI, 0x493e0` (five
+        // minutes). Windows patches this too (`apps/d2gs/runtime/gamereap.zig`, there about not
+        // exhausting the 8 Fog pool managers) but this engine has room for exactly one game, so the
+        // idle window IS the gap between games. Cut to one millisecond; `realm.pump` guards against
+        // reaping a just-made game by holding its empty-since stamp at zero until someone joins.
         .{ .at = 0x001ae8f2, .bytes = &.{ 0x01, 0x00, 0x00, 0x00 }, .why = "collect an empty game at once, not in five minutes" },
         // GAMELOGON's no-realm branch serves one game and calls it token 1: it refuses any other
         // token outright, then passes the immediate 1 to SERVER_IsTokenValid rather than the token
@@ -227,18 +215,15 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // exactly the 7 bytes `mov dword [esp], 1` occupied, so nothing after it moves. EAX is dead
         // here — the call overwrites it and the test that follows reads the result.
         .{ .at = 0x001a7a2f, .bytes = &.{ 0x0f, 0xb7, 0x46, 0x09, 0x89, 0x04, 0x24 }, .why = "join the token the client asked for" },
-        // ...and then translate it somewhere with room. SERVER_IsTokenValid reads a table with one
-        // usable slot (index 0 aliases the server-running byte at 0x53756c, and the token allocator
-        // clamps its counter to 1), and it indexes with an unchecked u16 — so a realm token is both
-        // unstorable and unsafe to look up. `gslink.installTokenResolver` replaces that function,
-        // which is where the translation has to be: a single GAMELOGON looks the token up from
-        // three separate functions. The table itself is left exactly as the engine keeps it.
-        // NET_D2GS_SERVER_SendPacketToClient 0x002ddd78 already has a verbatim path — the one the
-        // greeting itself rides — and mode 2 is how the engine asks for it. Windows reaches it with
-        // one patch because its compiler left one gate; this build split the same test in two, so
-        // both legs need sending down it: `JE raw` -> `JMP raw`, and the greeting-only test that
-        // guards the other leg NOPed out. What comes out is then Huffman-free and unframed, which
-        // is the only thing a client greeted with 0xAF00 can read.
+        // ...and then translate it somewhere with room: SERVER_IsTokenValid's table has one usable
+        // slot (index 0 aliases the server-running byte at 0x53756c, allocator clamps its counter to
+        // 1) and indexes with an unchecked u16, so a realm token is unstorable/unsafe there.
+        // `realm.installTokenResolver` replaces that function instead, since a GAMELOGON looks the
+        // token up from three separate functions; the table itself is left as the engine keeps it.
+        // NET_D2GS_SERVER_SendPacketToClient 0x002ddd78 already has a verbatim path (mode 2); this
+        // build split the compiler's one gate into two legs, so both need `JE raw` -> `JMP raw`,
+        // with the greeting-only test on the other leg NOPed out — output is then Huffman-free and
+        // unframed, the only thing a client greeted with 0xAF00 can read.
         .{ .at = 0x002dde12, .bytes = &.{ 0xeb, 0x09 }, .why = "send raw, not compressed" },
         .{ .at = 0x002dde1b, .bytes = &.{ 0x90, 0x90 }, .why = "send raw on the unlogged leg too" },
         // And say so: `movw $0x1af` builds the {0xAF, 0x01} greeting a byte at a time. 0x01 claims

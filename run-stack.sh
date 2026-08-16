@@ -1,24 +1,25 @@
 #!/bin/bash
 # run-stack.sh — bring up the whole local realm and prove it works.
 #
-# redis -> realmd -> qqserver -> the engine GS, in that order, each one WAITED FOR rather than
+# redis -> realmd -> d2ingress -> the engine GS, in that order, each one WAITED FOR rather than
 # slept on, and finished with a real join so "it's up" is a fact instead of a hope.
 #
 # The reason this exists: every piece has a flag that is easy to omit and whose absence shows up
-# three layers away as something unrelated. A GS without --gs-addr binds a port qqserver is not
-# looking at. A GS that never reaches gs-link is invisible to realmd, so JOINGAME resolves to
+# three layers away as something unrelated. A GS without --gs-addr binds a port d2ingress is not
+# looking at. A GS that never publishes itself is invisible to realmd, so JOINGAME resolves to
 # nothing and the client fails at a screen that says nothing. A client without --realm-gw quietly
 # dials real Battle.net. Each of those cost an afternoon at least once; they are all baked in here.
 #
 #   ./run-stack.sh            bring the stack up and smoke-test it
-#   ./run-stack.sh --trace    same, with qqserver hexdumping both directions of the game leg
+#   ./run-stack.sh --trace    same, with d2ingress hexdumping both directions of the game leg
 #   ./run-stack.sh --status   report what is up and what is not, change nothing
 #   ./run-stack.sh --down     stop what this script started (never touches wineserver)
 #
 # Config (env or ./.env):
-#   REDIS_ADDR   default 127.0.0.1:6390     GS_PORT      default 14000  (engine, behind qqserver)
-#   QQ_PORT      default 4000  (client-hardcoded)
-#   GSLINK_PORT  default 6115              HEALTH_PORT  default 18080
+#   REDIS_ADDR   default 127.0.0.1:6390     GS_PORT      default 14000  (engine, behind d2ingress)
+#   PG_ADDR/PG_DSN  default 127.0.0.1:55432   (both stores are required)
+#   INGRESS_PORT      default 4000  (client-hardcoded)
+#   HEALTH_PORT  default 18080
 #   TESTDIR      default ./testgame        LOG_DIR      default ./.stack
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -26,9 +27,10 @@ ROOT="$(pwd)"
 [ -f "$ROOT/.env" ] && set -a && . "$ROOT/.env" && set +a
 
 REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6390}"
-QQ_PORT="${QQ_PORT:-4000}"
+PG_DSN="${PG_DSN:-postgres://realmd:realmd@127.0.0.1:55432/realmd}"
+PG_ADDR="${PG_ADDR:-127.0.0.1:55432}"
+INGRESS_PORT="${INGRESS_PORT:-4000}"
 GS_PORT="${GS_PORT:-14000}"
-GSLINK_PORT="${GSLINK_PORT:-6115}"
 HEALTH_PORT="${HEALTH_PORT:-18080}"
 BNET_PORT="${BNET_PORT:-6112}"
 TESTDIR="${TESTDIR:-$ROOT/testgame}"
@@ -73,29 +75,29 @@ await() { # await <host:port> <seconds> <what>
   bad "$3 never came up on $1"; return 1
 }
 
-# The GS is the one piece whose readiness is NOT a port of its own: it dials OUT to realmd's
-# gs-link and registers. Until that lands, realmd has no server to hand out and every join fails
-# somewhere that looks like a client problem. So wait for the registration, not the process.
+# The GS is the one piece whose readiness is NOT a port of its own: it publishes itself into redis
+# and takes work from there. Until that lands, realmd has no server to hand out and every join
+# fails somewhere that looks like a client problem. So wait for the registration, not the process.
 await_gs_registered() {
   local t=0 log="$LOG_DIR/gs.log"
   while [ "$t" -lt "${1:-90}" ]; do
-    if grep -aqiE 'addrinfo|setgsinfo|gs-link|gslink' "$log" 2>/dev/null; then
-      ok "GS registered with realmd gs-link"; return 0
+    if grep -aqi 'published to the realm store' "$log" 2>/dev/null; then
+      ok "GS published itself to the realm store"; return 0
     fi
     grep -aqi 'panic\|assert' "$log" 2>/dev/null && { bad "GS died during boot — see $log"; return 1; }
     sleep 1; t=$((t+1))
   done
-  bad "GS never registered with gs-link in ${1:-90}s — realmd has no game server, so every join
-       will fail before it reaches qqserver. See $log"
+  bad "GS never published itself in ${1:-90}s — realmd has no game server, so every join
+       will fail before it reaches d2ingress. See $log"
   return 1
 }
 
 status() {
   say "status"
   listening "$REDIS_ADDR"        && ok "redis $REDIS_ADDR"          || bad "redis $REDIS_ADDR"
+  listening "$PG_ADDR"           && ok "postgres $PG_ADDR"          || bad "postgres $PG_ADDR"
   port_is "127.0.0.1:$BNET_PORT"   "realmd bnet :$BNET_PORT"     realmd
-  port_is "127.0.0.1:$GSLINK_PORT" "realmd gslink :$GSLINK_PORT" realmd
-  port_is "127.0.0.1:$QQ_PORT"     "qqserver :$QQ_PORT"          qqserver
+  port_is "127.0.0.1:$INGRESS_PORT"     "d2ingress :$INGRESS_PORT"          d2ingress
   # The GS picks its own game port and advertises it via ADDRINFO, so there is no fixed port to
   # probe — the process being alive and registered is the whole health signal.
   pgrep -f 'testgame' >/dev/null   && ok "GS process alive"         || bad "no GS process"
@@ -114,12 +116,11 @@ await_gone() { # await_gone <host:port> <seconds> <what>
 down() {
   say "stopping (wineserver is never touched)"
   pkill -9 -f 'testgame' 2>/dev/null && ok "GS stopped" || ok "no GS running"
-  pkill -f 'zig-out/bin/qqserver' 2>/dev/null && ok "qqserver stopped" || ok "no qqserver"
+  pkill -f 'zig-out/bin/d2ingress' 2>/dev/null && ok "d2ingress stopped" || ok "no d2ingress"
   pkill -f 'zig-out/bin/realmd' 2>/dev/null && ok "realmd stopped (draining)" || ok "no realmd"
-  await_gone "127.0.0.1:$QQ_PORT" 15 "qqserver" && ok "qqserver port released"
+  await_gone "127.0.0.1:$INGRESS_PORT" 15 "d2ingress" && ok "d2ingress port released"
   await_gone "127.0.0.1:$BNET_PORT" 15 "realmd" && ok "realmd port released"
-  await_gone "127.0.0.1:$GSLINK_PORT" 15 "realmd gs-link" >/dev/null
-  echo "redis left running (docker compose -f deploy/compose.dev.yaml down to stop it)"
+  echo "redis + postgres left running (docker compose -f deploy/compose.dev.yaml down to stop them)"
 }
 
 case "$MODE" in status) status; exit 0 ;; down) down; exit 0 ;; esac
@@ -127,8 +128,8 @@ case "$MODE" in status) status; exit 0 ;; down) down; exit 0 ;; esac
 say "building"
 # Only the three pieces this stack runs. The default install step also builds d2gs-native, which
 # targets i386 and does not compile for an arm64 host — an unrelated failure that stops the stack.
-zig build dlls realmd-bin qqserver || die "zig build failed"
-ok "d2gs.dll + realmd + qqserver built"
+zig build dlls realmd-bin d2ingress || die "zig build failed"
+ok "d2gs.dll + realmd + d2ingress built"
 
 # Building is not installing. The GS loads $TESTDIR/d2gs.dll, which only run.sh ever
 # wrote — so a fix could be built, launched and "tested" here while the engine went on
@@ -142,41 +143,45 @@ install_dlls() {
 }
 
 say "redis"
-listening "$REDIS_ADDR" || docker compose -f deploy/compose.dev.yaml up -d >/dev/null 2>&1
-await "$REDIS_ADDR" 20 "redis" || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
+# Both stores, always. There is no filesystem fallback any more: postgres keeps the characters
+# and accounts, redis keeps what is in flight, and realmd refuses to start without either.
+if ! listening "$REDIS_ADDR" || ! listening "$PG_ADDR"; then
+  docker compose -f deploy/compose.dev.yaml up -d >/dev/null 2>&1
+fi
+await "$REDIS_ADDR" 20 "redis"    || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
+await "$PG_ADDR"    30 "postgres" || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
 
 say "realmd"
 if listening "127.0.0.1:$BNET_PORT"; then
   ok "already running (leaving it alone — restarting drops live realm sessions)"
 else
-  REALMD_EPHEMERAL_STORE=redis REALMD_DURABLE_STORE=fs REALMD_REDIS_ADDR="$REDIS_ADDR" \
+  REALMD_REDIS_ADDR="$REDIS_ADDR" REALMD_PG_DSN="$PG_DSN" \
   REALMD_DATA_DIR="$REALMD_DATA_DIR" REALMD_REALM_ADDR=127.0.0.1 REALMD_GAME_ADDR=127.0.0.1 \
-  REALMD_QQ_PORT="$QQ_PORT" REALMD_HEALTH_PORT="$HEALTH_PORT" REALMD_PERMISSIVE_AUTH=1 \
+  REALMD_INGRESS_PORT="$INGRESS_PORT" REALMD_HEALTH_PORT="$HEALTH_PORT" REALMD_PERMISSIVE_AUTH=1 \
   REALMD_ADMIN_TOKEN="${REALMD_ADMIN_TOKEN:-}" \
     ./zig-out/bin/realmd > "$LOG_DIR/realmd.log" 2>&1 &
   await "127.0.0.1:$BNET_PORT" 20 "realmd bnet" || die "see $LOG_DIR/realmd.log"
 fi
-await "127.0.0.1:$GSLINK_PORT" 10 "realmd gs-link" || die "see $LOG_DIR/realmd.log"
 
-say "qqserver"
+say "d2ingress"
 # It must own the client-hardcoded port: D2 sends game traffic to the advertised IP on :4000 and
 # the join reply carries no port, so the public port is not ours to choose.
-if listening "127.0.0.1:$QQ_PORT"; then
-  ok "already running on :$QQ_PORT"
+if listening "127.0.0.1:$INGRESS_PORT"; then
+  ok "already running on :$INGRESS_PORT"
 else
   # Built as an argv array rather than an expanded word: `${TRACE:+VAR=1}` on its own line is a
   # COMMAND to bash, not an assignment, and it fails with "command not found" while looking like
   # an env var that simply did not take.
-  qq_env=(REALMD_REDIS_ADDR="$REDIS_ADDR" REALMD_QQ_PORT="$QQ_PORT")
-  [ "$TRACE" = 1 ] && qq_env+=(REALMD_QQ_TRACE=1)
-  env "${qq_env[@]}" ./zig-out/bin/qqserver > "$LOG_DIR/qq.log" 2>&1 &
-  await "127.0.0.1:$QQ_PORT" 15 "qqserver" || die "see $LOG_DIR/qq.log"
+  ingress_env=(REALMD_REDIS_ADDR="$REDIS_ADDR" REALMD_INGRESS_PORT="$INGRESS_PORT")
+  [ "$TRACE" = 1 ] && ingress_env+=(REALMD_INGRESS_TRACE=1)
+  env "${ingress_env[@]}" ./zig-out/bin/d2ingress > "$LOG_DIR/d2ingress.log" 2>&1 &
+  await "127.0.0.1:$INGRESS_PORT" 15 "d2ingress" || die "see $LOG_DIR/d2ingress.log"
 fi
-[ "$TRACE" = 1 ] && ok "qqserver tracing both directions -> $LOG_DIR/qq.log"
+[ "$TRACE" = 1 ] && ok "d2ingress tracing both directions -> $LOG_DIR/d2ingress.log"
 
 say "game server"
 [ -f "$TESTDIR/Game.exe" ] || die "no Game.exe in $TESTDIR — run ./run.sh once to assemble it"
-# Leave a healthy GS alone, the same as realmd and qqserver. It is the slowest piece to come back
+# Leave a healthy GS alone, the same as realmd and d2ingress. It is the slowest piece to come back
 # and the only one that sometimes refuses to: killing a working one to reach a green line at the
 # bottom of this script trades a running stack for a coin flip.
 if pgrep -f 'testgame' >/dev/null; then
@@ -186,15 +191,17 @@ if pgrep -f 'testgame' >/dev/null; then
 else
 install_dlls
 WINPATH="Z:$(printf '%s' "$TESTDIR/d2gs.dll" | tr '/' '\\')"
-# These flags and no others. --create-games, --gs-addr, --d2cs and --d2dbs all appear in older
-# notes, and on this build adding them crashes the engine during boot: an access violation at
-# 0x4fa680 dereferencing 0x16, exit 0xc0000005, before it ever reaches d2cs. The GS finds gs-link
-# and picks its own game port without them, and registers the result via ADDRINFO — which is what
-# qqserver reads, so nothing downstream needs to be told the port either.
+# These flags and no others. --create-games and --gs-addr appear in older notes, and on this build
+# adding them crashes the engine during boot: an access violation at 0x4fa680 dereferencing 0x16,
+# exit 0xc0000005. The GS picks its own game port without them and publishes the result to redis —
+# which is what d2ingress reads, so nothing downstream needs to be told the port either.
   # The boot is racy: the same command that works takes an access violation at 0x4fa680 often
   # enough that one attempt is not a fair test. Retry rather than report a broken stack.
   for attempt in 1 2 3; do
-    ( cd "$TESTDIR" && WINEDEBUG=-all WINEDLLOVERRIDES="dbghelp=n" "$WINE" Game.exe \
+    # Redis goes in by ENVIRONMENT, not a flag: the flag list above is exact, and this build
+    # takes an access violation during boot if it is extended.
+    ( cd "$TESTDIR" && WINEDEBUG=-all WINEDLLOVERRIDES="dbghelp=n" \
+        D2GS_REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6390}" "$WINE" Game.exe \
         -w -nosound --headless --loaddll "$WINPATH" \
         --d2gs --d2gs-boot --realm --no-compress \
         > "$LOG_DIR/gs.log" 2>&1 & )
@@ -225,7 +232,7 @@ say "up"
 status
 cat <<EOF
 
-  logs      $LOG_DIR/{realmd,qq,gs}.log
+  logs      $LOG_DIR/{realmd,d2ingress,gs}.log
   a client  cd <114Clean> && WINEDEBUG=-all WINEDLLOVERRIDES="dbghelp=n" wine Game.exe -w -ns \\
               -skiptobnet --loaddll 'Z:\\...\\d2gs.dll' --d2gs --realm-gw 127.0.0.1 \\
               --bypass-checkrev --auto-join tester:tester:mygame

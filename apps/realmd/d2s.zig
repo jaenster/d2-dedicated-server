@@ -1,20 +1,16 @@
 //! The realm's view of a .d2s save.
 //!
-//! The FORMAT itself is not defined here — it comes from libd2's `d2-formats`, which
-//! already models the 1.14d header: the offsets, the rolling checksum, the fresh-character
-//! writer, the name field. This file used to carry its own copy of all of that, byte
-//! offsets and all. Two implementations of a binary format is one more than can stay
-//! correct, and the duplicate is the one that goes.
+//! The FORMAT is not defined here — it comes from libd2's `d2-formats`, which already models
+//! the 1.14d header (offsets, rolling checksum, fresh-character writer, name field).
 //!
-//! What remains here is the part libd2 has no opinion about: reading a single ATTRIBUTE
-//! out of a played save, which the realm needs for the ladder (experience) and nothing
-//! else does in this shape. libd2's d2-save models the whole attribute section, but it
-//! pulls in the item model and the full excel table set to do it — a lot of machinery for
-//! "read one integer", so the realm keeps this narrow reader and shares the widths.
+//! What remains is the part libd2 has no opinion about: reading a single ATTRIBUTE out of a
+//! played save, needed only for the ladder (experience). libd2's d2-save models the whole
+//! attribute section but pulls in the item model + full excel tables to do it — too much
+//! machinery for "read one integer", so the realm keeps this narrow reader instead.
 const std = @import("std");
 const formats = @import("libd2").formats;
 
-// ── the format, from libd2 ───────────────────────────────────────────────────
+// the format, from libd2
 pub const off_checksum = formats.d2s.off_checksum;
 pub const off_name = formats.d2s.off_name;
 pub const off_status = formats.d2s.off_status;
@@ -42,7 +38,7 @@ pub fn setStatus(data: []u8, v: u8) void {
     if (data.len > off_status) data[off_status] = v;
 }
 
-// ── attributes ("gf" section) ────────────────────────────────────────────────
+// attributes ("gf" section)
 // Everything a played character actually IS lives past the header in a bit-packed list:
 // a 9-bit ItemStatCost id, then that stat's value at its own width, repeating until the
 // terminator id 0x1FF. The widths are ItemStatCost.txt's CSvBits column — the same table

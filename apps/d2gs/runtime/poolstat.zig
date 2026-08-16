@@ -1,19 +1,12 @@
 //! Census of the engine's memory-pool managers — the thing that actually caps games per GS.
 //!
-//! Fog::Memory::InitializePoolSystem @0x409dd0 hands out ONE pool manager per caller and there
-//! are exactly EIGHT of them: `if (7 < nManagers) { OutOfMemoryHandler(); RaiseException(0xe0000001); }`.
-//! The managers are a fixed array inside a static struct (pGlobalPoolSystem, 0xbea4 bytes =
-//! 8 * 0x17cc + a small header and tail), so the eighth is a wall in the data layout, not a
-//! tunable — raising the compare alone would write manager nine past the end of the struct.
-//!
-//! A battle.net game takes a manager for its own heap and gives it back when it is destroyed
-//! (nManagerIndex is a free list), so the limit is on CONCURRENT games: eight minus whatever
-//! the server itself is holding. Hitting the wall kills the process with 0xe0000001 and no
-//! other explanation — which is exactly what a GS does when asked to host a few games at once,
-//! so this prints who is holding what before the wall rather than after.
-//!
-//! Addresses verified against 1.14d Game.exe: pManagers[0] @0x74f104 + 8*0x17cc = 0x75af64,
-//! which is precisely where the nManagers counter sits.
+//! Fog::Memory::InitializePoolSystem @0x409dd0 hands out ONE pool manager per caller, and there are
+//! exactly EIGHT: `if (7 < nManagers) { OutOfMemoryHandler(); RaiseException(0xe0000001); }`. Fixed
+//! array in a static struct (pGlobalPoolSystem, 0xbea4 bytes = 8*0x17cc + header/tail), so eight is
+//! a wall in the data layout, not a tunable — raising the compare alone writes manager nine past the
+//! end. A game returns its manager on destroy (nManagerIndex free list), so the cap is on CONCURRENT
+//! games; hitting it kills the process with 0xe0000001. Verified vs 1.14d Game.exe: pManagers[0]
+//! @0x74f104 + 8*0x17cc = 0x75af64, exactly nManagers's address.
 
 const log = @import("../log.zig");
 const memstat = @import("memstat.zig");
@@ -51,14 +44,12 @@ pub fn markAttach() void {
     at_attach_in_use = inUse();
 }
 
-/// Managers still available. Zero means the next game to start raises 0xe0000001 and takes the
-/// whole process — every other game on it included — so this is a number to check BEFORE
-/// creating a game, not a statistic to look at afterwards.
+/// Managers still available. Zero means the next game to start raises 0xe0000001 and takes the whole
+/// process down with it, so check this BEFORE creating a game.
 ///
-/// Includes poolgrow's spare managers, which is the whole point of it: without them counted the
-/// create-game guard keeps refusing at seven while the allocator is perfectly able to serve more.
-/// poolgrow reports zero until both its call-site detours are actually live, so an install that
-/// failed leaves this reading exactly as it did before.
+/// Includes poolgrow's spare managers — without them the create-game guard refuses at seven while
+/// the allocator can serve more. poolgrow reports zero until both its call-site detours are live, so
+/// a failed install leaves this reading unchanged.
 pub fn freeManagers() u32 {
     const used = inUse();
     const engine_free: u32 = if (used < MAX_MANAGERS) @intCast(MAX_MANAGERS - used) else 0;

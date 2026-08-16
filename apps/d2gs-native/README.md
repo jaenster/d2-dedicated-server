@@ -24,21 +24,22 @@ i386 Linux.
 ## Joining a realm
 
 The server takes no flags beyond the image path — everything else is environment, so a container
-needs no command line. Without `D2GS_REALM` it boots and serves, but registers with nobody and
+needs no command line. Without `D2GS_REDIS_ADDR` it boots and serves, but joins no realm and
 says so.
 
 | variable | meaning |
 |-|-|
 | `D2MAC_BIN` | path to the `DiabloII` Mach-O, if not given as the argument |
-| `D2GS_REALM` | `host:port` of realmd's gs-link. Unset = no realm |
+| `D2GS_REDIS_ADDR` | `host:port` of the shared store — this server's only link to a realm. Unset = no realm |
 | `D2GS_GS_ADDR` | the `host:port` this server advertises to clients, default `127.0.0.1:4000` |
-| `D2GS_D2DBS` | `host:port` of the character store. Defaults to the realm host, one port below gs-link |
 | `D2GS_GSID` | fleet id. Defaults to FNV-1a over hostname **and** advertised port, so two servers on one host do not collide |
 | `D2GS_MAX_GAMES` | concurrent games, 1..7, default 1 |
 | `D2GS_CHAR_SOURCE` | `memory` (default) or `file` |
 
-The realm link is the same protocol the wine server speaks, so a fleet can mix both kinds. On a
-join the character is fetched over the network from d2dbs — no shared disk.
+It meets the realm exactly as the wine server does: publishes its own record into redis, takes
+create/join from `realmd:gsq:<gsid>`, answers on `realmd:gsreply:<seq>`, reports enter/leave/closed
+on `realmd:gsev`, and reads characters straight from the store. It never dials realmd, so a fleet
+can mix both kinds of server.
 
 **It always binds :4000.** Unlike the wine server, which moves its listener to whatever
 `D2GS_GS_ADDR` advertises, the port is an immediate inside `QSERVER_CreateAndInit` and nothing

@@ -1,26 +1,18 @@
-//! checkrev-probe — a clientless BNCS *version-check* client (protocol selector
-//! 0x01), distinct from the BNFTP tool (selector 0x02). It points at a real
-//! Battle.net server and exercises the version-check gauntlet end-to-end:
+//! checkrev-probe — a clientless BNCS *version-check* client (protocol selector 0x01, vs. BNFTP's
+//! 0x02). Runs the gauntlet against a real Battle.net server: connect 0x01 -> SID_AUTH_INFO (echoes
+//! SID_PING cookie; reply carries the version-check MPQ + base64 challenge) -> compute the response
+//! via the portable `checkrev_core` (same code the DLL/realmd use):
+//!   response = base64( SHA1( first4(b64decode(challenge)) + ":"+ver+":" + sigOk ) )
+//! -> send SID_AUTH_CHECK (dialog-result->EXE Version, first 4 b64 bytes->EXE Hash, rest->EXE Info).
 //!
-//!   1. connect 0x01 → SID_AUTH_INFO (echoing the SID_PING cookie). The reply
-//!      names the version-check MPQ + the base64 *challenge* (the "value string").
-//!   2. compute the CheckRevision response with our portable core
-//!      (`checkrev_core`, the same code the DLL and realmd use):
-//!         response = base64( SHA1( first4(b64decode(challenge)) + ":"+ver+":" + sigOk ) )
-//!   3. send SID_AUTH_CHECK carrying that response in the modern layout
-//!      (dialog-result → EXE Version, first 4 base64 bytes → EXE Hash, rest →
-//!      EXE Info) and print the server's result code.
-//!
-//! A version-error result (0x101/0x102) means our hash is wrong; a CD-key error
-//! (0x2xx) means the *version check passed* (we send no real key). CD-key-free —
-//! no account, no SRP, no login. Usage:
-//!   zig build checkrev-probe -- <host> [product] [gameVersion] [--sig0]
+//! 0x101/0x102 = wrong hash; 0x2xx = version check PASSED (no real key sent). CD-key-free.
+//! Usage: zig build checkrev-probe -- <host> [product] [gameVersion] [--sig0]
 const std = @import("std");
 const core = @import("libd2").bnet.checkrev;
 const cdkey = @import("libd2").bnet.cdkey;
 const xsha1 = @import("libd2").bnet.xsha1;
 
-// ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
+// libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16)
 const Socket = c_int;
 extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
@@ -290,7 +282,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var listen_sec: u32 = 0; // stay in chat reading events for N seconds (chat-session mode)
     var delay_sec: u32 = 0; // wait N seconds after joining before say/kick (2-client ordering)
     var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
-    var gs_port: u16 = 4000; // GS game port (qqserver public port)
+    var gs_port: u16 = 4000; // GS game port (d2ingress public port)
     var ver_byte: u8 = 0; // GAMELOGON version byte (GetGameVersion)
     var pos: usize = 0;
     while (args.next()) |a| {
@@ -338,7 +330,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = close(fd);
     try writeAll(fd, &[_]u8{0x01}); // protocol selector: BNCS
 
-    // ── SID_AUTH_INFO ──
+    // SID_AUTH_INFO
     var body: [128]u8 = undefined;
     var w: usize = 0;
     for ([_]u32{ 0, fourcc("IX86"), fourcc(product), 0x0E, 0, 0, 0, 0, 0 }) |v| {
@@ -359,7 +351,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const challenge = cstrAt(ai, 20 + mpq.len + 1);
     std.debug.print("\n[AUTH_INFO] serverToken=0x{x:0>8}  mpq=\"{s}\"  challenge=\"{s}\"\n", .{ stoken, mpq, challenge });
 
-    // ── compute the CheckRevision response with our portable core ──
+    // compute the CheckRevision response with our portable core
     var full_buf: [64]u8 = undefined;
     const full = core.response(challenge, game_ver, sig_ok, &full_buf) orelse return error.ShortChallenge;
     // modern split: first 4 base64 bytes -> EXE Hash (u32 LE); rest -> EXE Info string; EXE Version = 0
@@ -367,7 +359,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const exe_info = full[4..];
     std.debug.print("[checkrev] response=\"{s}\"  -> exeHash=0x{x:0>8}  exeInfo=\"{s}\"\n", .{ full, exe_hash, exe_info });
 
-    // ── SID_AUTH_CHECK (with real CD-key blocks, computed clientless) ──
+    // SID_AUTH_CHECK (with real CD-key blocks, computed clientless)
     var cb: [512]u8 = undefined;
     var cw: usize = 0;
     var nkeys: u32 = 0;
@@ -411,7 +403,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const result = std.mem.readInt(u32, ac[0..4], .little);
     std.debug.print("\n[AUTH_CHECK] result=0x{x:0>4}  info=\"{s}\"  => {s}\n", .{ result, cstrAt(ac, 4), authMeaning(result) });
 
-    // ── SID_CREATEACCOUNT2 (register — single broken-SHA-1 of the password) ──
+    // SID_CREATEACCOUNT2 (register — single broken-SHA-1 of the password)
     if (create_arg) |ca| {
         const sep = std.mem.indexOfScalar(u8, ca, ':') orelse ca.len;
         const acct = ca[0..sep];
@@ -430,7 +422,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (login_arg == null) login_arg = create_arg; // auto-login as the freshly-created account
     }
 
-    // ── SID_LOGONRESPONSE2 (OLS account login) ──
+    // SID_LOGONRESPONSE2 (OLS account login)
     if (login_arg) |la| {
         const sep = std.mem.indexOfScalar(u8, la, ':') orelse la.len;
         const acct = la[0..sep];
@@ -457,7 +449,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("[LOGONRESPONSE2] account=\"{s}\" result={d}  => {s}\n", .{ acct, lres, meaning });
         if (lres != 0) return; // can't query realms without a logged-in account
 
-        // ── SID_QUERYREALMS2 — the realm list (EMPTY body; real bnet closes on a non-empty one) ──
+        // SID_QUERYREALMS2 — the realm list (EMPTY body; real bnet closes on a non-empty one)
         try send(fd, SID_QUERYREALMS2, &[_]u8{});
         var qbuf: [4096]u8 = undefined;
         const qr = try recvUntil(fd, SID_QUERYREALMS2, &qbuf);
@@ -479,7 +471,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         if (first_realm.len == 0) return;
 
-        // ── SID_LOGONREALMEX — log on to the first realm (closed-bnet realm password = "password") ──
+        // SID_LOGONREALMEX — log on to the first realm (closed-bnet realm password = "password")
         const realm_pw = xsha1.doubleHash(CLIENT_TOKEN, stoken, xsha1.xsha1("password"));
         var rb: [128]u8 = undefined;
         std.mem.writeInt(u32, rb[0..4], CLIENT_TOKEN, .little);
@@ -506,7 +498,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         std.debug.print("  => OK — MCP handoff ({d}-byte reply)\n", .{rr.len});
 
-        // ── MCP (realm/character server) — connect to the addr the realm gave us ──
+        // MCP (realm/character server) — connect to the addr the realm gave us
         const ip4 = rr[16..20];
         const mport = std.mem.readInt(u16, rr[20..22], .big);
         var ipstr: [20]u8 = undefined;
@@ -573,7 +565,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
 
-        // ── MCP_CHARCREATE — make a character if the account has none ──
+        // MCP_CHARCREATE — make a character if the account has none
         if (cname_len == 0) {
             const newname = "Clientella"; // <=15 chars
             var ccb: [64]u8 = undefined;
@@ -593,7 +585,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (cname_len == 0) return;
         const charname = cname_buf[0..cname_len];
 
-        // ── MCP_CHARLOGON — select the character ──
+        // MCP_CHARLOGON — select the character
         var clb: [40]u8 = undefined;
         @memcpy(clb[0..cname_len], charname);
         clb[cname_len] = 0;
@@ -602,8 +594,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const clres = if (clr.len >= 4) std.mem.readInt(u32, clr[0..4], .little) else 0xffffffff;
         std.debug.print("[MCP_CHARLOGON] \"{s}\" result=0x{x}  => {s}\n", .{ charname, clres, if (clres == 0) "logged onto char" else "failed" });
 
-        // ── enter a GAME on the GS (clientless): CREATEGAME -> JOINGAME -> connect GS ->
-        //    GAMELOGON(0x68) -> JOINGAME(0x6b) -> read the world stream. Real GS only. ──
+        // enter a GAME on the GS (clientless): CREATEGAME -> JOINGAME -> connect GS ->
+        // GAMELOGON(0x68) -> JOINGAME(0x6b) -> read the world stream. Real GS only.
         if (game_arg) |gname| {
             // MCP_CREATEGAME (0x03): reqid, flags(u32), unk(1), playerDiff, maxPlayers, name, pass, desc
             var cgb: [128]u8 = undefined;
@@ -656,7 +648,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("[MCP_JOINGAME] token=0x{x} gs={s}:{d} hash=0x{x} result=0x{x}\n", .{ gtoken, gsips, gs_port, ghash, jresult });
             if (jresult != 0) return;
 
-            // Connect to the GS game port (qqserver) and play the entry sequence.
+            // Connect to the GS game port (d2ingress) and play the entry sequence.
             const gsfd = connectResolved(gpa, gsips, gs_port) catch {
                 std.debug.print("[GS] connect to {s}:{d} failed\n", .{ gsips, gs_port });
                 return;
@@ -664,7 +656,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             defer _ = close(gsfd);
             setRecvTimeout(gsfd, 5000);
             // GAMELOGON_MULTI (0x68), 37 bytes (D2GSPacketClt0x68 — raw, no framing).
-            // Field layout (the qqserver/edge rewrites nGameToken@5 -> gameid):
+            // Field layout (the d2ingress/edge rewrites nGameToken@5 -> gameid):
             //   [0]=id [1..5]=nGameHash [5..7]=nGameToken [7]=nCharClass [8..12]=nVerByte
             //   [12..16]=nVersionConstant(0xED5DCC50) [16..20]=nConstant(0x91A519B6)
             //   [20]=nLanguageCode [21..37]=szCharName[16].
@@ -764,10 +756,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             return;
         }
 
-        // ── enter chat (BNCS), byte-for-byte like the real 1.14d client (captured via
+        // enter chat (BNCS), byte-for-byte like the real 1.14d client (captured via
         //    REALMD_TRACE): GETCHANNELLIST(product 4cc) -> ENTERCHAT(char + "realm,char")
         //    -> JOINCHANNEL(flags=5, "Diablo II"). The real client enters chat before
-        //    accessing the ladder. ──
+        // accessing the ladder.
         var prodcode: [4]u8 = .{ 'P', 'X', '2', 'D' }; // D2XP reversed
         if (product.len == 4) prodcode = .{ product[3], product[2], product[1], product[0] };
         try send(fd, SID_GETCHANNELLIST, &prodcode);
@@ -800,8 +792,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         jc[4 + channel_arg.len] = 0;
         try send(fd, SID_JOINCHANNEL, jc[0 .. 5 + channel_arg.len]);
 
-        // ── chat-session mode (--listen): stay connected, print every chat event, and
-        //    optionally talk (--say) / kick (--kick) after --delay. Drives the 2-client demo. ──
+        // chat-session mode (--listen): stay connected, print every chat event, and
+        // optionally talk (--say) / kick (--kick) after --delay. Drives the 2-client demo.
         if (listen_sec > 0) {
             setRecvTimeout(fd, 400);
             const start = nowMs();
@@ -844,8 +836,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("[CHATEVENT] eid=0x{x} user=\"{s}\" text=\"{s}\"\n", .{ eid, uname, text });
         }
 
-        // ── MCP_LADDERDATA (0x11) — the real client sends 3 bytes: mode 0x1b + u16(0)
-        //    (captured via REALMD_TRACE). A 1-byte request makes real bnet reply 0x00. ──
+        // MCP_LADDERDATA (0x11) — the real client sends 3 bytes: mode 0x1b + u16(0)
+        // (captured via REALMD_TRACE). A 1-byte request makes real bnet reply 0x00.
         try mcpSend(mfd, MCP_LADDERDATA, &[_]u8{ 0x1b, 0, 0 });
         const ld = mcpRecv(mfd, MCP_LADDERDATA, &mb) catch &[_]u8{};
         if (ld.len < 19) {

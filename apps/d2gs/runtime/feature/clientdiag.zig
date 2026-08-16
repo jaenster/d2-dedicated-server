@@ -1,17 +1,10 @@
-//! Client-side D2GS join diagnostics. The d2gs.dll is injected into the real
-//! client too (--d2gs without --d2gs-boot); these entry detours log the key
-//! client-side decisions during the realm join handshake so we can see whether
-//! the client receives the server's game-setup packets and advances:
-//!
-//!   PacketHandle_from0xAF   @0x45c850 — connection packet dispatch (logs id at [ecx])
-//!   Incoming0x01_GameFlags  @0x45c8b0 — client dispatched game flags
-//!   Send_0x6B               @0x477da0 — client SENT JOINGAME (0x6b)
-//!   CLIENT_ConnectionRefused@0x44e380 — connection refused/timeout (ecx=reason)
-//!
-//! Each hook relocates the function's first `prologue_len` bytes into a VirtualAlloc
-//! trampoline (must be PIC-safe and end on an instruction boundary, >=5), patches a
-//! jmp at the entry, logs on hit, then resumes the original. `deref_ecx` logs the
-//! byte at [ecx] (a packet id) instead of the raw ecx value.
+//! Client-side D2GS join diagnostics (d2gs.dll injected into the real client via --d2gs).
+//! Entry detours log the realm-join handshake to see whether game-setup packets arrive:
+//!   PacketHandle_from0xAF @0x45c850, Incoming0x01_GameFlags @0x45c8b0,
+//!   Send_0x6B @0x477da0 (client sent JOINGAME), CLIENT_ConnectionRefused @0x44e380.
+//! Each hook relocates the first `prologue_len` bytes into a VirtualAlloc trampoline
+//! (PIC-safe, ends on an instruction boundary >=5), patches a jmp at entry, logs, then
+//! resumes the original. `deref_ecx` logs the byte at [ecx] (a packet id) instead of ecx.
 const std = @import("std");
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");

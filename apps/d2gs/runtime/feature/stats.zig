@@ -1,17 +1,14 @@
-//! Server counters — the numbers a headless GS is asked for when something looks wrong:
-//! is it ticking, how fast, how many games and players is it carrying, and what is the
-//! item pipeline actually producing.
+//! Server counters — is it ticking, how fast, how many games/players, what the item
+//! pipeline is producing.
 //!
-//! Everything here is written on the engine tick thread from feature hooks and read on
-//! the health thread (runtime/feature/health.zig serves /stats and /metrics). There is no
-//! lock and there is no allocation on either side: the counters are plain 32-bit words,
-//! which x86 reads and writes atomically when aligned, and the per-game table holds COPIES
-//! of the scalars rather than engine pointers — a reader can never be handed a game struct
-//! that the engine has since freed. The cost of a hook here is a couple of increments, so
-//! it stays out of the way of a 40 ms frame budget shared by every game on the process.
+//! Written on the engine tick thread from feature hooks, read on the health thread
+//! (runtime/feature/health.zig serves /stats and /metrics). No lock, no allocation: counters
+//! are plain 32-bit words (atomic on x86 when aligned), and the per-game table holds COPIES
+//! of scalars rather than engine pointers, so a reader can never dereference a freed game
+//! struct. A hook here costs a couple increments, staying clear of the 40ms frame budget.
 //!
-//! Rendering happens on the reader's thread into the reader's buffer, so a slow or stuck
-//! HTTP client cannot hold anything the engine needs.
+//! Rendering happens on the reader's thread into the reader's buffer, so a slow/stuck HTTP
+//! client can't hold anything the engine needs.
 const std = @import("std");
 const GameCtx = @import("../../engine/ctx.zig").GameCtx;
 const t = @import("../../engine/d2/types.zig");
@@ -30,7 +27,7 @@ fn readU32(base: usize, off: usize) u32 {
     return @as(*align(1) const u32, @ptrFromInt(base + off)).*;
 }
 
-// ── counters ─────────────────────────────────────────────────────────────────
+// counters
 
 var boot_ms: u32 = 0;
 var ticks: u32 = 0;
@@ -55,7 +52,7 @@ const CODE_SLOTS = 128;
 var code_key: [CODE_SLOTS]u32 = .{0} ** CODE_SLOTS; // packed 4-char code, 0 = free
 var code_hits: [CODE_SLOTS]u32 = .{0} ** CODE_SLOTS;
 
-// ── live game table ──────────────────────────────────────────────────────────
+// live game table
 // `game` is only ever touched on the engine thread; every other field is a copy so the
 // health thread has nothing to dereference.
 
@@ -82,7 +79,7 @@ fn slotOf(game: usize) ?*Slot {
     return null;
 }
 
-// ── hooks ────────────────────────────────────────────────────────────────────
+// hooks
 
 pub fn install() void {
     boot_ms = GetTickCount();
@@ -190,7 +187,7 @@ pub fn serverTick() void {
     }
 }
 
-// ── rendering (reader's thread, reader's buffer, no allocation) ──────────────
+// rendering (reader's thread, reader's buffer, no allocation)
 
 /// eD2ItemQuality names, indexed the way the engine numbers them.
 const quality_name = [9][]const u8{

@@ -1,25 +1,19 @@
-//! ver-IX86-1.dll / CheckRevision.dll — a FAITHFUL replica of the genuine (2020)
-//! Battle.net CheckRevision module the 1.14d client downloads and calls during the
-//! version check. Verified byte-for-byte identical to the real Blizzard DLL (loaded
-//! in the same process) across many challenges — see CHECKREVISION.md.
+//! ver-IX86-1.dll / CheckRevision.dll — faithful replica of the genuine (2020) Battle.net
+//! CheckRevision module the 1.14d client downloads for its version check. Verified byte-for-byte
+//! against the real Blizzard DLL — see CHECKREVISION.md.
 //!
-//! The genuine module is an Authenticode self-attest + SHA-1 responder:
+//! Authenticode self-attest + SHA-1 responder:
 //!   full = base64( SHA1( first4(b64decode(versionString)) + ":"+fileVersion+":" + sigOk ) )
-//! and it returns that string SPLIT across the out-params (a quirk of reusing the
-//! classic CheckRevision ABI slots):
-//!   *lpDialogResult  = a MessageBoxW result (0 unless the legal-disclaimer path fires)
-//!   *lpResultLength   = the FIRST 4 bytes of `full`, packed little-endian as a u32
-//!   lpResultBuffer    = the REST of `full`, NUL-terminated  (also returned in EAX)
+//! returned SPLIT across the out-params (a quirk of reusing the classic CheckRevision ABI slots):
+//!   *lpDialogResult = a MessageBoxW result (0 unless the legal-disclaimer path fires)
+//!   *lpResultLength = the FIRST 4 bytes of `full`, packed little-endian as a u32
+//!   lpResultBuffer  = the REST of `full`, NUL-terminated (also returned in EAX)
 //!
-//! Game.exe call site (BNDOWNLOAD_PerformCheckRevision @0x51e6d0):
-//!   (*pfnCheckRevision)(&exePath, &emptyBuf, &emptyBuf, &challenge, &ver, &checksum, &result)
-//! i.e. args 1-3 are the classic file paths (ignored here — we read the host EXE
-//! ourselves), arg4 is the server challenge, args 5-7 are the split outputs above.
-//!
-//! The hash math, base64 and challenge decode live in `checkrev_core.zig`, which is
-//! pure Zig (no Win32, no libc) so native realmd can compute/validate the same
-//! response without wine. This file only adds the Win32 host-introspection: the EXE
-//! file version (VERSION.dll) and the signature gate (WinVerifyTrust).
+//! Call site BNDOWNLOAD_PerformCheckRevision @0x51e6d0 passes (&exePath, &emptyBuf, &emptyBuf,
+//! &challenge, &ver, &checksum, &result): args 1-3 are the classic file paths, ignored here since we
+//! read the host EXE ourselves. Hash math, base64 and challenge decode live in `checkrev_core.zig`
+//! (pure Zig, no Win32/libc) so native realmd can validate without wine; this file adds only the
+//! Win32 host-introspection: EXE file version (VERSION.dll) and the WinVerifyTrust signature gate.
 const std = @import("std");
 const win = std.os.windows;
 const core = @import("libd2").bnet.checkrev;

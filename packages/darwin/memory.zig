@@ -1,13 +1,12 @@
 //! The classic Memory Manager: handles, pointers, and the errors they report.
 //!
-//! A `Ptr` is malloc and nothing else. A `Handle` is the part that has no C equivalent: a pointer to
-//! a master pointer, so the Memory Manager could move a block and fix every reference by updating
-//! one word. Nothing moves here, but the indirection is still real — the game dereferences twice —
-//! so a handle is a two-word record whose first word is the block and whose second is its size, and
-//! the handle the game holds points at that first word.
+//! A `Ptr` is malloc and nothing else. A `Handle` has no C equivalent: a pointer to a master
+//! pointer, so the original Memory Manager could move a block and fix every reference via one
+//! word. Nothing moves here, but the game still dereferences twice, so a handle is a two-word
+//! record (block ptr, size) and the game's handle points at the first word.
 //!
-//! Locking, purging and compaction all existed to manage a heap that relocated blocks. This one does
-//! not, which makes "the block is already locked and will not move" a description rather than a stub.
+//! Locking/purging/compaction existed to manage a heap that relocated blocks; this one doesn't,
+//! so "already locked and will not move" is a true description here, not a stub.
 
 const std = @import("std");
 

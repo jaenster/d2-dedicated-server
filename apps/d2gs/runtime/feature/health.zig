@@ -1,22 +1,15 @@
 //! In-process HTTP observability endpoint for the headless GS.
 //!
 //! A tiny winsock listener on its own thread, routed by path:
-//!   /          — unchanged from the original single-answer endpoint (200 ok / 503 down),
-//!                because the shipped k8s chart has been probing it and a rename here
-//!                would break every already-running pod on the next config reload.
-//!   /healthz   — liveness, and ONLY from the engine heartbeat. Never from this thread's
-//!                own liveness: a GS whose engine is wedged still accepts sockets and
-//!                still writes a reply, and answering 200 from that state is exactly the
-//!                failure this endpoint exists to catch (see run-stress.sh's header).
-//!   /readyz    — readiness: registered with the realm over gs-link, so a game can
-//!                actually be placed here. A live-but-unregistered GS is not ready.
-//!   /stats     — the counters as JSON (runtime/feature/stats.zig).
-//!   /metrics   — the same counters in Prometheus text exposition format.
+//!   /          — the original single-answer endpoint (200 ok / 503 down); the shipped k8s chart
+//!                probes it, so renaming breaks every running pod on the next config reload.
+//!   /healthz   — liveness, from the engine heartbeat ONLY: a wedged engine still accepts sockets
+//!                and replies 200, which is the failure this must catch (see run-stress.sh).
+//!   /readyz    — published into the realm's shared store; a live-but-unpublished GS is not ready.
+//!   /stats     — counters as JSON (runtime/feature/stats.zig); /metrics is the same in Prometheus.
 //!
-//! Liveness = `beat` advancing. The server tick loop calls tick() every frame; the
-//! responder remembers when beat last changed and fails if it's been stale too long.
-//! Nothing here blocks the engine: rendering happens into this thread's own buffer from
-//! plain 32-bit counters, so a stalled HTTP client costs the tick loop nothing.
+//! Liveness = `beat` advancing (tick loop calls tick() every frame); stale too long -> fail.
+//! Rendering uses this thread's own buffer, so a stalled HTTP client costs the tick loop nothing.
 const std = @import("std");
 const win = std.os.windows;
 const log = @import("../../log.zig");

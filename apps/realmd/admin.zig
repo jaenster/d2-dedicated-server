@@ -1,8 +1,6 @@
-//! HTTP admin API, served on the same listener as the health probes (health.zig
-//! routes /admin/* here). JSON, bearer-token gated. The token comes from
-//! REALMD_ADMIN_TOKEN: when EMPTY the whole API is disabled (403) — off by
-//! default so a misconfigured deploy never exposes it. JSON is hand-rolled
-//! (tiny payloads, no std.json dependency).
+//! HTTP admin API on the same listener as health probes (health.zig routes /admin/* here). JSON,
+//! bearer-token gated via REALMD_ADMIN_TOKEN — EMPTY disables the whole API (403), off by default
+//! so a misconfigured deploy never exposes it. JSON is hand-rolled (tiny payloads, no std.json).
 //!
 //!   GET  /admin/status       counts + which instance/backends
 //!   GET  /admin/gameservers  the registered GS fleet
@@ -13,7 +11,7 @@
 //!   POST /admin/chars/copy   {"src_account","src_char","dst_char"[,"dst_account"]} -> clone char
 const std = @import("std");
 const net = @import("realm_infra").net;
-const gslink = @import("gslink.zig");
+const fleet = @import("fleet.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
@@ -337,9 +335,15 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
         if (is_get) return accountsList(fd);
         if (is_post) return accountsCreate(fd, req);
         return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+    } else if (std.mem.eql(u8, p, "/admin/accounts/delete")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return accountsDelete(fd, req, auth.?.name);
     } else if (std.mem.eql(u8, p, "/admin/accounts/admin")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return setAdminEndpoint(fd, req, auth.?.name);
+    } else if (std.mem.eql(u8, p, "/admin/chars/delete")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return charsDelete(fd, req);
     } else if (std.mem.eql(u8, p, "/admin/chars/copy")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return charsCopy(fd, req);
@@ -377,7 +381,7 @@ fn status(fd: net.Socket) void {
     const body = std.fmt.bufPrint(&buf, "{{\"sessions\":{d},\"games\":{d},\"gameservers\":{d},\"instance\":\"{s}\",\"durable\":\"{s}\",\"ephemeral\":\"{s}\"}}", .{
         state.global.sessionCount(),
         countGames(),
-        gslink.registeredCount(),
+        fleet.registeredCount(),
         instance,
         durable,
         ephemeral,
@@ -391,8 +395,8 @@ fn countGames() usize {
 }
 
 fn gameservers(fd: net.Socket) void {
-    var gs: [gslinkMax]gslink.GsInfo = undefined;
-    const n = gslink.snapshot(&gs);
+    var gs: [fleetMax]fleet.GsInfo = undefined;
+    const n = fleet.snapshot(&gs);
     var buf: [4096]u8 = undefined;
     var w: usize = 0;
     buf[w] = '[';
@@ -414,7 +418,7 @@ fn gameservers(fd: net.Socket) void {
     respond(fd, ok, buf[0..w]);
 }
 
-const gslinkMax = 64;
+const fleetMax = 64;
 
 /// JSON booleans: the format string needs a string, not a Zig bool.
 fn boolJson(v: bool) []const u8 {
@@ -494,6 +498,17 @@ fn charsCopy(fd: net.Socket, req: []const u8) void {
     }
 }
 
+// POST /admin/chars/delete {"account","char"} — remove one character. The companion to
+// chars/copy: an operator who can clone a character should be able to undo it. Idempotent, so
+// a repeat is not an error.
+fn charsDelete(fd: net.Socket, req: []const u8) void {
+    const body = bodyOf(req);
+    const account = jsonStr(body, "account") orelse return respond(fd, bad_request, "{\"error\":\"missing account\"}");
+    const char = jsonStr(body, "char") orelse return respond(fd, bad_request, "{\"error\":\"missing char\"}");
+    if (!store.deleteCharD2s(account, char)) return respond(fd, conflict, "{\"error\":\"delete failed\"}");
+    respond(fd, ok, "{\"deleted\":true}");
+}
+
 /// True if the flat JSON body has `"key": true`. Crude (no nesting), matches jsonStr.
 fn jsonBool(body: []const u8, key: []const u8) bool {
     var kbuf: [64]u8 = undefined;
@@ -518,6 +533,20 @@ fn accountsCreate(fd: net.Socket, req: []const u8) void {
     if (!store.createAccount(name, pwhash)) return respond(fd, conflict, "{\"error\":\"exists\"}");
     if (jsonBool(body, "admin")) _ = store.setAdmin(name, true);
     respond(fd, ok, "{\"created\":true}");
+}
+
+// POST /admin/accounts/delete {"name"} — remove an account and everything under it.
+// `caller` is the logged-in identity: you cannot delete the account you are using, which is the
+// same lockout guard the demote path has and for the same reason.
+fn accountsDelete(fd: net.Socket, req: []const u8, caller: []const u8) void {
+    const body = bodyOf(req);
+    const name = jsonStr(body, "name") orelse return respond(fd, bad_request, "{\"error\":\"missing name\"}");
+    if (name.len == 0) return respond(fd, bad_request, "{\"error\":\"missing name\"}");
+    if (std.ascii.eqlIgnoreCase(name, caller))
+        return respond(fd, conflict, "{\"error\":\"refusing to delete yourself\"}");
+    if (!store.accountExists(name)) return respond(fd, not_found, "{\"error\":\"no such account\"}");
+    if (!store.deleteAccount(name)) return respond(fd, conflict, "{\"error\":\"delete failed\"}");
+    respond(fd, ok, "{\"deleted\":true}");
 }
 
 // POST /admin/accounts/admin {"name","admin":bool} — promote/demote an account's web-UI

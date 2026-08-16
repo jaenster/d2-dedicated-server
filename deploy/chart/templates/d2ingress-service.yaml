@@ -1,16 +1,16 @@
-{{- if .Values.qqserver.enabled }}
+{{- if .Values.d2ingress.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: qqserver
+  name: d2ingress
   labels:
     {{- include "realm.labels" . | nindent 4 }}
-    app.kubernetes.io/component: qqserver
+    app.kubernetes.io/component: d2ingress
 spec:
   {{- if .Values.floatingIPs }}
   # The single public game entry point: the floating IPs on :4000. Clients dial here with
-  # a token; qqserver splices through to the right GS pod. The FIP lands on one node, so
-  # Cluster lets any node route the traffic to a qqserver pod anywhere.
+  # a token; d2ingress splices through to the right GS pod. The FIP lands on one node, so
+  # Cluster lets any node route the traffic to a d2ingress pod anywhere.
   type: LoadBalancer
   externalIPs:
     {{- range .Values.floatingIPs }}
@@ -21,7 +21,7 @@ spec:
   type: ClusterIP
   {{- end }}
   selector:
-    {{- include "realm.selectorLabels" (dict "root" . "component" "qqserver") | nindent 4 }}
+    {{- include "realm.selectorLabels" (dict "root" . "component" "d2ingress") | nindent 4 }}
   ports:
     - { port: 4000, targetPort: 4000, name: game }
 {{- end }}

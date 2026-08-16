@@ -1,15 +1,9 @@
-//! mpqcat — list / inspect files inside an MPQ via StormLib (handles the
-//! encrypted (listfile) and compression that pure-Zig/mpyq readers can't).
-//!
-//! Usage: mpqcat <archive.mpq> [member [outfile]]
-//!   no member  → list (listfile) and flag any Mach-O / PE / fat-binary members
-//!                with their architecture (answers "is this build 32- or 64-bit?")
-//!   member     → extract that member; with outfile, write it there.
-//!
-//! Build (mirrors tools/vermpq/build.sh):
-//!   SL=/opt/homebrew/opt/stormlib
-//!   zig build-exe mpqcat.zig -O ReleaseSafe -lc -lstorm -lz -lbz2 \
-//!       -I"$SL/include" -L"$SL/lib"
+//! mpqcat — list / inspect files inside an MPQ via StormLib (handles encrypted (listfile)
+//! and compression that pure-Zig/mpyq readers can't).
+//! Usage: mpqcat <archive.mpq> [member [outfile]] — no member lists (listfile) and flags
+//! Mach-O/PE/fat-binary members with architecture; member extracts it (outfile writes it).
+//! Build (mirrors tools/vermpq/build.sh): SL=/opt/homebrew/opt/stormlib; zig build-exe
+//! mpqcat.zig -O ReleaseSafe -lc -lstorm -lz -lbz2 -I"$SL/include" -L"$SL/lib"
 const std = @import("std");
 
 const HANDLE = ?*anyopaque;

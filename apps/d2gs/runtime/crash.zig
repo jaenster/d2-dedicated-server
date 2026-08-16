@@ -1,15 +1,12 @@
 //! Panic diagnostics for the injected DLL.
 //!
-//! A safety-check panic inside d2gs.dll used to print one line — `thread 284 panic:
-//! integer overflow` — and then vanish: the thread died, the process stayed up, the
-//! health endpoint stayed green, and every join after that hung at a screen that said
-//! nothing. The failure was real at 16:24 and only visible as "the server feels
-//! unstable" an hour later.
+//! A safety-check panic used to print one line and vanish: thread dies, process stays up,
+//! health endpoint stays green, every join after that hangs silently — failure invisible
+//! until "the server feels unstable" an hour later.
 //!
-//! So a panic here does two things instead. It logs where it happened, as addresses
-//! relative to this DLL's image base (`tools/symbolize.sh` turns those back into
-//! file:line against zig-out/bin/d2gs.pdb), and then it takes the process down. A GS
-//! that is dead is worse than a GS that works and better than a GS that lies.
+//! So a panic here logs where it happened as addresses relative to this DLL's image base
+//! (`tools/symbolize.sh` resolves those to file:line against zig-out/bin/d2gs.pdb), then
+//! kills the process. A dead GS beats one that lies about being healthy.
 const std = @import("std");
 const win = std.os.windows;
 const log = @import("../log.zig");

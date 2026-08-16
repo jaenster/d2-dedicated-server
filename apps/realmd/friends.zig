@@ -1,24 +1,14 @@
-//! Friend lists + presence for the realm. Per-account friend lists (who you added)
-//! and a set of currently-online accounts, so SID_FRIENDSLIST can report each friend's
-//! online/offline location. Guarded by a spinlock — bnet connections touch this from
-//! their own threads.
-//!
-//! The two halves have deliberately different lifetimes. PRESENCE is per-run by nature:
-//! who is online is a fact about live connections, and a restart makes every one of them
-//! false, so keeping it in memory is not a shortcut. The friend LIST is the opposite — a
-//! player added someone once and expects it to still be there tomorrow — so it is written
-//! through to the durable per-account key/value store on every change and read back on
-//! demand. Storing it under the same account-scoped keys the BNCS profile uses means no
-//! new schema and no new backend surface; every backend already serves it.
-//!
-//! The in-memory pair table stays as the working set so reads don't hit the store, and is
-//! seeded lazily the first time an account's list is touched after a restart.
+//! Friend lists + presence for the realm: per-account friend lists plus a set of currently-online
+//! accounts, so SID_FRIENDSLIST can report each friend's location. Spinlock-guarded — bnet
+//! connections touch this from their own threads. Different lifetimes on purpose: PRESENCE is
+//! per-run (restart clears it), the friend LIST is durable, written through to the per-account
+//! key/value store under the same account-scoped keys the BNCS profile uses. The in-memory pair
+//! table is the working set, seeded lazily on first touch after a restart.
 const std = @import("std");
 const Lock = @import("realm_infra").lock.Lock;
 const store = @import("store.zig");
 const chat = @import("chat.zig");
 
-extern "c" fn system(cmd: [*:0]const u8) c_int;
 
 /// Key the friend list lives under, per account. The value is one name per line.
 const friends_key = "friends\\list";
@@ -220,10 +210,9 @@ pub const FriendInfo = struct {
 
 /// Snapshot `owner`'s friends into `out`, with where each one is. Returns the count.
 ///
-/// Two passes on purpose: the names come out under the friends lock, then presence is
-/// resolved with that lock RELEASED, because it lives in the chat registry behind a
-/// different lock. Holding both at once would work today and be a deadlock the first time
-/// anything took them in the other order.
+/// Two passes on purpose: names come out under the friends lock, then presence is resolved with that
+/// lock RELEASED, since it lives in the chat registry behind a different lock. Holding both would
+/// work today and be a deadlock the first time anything took them in the other order.
 pub fn list(owner: []const u8, out: []FriendInfo) usize {
     var n: usize = 0;
     {
@@ -240,7 +229,7 @@ pub fn list(owner: []const u8, out: []FriendInfo) usize {
         }
     }
     for (out[0..n]) |*fi| {
-        const pres = chat.presenceOf(fi.nameSlice()) orelse continue;
+        const pres = chat.presenceOfAnywhere(fi.nameSlice()) orelse continue;
         fi.away = pres.away;
         fi.dnd = pres.dnd;
         fi.in_game = pres.in_game;
@@ -252,74 +241,9 @@ pub fn list(owner: []const u8, out: []FriendInfo) usize {
     return n;
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
-// These exercise the durable half. The in-memory pair table is cleared between cases so
-// each one genuinely goes back to the store rather than reading its own leftovers — which
-// is the only thing that distinguishes "persisted" from "still in RAM".
-
-var test_io: std.Io.Threaded = std.Io.Threaded.init_single_threaded;
-
-fn testInitStore(dir: []const u8) void {
-    store.init(.{ .io = test_io.io(), .data_dir = dir });
-}
-
-/// Drop everything cached this run, as though realmd had just started.
-fn testForgetCache() void {
-    lock.lock();
-    defer lock.unlock();
-    for (&pairs) |*p| p.* = .{};
-    for (&loaded) |*p| p.* = .{};
-    for (&online) |*p| p.* = .{};
-}
-
-test "a friend list survives losing the in-memory table" {
-    const dir = "/tmp/realmd-friends-test";
-    var cmd: [128]u8 = undefined;
-    const rm = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{dir}) catch return error.SkipZigTest;
-    _ = system(rm.ptr);
-    testInitStore(dir);
-    testForgetCache();
-
-    try std.testing.expect(add("Owner", "Gheed"));
-    try std.testing.expect(add("Owner", "Charsi"));
-    try std.testing.expect(!add("Owner", "Gheed")); // already there
-
-    // Wipe the working set: anything that comes back now came off disk.
-    testForgetCache();
-    var out: [8]FriendInfo = undefined;
-    try std.testing.expectEqual(@as(usize, 2), list("Owner", &out));
-    try std.testing.expectEqualStrings("Gheed", out[0].nameSlice());
-    try std.testing.expectEqualStrings("Charsi", out[1].nameSlice());
-
-    // A removal has to persist too — the failure mode of writing only on add is that
-    // deleted friends reappear on the next restart.
-    try std.testing.expect(remove("Owner", "Gheed"));
-    testForgetCache();
-    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
-    try std.testing.expectEqualStrings("Charsi", out[0].nameSlice());
-
-    _ = system(rm.ptr);
-}
-
-test "presence is per-run and never persisted" {
-    const dir = "/tmp/realmd-friends-test2";
-    var cmd: [128]u8 = undefined;
-    const rm = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{dir}) catch return error.SkipZigTest;
-    _ = system(rm.ptr);
-    testInitStore(dir);
-    testForgetCache();
-
-    try std.testing.expect(add("Owner", "Gheed"));
-    setOnline("Gheed");
-    var out: [8]FriendInfo = undefined;
-    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
-    try std.testing.expect(out[0].online);
-
-    // Who is online is a fact about live connections: a restart makes it false, and it
-    // would be wrong for the store to claim otherwise.
-    testForgetCache();
-    try std.testing.expectEqual(@as(usize, 1), list("Owner", &out));
-    try std.testing.expect(!out[0].online);
-
-    _ = system(rm.ptr);
-}
+// tests
+//
+// The durable half is not unit-tested here any more, and deliberately not faked. A friend list
+// lives in the account's profile, which is Postgres, and the only honest test of "it survives a
+// restart" is one that restarts against a real Postgres — the e2e suite's `friends_persist`
+// scenario, which does exactly that. A stand-in store here would have tested the stand-in.

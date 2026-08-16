@@ -18,19 +18,11 @@ fn funcPtr(comptime addr: usize, comptime FnT: type) FnT {
     return @ptrFromInt(addr);
 }
 
-// ============================================================================
-// Comptime fastcall generator
-// ============================================================================
-// Zig's .Fastcall is broken on x86 (github.com/ziglang/zig/issues/10363).
-// This generates correct inline asm: ECX=arg1, EDX=arg2, stack=rest (R→L),
-// callee cleans stack.
-//
-// Usage:
+// Comptime fastcall generator. Zig's .Fastcall is broken on x86
+// (github.com/ziglang/zig/issues/10363), so this emits inline asm: ECX=arg1, EDX=arg2, stack=rest
+// (R→L), callee cleans stack.
 //   pub const SetFont = fastcall(0x502EF0, fn (DWORD) DWORD);
 //   _ = SetFont.call(.{1});
-//
-//   pub const DrawText = fastcall(0x502320, fn ([*:0]const u16, c_int, c_int, DWORD, BOOL) void);
-//   DrawText.call(.{text, 100, 50, 4, 0});
 
 fn argToU32(comptime T: type, val: T) u32 {
     return switch (@typeInfo(T)) {
@@ -129,9 +121,7 @@ pub fn fastcall(comptime addr: u32, comptime FnType: type) type {
     };
 }
 
-// ============================================================================
 // Drawing (__fastcall)
-// ============================================================================
 
 pub const SetFont = fastcall(0x502EF0, fn (DWORD) DWORD);
 
@@ -143,9 +133,7 @@ pub const GetUnitName = fastcall(0x464A60, fn (?*UnitAny) ?[*:0]u16);
 
 pub const GetLocaleString = fastcall(0x524A30, fn (u16) ?[*:0]u16);
 
-// ============================================================================
 // Drawing (__stdcall)
-// ============================================================================
 
 pub const DrawLine = struct {
     const Fn = *const fn (c_int, c_int, c_int, c_int, DWORD, DWORD) callconv(.winapi) void;
@@ -201,9 +189,7 @@ pub const DrawImage = struct {
     }
 };
 
-// ============================================================================
 // Units (__stdcall)
-// ============================================================================
 
 pub const GetUnitStat = struct {
     const Fn = *const fn (?*UnitAny, DWORD, DWORD) callconv(.winapi) DWORD;
@@ -234,9 +220,7 @@ pub const UnitLocation = struct {
 // For an object: CreateUnit(.object, classId, x, y, pGame, pRoom, 1, null).
 pub const CreateUnit = fastcall(0x555230, fn (types.UnitType, i32, i32, i32, ?*anyopaque, ?*anyopaque, u32, ?*anyopaque) ?*UnitAny);
 
-// ============================================================================
 // Level / Room (__stdcall)
-// ============================================================================
 
 pub const AddRoomData = struct {
     const Fn = *const fn (?*Act, c_int, c_int, c_int, ?*Room1) callconv(.winapi) void;
@@ -294,9 +278,7 @@ pub const GetAct = struct {
     }
 };
 
-// ============================================================================
 // Screen (__stdcall)
-// ============================================================================
 
 pub const GetScreenMode = struct {
     const Fn = *const fn () callconv(.winapi) DWORD;
@@ -321,9 +303,7 @@ pub const EscMenuShowMenu = fastcall(0x47E090, fn (i32, i32) void);
 
 pub const ImageLoadDC6Ex = fastcall(0x4788B0, fn ([*:0]const u8, DWORD) ?*anyopaque);
 
-// ============================================================================
 // Room / Collision — game engine functions for teleport validation
-// ============================================================================
 
 /// DRLGROOM_FindBetterNearbyRoom: checks if (x,y) is in pRoom or its adjacent rooms.
 /// Returns the room containing (x,y), or NULL if unreachable. This is the exact function
@@ -335,15 +315,11 @@ pub const FindBetterNearbyRoom = fastcall(0x463740, fn (?*Room1, i32, i32) ?*Roo
 /// collision mask 0x1C09 = PLAYER_COLLISION_DEFAULT (what teleport uses).
 pub const CheckCollisionWidth = fastcall(0x64D9B0, fn (?*Room1, i32, i32, u32, u16) u16);
 
-/// D2Game::Game::Level::InitLevel @0x53AEC0 — __fastcall(pGame ECX, pUnit EDX,
-/// eLevel, nMasks). Relocates a player unit into a different level: resolves the
-/// destination act, lazily allocates that act's DRLG if absent, lazy-loads the
-/// level's rooms, finds a collision-free spawn, and re-links the unit. This is
-/// the same routine waypoints, resurrects, and town portals use.
-///
-/// Named `WarpUnitToLevel` here to avoid colliding with the unrelated
-/// D2Common::Drlg `InitLevel` (0x6424A0) bound above. nMasks: 0 = random spawn
-/// point, 0xD = waypoint spawn anchor (if the level has one).
+/// D2Game::Game::Level::InitLevel @0x53AEC0 — __fastcall(pGame ECX, pUnit EDX, eLevel, nMasks).
+/// Relocates a player unit into another level: resolves the act, lazily allocates DRLG + rooms,
+/// finds a collision-free spawn, re-links the unit. Same routine waypoints/resurrect/TP use.
+/// Named `WarpUnitToLevel` to avoid colliding with D2Common::Drlg `InitLevel` (0x6424A0) above.
+/// nMasks: 0 = random spawn point, 0xD = waypoint spawn anchor (if the level has one).
 pub const WarpUnitToLevel = fastcall(0x53AEC0, fn (?*anyopaque, ?*UnitAny, u32, u32) void);
 
 /// D2Game::Game::Clients::GetPlayerFromClient @0x537860 — __stdcall(pClient,
@@ -358,17 +334,14 @@ pub const GetPlayerFromClient = struct {
     }
 };
 
-/// PARTYSCREEN_SetHostileRelation @0x5A60E0 — __fastcall(pGame ECX, pUnit EDX,
-/// pTarget). Declares pUnit hostile toward pTarget: allocates the player-list
-/// entry if needed, sets the hostile bit (0x8), and sends the 0x8C relationship
-/// packet so pTarget's client allows attacks. Bypasses the level>=9 UI gate.
-/// For mutual PvP call BOTH directions: (a,b) and (b,a). The damage gate
+/// PARTYSCREEN_SetHostileRelation @0x5A60E0 — __fastcall(pGame ECX, pUnit EDX, pTarget). Declares
+/// pUnit hostile toward pTarget: allocates the player-list entry if needed, sets the hostile bit
+/// (0x8), sends the 0x8C relationship packet so pTarget's client allows attacks. Bypasses the
+/// level>=9 UI gate. For mutual PvP call BOTH directions: (a,b) and (b,a) — the damage gate
 /// UNITS_CheckIfCanAttackTarget (0x554200) checks the attacker's list entry.
 pub const SetHostileRelation = fastcall(0x5A60E0, fn (?*anyopaque, ?*UnitAny, ?*UnitAny) void);
 
-// ============================================================================
 // Game entry
-// ============================================================================
 
 pub const EnumerateLocalSaves = struct {
     const Fn = *const fn () callconv(.winapi) DWORD;
@@ -396,9 +369,7 @@ pub const ClearMessageLoopFlag = struct {
     }
 };
 
-// ============================================================================
 // Net
-// ============================================================================
 
 pub const NET_D2GS_CLIENT_IncomingReturn = struct {
     const Fn = *const fn ([*]u8) callconv(.c) void;
@@ -408,15 +379,11 @@ pub const NET_D2GS_CLIENT_IncomingReturn = struct {
     }
 };
 
-// ============================================================================
 // Dialog (__fastcall)
-// ============================================================================
 
 pub const OkDialog = fastcall(0x4331C0, fn ([*:0]const u16, [*:0]const u16, [*:0]const u16, ?*const fn () callconv(.c) void) void);
 
-// ============================================================================
 // Automap (__fastcall / __stdcall)
-// ============================================================================
 
 /// Render the automap. The engine calls this at DRAW_UI; runtime/drawing.zig
 /// replaces that call so features can draw before/after it.
@@ -444,16 +411,12 @@ pub const GetAutomapSize = struct {
 
 pub const GetLayer = fastcall(0x61E470, fn (DWORD) ?*types.AutomapLayer2);
 
-// ============================================================================
 // Mouse offset (__fastcall)
-// ============================================================================
 
 pub const GetMouseXOffset = fastcall(0x45AFC0, fn () i32);
 pub const GetMouseYOffset = fastcall(0x45AFB0, fn () i32);
 
-// ============================================================================
 // Collision (__stdcall / __fastcall)
-// ============================================================================
 
 pub const TestCollisionByCoordinates = struct {
     const Fn = *const fn (?*UnitAny, c_int, c_int, DWORD) callconv(.winapi) BOOL;
@@ -474,9 +437,7 @@ pub const HasLineOfSight = struct {
     }
 };
 
-// ============================================================================
 // Net — outgoing packets
-// ============================================================================
 
 /// Send a raw packet to the game server.
 /// NET_D2GS_CLIENT_Send at 0x478350: size in EDI, pBytes on stack.
@@ -525,9 +486,7 @@ pub fn castRunTo(x: u16, y: u16) void {
     SendShortShort.call(.{ 0x03, @as(i16, @bitCast(x)), @as(i16, @bitCast(y)) });
 }
 
-// ============================================================================
 // Game state control
-// ============================================================================
 
 /// D2CLIENT_ExitGame at 0x44DD60 — gracefully leave current game.
 /// Sends packet 0x69, sets exit vars, transitions to menu.
@@ -560,9 +519,7 @@ pub fn takeWaypoint(waypoint_id: u32, dest_area: u32) void {
     _ = SetUIFlag.call(.{ 0x14, 1, 0 });
 }
 
-// ============================================================================
 // Unit Interaction (client-side)
-// ============================================================================
 
 const D2UnderMouseStrc = types.D2UnderMouseStrc;
 
@@ -693,9 +650,7 @@ pub fn npcMenuOptionId(npc_class_id: u32, index: u32) u16 {
     return @bitCast(@as(*align(1) const i16, @ptrCast(entry + NPC_MENU_STRING_IDS_OFFSET + index * 2)).*);
 }
 
-// ============================================================================
 // ClickMap / Movement
-// ============================================================================
 
 /// ClickMap: __fastcall(clickType, screenX, screenY, flags)
 pub const ClickMap = fastcall(0x462D00, fn (i32, i32, i32, u8) void);
@@ -725,9 +680,7 @@ pub fn clickAtWorld(click_type: i32, world_x: i32, world_y: i32) void {
     MouseY.* = saved_my;
 }
 
-// ============================================================================
 // Skill switching
-// ============================================================================
 
 /// Switch skill on a hand. left=true for left, false for right.
 /// Packet 0x3C: [u8:0x3C, u32:skillId|leftBit31, u32:ownerId]
@@ -744,18 +697,14 @@ pub fn sendSelectSkill(skill_id: u16, left: bool) void {
     sendPacket(&buf);
 }
 
-// ============================================================================
 // Quest (__fastcall)
-// ============================================================================
 
 /// GetQuestState: check a single quest bit.  __stdcall, all 3 params on stack.
 /// pBitBuffer is a D2BitBufferStrc* (NOT raw bytes — has a pBuffer pointer at offset 0).
 /// Bit offset = questId * 16 + stateId.  Buffer is 0x60 bytes = 768 bits = 48 quests × 16 states.
 pub const GetQuestState: *const fn (?*anyopaque, u32, u32) callconv(.winapi) i32 = @ptrFromInt(0x0065C310);
 
-// ============================================================================
 // Portal / Object creation (__fastcall)
-// ============================================================================
 
 /// OBJECT_CreateTombPortal: creates the Arcane→Canyon portal.
 /// Internally calls SelectUnkownArkaneThingId to pick the right tomb portal class ID.
@@ -770,9 +719,7 @@ pub const SpawnPortal = fastcall(0x0056D130, fn (?*anyopaque, ?*UnitAny, ?*anyop
 /// ECX=pRoom (Room1), EDX=pPoint (in/out POINT*), stack: nScanRadius, eCollisionFlags, ppRoomOut, dwTag, nMaxIter
 pub const FindSpawnableLocation = fastcall(0x00545340, fn (?*anyopaque, *[2]i32, u32, u32, *?*anyopaque, u32, i32) void);
 
-// ============================================================================
 // Skills (__fastcall / __stdcall)
-// ============================================================================
 
 /// GetSkill: returns D2SkillStrc* for a skill on a unit, or null.
 /// Calling convention is unknown — d2bs walks the skill list manually instead of calling this.
@@ -794,9 +741,7 @@ pub const GetSkillLevel = struct {
 /// __fastcall: ECX=pUnit, EDX=eSkill → int32_t
 pub const GetSkillLevelById = fastcall(0x006447B0, fn (?*UnitAny, i32) i32);
 
-// ============================================================================
 // Txt record accessors (__fastcall)
-// ============================================================================
 
 /// TXT_MonStats_GetLine: returns pointer to D2MonStatsTxt record (0x1A8 bytes) or null.
 /// ECX=nMonStatsId
@@ -868,16 +813,12 @@ pub const TxtQualityItemsGetLine = cdeclTxt(0x00636B20);
 /// D2NpcTxt
 pub const TxtNpcGetLine = cdeclTxt(0x00656900);
 
-// ============================================================================
 // Merc / Roster
-// ============================================================================
 
 /// D2CLIENT_GetMonsterOwner: __fastcall(nMonsterId) -> owner unit ID
 pub const GetMonsterOwner = fastcall(0x479150, fn (u32) u32);
 
-// ============================================================================
 // Ubers (server) — monster/item/portal spawn + boss AI (recon 9df5e900)
-// ============================================================================
 
 /// SERVER_SpawnMonster @0x5A4440 — __fastcall. Full monster spawn with GUID/seed/
 /// flags/mods. ECX=pGame, EDX=pRoom; stack: x, y, classId, guid, seed, isChampion,

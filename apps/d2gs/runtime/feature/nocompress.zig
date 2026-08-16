@@ -1,33 +1,16 @@
-//! Serve the game stream UNCOMPRESSED and UNFRAMED, using the engine's own raw send mode.
+//! Serve the game stream UNCOMPRESSED and UNFRAMED, via the engine's own raw send mode.
 //!
-//! NET_D2GS_SERVER_SendPacketToClient @0x52b330 already has a verbatim path — the one the
-//! 0xAF greeting itself rides:
+//! NET_D2GS_SERVER_SendPacketToClient @0x52b330 already has a verbatim path: `nMode == 2` skips
+//! CompressPacket + the length prefix (JZ @0x52b3b5) and sends the bytes as-is. Forcing that test
+//! to always fall through turns every server packet raw — one 6-byte patch, no codec of our own.
 //!
-//!     if (nMode != 0 || pBytes[0] != 0xAF) {
-//!         LogSentPacket(pBytes, nSize);
-//!         if (nMode != 2) {                                  <- 0x52b3b5
-//!             CompressPacket(pBuffer + 2, 1032, pBytes, nSize);
-//!             SendPacketByClientId(... 1/2-byte length prefix ...);
-//!             return;
-//!         }
-//!     }
-//!     SendPacketByClientId(pQServer, nClientId, pBytes, nSize);   // raw, no prefix
-//!
-//! So mode 2 means "send exactly these bytes". Forcing the `nMode != 2` test to fall through
-//! turns every server packet into a raw one: no Huffman, no length header. One 6-byte patch,
-//! no detour, no codec of our own — we just take a road the engine already paves.
-//!
-//! This pairs with the 0xAF00 greeting. The client's receive thread has two disjoint paths
-//! (ThreadClientToServer @0x52ab30, gated on the phase flag that
-//! NET_D2GS_CLIENT_ParseRecvBufferIntoPacketQueues returns):
-//!   * flag 0 (after 0xAF00) — recv straight into the packet buffer, then parse. NO length
-//!     framing and NO DecompressPacket call anywhere on this path.
-//!   * flag 1 (after 0xAF01) — the length-framed loop that decompresses every frame.
-//! A STOCK client greeted with 0xAF00 therefore reads our raw stream natively. Nothing is
-//! patched on the client, which is the point: the previous approach replaced BOTH codec
-//! functions with an identity `rep movsb` that ignored the destination size, so a verbatim
-//! world packet memcpy'd into a buffer sized for a decompressed one and corrupted the
-//! client's heap during world-load.
+//! Pairs with the 0xAF00 greeting: the client's ThreadClientToServer @0x52ab30 has two disjoint
+//! recv paths gated on the phase flag from NET_D2GS_CLIENT_ParseRecvBufferIntoPacketQueues — flag 0
+//! (after 0xAF00) parses straight from the recv buffer, no framing, no DecompressPacket; flag 1
+//! (0xAF01) is the length-framed, decompressing loop. So a STOCK client greeted 0xAF00 reads our
+//! raw stream natively, unpatched. The earlier approach instead identity-patched both codec
+//! functions with `rep movsb`, ignoring destination size — a verbatim world packet memcpy'd into a
+//! decompressed-size buffer and corrupted the client's heap during world-load.
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");
 

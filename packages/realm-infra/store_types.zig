@@ -56,22 +56,40 @@ pub const GameRec = struct {
 };
 
 /// The backend GS a client's game traffic should be spliced to — keyed by the client's
-/// source IP, recorded by realmd on JOINGAME and looked up by the qqserver per connection.
+/// source IP, recorded by realmd on JOINGAME and looked up by the d2ingress per connection.
 pub const Route = struct {
     gs_ip: [4]u8,
     gs_port: u16 = 4000,
 };
 
 /// Token-keyed route — the NAT-proof replacement for source-IP routing. realmd mints a
-/// realm-globally-unique u16 token per CREATE/JOIN, hands it to the client, and records
-/// it here against the GS that owns the game plus the engine's real gameid. The qqserver
-/// reads the token from the client's first GAMELOGON packet, looks this up, rewrites the
-/// token in the packet to `gameid`, and splices to gs_ip:gs_port. Globally-unique tokens
-/// mean two clients behind one public IP never collide.
+/// realm-globally-unique u16 token per CREATE/JOIN, hands it to the client, and records it here
+/// against the owning GS plus the engine's real gameid. d2ingress reads the token off the
+/// client's first GAMELOGON packet, rewrites it to `gameid`, and splices to gs_ip:gs_port.
 pub const TokenRoute = struct {
     gs_ip: [4]u8,
     gs_port: u16 = 4000,
     gameid: u32,
+};
+
+/// One game server as the whole realm sees it, rather than as the instance holding its control
+/// connection sees it. Published by whichever realmd owns that connection and refreshed on the
+/// link's own liveness traffic, so it expires by itself if that realmd dies with the socket.
+///
+/// This is the fleet's *view*, not its *reachability*: dispatch still travels the control socket,
+/// so an instance can read a record here for a server it cannot itself talk to. What it buys is
+/// that every instance sees the same capacity and load — without it a second realmd sees an empty
+/// fleet and refuses every create.
+pub const GsRec = struct {
+    gsid: u32,
+    gs_ip: [4]u8,
+    gs_port: u16 = 4000,
+    /// Advertised capacity; 0 means the server did not say, i.e. unlimited.
+    maxgame: u32 = 0,
+    live_games: u32 = 0,
+    /// The server itself answered "full" — it knows about slots still held by the reap window,
+    /// which `live_games` cannot see.
+    full: bool = false,
 };
 
 /// A game enumerated from the shared store (name + record) — used to serve /admin/games

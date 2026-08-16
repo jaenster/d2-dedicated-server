@@ -1,13 +1,10 @@
 //! Reap empty games promptly so their FOG pools don't leak.
 //!
-//! QSERVER_DispatchAndCleanup @0x0052fd90 destroys a game with zero clients only after it
-//! has been idle for 300000 ms (5 minutes): `CMP EDX, 0x493e0; JA <destroy>` at 0x0052fe57,
-//! so the imm32 (e0 93 04 00) lives at 0x0052fe59. On a dedicated server that holds no value
-//! — empty games created and abandoned in quick succession pile up, and FOG only supports 8
-//! pool managers (Fog/Memory.cpp: `7 < nManagers` -> RaiseException(0xe0000001)); the ~9th
-//! game then can't allocate and the engine raises 0xe0000001 and dies. Shrinking the idle
-//! window to a few seconds makes the engine's own (safe, locked) destroy path collect empty
-//! games almost immediately, which keeps the pool-manager count bounded.
+//! QSERVER_DispatchAndCleanup @0x0052fd90 destroys an empty game only after 300000 ms idle
+//! (`CMP EDX, 0x493e0; JA <destroy>` at 0x0052fe57, imm32 at 0x0052fe59). FOG supports only
+//! 8 pool managers (Fog/Memory.cpp: `7 < nManagers` -> RaiseException(0xe0000001)), so empty
+//! games piling up for 5 minutes each exhausts them and kills the process. Shrinking the idle
+//! window lets the engine's own destroy path collect empties almost immediately.
 const patch = @import("patch.zig");
 const log = @import("../log.zig");
 
@@ -23,12 +20,10 @@ pub fn apply(idle_ms: u32) void {
     }
 }
 
-/// Overridable, because this window is the real throttle on game THROUGHPUT, not the 8-manager
-/// ceiling: a finished game keeps its pool manager for this long, so a server churning games
-/// faster than the window runs out of managers while nothing is actually being played. Measured
-/// at 5000 ms: 3 games created every ~4 s saturates the table and one client per round is turned
-/// away. The trade is the other direction — too short and a player who drops for a moment loses
-/// the game rather than getting back into it.
+/// Overridable: this window throttles game THROUGHPUT, not the 8-manager ceiling — a finished
+/// game keeps its manager until reap, so churning games faster than this exhausts managers.
+/// Measured: at 5000ms, 3 games/~4s saturates the table. Trade-off: too short evicts a player
+/// who drops mid-game before they can rejoin.
 pub fn applyDefault() void {
     apply(default_idle_ms);
 }

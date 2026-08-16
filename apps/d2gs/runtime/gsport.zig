@@ -1,10 +1,10 @@
-//! Patch the engine's QServer LISTEN port so the qqserver can own the client-facing :4000.
+//! Patch the engine's QServer LISTEN port so the d2ingress can own the client-facing :4000.
 //!
 //! QSERVER_CreateAndInit @0x0052b7a0 calls NET_QServer_Init(connType, 3, 4000, ...) — the
 //! game port 4000 is pushed as `push 0xfa0` @0x0052b7be, so its imm32 lives at 0x0052b7bf
 //! (bytes a0 0f 00 00). Rewriting that imm32 moves the GS's listener off 4000. Combined
 //! with the GS self-reporting the same port via ADDRINFO, the realm records the route to
-//! the moved port and the qqserver (on :4000) splices client game traffic through to it.
+//! the moved port and the d2ingress (on :4000) splices client game traffic through to it.
 const patch = @import("patch.zig");
 const log = @import("../log.zig");
 

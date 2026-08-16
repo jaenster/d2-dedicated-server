@@ -1,14 +1,11 @@
-//! Darwin-internal names the host libc does not spell at all.
+//! Darwin-internal names the host libc does not spell at all: the ones the compiler emits rather
+//! than what the game wrote — `__memcpy_chk` behind a fortified `memcpy`, `__error` behind the
+//! `errno` macro, `__maskrune`/`_DefaultRuneLocale` behind `isspace`, `__udivdi3` behind a 64-bit
+//! divide on a 32-bit machine. None exist on Linux under any name; small enough to write out here
+//! rather than guess through a thunk.
 //!
-//! These are the ones the compiler emits rather than the ones the game wrote: `__memcpy_chk` behind
-//! a fortified `memcpy`, `__error` behind the `errno` macro, `__maskrune` and `_DefaultRuneLocale`
-//! behind `isspace`, `__udivdi3` behind a 64-bit divide on a 32-bit machine. None of them exist on
-//! Linux under any name, and all of them are small enough to be written out here rather than guessed
-//! at through a thunk.
-//!
-//! Keyed on the name exactly as the image spells it, because normalise() cannot help here: `___error`
-//! would come out as `__error` and `__DefaultRuneLocale` as `_DefaultRuneLocale`, and neither is the
-//! name of anything.
+//! Keyed on the name exactly as the image spells it — normalise() can't help: `___error` would
+//! come out as `__error`, `__DefaultRuneLocale` as `_DefaultRuneLocale`, neither the real name.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,7 +33,7 @@ pub fn address(name: []const u8) ?usize {
     return null;
 }
 
-// ── the fortified string family ──
+// the fortified string family
 
 /// How a fortified call reports that the game asked for a copy longer than the destination it
 /// declared. Darwin's `__chk_fail` aborts; replaced by the host so this package does not decide how
@@ -106,7 +103,7 @@ pub fn bzero(dst: [*]u8, len: usize) callconv(.c) void {
     @memset(dst[0..len], 0);
 }
 
-// ── errno ──
+// errno
 
 const errnoLocation = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos => struct {
@@ -122,7 +119,7 @@ pub fn errorLocation() callconv(.c) *c_int {
     return errnoLocation();
 }
 
-// ── ctype and the C locale ──
+// ctype and the C locale
 
 /// Darwin's `_CTYPE_*`. The low eight bits of a `__runetype` entry are the digit value, which is
 /// what `digittoint` reads out of a hex digit.
@@ -244,7 +241,7 @@ pub fn toUpper(c: c_int) callconv(.c) c_int {
     return DefaultRuneLocale.mapupper[@intCast(c)];
 }
 
-// ── 64-bit division on a 32-bit machine ──
+// 64-bit division on a 32-bit machine
 
 /// i386 has no 64-bit divide, so the compiler calls these. Truncating division and a remainder that
 /// takes the dividend's sign, which is C's rule and Zig's `@divTrunc`/`@rem`.

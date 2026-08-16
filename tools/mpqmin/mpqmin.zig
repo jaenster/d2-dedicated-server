@@ -1,27 +1,15 @@
-//! mpqmin — rebuild an MPQ with only the members a headless game server reads.
+//! mpqmin — rebuild an MPQ with only the members a headless game server reads. Retail d2data.mpq
+//! is ~256MB; a server touches ~4MB (excel tables, level tiles for collision, COF animation data,
+//! string tables) vs client-only art/sound/light data — filtering by extension separates the two
+//! exactly, reproducing this repo's shipped minimal d2data.mpq/d2exp.mpq member-for-member. The
+//! macOS archives are the same archives plus Mac-only members (e.g. D2Resources.rsrc, which
+//! PreInitApplication extracts and the `.rsrc` keep-list entry saves).
 //!
-//! A retail d2data.mpq is ~256 MB and a server touches ~4 MB of it: the excel tables, the level
-//! tiles it needs for collision, the COF animation data, the string tables. Everything else is
-//! art (.dc6/.dcc), sound (.wav) and light tables (.pl2) — pixels for a client that isn't there.
-//! Filtering by extension is what separates the two, and it is exact: applied to a retail archive
-//! it reproduces this repo's shipped minimal d2data.mpq and d2exp.mpq member-for-member.
-//!
-//! The same rule holds for the macOS archives, because they are the same archives: "Diablo II
-//! Expansion Data" is byte-identical to d2exp.mpq, and "Diablo II Game Data" is d2data.mpq plus a
-//! handful of Mac-only members — among them Data\Local\MacUI\<lang>\D2Resources.rsrc, which
-//! PreInitApplication extracts and which the `.rsrc` entry in the keep-list is there to save.
-//!
-//! Usage:
-//!   mpqmin [--ui] <src> <dst>   rebuild <src> into <dst>, keeping only what the rule keeps
-//!   mpqmin --list <src>         one line per member: flags size csize offset locale name
-//!   mpqmin --keep <list> <src> <dst>   keep exactly the members named in <list>, one per line
-//!
-//! `--list` doubles as the offset map for read tracing: the host's file shim logs archive reads as
-//! (offset, length), and a read inside [offset, offset+csize) is a read of that member.
-//!
-//! Build (mirrors tools/mpqcat):
-//!   SL=/opt/homebrew/opt/stormlib
-//!   zig build-exe mpqmin.zig -O ReleaseSafe -lc -lstorm -lz -lbz2 -I"$SL/include" -L"$SL/lib"
+//! mpqmin [--ui] <src> <dst> rebuilds; --list <src> dumps flags/size/csize/offset/locale/name per
+//! member (doubles as the offset map for read tracing: a read at (offset,length) falls in a
+//! member's [offset, offset+csize)); --keep <list> <src> <dst> keeps exactly the named members.
+//! Build mirrors tools/mpqcat: zig build-exe mpqmin.zig -O ReleaseSafe -lc -lstorm -lz -lbz2
+//!   -I"$SL/include" -L"$SL/lib" with SL=/opt/homebrew/opt/stormlib.
 const std = @import("std");
 
 const HANDLE = ?*anyopaque;
@@ -79,10 +67,8 @@ const compression_pkware: u32 = 0x08;
 
 const gpa = std.heap.c_allocator;
 
-/// The keep rule. Extensions rather than paths because the split is by KIND, not by location:
-/// tables, tiles, animation data and string tables live scattered under data\global and data\local,
-/// and every one of them is a small format the server parses itself.
-///
+/// The keep rule: extensions not paths, since tables/tiles/animation/string data live scattered
+/// under data\global and data\local, each a small format the server parses itself.
 ///   txt tbl        excel tables, string tables, font metrics
 ///   dat d2         palettes, palshift, AnimData.D2, the compiled COF archives
 ///   ds1 dt1 dn1    level presets and tiles — the collision map is built from these

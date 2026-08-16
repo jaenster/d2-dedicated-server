@@ -1,12 +1,9 @@
 //! A lock that waits by sleeping, not by burning a core. (0.16's Io migration took
 //! std.Thread.Mutex and Futex out of std.Thread, so this is hand-rolled.)
 //!
-//! Callers hold it across IO -- redis for a whole command/reply round trip, fs across a disk
-//! write, gslink's req_lock across a create/join the game server can take seconds to answer --
-//! and a pure spinner waiting on one of those burns a full core for the entire wait. So back
-//! off in three stages: spin as long as a genuinely short section could last, then yield in
-//! case the holder just wants a core, then sleep in doubling steps. An uncontended take is
-//! still one atomic swap.
+//! Callers hold it across IO (redis round trips, disk writes, a create/join
+//! that can take seconds), where a pure spinner burns a full core for the whole wait. Back off in
+//! three stages: spin, yield, then sleep in doubling steps. Uncontended take is one atomic swap.
 const std = @import("std");
 
 extern "c" fn usleep(usec: c_uint) c_int;

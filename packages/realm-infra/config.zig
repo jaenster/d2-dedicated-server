@@ -1,10 +1,10 @@
 //! realmd configuration. Everything comes from the environment with sane
 //! defaults — no config files, no sed. One binary, one set of env vars.
 //!
-//! Multi-instance note: every instance reads the same vars; what makes them
-//! distinct is REALMD_INSTANCE (an id for logging/coordination) and the shared
-//! Store backend (added later) they all point at. The protocol listeners
-//! themselves are stateless, so scaling out is just "run more of these".
+//! Multi-instance note: every instance reads the same vars; what makes them distinct is
+//! REALMD_INSTANCE, which must differ per instance (it seeds session and request id ranges).
+//! Everything else is shared — Postgres for the record, Redis for what is in flight — so the
+//! listeners are stateless and scaling out is just "run more of these".
 const std = @import("std");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -13,8 +13,6 @@ pub const Config = struct {
     instance_id: []const u8 = "realmd-0",
     bind: []const u8 = "0.0.0.0",
     bnet_port: u16 = 6112,
-    d2cs_port: u16 = 6113,
-    d2dbs_port: u16 = 6114,
 
     /// Realm advertised to clients (what bnetd hands back as the realm address).
     realm_name: []const u8 = "TypeGuru",
@@ -28,27 +26,24 @@ pub const Config = struct {
     ad_file: []const u8 = "",
     ad_url: []const u8 = "",
 
-    /// Port the game server (our injected d2gs) connects to for the control
-    /// link (its own port so we never confuse it with a client MCP connection).
-    gs_port: u16 = 6115,
     /// Optional override for the game-server IP advertised to clients (when the
-    /// GS is behind NAT). Empty = use the control connection's peer IP.
+    /// GS is behind NAT). Empty = use the address the server reports for itself.
     gs_addr: []const u8 = "",
 
     /// REQUIRED (dotted-quad). Public address of the game-traffic ingress, advertised to
-    /// clients on JOINGAME — either a standalone qqserver or realmd's own edge (`game_port`).
+    /// clients on JOINGAME — either a standalone d2ingress or realmd's own edge (`game_port`).
     /// Never a game server's own address: the token clients are handed is realm-global, so
     /// only an ingress can translate it. realmd refuses to start without it.
     game_addr: []const u8 = "",
     /// TTL (seconds) for the {client-ip → GS} routes realmd records on JOINGAME for
-    /// the qqserver to consume.
+    /// the d2ingress to consume.
     route_ttl_s: u32 = 60,
-    /// Public port the qqserver listens on for game traffic (consumed by the qqserver
-    /// binary; parsed here so realmd and qqserver share one config surface).
-    qq_port: u16 = 4000,
+    /// Public port the d2ingress listens on for game traffic (consumed by the d2ingress
+    /// binary; parsed here so realmd and d2ingress share one config surface).
+    ingress_port: u16 = 4000,
     /// When non-zero, realmd runs the EMBEDDED game-traffic edge (gameedge.zig) on this
-    /// port itself — the lightweight, single-binary alternative to a standalone qqserver
-    /// (in-process token-route lookup, thread-per-conn splice). 0 = off (use qqserver).
+    /// port itself — the lightweight, single-binary alternative to a standalone d2ingress
+    /// (in-process token-route lookup, thread-per-conn splice). 0 = off (use d2ingress).
     game_port: u16 = 0,
 
     /// Directory for durable data (character saves). A shared volume here is
@@ -74,15 +69,10 @@ pub const Config = struct {
     shutdown_grace_ms: u32 = 5000,
 
     /// Persistence backends. `durable` serves character saves (the store of record);
-    /// `ephemeral` serves sessions + games (short-lived, TTL'd). They are independent
-    /// so Postgres and Redis are co-equal (durable=pg, ephemeral=redis is the common
-    /// split). REALMD_STORE sets both; REALMD_DURABLE_STORE / REALMD_EPHEMERAL_STORE
-    /// override each. Values: fs | redis | pg.
-    durable_store: Backend = .fs,
-    ephemeral_store: Backend = .fs,
-    /// "host:port" for the Redis backend (DNS name ok).
+    /// REQUIRED. Where the realm coordinates: sessions, games, the fleet and its queues, and the
+    /// live character in front of Postgres. "host:port", DNS name ok.
     redis_addr: []const u8 = "redis:6379",
-    /// libpq-style DSN for the Postgres backend.
+    /// REQUIRED. The store of record: characters, accounts, profiles, guilds. libpq-style DSN.
     pg_dsn: []const u8 = "",
 
     /// Bearer token for the HTTP admin API (served on the health port under
@@ -123,15 +113,6 @@ pub const Config = struct {
     trusted_auth_header: []const u8 = "",
 };
 
-pub const Backend = enum { fs, redis, pg };
-
-fn parseBackend(s: []const u8, current: Backend) Backend {
-    if (std.mem.eql(u8, s, "fs")) return .fs;
-    if (std.mem.eql(u8, s, "redis")) return .redis;
-    if (std.mem.eql(u8, s, "pg")) return .pg;
-    return current;
-}
-
 fn env(name: [*:0]const u8) ?[]const u8 {
     const v = getenv(name) orelse return null;
     return std.mem.span(v);
@@ -147,13 +128,10 @@ pub fn fromEnv() Config {
     if (env("REALMD_INSTANCE")) |v| c.instance_id = v;
     if (env("REALMD_BIND")) |v| c.bind = v;
     c.bnet_port = envPort("REALMD_BNET_PORT", c.bnet_port);
-    c.d2cs_port = envPort("REALMD_D2CS_PORT", c.d2cs_port);
-    c.d2dbs_port = envPort("REALMD_D2DBS_PORT", c.d2dbs_port);
-    c.gs_port = envPort("REALMD_GS_PORT", c.gs_port);
     if (env("REALMD_GS_ADDR")) |v| c.gs_addr = v;
     if (env("REALMD_GAME_ADDR")) |v| c.game_addr = v;
     if (env("REALMD_ROUTE_TTL_S")) |v| c.route_ttl_s = std.fmt.parseInt(u32, v, 10) catch c.route_ttl_s;
-    c.qq_port = envPort("REALMD_QQ_PORT", c.qq_port);
+    c.ingress_port = envPort("REALMD_INGRESS_PORT", c.ingress_port);
     c.game_port = envPort("REALMD_GAME_PORT", c.game_port);
     if (env("REALMD_REALM_NAME")) |v| c.realm_name = v;
     if (env("REALMD_ADMINS")) |v| c.admins = v;
@@ -167,13 +145,6 @@ pub fn fromEnv() Config {
     if (env("REALMD_LOG_JSON")) |_| c.log_json = true;
     if (env("REALMD_REQUIRE_GS")) |_| c.require_gs = true;
     if (env("REALMD_SHUTDOWN_GRACE_MS")) |v| c.shutdown_grace_ms = std.fmt.parseInt(u32, v, 10) catch c.shutdown_grace_ms;
-    // REALMD_STORE sets both backends; the granular vars override each.
-    if (env("REALMD_STORE")) |v| {
-        c.durable_store = parseBackend(v, c.durable_store);
-        c.ephemeral_store = parseBackend(v, c.ephemeral_store);
-    }
-    if (env("REALMD_DURABLE_STORE")) |v| c.durable_store = parseBackend(v, c.durable_store);
-    if (env("REALMD_EPHEMERAL_STORE")) |v| c.ephemeral_store = parseBackend(v, c.ephemeral_store);
     if (env("REALMD_REDIS_ADDR")) |v| c.redis_addr = v;
     if (env("REALMD_PG_DSN")) |v| c.pg_dsn = v;
     if (env("REALMD_ADMIN_TOKEN")) |v| c.admin_token = v;

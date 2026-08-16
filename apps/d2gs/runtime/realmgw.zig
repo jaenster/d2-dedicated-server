@@ -1,23 +1,17 @@
-//! Make the Battle.net gateway list come from memory, never the registry — so clients
-//! can share one wineprefix without the gateway-assert crash.
-//!
-//! D2Client::BNGatewayAccess::Load @0x5186d0 calls GetGatewayList @0x518190, which reads
-//! the REG_MULTI_SZ value via Storm's SSTR_RegistryReadValueEx. With two Game.exe sharing
-//! one wineprefix (shared HKCU user.reg), that read returns EMPTY for the 2nd client under
-//! contention -> Load falls to UpdateGatewaysFromIni @0x518850, whose ini parse asserts
-//! (FindSection @0x5183f0 -> NULL -> BNetGW.cpp:0x277 -> 0xc0000005). Writing the registry
-//! value ourselves did NOT fix it: the contended read still came back empty.
+//! Make the Battle.net gateway list come from memory, never the registry — so clients can share
+//! one wineprefix without the gateway-assert crash. D2Client::BNGatewayAccess::Load @0x5186d0 calls
+//! GetGatewayList @0x518190, which reads the REG_MULTI_SZ via Storm's SSTR_RegistryReadValueEx; with
+//! two Game.exe sharing one wineprefix that read comes back EMPTY under contention for the 2nd
+//! client, falling to UpdateGatewaysFromIni @0x518850 whose ini parse asserts (FindSection @0x5183f0
+//! -> NULL -> BNetGW.cpp:0x277 -> 0xc0000005). Writing the registry value ourselves did NOT fix it.
 //! See [[d2-multiclient-gateway-assert]].
 //!
-//! So we detour GetGatewayList itself: fill the gateway-access struct from an in-memory
-//! REG_MULTI_SZ we build (every realm entry -> the injected IP), allocated with the engine's
-//! own SMemAlloc so the engine's later SMemFree (SaveAndUnload) is valid. No registry read
-//! ever happens -> no contention -> no crash, regardless of wineprefix sharing.
-//!
-//! GetGatewayList is __thiscall: ECX = pGatewayAccess (this), one stack arg (the value name
-//! we ignore), `ret 4`. Struct fields it sets: +0x10 pGatewayData, +0x14 nGatewayDataSize,
-//! +0x18 nFormatVersion. Buffer layout (same as the working rig value):
-//!   <version>\0 <curidx>\0  then N x (<ip>\0 <timezone>\0 <name>\0), MULTI_SZ double-null.
+//! Fix: detour GetGatewayList to fill the gateway-access struct from an in-memory REG_MULTI_SZ we
+//! build (every realm entry -> the injected IP), SMemAlloc'd so the engine's later SMemFree
+//! (SaveAndUnload) is valid — no registry read, no contention, no crash. GetGatewayList is
+//! __thiscall (ECX=this, one ignored stack arg, `ret 4`); sets +0x10 pGatewayData, +0x14
+//! nGatewayDataSize, +0x18 nFormatVersion. Buffer: `<version>\0<curidx>\0` then N x
+//! `<ip>\0<timezone>\0<name>\0`, MULTI_SZ double-null.
 const std = @import("std");
 const patch = @import("patch.zig");
 const fastcall = @import("fastcall.zig");

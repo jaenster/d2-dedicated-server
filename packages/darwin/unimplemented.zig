@@ -1,18 +1,12 @@
 //! What an import resolves to when nothing implements it.
 //!
-//! There are 626 of them and most will never be called: a headless server never opens a window,
-//! never draws a menu, never plays a sound. Writing 626 stubs to find out which ones matter is the
-//! wrong way round — instead every unresolved name gets sixteen bytes of generated code that names
-//! itself and returns zero, so the game both tells us what it needs and carries on without it.
-//!
+//! There are 626 and most are never called. Each unresolved name gets sixteen bytes of generated
+//! code that names itself and returns zero, so the game reports what it needs and carries on:
 //!     push <name>          ; cdecl argument
 //!     call dispatch        ; reports once, returns 0
 //!     add  esp, 4
 //!     ret
-//!
-//! Emitting code rather than sharing one stub is what preserves the name. A single shared stub
-//! would report only that something unimplemented was called, which is the one detail already
-//! known.
+//! Emitting code rather than sharing one stub is what preserves the name.
 
 const std = @import("std");
 
@@ -20,16 +14,11 @@ pub const Error = error{ OutOfThunks, MapFailed };
 
 const thunk_size = 16;
 
-/// Returning zero is what makes an unimplemented import survivable, and it is not a guess: nearly
-/// every Carbon and CoreFoundation entry point here returns an OSErr or a pointer, and `noErr` is 0.
-/// So a call the shim does not implement reads as "succeeded, nothing to report" and the game goes
-/// on — which is how far more of the boot gets reached than by implementing them one at a time.
-///
-/// Safe for any signature because Darwin i386 is uniformly cdecl: the caller cleans its own
+/// Returning zero is not a guess: nearly every Carbon and CoreFoundation entry point here returns an
+/// OSErr or a pointer and `noErr` is 0, so an unimplemented call reads as "succeeded, nothing to
+/// report". Safe for any signature because Darwin i386 is uniformly cdecl — the caller cleans its own
 /// arguments, so a callee that ignores them and returns 0 in EAX cannot corrupt the stack.
-///
-/// `strict` turns that off and aborts on the first one instead — the mode to use when a failure has
-/// to be traced to its cause rather than absorbed.
+/// `strict` aborts on the first one instead, for tracing a failure to its cause.
 pub var strict = false;
 
 /// Where the one-line reports go. Stderr by default; negative silences them.

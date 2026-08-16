@@ -1,5 +1,5 @@
 //! realm_infra — shared host-side infrastructure imported by the native binaries
-//! (realmd server + qqserver gateway), but NOT by the injected Windows DLL. Kept
+//! (realmd server + d2ingress gateway), but NOT by the injected Windows DLL. Kept
 //! separate from `realm_proto` (the wire protocol, which the x86-windows DLL also
 //! imports) so libc-socket / POSIX code never gets dragged into the DLL build.
 pub const net = @import("net.zig");

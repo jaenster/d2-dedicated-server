@@ -1,0 +1,42 @@
+{{- if .Values.d2ingress.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d2ingress
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: d2ingress
+spec:
+  replicas: 1
+  revisionHistoryLimit: {{ .Values.realmd.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "realm.selectorLabels" (dict "root" . "component" "d2ingress") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "realm.selectorLabels" (dict "root" . "component" "d2ingress") | nindent 8 }}
+    spec:
+      {{- if .Values.d2ingress.pullSecret }}
+      # The d2ingress image is private; pull it with this dockerconfigjson secret.
+      imagePullSecrets:
+        - name: {{ .Values.d2ingress.pullSecret }}
+      {{- end }}
+      containers:
+        - name: d2ingress
+          image: "{{ .Values.images.d2ingress.repository }}:{{ .Values.images.d2ingress.tag }}"
+          imagePullPolicy: {{ .Values.images.d2ingress.pullPolicy }}
+          ports:
+            - { containerPort: 4000, name: game }
+          env:
+            - name: REALMD_BIND
+              value: "0.0.0.0"
+            - name: REALMD_INGRESS_PORT
+              value: "4000"
+            - name: REALMD_REDIS_ADDR
+              value: "realmd-redis:6379"
+            - name: REALMD_LOG_JSON
+              value: {{ ternary "1" "0" .Values.d2ingress.logJson | quote }}
+          resources:
+            {{- toYaml .Values.d2ingress.resources | nindent 12 }}
+{{- end }}
