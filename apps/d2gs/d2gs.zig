@@ -18,6 +18,7 @@ const command = @import("engine/command.zig");
 const realm = @import("engine/realm.zig");
 const d2cs = @import("realmclient/d2cs.zig");
 const d2dbs = @import("realmclient/d2dbs.zig");
+const gsredis = @import("realmclient/redis.zig");
 const feature = @import("engine/feature.zig");
 const halt_hook = @import("runtime/feature/halt_hook.zig"); // for enableSuppress (sub-mode, not a toggle)
 const headless = @import("runtime/feature/headless.zig"); // server_ready flag for the ExitProcess interceptor
@@ -339,6 +340,15 @@ fn parseEndpoints() void {
                     gs_public_port = port;
                 }
             }
+        }
+    }
+    // Where the shared store is, so the server can publish its own record and — once the
+    // character path moves — read and write saves without a realm in the middle.
+    {
+        const got = flagToken("redis", &tmp) orelse envToken("D2GS_REDIS_ADDR", &tmp);
+        if (got) |len| {
+            gsredis.configure(tmp[0..len]);
+            log.print("d2gs: redis configured");
         }
     }
     // Advertised capacity — flag, then env.

@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const feature = @import("feature.zig");
+const d2cs = @import("../realmclient/d2cs.zig");
 const memstat = @import("../runtime/memstat.zig");
 const poolstat = @import("../runtime/poolstat.zig");
 const log = @import("../log.zig");
@@ -316,4 +317,7 @@ pub fn tick() void {
     // gameCreate/Destroy with a GameCtx carrying the game's FOG-pool allocator)
     // are dispatched once the per-game pool pointer is wired from D2GameStrc.
     feature.fanServerTick();
+    // The server publishes its own presence, rather than a realmd publishing it on the server's
+    // behalf over a link only that one instance holds. Rate-limited inside; cheap when off.
+    d2cs.heartbeat();
 }

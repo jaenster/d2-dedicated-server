@@ -13,6 +13,7 @@ const p = @import("realm_proto").protocol;
 const server = @import("../engine/server.zig");
 const command = @import("../engine/command.zig");
 const joinctx = @import("joinctx.zig");
+const redis = @import("redis.zig");
 const poolstat = @import("../runtime/poolstat.zig");
 const log = @import("../log.zig");
 
@@ -197,6 +198,31 @@ var games_tracked = [_]GameSlot{.{}} ** 256;
 var live_count = std.atomic.Value(u32).init(0);
 
 /// Number of games live on this GS (create→destroy). Lock-free, called every tick.
+/// Publish this server's own record into the shared store, so any realmd can see it exists and
+/// how loaded it is — including instances that hold no connection to it.
+///
+/// The server reports itself rather than being reported by whichever realmd happens to hold its
+/// control link. That is the point: the record outlives any one instance's view of the fleet, and
+/// its TTL means a server that dies leaves on its own without anyone noticing it should.
+///
+/// Best-effort and silent on failure: the control link is still the path that carries create and
+/// join, so a store that is down must not take the game server with it.
+const heartbeat_ttl_s: u32 = 90;
+var last_heartbeat_ms: u32 = 0;
+extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
+
+pub fn heartbeat() void {
+    if (!redis.enabled() or gsid == 0) return;
+    const now_ms = GetTickCount();
+    // A third of the TTL: frequent enough that a healthy server never blinks out of the fleet,
+    // rare enough that it is not a store round trip per tick.
+    // Wrapping subtraction: GetTickCount rolls over about every 49 days, and a server that
+    // has been up that long must not stop reporting itself.
+    if (now_ms -% last_heartbeat_ms < heartbeat_ttl_s * 1000 / 3) return;
+    last_heartbeat_ms = now_ms;
+    _ = redis.putHeartbeat(gsid, public_ip, public_port, max_games, liveGames(), false, heartbeat_ttl_s);
+}
+
 pub fn liveGames() u32 {
     return live_count.load(.monotonic);
 }

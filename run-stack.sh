@@ -194,7 +194,10 @@ WINPATH="Z:$(printf '%s' "$TESTDIR/d2gs.dll" | tr '/' '\\')"
   # The boot is racy: the same command that works takes an access violation at 0x4fa680 often
   # enough that one attempt is not a fair test. Retry rather than report a broken stack.
   for attempt in 1 2 3; do
-    ( cd "$TESTDIR" && WINEDEBUG=-all WINEDLLOVERRIDES="dbghelp=n" "$WINE" Game.exe \
+    # Redis goes in by ENVIRONMENT, not a flag: the flag list above is exact, and this build
+    # takes an access violation during boot if it is extended.
+    ( cd "$TESTDIR" && WINEDEBUG=-all WINEDLLOVERRIDES="dbghelp=n" \
+        D2GS_REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6390}" "$WINE" Game.exe \
         -w -nosound --headless --loaddll "$WINPATH" \
         --d2gs --d2gs-boot --realm --no-compress \
         > "$LOG_DIR/gs.log" 2>&1 & )
