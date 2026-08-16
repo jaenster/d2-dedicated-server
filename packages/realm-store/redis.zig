@@ -29,6 +29,7 @@ const net = @import("realm_infra").net;
 const Lock = @import("realm_infra").lock.Lock;
 const types = @import("realm_infra").types;
 const fs = @import("fs.zig");
+const resp = @import("resp");
 
 const Name = types.Name;
 const GameRec = types.GameRec;
@@ -194,23 +195,31 @@ const Reply = union(enum) {
     err,
 };
 
-/// Read and classify one RESP reply line. Bulk/array payloads stay in `r.buf`.
+/// Read and classify one RESP reply. Bulk/array payloads stay in `r.buf`.
+///
+/// The framing itself lives in the `resp` module rather than here, because the game server needs
+/// the same parser and cannot have this file: it is built for x86-windows and given no libc
+/// sockets. Two parsers for one format is one more than can stay correct, and a framing bug in
+/// the DLL is the hardest place to see one.
 fn readReply(r: *Reader) ?Reply {
-    const ln = r.line() orelse return null;
-    if (ln.len == 0) return null;
-    return switch (ln[0]) {
-        '+' => .{ .status = ln[1..] },
-        '-' => .err,
-        ':' => .{ .int = std.fmt.parseInt(i64, ln[1..], 10) catch return null },
-        '$' => blk: {
-            const len = std.fmt.parseInt(i64, ln[1..], 10) catch return null;
-            if (len < 0) break :blk Reply{ .bulk = null };
-            const b = r.bytes(@intCast(len)) orelse return null;
-            break :blk Reply{ .bulk = b };
-        },
-        '*' => .{ .array_len = std.fmt.parseInt(i64, ln[1..], 10) catch return null },
-        else => null,
-    };
+    while (true) {
+        switch (resp.parse(r.buf[r.pos..r.fill])) {
+            .ok => |o| {
+                r.pos += o.consumed;
+                return switch (o.reply) {
+                    .status => |s| .{ .status = s },
+                    .int => |v| .{ .int = v },
+                    .bulk => |b| .{ .bulk = b },
+                    .array_len => |n| .{ .array_len = n },
+                    .err => .err,
+                };
+            },
+            // A reply can straddle reads — a d2s save is many times an MTU.
+            .need_more => if (!r.fillMore()) return null,
+            // Framing is lost; there is no way to find the next reply's start.
+            .invalid => return null,
+        }
+    }
 }
 
 /// Accumulates one command — or a whole pipeline of them — and writes in whole-buffer chunks.
