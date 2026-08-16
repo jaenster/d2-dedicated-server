@@ -1,32 +1,16 @@
-//! BSD sockets, translated from Darwin's ABI to the host's.
-//!
-//! Every entry point here exists because something in it is a different number on the two platforms,
-//! and a socket call that is wrong by a constant fails somewhere else entirely. The five that matter:
-//!
-//!   struct sockaddr  Darwin spends its first byte on `sa_len` and its second on `sa_family`; Linux
-//!                    spends both on a 16-bit family. Everything from byte two on is identical, so
-//!                    the translation is those two bytes — but it has to happen in both directions on
-//!                    every call carrying an address, or a connect reaches a different host.
-//!   SOL_SOCKET       0xffff on Darwin, 1 on Linux, and every SO_* differs too. An untranslated
-//!                    setsockopt fails rather than corrupts, which is why libc.zig was willing to
-//!                    forward it — but a refused SO_REUSEADDR is still a server that cannot restart.
-//!   MSG_*            Only OOB, PEEK and DONTROUTE agree. WAITALL is 0x40 on Darwin and 0x100 on
-//!                    Linux, where 0x40 means DONTWAIT — so a forwarded blocking read stops blocking.
-//!   struct timeval   Darwin i386 is two 32-bit longs, and musl publishes two different structs
-//!                    under that name — see `HostTimeval` and `SelectTimeval` below. Which one a
-//!                    call wants depends on which symbol it reaches, not on the platform.
-//!   errno            The game reads it through `___error` and compares against its own errno.h,
-//!                    where EWOULDBLOCK is 35 and EINPROGRESS 36 rather than Linux's 11 and 115. Each
-//!                    failing call translates before it returns, the way pthread.zig returns Darwin's
-//!                    numbers. Calls forwarded straight to the host in libc.zig do not, which is why
-//!                    nothing whose errno the game reads is forwarded.
-//!
-//! `fd_set` is the exception that needs no work, and the comment saying so is the point: Darwin's is
-//! 32 `__int32_t`, musl's is `unsigned long fds_bits[1024/8/sizeof(long)]`. Both are 128 bytes, and on
-//! any little-endian host fd N lands on the same physical bit whichever word size splits them.
-//!
-//! FIONBIO rather than fcntl, and that is not a choice: the image imports no fcntl at all, so
-//! O_NONBLOCK — 4 on Darwin, 0x800 on Linux — never crosses this boundary.
+//! BSD sockets, translated from Darwin's ABI to the host's. A call wrong by a constant fails
+//! somewhere else entirely: sockaddr (Darwin byte0=sa_len byte1=sa_family vs Linux 16-bit
+//! family; translate both bytes both directions on every address-carrying call), SOL_SOCKET
+//! (0xffff Darwin / 1 Linux, every SO_* differs — untranslated setsockopt fails rather than
+//! corrupts, but refused SO_REUSEADDR still blocks a restart), MSG_* (only OOB/PEEK/DONTROUTE
+//! agree; WAITALL is 0x40 Darwin / 0x100 Linux where 0x40 means DONTWAIT), struct timeval
+//! (Darwin i386 = two 32-bit longs; musl has two different structs under that name, see
+//! `HostTimeval`/`SelectTimeval` below), errno (game reads via `___error` against its own
+//! errno.h: EWOULDBLOCK=35, EINPROGRESS=36 vs Linux 11/115 — translated on every failing call
+//! except forwards in libc.zig). `fd_set` needs no translation: Darwin's 32 `__int32_t` and
+//! musl's `unsigned long fds_bits[...]` are both 128 bytes, same bit per fd on little-endian.
+//! FIONBIO not fcntl: the image imports no fcntl, so O_NONBLOCK (4 Darwin / 0x800 Linux) never
+//! crosses this boundary.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -57,7 +41,7 @@ pub fn address(name: []const u8) ?usize {
     return null;
 }
 
-// ── the constants, both platforms ──
+// the constants, both platforms
 
 /// Darwin's numbers, as the game was compiled against them.
 pub const darwin = struct {
@@ -177,7 +161,7 @@ comptime {
 /// every table below is the identity and `--dry-run` exercises the same code without double-mapping.
 const translating = builtin.os.tag == .linux;
 
-// ── struct sockaddr ──
+// struct sockaddr
 
 /// `struct sockaddr_in` as the game lays it out. The port and address are network order and stay that
 /// way; only the first two bytes are Darwin's own idea.
@@ -281,7 +265,7 @@ fn writeBackAddr(scratch: []const u8, host_len: u32, addr: ?[*]u8, len: ?*u32) v
     cap.* = @intCast(n);
 }
 
-// ── errno ──
+// errno
 
 const ErrnoPair = struct { darwin: c_int, linux: c_int };
 
@@ -386,7 +370,7 @@ fn checkedSize(rc: isize) isize {
     return rc;
 }
 
-// ── flags and options ──
+// flags and options
 
 const FlagPair = struct { darwin: c_int, host: c_int };
 
@@ -452,7 +436,7 @@ pub fn socketOptionToHost(option: c_int) ?c_int {
     return null;
 }
 
-// ── timeval and fd_set ──
+// timeval and fd_set
 
 /// Darwin i386's `struct timeval`: `time_t` and `suseconds_t` are both 32-bit longs there.
 pub const DarwinTimeval = extern struct { sec: i32, usec: i32 };
@@ -466,15 +450,12 @@ pub const HostTimeval = switch (builtin.os.tag) {
     else => extern struct { sec: c_long, usec: i32 },
 };
 
-/// What `select` reads, which on i386 musl is NOT the struct above.
-///
-/// musl ships the time64 transition as two entry points. C compiled against its headers is
-/// redirected to `__select_time64` and passes `HostTimeval`; the exported `select` symbol keeps the
-/// legacy `{long, long}` — eight bytes on i386. A Zig `extern fn` binds by name and no header
-/// redirect applies, so it always reaches the legacy one. Handing that sixteen bytes makes it take
-/// tv_usec from the high half of tv_sec, so every timeout reads as zero: `select` returns 0 the
-/// instant it is called, forever, and a thread that is supposed to block on it burns a core.
-/// `setsockopt` has no second entry point and so keeps `HostTimeval`; the two really do differ.
+/// What `select` reads, which on i386 musl is NOT the struct above. musl's time64 transition
+/// redirects C callers to `__select_time64` (takes `HostTimeval`), but the exported `select`
+/// symbol keeps the legacy `{long, long}` (8 bytes on i386); a Zig `extern fn` binds by name so
+/// it always hits the legacy one. Passing 16 bytes there reads tv_usec from tv_sec's high half,
+/// so every timeout is zero and a blocking thread busy-loops forever. `setsockopt` has no second
+/// entry point, so it keeps `HostTimeval` — the two structs really do differ.
 pub const SelectTimeval = switch (builtin.os.tag) {
     .linux => extern struct { sec: c_long, usec: c_long },
     else => extern struct { sec: c_long, usec: i32 },
@@ -498,7 +479,7 @@ comptime {
     std.debug.assert(builtin.cpu.arch.endian() == .little);
 }
 
-// ── SO_NOSIGPIPE ──
+// SO_NOSIGPIPE
 
 const nosigpipe_fds = 1024;
 
@@ -526,7 +507,7 @@ fn sendFlags(fd: c_int, flags: c_int) c_int {
     return host_flags | linux.MSG_NOSIGNAL;
 }
 
-// ── the host libc ──
+// the host libc
 
 pub const Hostent = extern struct {
     name: ?[*:0]u8,
@@ -570,7 +551,7 @@ const host = struct {
     extern fn gethostbyname(name: [*:0]const u8) ?*Hostent;
 };
 
-// ── the entry points ──
+// the entry points
 
 pub fn socket(domain: c_int, kind: c_int, protocol: c_int) callconv(.c) c_int {
     const host_domain = familyToLinux(domain) orelse return fail(darwin.EAFNOSUPPORT);

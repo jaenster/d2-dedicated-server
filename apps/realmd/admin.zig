@@ -1,8 +1,6 @@
-//! HTTP admin API, served on the same listener as the health probes (health.zig
-//! routes /admin/* here). JSON, bearer-token gated. The token comes from
-//! REALMD_ADMIN_TOKEN: when EMPTY the whole API is disabled (403) — off by
-//! default so a misconfigured deploy never exposes it. JSON is hand-rolled
-//! (tiny payloads, no std.json dependency).
+//! HTTP admin API on the same listener as health probes (health.zig routes /admin/* here). JSON,
+//! bearer-token gated via REALMD_ADMIN_TOKEN — EMPTY disables the whole API (403), off by default
+//! so a misconfigured deploy never exposes it. JSON is hand-rolled (tiny payloads, no std.json).
 //!
 //!   GET  /admin/status       counts + which instance/backends
 //!   GET  /admin/gameservers  the registered GS fleet

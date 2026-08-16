@@ -1,19 +1,14 @@
-//! Postgres persistence backend — the durable store of record. Uses the vendored
-//! pure-Zig `pg.zig` client (no libpq, so the static-musl scratch image is preserved).
+//! Postgres persistence backend — the durable store of record. Uses the vendored pure-Zig
+//! `pg.zig` client (no libpq, so the static-musl scratch image is preserved).
 //!
-//! The store of record behind the store.zig facade. Schema:
-//!   chars(account, name, d2s)        accounts(name, pwhash, is_admin)
-//!   userdata(account, key, value)    guilds(name, data)
+//! Schema: chars(account, name, d2s), accounts(name, pwhash, is_admin), userdata(account, key,
+//! value), guilds(name, data). Nothing short-lived is here — sessions, games, routes and the
+//! fleet are in flight and belong to Redis; a Postgres copy would be a second answer to a
+//! question that must have one.
 //!
-//! Nothing short-lived is here. Sessions, games, routes and the fleet are what is *in flight*,
-//! they belong to Redis, and a Postgres copy of them would be a second answer to questions that
-//! must have one.
-//!
-//! Concurrency: the pg.zig Pool is internally threadsafe, so per-call we just use
-//! the pool's exec/query/row wrappers (which acquire+release a connection). The
-//! *one-time* lazy pool creation + schema DDL is guarded by a spinlock. The pool
-//! owns its own std.Io (a process-global Threaded) so it can drive blocking socket
-//! IO from realmd's thread-per-peer workers.
+//! Concurrency: the pg.zig Pool is internally threadsafe; one-time lazy pool creation + schema
+//! DDL is guarded by a spinlock. The pool owns its own std.Io (process-global Threaded) to drive
+//! blocking socket IO from realmd's thread-per-peer workers.
 const std = @import("std");
 const pg = @import("pg");
 const Lock = @import("realm_infra").lock.Lock;
@@ -21,7 +16,7 @@ const types = @import("realm_infra").types;
 
 const Name = types.Name;
 
-// ── accounts, profiles and guilds (durable) ──────────────────────────────────
+// accounts, profiles and guilds (durable)
 //
 // These used to route to the filesystem backend, on the argument that they are low-volume and
 // simple. That holds right up until there is more than one instance, at which point "the file on
@@ -190,7 +185,7 @@ pub fn listGuilds(names: []Name) usize {
     return count;
 }
 
-// ── lazy global pool ─────────────────────────────────────────────────────────
+// lazy global pool
 
 var dsn: []const u8 = "";
 var pool: ?*pg.Pool = null;
@@ -270,7 +265,7 @@ fn createSchema(p: *pg.Pool) !void {
     , .{});
 }
 
-// ── name sanitising ──────────────────────────────────────────────────────────
+// name sanitising
 
 fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
     if (name.len == 0 or name.len >= out.len) return null;
@@ -287,7 +282,7 @@ fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
 
 
 
-// ── characters (durable) ─────────────────────────────────────────────────────
+// characters (durable)
 
 pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8) bool {
     var ab: [64]u8 = undefined;
@@ -344,7 +339,7 @@ pub fn listChars(account: []const u8, names: []Name) usize {
     return count;
 }
 
-// ── housekeeping ─────────────────────────────────────────────────────────────
+// housekeeping
 
 pub fn healthy() bool {
     const p = ensurePool() orelse return false;

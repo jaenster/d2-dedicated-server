@@ -29,7 +29,7 @@ pub const D2LevelStrc = opaque {}; // recon D2DrlgLevelStrc
 pub const D2ActStrc = opaque {}; // recon D2DrlgActStrc
 pub const D2AutomapLayer2Strc = opaque {}; // automap layer-2 (GetLayer result)
 
-// ── D2GameStrc — a QServer game instance (recon: 7672 bytes, 72 fields) ───────
+// D2GameStrc — a QServer game instance (recon: 7672 bytes, 72 fields)
 // Partial: head through the fields we read, then a tail pad to full size.
 pub const D2GameStrc = extern struct {
     nToken: u32, // 0x00 hash key / game token from QServer
@@ -80,7 +80,7 @@ pub const D2GameStrc = extern struct {
     }
 };
 
-// ── D2UnitStrc — any unit (recon: 244 bytes, 52 fields) ───────────────────────
+// D2UnitStrc — any unit (recon: 244 bytes, 52 fields)
 // Partial: the fields features read, gaps padded to keep offsets exact.
 pub const D2UnitStrc = extern struct {
     eUnitType: UnitType, // 0x00
@@ -122,7 +122,7 @@ pub const D2UnitStrc = extern struct {
     }
 };
 
-// ── D2PresetUnitStrc — a DRLG preset placement (recon: 32 bytes) ──────────────
+// D2PresetUnitStrc — a DRLG preset placement (recon: 32 bytes)
 pub const D2PresetUnitStrc = extern struct {
     nMode: i32, // 0x00 1=monster, 3=item (item code encoded)
     nClassId: i32, // 0x04 MonStats/Object id
@@ -151,7 +151,7 @@ pub const D2PresetUnitStrc = extern struct {
     }
 };
 
-// ── automap (recon /Diablo2/AUTOMAP) ─────────────────────────────────────────
+// automap (recon /Diablo2/AUTOMAP)
 pub const D2AutomapCellStrc = extern struct {
     fSaved: u8, // 0x00 1=loaded from save, 0=revealed at runtime
     _pad_0x01: [3]u8, // 0x01

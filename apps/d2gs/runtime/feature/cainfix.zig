@@ -1,11 +1,10 @@
 //! Put Deckard Cain at the Act 5 (Harrogath) waypoint, like an online game does.
 //!
-//! Town NPC positions come from the .ds1 preset (identical for SP and online), so the
-//! headless GS spawns Cain at the single-player spot. We fix it server-side at room-init
-//! (before any client renders the town): find the spawned Cain (monster class 520 =
-//! DeckardCain6, the Act-5 variant) and the town waypoint object, and place Cain next to
-//! the waypoint. v1 = DISCOVERY: log Cain + every object's id/pos once we're in Act 5, so
-//! we can read the waypoint's real class id and coords from the live game.
+//! Town NPC positions come from the .ds1 preset (identical for SP and online), so the headless GS
+//! spawns Cain at the single-player spot. Fixed server-side at room-init (before any client renders
+//! the town): find Cain (monster class 520 = DeckardCain6, the Act-5 variant) and the town waypoint
+//! object, and place Cain next to it. DISCOVERY mode logs Cain + every object id/pos in Act 5 so the
+//! waypoint's real class id and coords can be read from the live game.
 const std = @import("std");
 const log = @import("../../log.zig");
 const feature = @import("../../engine/feature.zig");

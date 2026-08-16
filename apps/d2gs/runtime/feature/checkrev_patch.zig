@@ -1,28 +1,21 @@
-//! Client-side CheckRevision bypass (launcher model — D2Launcher does similar).
+//! Client-side CheckRevision bypass (launcher model — D2Launcher does similar). The client
+//! downloads our MPQ via BNFTP then calls BNDOWNLOAD_PerformCheckRevision @0x0051e6d0. Rather
+//! than fight weak-sig + Authenticode gates for our own DLL, we overwrite the function entry
+//! with a stub returning dummy version/checksum + success — realmd accepts any SID_AUTH_CHECK.
+//! Safe only because the download already completed (see [[d2-checkrevision]]).
 //!
-//! Now that the BNFTP download works, the client successfully downloads our MPQ
-//! and calls BNDOWNLOAD_PerformCheckRevision @0x0051e6d0 to process it. Instead of
-//! fighting the weak-sig + Authenticode gates to make our own DLL load, we just
-//! overwrite the function entry with a stub that writes dummy version/checksum
-//! and returns success — realmd accepts any SID_AUTH_CHECK. (This is safe ONLY
-//! because the download already completed; the earlier failure was the download
-//! asserting first, not this patch.) See [[d2-checkrevision]].
-//!
-//! __fastcall(uint32_t* version [ECX], uint32_t* checksum [EDX],
-//!            uint8_t* exeInfoOut [stack]) -> int. ret 4 (callee cleans the one
-//! stack arg).
+//! __fastcall(uint32_t* version [ECX], uint32_t* checksum [EDX], uint8_t* exeInfoOut [stack])
+//! -> int, ret 4 (callee cleans the one stack arg).
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");
 
 const PERFORM_CHECKREVISION: usize = 0x0051e6d0;
 
-// The launcher (Game/Launcher.cpp) gates on `if (BNDOWNLOAD_GetProgress() != 0x66)
-// { ApplyPrepatch(); TerminateProcess() }`. 0x66 (102) means "no patch needed".
-// With our dummy checkrevision the progress state never lands on 0x66, so the
-// launcher thinks a patch is pending, terminates Game.exe and spawns BNUpdate.exe.
-// Force the getter to 0x66 so the launcher concludes "current, no patch" and
-// proceeds into the game — and never starts the patch download that divides by
-// zero on a size-0 reply. __stdcall(void) -> mov eax,0x66 ; ret.
+// Launcher (Game/Launcher.cpp) gates on `if (BNDOWNLOAD_GetProgress() != 0x66) { ApplyPrepatch();
+// TerminateProcess() }` — 0x66 = "no patch needed". Our dummy checkrevision never lands on 0x66,
+// so the launcher thinks a patch is pending and spawns BNUpdate.exe. Force the getter to 0x66 to
+// skip that path — it also avoids the patch download's divide-by-zero on a size-0 reply.
+// __stdcall(void) -> mov eax,0x66 ; ret.
 const GET_PROGRESS: usize = 0x0051ea70;
 const ret_0x66 = [_]u8{ 0xB8, 0x66, 0x00, 0x00, 0x00, 0xC3 };
 

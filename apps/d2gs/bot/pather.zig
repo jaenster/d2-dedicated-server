@@ -1,15 +1,12 @@
 //! Movement. kolbot's `Pather.moveTo` analogue: step the player toward a tile,
 //! re-reading positions each step, until in range or a frame budget runs out.
 //!
-//! VIEWPORT LIMITATION: real movement uses ClickMap (`clickAtWorld`), which
-//! translates a world tile to a SCREEN point and clicks it — that requires a
-//! rendered viewport (the engine's viewport-offset globals are only valid when a
-//! display is up). In the current display-less headless harness the player can
-//! NOT be moved: ClickMap has no viewport to project into, and `sendRunToLocation`
-//! (packet 0x04) is also rejected without one. So this module is implemented and
-//! correct, but only takes effect when run under a viewport (e.g. Xvfb + a real
-//! renderer). Do not block on testing it headless — for a town vendor the server
-//! auto-walks the player on interact, so `town.interact` works without pathing.
+//! VIEWPORT LIMITATION: real movement uses ClickMap (`clickAtWorld`), which projects a
+//! world tile to a screen point (needs the engine's viewport-offset globals, valid only
+//! with a display up). Headless, the player can NOT be moved this way — nor via
+//! `sendRunToLocation` (packet 0x04), also rejected without a viewport. This module is
+//! correct but only takes effect under a real viewport (e.g. Xvfb). Don't block on testing
+//! it headless: `town.interact` works fine, since the server auto-walks on vendor interact.
 
 const std = @import("std");
 const oog = @import("../test/oog.zig");

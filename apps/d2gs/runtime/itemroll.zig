@@ -1,31 +1,13 @@
-//! Server item-generation driver — fans out the per-game `itemRoll` hook once an item
-//! is fully built.
-//!
-//! The engine materialises a server-side item through exactly two doors, and a counter
-//! that watches only one of them reads zero for an ordinary session:
-//!   ITEM_CreateItemInstance @0x558d90 — a GENERATED item: monster drop, chest, gamble,
-//!     cube output, vendor stock, shrine gem. Twenty call sites funnel into it.
-//!   ITEM_CreateFromSaveData  @0x558cb0 — a RESTORED item: everything a character walks
-//!     in wearing, rebuilt from the save blob the realm handed us. This is the one that
-//!     actually fires on a join-and-idle workload, and missing it is why a first cut of
-//!     this counter stayed at zero through three full games.
-//!
-//! Neither one's ENTRY is the right place to read quality. The generation context carries
-//! only the quality that was ASKED for, and ITEM_ApplyQualityAndAffixes (reached from
-//! ITEM_InitItemBaseStats, inside the call) still downgrades it whenever the roll finds no
-//! valid affix set — counting at entry over-reports rares and uniques. The restore path
-//! does not know the quality at entry at all; it is still in the bit buffer.
-//!
-//! So we wrap the LAST call each of them makes instead. Both tails are the same shape:
-//!   00558d5e  call RefreshQuantity   ; ECX=pGame EDX=pItem, then `mov eax,esi` = return
-//!   00559120  call RefreshQuantity   ; ECX=pGame EDX=pItem, then `mov eax,edi` = return
-//! Every successful creation reaches its site (the failure paths bail earlier and free the
-//! unit), and by then the item's quality, affixes and stats are final. RefreshQuantity is
-//! called from four other places, none of which create anything, which is why we wrap the
-//! two call SITES rather than the callee. Verified against 1.14d Game.exe (Ghidra c18aa0f2).
-//!
-//! Wrapping a call rather than detouring an entry also keeps this off srvtrace's toes: it
-//! owns the first six bytes of 0x558d90 for its `item_spawn` event.
+//! Server item-generation driver — fans out the per-game `itemRoll` hook once an item is fully
+//! built. Two doors materialise a server-side item: ITEM_CreateItemInstance @0x558d90 (GENERATED
+//! — drop/chest/gamble/cube/vendor/shrine, twenty call sites) and ITEM_CreateFromSaveData
+//! @0x558cb0 (RESTORED from the save blob, the join-and-idle path). Neither ENTRY can read
+//! quality yet (ITEM_ApplyQualityAndAffixes can still downgrade it, restore still has it in the
+//! bit buffer), so we wrap the LAST call each makes instead — both `call RefreshQuantity` with
+//! ECX=pGame EDX=pItem, at 00558d5e and 00559120 — by which point quality/affixes/stats are
+//! final. We patch the call SITES not the callee (RefreshQuantity has four other, non-creating
+//! callers) which also keeps srvtrace's entry detour on 0x558d90 (`item_spawn`) intact. Verified
+//! against 1.14d Game.exe (Ghidra c18aa0f2).
 const patch = @import("patch.zig");
 const log = @import("../log.zig");
 const feature = @import("../engine/feature.zig");

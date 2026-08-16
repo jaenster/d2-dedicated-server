@@ -1,16 +1,10 @@
-//! BNFTP — Battle.net File Transfer (protocol selector 0x02 on the bnetd port).
-//!
-//! After SID_AUTH_INFO names a version-check MPQ, the client opens a SECOND
-//! connection with protocol byte 0x02 and BNFTP-requests that file. The MPQ
-//! carries the CheckRevision module the client runs to produce its version
-//! checksum; since we accept any SID_AUTH_CHECK, the value is irrelevant — we
-//! just have to deliver the file correctly. (Also used for ads/news/MOTD files.)
-//!
-//! The wire format lives in libd2's d2-bnet, shared with the clientless fetcher and the probe
-//! that points at real Battle.net, so all three read and write one definition of it. What is
-//! here is the SERVING: which file, from where, and how much of it.
-//!
-//! Files are served from <data_dir>/bnftp/<filename>.
+//! BNFTP — Battle.net File Transfer (protocol selector 0x02 on the bnetd port). After
+//! SID_AUTH_INFO names a version-check MPQ, the client opens a SECOND connection with protocol
+//! byte 0x02 and BNFTP-requests it. The MPQ carries the CheckRevision module that produces the
+//! version checksum; since we accept any SID_AUTH_CHECK, the value is irrelevant — we just have
+//! to deliver the file correctly (also used for ads/news/MOTD). Wire format lives in libd2's
+//! d2-bnet, shared with the clientless fetcher and the real-Battle.net probe. This file is only
+//! the SERVING: which file, from where, how much, from <data_dir>/bnftp/<filename>.
 const std = @import("std");
 const bnftp = @import("libd2").bnet.bnftp;
 const net = @import("realm_infra").net;

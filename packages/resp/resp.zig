@@ -1,19 +1,13 @@
 //! RESP — the Redis wire format, as a codec and nothing else.
 //!
-//! No sockets, no allocator, no libc: encoding writes into a caller's buffer and parsing reads
-//! from a caller's buffer. That is the whole point. The game server is an injected DLL built for
-//! x86-windows and is given `realm_proto` and nothing else — no `realm_infra`, so no libc sockets
-//! — while realmd and the ingress are native binaries that have both. Keeping the format free of
-//! IO is what lets one implementation serve both instead of a second one growing inside the DLL.
+//! No sockets, no allocator, no libc: encoding writes into a caller's buffer, parsing reads from
+//! one. The game server is an x86-windows DLL with only `realm_proto` (no `realm_infra`, so no
+//! libc sockets), while realmd/ingress are native with both — an IO-free codec lets one
+//! implementation serve both, same reasoning as `realm_proto`.
 //!
-//! Same reasoning as `realm_proto`: put the wire in one place both ends import, so they agree by
-//! construction rather than by review.
-//!
-//! A command is an array of bulk strings — `*<n>\r\n` then `$<len>\r\n<bytes>\r\n` per argument.
-//! Replies are one of five typed lines: `+status`, `-error`, `:int`, `$bulk`, `*array`.
-//!
-//! Bulk strings are BINARY-SAFE and must stay that way: a .d2s save contains NULs and stray \n,
-//! so a bulk value is read by its declared length, never by scanning for a newline.
+//! A command is an array of bulk strings (`*<n>\r\n` then `$<len>\r\n<bytes>\r\n` per arg).
+//! Replies: `+status`, `-error`, `:int`, `$bulk`, `*array`. Bulk strings are BINARY-SAFE — a .d2s
+//! save contains NULs and stray \n, so a bulk value is read by declared length, never scanned.
 const std = @import("std");
 
 pub const Reply = union(enum) {
@@ -130,7 +124,7 @@ fn writeCrlf(buf: []u8) usize {
     return 2;
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
+// tests
 
 test "encode is the exact length it promises" {
     var buf: [64]u8 = undefined;

@@ -83,24 +83,17 @@ pub fn install(loaded: *const macho.load.Loaded) void {
 
 /// Stop `sServerThread` indexing its `fd_set` with a socket that has since been closed.
 ///
-/// The listener thread snapshots every client's socket into an `fd_set`, skipping any that is
-/// already -1, and then reads the socket twice MORE — once before `select` and once after it, both
-/// times without the check. A player leaving a game closes that socket in between, and `-1 >> 5` is
-/// 0x07ffffff, so `readfds[socket >> 5]` lands half a gigabyte past the thread's own stack frame:
-///
-///   0x002f5a78  AND byte ptr [EBP + 0x1ffffe67], 0x7f  — the compiler folded the constant already
+/// The listener thread snapshots each client's socket into an `fd_set` (skipping -1), then reads
+/// the socket twice more around `select`, both times without the check. A player leaving a game
+/// closes that socket in between: `-1 >> 5` == 0x07ffffff, so `readfds[socket >> 5]` lands half a
+/// gigabyte past the thread's stack frame — the crash a returning client hits (reporter names
+/// 0x002f5c40, ECX = 0xffffffff):
+///   0x002f5a78  AND byte ptr [EBP + 0x1ffffe67], 0x7f  — constant already folded by the compiler
 ///   0x002f5c40  MOV ESI, dword ptr [EBP + EBX*4 - 0x218]  — EBX = socket >> 5, freshly reloaded
 ///
-/// That is what a returning client crashes on: it is the one thing that closes a socket while the
-/// game it belonged to is still being served. The reporter names 0x002f5c40 with ECX = 0xffffffff.
-///
-/// The first site sits inside `if (socket == -1)` and so can do nothing BUT fault — the bit it
-/// means to clear was never set, the snapshot having skipped this client for that same reason. Its
-/// `JNZ` past the block becomes an unconditional `JMP`.
-///
-/// The second is the live path, where the socket is usually real, so it gets the bounds test the
-/// engine never wrote and skips to the loop's own next-client at 0x002f5f13. `MOV EAX, 1` is
-/// exactly the five bytes a `JMP rel32` needs, and both EAX and the flags are dead across it.
+/// Site 1 (inside `if (socket == -1)`) can only fault — its `JNZ` past the block becomes an
+/// unconditional `JMP`. Site 2 is the live path: patched to the bounds test the engine never wrote,
+/// jumping to the loop's next-client at 0x002f5f13 (`MOV EAX, 1` is exactly 5 bytes, EAX/flags dead).
 fn guardClosedSockets(loaded: *const macho.load.Loaded) void {
     // The guard below is i386 instructions; there is no image running anywhere else to patch.
     if (comptime @import("builtin").cpu.arch != .x86) return;

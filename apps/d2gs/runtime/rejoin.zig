@@ -1,28 +1,12 @@
 //! Let a character come straight back after the game it was in.
 //!
-//! NET_D2GS_SERVER_IsValidChecks @0x52c690 refuses a GAMELOGON whose character is still linked
-//! in the engine's global by-name client table, and it refuses it with SILENCE: the reject path
-//! is GuardStack(0), so nothing goes back on the wire and the client sits at the loading screen
-//! until its own timeout. A character keeps that seat until the client holding it is cleaned
-//! up, which lands a second or two after the socket died — so a player, or a bot, who leaves a
-//! game and immediately makes the next one is refused roughly every other game, with no error
-//! anywhere to explain it. Measured: 15/30 back-to-back joins on one character, and 10/10 once
-//! the character alternates.
-//!
-//! The seat outlives the socket because the two halves of a client die on different clocks. The
-//! QServer connection is gone the moment the socket closes, but the game-side D2ClientStrc is
-//! still in its game and in both server hash tables (observed: connState=4 "in game", a live
-//! pGame). The engine's own QSERVER_DisconnectClientByName cannot clear that state — it resolves
-//! the game through the CONNECTION (GetClientServerTokenByClientId), which is exactly the half
-//! that is already gone, so it finds no game and silently does nothing.
-//!
-//! So we resolve it the other way around, from the seat we can see: find the client in the
-//! by-name table, take the game token off its own pGame, lock that game and hand both pointers
-//! to SERVER_DisconnectClient. That is the same disconnect the engine's timeout path performs,
-//! and it cleans up with bSavePlayer=1 — the character is saved on the way out, not rolled back.
-//!
-//! The realm's join record is the authorization. Only realmd writes joinctx, so a client cannot
-//! name somebody else's character to have them thrown out of the game they are in.
+//! NET_D2GS_SERVER_IsValidChecks @0x52c690 silently refuses a GAMELOGON whose character is still
+//! linked in the engine's by-name client table (client sits until its own timeout). The seat
+//! outlives the socket by ~1-2s, and QSERVER_DisconnectClientByName can't clear it — it resolves
+//! the game via the already-gone connection half. Measured 15/30 back-to-back joins refused. Fix:
+//! resolve from the seat instead — find the client by name, take the game token off its own pGame,
+//! and hand both to SERVER_DisconnectClient (bSavePlayer=1, same as the engine's timeout path).
+//! Authorized by the realm's join record: only realmd writes joinctx.
 
 const std = @import("std");
 const patch = @import("patch.zig");

@@ -1,17 +1,12 @@
 //! Moves characters from the redis cache to the store of record.
 //!
-//! Every realmd runs one of these, and they do not coordinate. They do not need to: the dirty set
-//! holds NAMES, and a flush reads whatever bytes are current, so two instances flushing the same
-//! character both write the newest save. Duplicated work is wasted, not wrong — which is why
-//! there is no queue, no consumer group, no acknowledgement and no lock on this path.
+//! Every realmd runs one of these, uncoordinated: the dirty set holds NAMES, so two instances
+//! flushing the same character both write the newest save — duplicated work is wasted, not
+//! wrong. No queue, no consumer group, no ack, no lock.
 //!
-//! What it must never do is clear the dirty flag for a save it did not persist. A save landing
-//! while a flush is in flight bumps the version, the compare-and-clear then refuses, and the
-//! character stays dirty for the next pass. Everything else here is a retry loop around that one
-//! guarantee.
-//!
-//! A crash anywhere leaves the character dirty, so the next instance — or this one after a
-//! restart — picks it up. That is the whole recovery story; there is no journal to replay.
+//! Must never clear the dirty flag for a save it did not persist: a save landing mid-flush bumps
+//! the version, the compare-and-clear refuses, and the character stays dirty for the next pass.
+//! A crash anywhere just leaves it dirty for the next pass to pick up — no journal to replay.
 const std = @import("std");
 const log = @import("realm_infra").log;
 const store = @import("store.zig");

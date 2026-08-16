@@ -1,29 +1,15 @@
-//! Redis persistence backend. Speaks RESP straight over a raw TCP socket — no
-//! hiredis, no C client, nothing beyond the libc-backed net helpers in net.zig.
-//! RESP is dead simple to drive by hand: a command is an array of bulk strings
-//! (`*<n>\r\n` then `$<len>\r\n<bytes>\r\n` per arg) and replies are one of a
-//! handful of typed lines (`+`, `-`, `:`, `$`, `*`). We encode commands with a
-//! tiny `command()` and decode with a reader that is careful to treat bulk
-//! strings as BINARY-SAFE: d2s saves contain NULs and stray \n, so we read
-//! exactly <len> bytes rather than scanning for a newline.
+//! Redis backend: RESP straight over a raw TCP socket, no hiredis, just the libc net helpers.
+//! Bulk strings are read BINARY-SAFE (exactly <len> bytes, never newline-scanned) because d2s
+//! saves contain NULs and stray \n.
 //!
-//! Concurrency: realmd opens a connection thread per peer, but Redis ops here
-//! are infrequent (game/session create + join). So we keep a single persistent
-//! connection, lazily connected on first use and torn down + reconnected on any
-//! IO error. A small POOL of them, because a connection is held for a whole
-//! command/reply cycle: with one, thread-per-connection bought no concurrency
-//! at all. A slot is held across a network round trip, so its lock must sleep
-//! rather than spin (see infra lock.zig) — and anything that would take N round
-//! trips is pipelined into one instead of looping `command`.
+//! A connection is held for a whole command/reply cycle, so one shared connection bought
+//! thread-per-peer no concurrency at all — hence a small POOL, whose slot lock must sleep rather
+//! than spin (infra lock.zig) since it is held across a round trip. Anything needing N round trips
+//! is pipelined into one instead of looping `command`.
 //!
 //! Lock order: game_index_lock before a pool slot, never the reverse.
-//!
-//! DDD role: this is one concrete backend, not an adapter layer. The facade
-//! (store.zig) picks exactly one of {fs, redis, pg} and calls it directly; each
-//! backend exposes the identical public surface so the
-//! facade can switch among them with zero glue. Keys live under a "realmd:"
-//! prefix; the schema mirrors the fs backend's records (chars durable; sessions
-//! and games ephemeral with PX TTL and reverse indexes by gameid and by gs).
+//! Keys live under a "realmd:" prefix; chars durable, sessions/games ephemeral with PX TTL and
+//! reverse indexes by gameid and by gs.
 const std = @import("std");
 const net = @import("realm_infra").net;
 const Lock = @import("realm_infra").lock.Lock;
@@ -37,7 +23,7 @@ const TokenRoute = types.TokenRoute;
 
 const prefix = "realmd:";
 
-// ── accounts, profiles and guilds (durable) ──────────────────────────────────
+// accounts, profiles and guilds (durable)
 //
 // One 22-byte record per account, the same layout the filesystem backend writes: [0] whether a
 // password is set, [1..21] its hash, [21] the admin flag. Sharing the shape means a realm can be
@@ -305,7 +291,7 @@ pub fn listGuilds(names: []Name) usize {
     return filled;
 }
 
-// ── connection state ─────────────────────────────────────────────────────────
+// connection state
 
 var host_buf: [256]u8 = undefined;
 var host_z: [:0]const u8 = "127.0.0.1"; // sentinel-terminated host for net.connectTcp
@@ -342,18 +328,15 @@ fn release(s: *Slot) void {
     s.lock.unlock();
 }
 
-/// Serialises every mutation of the GAME INDEX — the record plus its by-id and by-gs reverse
-/// keys. Reads and every other key (sessions, routes, char blobs) stay fully concurrent.
+/// Serialises every mutation of the GAME INDEX (record + by-id/by-gs reverse keys). Reads and
+/// other keys stay concurrent.
 ///
-/// Not just lost updates: the engine recycles game ids from a 1024-slot ring, and
-/// `removeGameById` resolves a name by reading `byid:<id>`. A close interleaved with a create
-/// that reused the id resolves the NEW game's name and deletes the record just written.
+/// Needed because the engine recycles game ids from a 1024-slot ring: a close interleaved with
+/// a create that reused the id would resolve the NEW game's name via `byid:<id>` and delete the
+/// record just written.
 ///
-/// Held across IO, so it must be a sleeping lock. Always taken BEFORE a slot, never after, so
-/// a waiter for the index can never be sitting on a connection somebody else needs.
-///
-/// Within-process only: two realmd instances on one redis still race here. The real cure is
-/// for CLOSEGAME to carry the game NAME so a recycled id is unambiguous.
+/// Held across IO (sleeping lock), always taken BEFORE a slot. Within-process only — two realmd
+/// instances on one redis still race; the real cure is CLOSEGAME carrying the game NAME.
 var game_index_lock: Lock = .{};
 
 /// `addr` is "host:port" (DNS name ok), e.g. "realmd-redis:6379"; port defaults
@@ -386,7 +369,7 @@ fn dropConn(s: *Slot) void {
     s.fd = null;
 }
 
-// ── RESP encode + reply read ─────────────────────────────────────────────────
+// RESP encode + reply read
 
 /// Per-command read buffer + cursor. Bulk-string reads append straight into
 /// `buf`; `pos`/`fill` track the consumed/available window of socket bytes.
@@ -452,10 +435,9 @@ const Reply = union(enum) {
 
 /// Read and classify one RESP reply. Bulk/array payloads stay in `r.buf`.
 ///
-/// The framing itself lives in the `resp` module rather than here, because the game server needs
-/// the same parser and cannot have this file: it is built for x86-windows and given no libc
-/// sockets. Two parsers for one format is one more than can stay correct, and a framing bug in
-/// the DLL is the hardest place to see one.
+/// Framing lives in the `resp` module, not here: the game server (x86-windows, no libc sockets)
+/// needs the same parser and can't use this file. One parser for both keeps a framing bug from
+/// hiding in the DLL, the hardest place to see one.
 fn readReply(r: *Reader) ?Reply {
     while (true) {
         switch (resp.parse(r.buf[r.pos..r.fill])) {
@@ -553,13 +535,9 @@ fn command(s: *Slot, r: *Reader, args: []const []const u8) ?Reply {
     return rep;
 }
 
-/// Send several commands as ONE round trip and drain their replies in order. For operations
-/// that are a handful of independent writes which all have to land but whose replies carry no
-/// value; callers that need a VALUE back still use `command`.
-///
-/// Every reply is consumed even on error — leaving any on the socket would desync the
-/// connection and hand the next caller this call's leftovers. False if any reply was an error
-/// or the connection failed.
+/// Send several commands as ONE round trip and drain their replies in order, for writes that
+/// all have to land but whose replies carry no value (callers needing a value use `command`).
+/// Every reply is consumed even on error, or the leftovers would desync the next caller.
 fn pipeline(s: *Slot, r: *Reader, cmds: []const []const []const u8) bool {
     const fd = ensureConn(s) orelse return false;
     var c = CmdBuf{ .fd = fd };
@@ -581,7 +559,7 @@ fn pipeline(s: *Slot, r: *Reader, cmds: []const []const []const u8) bool {
     return ok;
 }
 
-// ── name sanitising ──────────────────────────────────────────────────────────
+// name sanitising
 
 fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
     if (name.len == 0 or name.len >= out.len) return null;
@@ -594,21 +572,16 @@ fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
     return out[0..name.len];
 }
 
-/// A game name reduced to the key it is stored under.
-///
-/// LOWERCASED, and that is the point. Battle.net treats game names case-insensitively — "Jan" and
-/// "jan" are the same game to a player typing one into the join box — but a key that preserves
-/// case makes them two rows. The failure that produces is genuinely baffling from the outside:
-/// CREATEGAME matches one record and answers "a game already exists with that name", while
-/// JOINGAME matches the other and routes to a game that is not the one on screen, so the client
-/// says "game name and password don't match" about a game it can see in the list.
+/// A game name reduced to the key it is stored under. LOWERCASED: Battle.net treats game names
+/// case-insensitively ("Jan" == "jan"), so a case-preserving key would split CREATEGAME and
+/// JOINGAME onto two different records for what the player sees as one game.
 fn gameKey(name: []const u8, out: []u8) ?[]const u8 {
     const safe = sanitize(name, out) orelse return null;
     for (out[0..safe.len]) |*c| c.* = std.ascii.toLower(c.*);
     return out[0..safe.len];
 }
 
-// ── characters (durable) ─────────────────────────────────────────────────────
+// characters (durable)
 
 pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8) bool {
     var ab: [64]u8 = undefined;
@@ -714,7 +687,7 @@ pub fn listChars(account: []const u8, names: []Name) usize {
     return filled;
 }
 
-// ── sessions (ephemeral, PX TTL) ─────────────────────────────────────────────
+// sessions (ephemeral, PX TTL)
 
 pub fn saveSession(id: u64, account: []const u8, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
@@ -761,7 +734,7 @@ pub fn expireSession(id: u64) void {
     _ = command(s, &r, &.{ "DEL", key });
 }
 
-// ── games (ephemeral, PX TTL, reverse indexed by id and by gs) ───────────────
+// games (ephemeral, PX TTL, reverse indexed by id and by gs)
 
 pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
@@ -1107,7 +1080,7 @@ pub fn expireGamesByGs(gsid: u32) void {
     _ = command(s, &r, &.{ "DEL", gskey });
 }
 
-// ── routes (ephemeral, PX TTL) — keyed by client source IP ───────────────────
+// routes (ephemeral, PX TTL) — keyed by client source IP
 
 fn routeKey(buf: []u8, client_ip: [4]u8) []const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "route:{d}.{d}.{d}.{d}", .{ client_ip[0], client_ip[1], client_ip[2], client_ip[3] }) catch unreachable;
@@ -1159,31 +1132,19 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
     return .{ .gs_ip = ip, .gs_port = gs_port };
 }
 
-// ── token routes (ephemeral, PX TTL) — keyed by realm-global token ───────────
+// token routes (ephemeral, PX TTL) — keyed by realm-global token
 
 fn tokenRouteKey(buf: []u8, token: u16) []const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "troute:{x}", .{token}) catch unreachable;
 }
 
-// ── save durability ──────────────────────────────────────────────────────────
-//
-// Redis holds the live character; Postgres is the store of record. Between a save landing here
-// and reaching Postgres there is a window, and losing that window loses a player's progress —
-// the one failure in this design that cannot be repaired afterwards.
-//
-// So the dirty set is not a queue of saves, it is a set of NAMES. A flusher reads whatever bytes
-// are current rather than bytes carried in a message, which makes duplicated and out-of-order
-// work harmless: every flusher writes the newest save. That is what removes the need for
-// exactly-once delivery, acknowledgements, or ordering.
-//
-// This is deliberately NOT the character lock. That lock says which game owns a character and is
-// about gameplay; this says the stored copy is newer than Postgres and is about durability. A
-// lock cannot do this job: the writer never contends for it, so holding one would not stop a save
-// landing mid-flush. Only the version does.
-//
-// TWO RULES, or the rest is theatre:
-//   * a dirty blob must NEVER carry a TTL — expiry would delete the only copy
-//   * redis must not be allowed to evict these keys (noeviction, or their own instance)
+// save durability: Redis holds the live character, Postgres is the store of record. The window
+// between a save landing here and reaching Postgres is the one failure that can't be repaired.
+// The dirty set is a set of NAMES, not a queue: a flusher reads whatever bytes are current, so
+// duplicated/out-of-order work is harmless. Deliberately NOT the character lock — that's gameplay
+// ownership; this is durability, and a lock can't do the job since the writer never contends for
+// it. TWO RULES: a dirty blob must NEVER carry a TTL, and redis must not evict these keys
+// (noeviction, or a dedicated instance).
 
 fn charVerKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "charver:{s}/{s}", .{ account, charname }) catch buf[0..0];
@@ -1309,18 +1270,16 @@ pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64
     };
 }
 
-// ── character ownership ──────────────────────────────────────────────────────
+// character ownership
 //
-// A character may be in exactly one game. The holder writes its own id into the lock, so the
-// lock does not merely say "taken" — it says WHO by, which is what lets a join be refused with a
-// reason instead of silence, and what makes releasing safe.
+// A character may be in exactly one game. The holder writes its own id into the lock, so it says
+// WHO holds it, letting a join be refused with a reason and releasing be safe.
 //
-// Every mutation is compare-and-swap against that owner id. A release that just DELs is the
-// classic distributed-lock bug: if the TTL lapses mid-session and another game takes the
-// character, a blind DEL frees somebody else's lock and two games hold one character.
+// Every mutation is compare-and-swap against that owner id — a release that just DELs is the
+// classic distributed-lock bug: a lapsed TTL mid-session lets another game take the character,
+// then a blind DEL frees somebody else's lock and two games hold one character.
 //
-// The TTL is a backstop for a holder that dies without releasing — refreshed while the game
-// lives, so it only fires when nothing is refreshing it.
+// TTL is a backstop for a holder that dies without releasing; refreshed while the game lives.
 
 fn charLockKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch buf[0..0];
@@ -1328,14 +1287,11 @@ fn charLockKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 
 
 /// Take the character for `owner`. False if it is held at all — including by the same game.
 ///
-/// A seat, not a game. Two clients presenting one character to the SAME game are two seats, and
-/// the engine refuses the second outright; making the claim re-takeable by its own owner made
-/// those two indistinguishable and let the realm say yes to a join the engine would then drop in
-/// silence. So the claim is strict, and exactly one seat holds it.
+/// A seat, not a game: the engine itself refuses a second client presenting the same character
+/// to the same game, so making the claim re-takeable by its own owner would have let the realm
+/// say yes to a join the engine then silently drops. The claim is strict.
 ///
-/// Nothing is locked out by this: the claim is released when the player leaves, when the game
-/// ends, and by its own lease if the server holding it dies. A client whose session died has its
-/// seat reaped by the engine, which reports the departure and frees the character.
+/// Released when the player leaves, the game ends, or (a dead server) the lease expires.
 pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32) bool {
     var kb: [96]u8 = undefined;
     const key = charLockKey(&kb, account, charname);
@@ -1404,15 +1360,10 @@ pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) 
     };
 }
 
-/// Claim a game name before the game exists.
-///
-/// A game is only recorded once the server has accepted the create, and everything between those
-/// two moments is a window in which a second client can be told the name is free, lose the race at
-/// the server, and then fail to join what it was just told already exists. Claiming the name first
-/// closes it: the loser learns immediately, while the winner's game is still being made.
-///
-/// The TTL is a backstop for a create that dies mid-flight, not the lifetime of the claim — a
-/// successful create replaces it with the game record and releases this.
+/// Claim a game name before the game exists. Without this, a second client could be told the
+/// name is free, lose the create race at the server, and fail to join what it was just told
+/// already exists. TTL is a backstop for a create that dies mid-flight; a successful create
+/// replaces this with the game record.
 pub fn reserveGameName(name: []const u8, ttl_s: u32) bool {
     var kb: [96]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, prefix ++ "gamename:{s}", .{name}) catch return false;
@@ -1455,16 +1406,10 @@ pub fn releaseGameName(name: []const u8) void {
     _ = command(s, &r, &.{ "DEL", key });
 }
 
-/// Populate the cache from the store of record, but ONLY if nothing is cached yet.
-///
-/// The unconditional write this replaces could destroy a save. A miss reads the durable copy, and
-/// if a newer save lands in redis before that copy is written back, an unconditional SET would put
-/// the OLDER bytes over the newer ones — losing whatever the player did in between. Two instances
-/// missing at once makes the window ordinary rather than exotic.
-///
-/// SET NX also removes the need to lock the load: instances that miss together all read, one wins
-/// the write, and the losers simply discard what they read. Nothing to hold, nothing to expire,
-/// and no way for a loader to lose the character it was trying to warm.
+/// Populate the cache from the store of record, but ONLY if nothing is cached yet. An
+/// unconditional write could put OLDER bytes over a newer save that lands mid-miss. SET NX also
+/// avoids locking the load: instances that miss together all read, one wins the write, the rest
+/// discard what they read.
 pub fn cacheCharIfAbsent(account: []const u8, charname: []const u8, bytes: []const u8) bool {
     var ab: [64]u8 = undefined;
     var cb: [64]u8 = undefined;
@@ -1637,12 +1582,11 @@ pub fn mintToken() ?u16 {
     return @intCast(@as(u64, @bitCast(n)) % 65535 + 1);
 }
 
-// ── the game-server fleet, as every instance sees it ─────────────────────────
+// the game-server fleet, as every instance sees it
 //
-// One key per server plus a set to enumerate them, the same shape the game index uses. The record
-// carries a TTL and the owning realmd refreshes it on the control link's own liveness traffic, so
-// a realmd that dies with its sockets takes its servers out of the shared view without anyone
-// having to notice and clean up.
+// One key per server plus a set to enumerate them. The record carries a TTL refreshed on the
+// control link's liveness traffic, so a dead realmd's servers drop out of the shared view
+// without anyone having to notice and clean up.
 
 fn gsKey(buf: []u8, gsid: u32) []const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "gs:{x}", .{gsid}) catch buf[0..0];
@@ -1723,7 +1667,7 @@ pub fn removeGs(gsid: u32) void {
     }
 }
 
-// ── dispatch ─────────────────────────────────────────────────────────────────
+// dispatch
 //
 // Create and join travel the store rather than a socket, so the instance that serves a client
 // need not be the one a game server happens to be connected to. The payload is the SAME control
@@ -1798,7 +1742,7 @@ pub fn takeGsReply(seq: u32, out: []u8) ?usize {
     };
 }
 
-// ── events (game server -> realm) ────────────────────────────────────────────
+// events (game server -> realm)
 //
 // Create and join are requests with an answer, so they are a queue plus a reply key. A player
 // joining or leaving, and a game ending, are neither: the server is telling the realm something
@@ -2093,7 +2037,7 @@ pub fn lookupTokenRoute(token: u16) ?TokenRoute {
     };
 }
 
-// ── housekeeping ─────────────────────────────────────────────────────────────
+// housekeeping
 
 pub fn healthy() bool {
     const s = acquire();
@@ -2177,7 +2121,7 @@ test "a slot's connection is dropped independently of the rest of the pool" {
     a.fd = null; // leave the pool as we found it
 }
 
-// ── chat (cross-instance) ────────────────────────────────────────────────────
+// chat (cross-instance)
 //
 // Chat used to be a process-global table keyed by socket, which made two realmd instances two
 // disjoint channels wearing the same name: talk did not cross, a whisper could not find someone

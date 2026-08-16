@@ -1,21 +1,14 @@
 //! The Mach imports: identity, the monotonic clock, virtual memory, and the crash handler.
 //!
-//! Three groups with three different answers.
+//! Identity and time have honest Linux equivalents: a thread's Mach port name is process-unique
+//! (same as a tid; task/host ports are fixed small names, so constants fit), and
+//! `mach_absolute_time` is a monotonic tick count whose `mach_timebase_info` unit is declared
+//! 1/1 nanoseconds, i.e. CLOCK_MONOTONIC.
 //!
-//! Identity and time have honest Linux equivalents. A Mach port name for a thread is a number that
-//! is unique to that thread within the process, which is exactly what a tid is; the task and host
-//! ports are fixed small names in a real task too, so a constant is the right shape. And
-//! `mach_absolute_time` is a monotonic tick count whose unit `mach_timebase_info` declares — with a
-//! 1/1 timebase the unit is nanoseconds, which is what CLOCK_MONOTONIC already reports.
-//!
-//! `vm_allocate`/`vm_deallocate`/`vm_protect` are mmap/munmap/mprotect with the arguments in a
-//! different order and one real difference: Mach rounds a range out to whole pages and Linux
-//! rejects one that is not already aligned. That rounding is done here.
-//!
-//! Everything else is Fog's crash handler asking for Mach exception ports, and it fails on purpose.
-//! There is no Mach IPC in this process to install a handler on, and Linux's signal handlers are not
-//! reachable through this interface. A faked success would leave the game believing a handler exists
-//! that will never run, which is worse than it knowing it has none.
+//! `vm_allocate`/`vm_deallocate`/`vm_protect` are mmap/munmap/mprotect with reordered args, plus
+//! page rounding (Mach rounds out to whole pages, Linux rejects misaligned ranges). Everything
+//! else is Fog's crash handler asking for Mach exception ports; it fails on purpose since there's
+//! no Mach IPC here and a faked success would leave the game believing in a handler that never runs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -65,7 +58,7 @@ pub fn address(name: []const u8) ?usize {
     return null;
 }
 
-// ── identity ──
+// identity
 
 /// Data, not a function: `mach_task_self()` is a macro over this variable, so the image binds a
 /// pointer straight at it. Any non-null name will do, because nothing here dereferences a port.
@@ -97,7 +90,7 @@ pub fn hostSelf() callconv(.c) mach_port_t {
     return host_port;
 }
 
-// ── time ──
+// time
 
 /// Darwin's `mach_timebase_info_data_t`: the ratio that turns absolute ticks into nanoseconds.
 pub const TimebaseInfo = extern struct { numer: u32, denom: u32 };
@@ -120,7 +113,7 @@ pub fn timebaseInfo(info: ?*TimebaseInfo) callconv(.c) kern_return_t {
     return KERN_SUCCESS;
 }
 
-// ── virtual memory ──
+// virtual memory
 
 const PROT = struct {
     const READ: c_int = 1;
@@ -225,7 +218,7 @@ pub fn machVmRegion(
     return KERN_INVALID_ADDRESS;
 }
 
-// ── the crash handler, deliberately unavailable ──
+// the crash handler, deliberately unavailable
 
 /// Enumerating threads by port is only useful to something that will then act on them through Mach,
 /// which nothing here can do.
@@ -356,7 +349,7 @@ pub fn exceptionRaiseStateIdentity(port: mach_port_t, thread: mach_port_t, task:
     return KERN_FAILURE;
 }
 
-// ── page size ──
+// page size
 
 pub fn hostPageSize(host: mach_port_t, out: ?*usize) callconv(.c) kern_return_t {
     _ = host;

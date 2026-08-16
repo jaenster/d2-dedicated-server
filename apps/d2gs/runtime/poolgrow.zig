@@ -1,24 +1,13 @@
 //! Lift the engine's eight-manager ceiling so a GS can host more than seven games.
 //!
-//! `Fog::Memory::InitializePoolSystem` @0x409dd0 hands out one memory-pool manager per game from
-//! a fixed array of EIGHT inside the static `pGlobalPoolSystem`; the ninth request raises
-//! 0xe0000001 and kills the process. One manager is permanently the Global Pool System, so the
-//! engine caps at seven concurrent games (measured). That eight is a 1.14d CLIENT-build constant
-//! — the 1.00 server-side Fog.dll contains no such allocator at all — so it is a limit worth
-//! lifting rather than a design invariant.
+//! `Fog::Memory::InitializePoolSystem` @0x409dd0 hands one pool manager per game from a fixed
+//! array of EIGHT in `pGlobalPoolSystem`; the ninth raises 0xe0000001 and kills the process. One
+//! manager is permanently the Global Pool System, so the engine caps at seven games (measured).
+//! Eight is a 1.14d CLIENT-build constant, not a design invariant.
 //!
-//! We do NOT relocate the engine's array. By the time our DLL attaches the table is already in
-//! use (measured: in-use=1 at DLL_PROCESS_ATTACH), and a live manager cannot be moved — every
-//! pGame->pMemoryPool points into it, its CRITICAL_SECTIONs are self-referential, and every
-//! "null manager -> pManagers[0]" fallback in Alloc/Free/ReAlloc resolves through that base.
-//!
-//! Instead we leave all eight engine slots untouched and step in only when they are exhausted:
-//!   * InitializePoolSystem: engine full -> hand out one of OUR managers instead of raising.
-//!   * FreeMemoryPool: our pointer -> let the ORIGINAL do the teardown (it is correct for any
-//!     manager), then undo the one step it gets wrong for us and recycle the slot ourselves.
-//! Alloc/Free/ReAlloc need no patching at all: they take the manager pointer directly and only
-//! consult the array base for the null-default, which still resolves to the engine's manager 0.
-//! So the existing seven-game path behaves byte-for-byte as before.
+//! The array can't be relocated (already in use at DLL_PROCESS_ATTACH; pGame->pMemoryPool and the
+//! null-manager fallback point into it), so all eight engine slots stay untouched and we step in
+//! only once they're exhausted. Alloc/Free/ReAlloc need no patching.
 
 const std = @import("std");
 
@@ -32,12 +21,10 @@ extern "kernel32" fn LeaveCriticalSection(cs: usize) callconv(.winapi) void;
 const INIT_POOL_SYSTEM: usize = 0x0040_9dd0; // void __stdcall(D2PoolManagerStrc**, char*, int)
 const FREE_MEMORY_POOL: usize = 0x0040_9c80; // void __cdecl(D2PoolManagerStrc*)
 
-// We patch the CALL SITES, not the function entries. Entry-detouring these two needs a
-// trampoline, and getting the handoff wrong faults inside the very first game creation with no
-// useful evidence (it did: we ended up executing our own DLL's PE header). Replacing a single
-// 5-byte E8 leaves both originals untouched and callable at their real addresses, which is the
-// same approach joindiag already uses here. Only the GAME paths are redirected — Alloc,
-// GAME_InitClientSide and the shutdown paths keep the engine's own slots, unchanged.
+// We patch the CALL SITES, not the function entries: entry-detouring these two needs a trampoline,
+// and a wrong handoff faults inside the very first game creation with no useful evidence (it did —
+// we ended up executing our own DLL's PE header). Replacing a single 5-byte E8 leaves both originals
+// callable at their real addresses. Only the GAME paths are redirected.
 const CREATE_GAME_CALLSITE: usize = 0x0053_09ec; // CALL InitializePoolSystem in GAME_CreateBattleNetGame
 const DESTROY_GAME_CALLSITE: usize = 0x0052_c8a3; // CALL FreeMemoryPool in GAME_DestroyGame
 
@@ -176,13 +163,11 @@ fn initManager(m: usize, sz_name: usize, n_param: u32) void {
 
 // The originals, called at their real addresses — nothing about them is patched.
 //
-// InitializePoolSystem is __cdecl with FOUR arguments, verified against 1.14d Game.exe rather
-// than assumed: the call site at 0x5309ec pushes 0x1000, 0x8000, ebx, eax and every return in
-// the function is a plain `ret`, so the CALLER cleans. Getting this wrong is not subtle — a
-// stdcall `ret $12` here unbalances the caller's frame and the process ends up executing off
-// the stack during the first create (0xc0000005 with eip inside the stack region).
-// arg3 is the one the body bit-scans (`bsr [ebp+0x10]`) to size the pool table, so that is
-// `n_param`; arg4 is passed through untouched.
+// InitializePoolSystem is __cdecl with FOUR args, verified against 1.14d Game.exe: the call site
+// at 0x5309ec pushes 0x1000, 0x8000, ebx, eax and every return is a plain `ret`, so the CALLER
+// cleans. A stdcall `ret $12` here unbalances the frame (0xc0000005, eip in stack region on first
+// create). arg3 is what the body bit-scans (`bsr [ebp+0x10]`) to size the pool table — that's
+// `n_param`; arg4 passes through untouched.
 const initOriginal: *const fn (usize, usize, u32, u32) callconv(.c) void = @ptrFromInt(INIT_POOL_SYSTEM);
 const freeOriginal: *const fn (usize) callconv(.c) void = @ptrFromInt(FREE_MEMORY_POOL);
 
@@ -233,13 +218,11 @@ fn tryFree(p_manager: usize) callconv(.c) u32 {
         return 1;
     }
 
-    // The original's teardown is correct for any manager — it walks the pools, VirtualFrees every
-    // region, frees the block and overflow nodes with the engine's own CRT, deletes the critical
-    // sections and zeroes the struct. The ONE thing it gets wrong for us is the last step: it
-    // computes (ptr - pManagers) / 0x17cc and pushes that index onto the engine's 8-entry free
-    // list. For our pointer that index is nonsense and the push would eventually overrun the
-    // list. So snapshot the counter, let it run, then put the counter back — the bogus entry is
-    // left above the live region where nothing reads it.
+    // The original's teardown is correct for any manager. The ONE thing it gets wrong for us is the
+    // last step: it computes (ptr - pManagers) / 0x17cc and pushes that index onto the engine's
+    // 8-entry free list. For our pointer that index is nonsense and would eventually overrun the
+    // list. So snapshot the counter, let it run, then put the counter back — the bogus entry lands
+    // above the live region where nothing reads it.
     const saved = u32At(N_FREE_INDEX);
     freeOriginal(p_manager);
     setU32(N_FREE_INDEX, saved);

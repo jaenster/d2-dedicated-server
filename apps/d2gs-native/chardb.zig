@@ -1,38 +1,23 @@
-//! Where a joining character comes from.
+//! Where a joining character's save data comes from.
 //!
-//! `CLIENT_LoadCharacterSave` 0x0020a9b6 has two sources and picks between them on one byte,
-//! `game+0x6a`:
+//! `CLIENT_LoadCharacterSave` 0x0020a9b6 picks by `game+0x6a`: in {1,2} or realm table
+//! `*0x396220` set -> read `client+0x17c`/`+0x180` (in memory, size 0 -> 0x0e); else
+//! fopen/fread `<save path><charname>.d2s` (disk, failure -> 0x0e). This build never sets
+//! 0x396220 and a fresh game has `game+0x6a` zero, so unmodified it reads a file — a needless
+//! round trip since realmd's d2dbs already handed us the bytes on JOINGAME.
 //!
-//!     in {1,2}, or the realm table *0x396220 is set:
-//!         bytes = client+0x17c, size = client+0x180      // in memory
-//!         size 0 -> 0x0e
-//!     otherwise:
-//!         sprintf(path, "%s%s.d2s", <save path>, charname); fopen(path, "rb"); fread(buf, 1, 0x2000)
-//!         open or read failure -> 0x0e                   // off disk
+//! Fix: `CLIENT_LoadCharacterAndSendGameData`'s one call site, 0x001a8576, is redirected to
+//! put the bytes in the client, flip `game+0x6a` to in-memory for the call, then restore it.
+//! No file touched.
 //!
-//! This build has no realm callback table — 0x396220 is never written — and a game the engine makes
-//! has `game+0x6a` zero, so left alone it reads a file. That is where the save had to be put, and it
-//! is a disk round trip for bytes this process already has: realmd's d2dbs hands them over on the
-//! realm's JOINGAME, before the client connects.
+//! The buffer is the engine's, never ours: `client+0x17c` is allocated by
+//! `CLIENT_AccumulateSaveData` 0x001aa5fe (pool `client+0x1a8 -> +0x1c`) via
+//! `FOG_AllocPoolMem` 0x002f3348, freed by `CLIENT_FreeSaveData` 0x001aa6f0 (loader calls it
+//! on success) and again by `CleanUpClient`. Bytes must go in through
+//! `CLIENT_AccumulateSaveData`, which allocates and memcpys — never store a pointer directly.
 //!
-//! So the file is skipped. `CLIENT_LoadCharacterAndSendGameData` calls the loader from exactly one
-//! place, 0x001a8576, and that call is redirected here: put the bytes in the client, flip
-//! `game+0x6a` to the in-memory source for the length of the call, and put it back. Nothing else in
-//! the game sees a different byte, and no file is written or read.
-//!
-//! **The buffer is the engine's, never ours.** `client+0x17c` is allocated by
-//! `CLIENT_AccumulateSaveData` 0x001aa5fe from the client's own pool (`client+0x1a8 -> +0x1c`)
-//! through `FOG_AllocPoolMem` 0x002f3348, and freed on that same pool by `CLIENT_FreeSaveData`
-//! 0x001aa6f0 — which the loader itself calls the moment the load succeeds — and again by
-//! `CleanUpClient`. A pointer of ours stored there would be handed to `SMemFree`. So the bytes go in
-//! through `CLIENT_AccumulateSaveData`, which allocates and memcpys, and this file never writes
-//! either field.
-//!
-//! `D2GS_CHAR_SOURCE=file` restores the old route — write `<save path><charname>.d2s` and let the
-//! engine's own file branch read it — because that one is known good.
-//!
-//! The d2dbs wire format is the same one `apps/d2gs/realmclient/d2dbs.zig` speaks on Windows; only
-//! the socket layer differs, because this host is Linux and that one is winsock.
+//! `D2GS_CHAR_SOURCE=file` restores the old known-good disk route. Wire format matches
+//! `apps/d2gs/realmclient/d2dbs.zig` (Windows); only the socket layer (winsock vs Linux) differs.
 
 const std = @import("std");
 const macho = @import("macho");
@@ -143,24 +128,20 @@ pub fn installLoadHook(loaded: *const macho.load.Loaded) void {
     at[0] = 0xe8;
     std.mem.writeInt(i32, at[1..5], rel, .little);
 
-    // And stop the other half of the round trip. `SaveToFile` runs on a timer out of
-    // `ServerGameLoop` and writes `<save path><charname>.d2s` every time, and with the load coming
-    // from the realm nothing ever reads that file again: it is not what the next join is seated
-    // from and it is not what the realm keeps. Clearing the flag is the engine's own `-nosave`, and
-    // the save returns success without opening anything. Only `ClientInit_SetNoSaveFlag` writes
-    // this word and it only ever writes 0, so a value put here before the initializers stays.
+    // Stop the other half of the round trip: `SaveToFile` (timer, `ServerGameLoop`) writes
+    // `<save path><charname>.d2s`, but nothing reads it back once loads come from the realm.
+    // Clearing this flag is the engine's own `-nosave`; only `ClientInit_SetNoSaveFlag` writes
+    // this word and only ever with 0, so a value set here before init sticks.
     const enabled: *u32 = @ptrFromInt(loaded.at(addr.save_to_file_enabled));
     enabled.* = 0;
 }
 
-/// Standing in for `CLIENT_LoadCharacterSave`, whose arguments these are — `game` and `client` are
-/// live pointers, not image offsets, and everything past the character name is passed through
-/// untouched.
+/// Standing in for `CLIENT_LoadCharacterSave`; `game`/`client` are live pointers, not image
+/// offsets, rest passed through untouched.
 ///
-/// The source byte is put back before returning because it is the game's, not this call's. Left at
-/// 2 it would also make `SendSaveFileToClient` 0x001ad4fc push a 0xB3 save-file packet at every
-/// client walking out, which is how an open TCP/IP game hands a character back to the machine that
-/// supplied it — not how a realm keeps one, and not something a client joining a realm expects.
+/// Restores the source byte before returning — it's the game's, not this call's. Left at 2 it
+/// would also make `SendSaveFileToClient` 0x001ad4fc push a 0xB3 save-file packet on client exit,
+/// the open-TCP/IP handback behavior a realm join shouldn't trigger.
 fn loadCharacterSave(
     game: u32,
     client: u32,
@@ -247,7 +228,7 @@ fn fill(i: usize, charname: []const u8, save: []const u8) void {
     pending[i].len = save.len;
 }
 
-// ── the file route, kept because it is the one that is known to work ──────────
+// the file route, kept because it is the one that is known to work
 
 /// Whether to write `<save path><charname>.d2s` and let the engine read it back, rather than hand
 /// the bytes over in memory. `D2GS_CHAR_SOURCE=file`.
@@ -291,7 +272,7 @@ fn savePathFor(charname: []const u8, out: []u8) ?[:0]u8 {
     return std.fmt.bufPrintZ(out, "{s}{s}.d2s", .{ d, charname }) catch null;
 }
 
-// ── d2dbs ────────────────────────────────────────────────────────────────────
+// d2dbs
 
 /// GET_DATA_REQUEST -> GET_DATA_REPLY, one connection per fetch. Returns the bytes written to
 /// `out`, or 0.

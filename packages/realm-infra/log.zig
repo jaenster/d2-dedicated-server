@@ -1,11 +1,9 @@
 //! Tiny thread-safe logger for realmd and the gateway: one line, one write(2).
 //!
-//! Not std.debug.print: it takes std's stderr mutex and flushes its own 64-byte buffer per
-//! call, so a JSON line built a character at a time cost a syscall per character, all of it
-//! under this file's lock. Building the line in one buffer holds the lock for one write.
-//!
-//! stderr because k8s captures it; one write per line is what stops concurrent threads
-//! interleaving halves of each other's output.
+//! Not std.debug.print: it takes std's stderr mutex and flushes a 64-byte buffer per call, so
+//! a JSON line built a character at a time cost a syscall per character under this file's
+//! lock. Building the line in one buffer holds the lock for one write. stderr because k8s
+//! captures it; one write per line stops concurrent threads interleaving output.
 const std = @import("std");
 const obs = @import("obs"); // per-thread trace/span/account context, stamped on every JSON line
 const Lock = @import("lock.zig").Lock;

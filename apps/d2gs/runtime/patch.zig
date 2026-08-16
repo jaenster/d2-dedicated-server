@@ -1,14 +1,10 @@
-//! Byte-patch util for the live Game.exe .text.
-//! Self-contained: only needs kernel32 VirtualProtect. Addresses are absolute
-//! against image base 0x00400000 (1.14d has no ASLR — confirmed at runtime).
+//! Byte-patch util for the live Game.exe .text. Self-contained: only needs kernel32
+//! VirtualProtect. Addresses are absolute against image base 0x00400000 (1.14d has no ASLR).
 //!
-//! Patching code that another thread is *running* is the interesting part. The engine's
-//! out-of-game message pump is an infinite loop, and the pacing patch rewrites 23 bytes
-//! in the middle of it — so the main thread is always somewhere in the bytes being
-//! replaced. Left unsynchronised that lost roughly two boots in three: the thread would
-//! resume one byte into an instruction that no longer started there and die reading
-//! 0x1a. So a patch here is applied whole, with every other thread stopped and none of
-//! them standing on the bytes (see quiesce below).
+//! Patching code another thread is *running* matters: the pacing patch rewrites 23 bytes mid the
+//! out-of-game message pump's infinite loop, so the main thread is always somewhere in those
+//! bytes. Unsynchronised, that lost ~2 boots in 3 (resumed mid-instruction, died reading 0x1a) —
+//! so a patch is applied whole with every other thread stopped and off the bytes (see quiesce).
 const std = @import("std");
 
 const DWORD = u32;
@@ -19,7 +15,7 @@ extern "kernel32" fn VirtualProtect(addr: *anyopaque, size: usize, new_protect: 
 
 const PAGE_READWRITE: DWORD = 0x04;
 
-// ── stopping the world for the length of one patch ───────────────────────────
+// stopping the world for the length of one patch
 // Nothing in here may log, allocate, or take a lock: the other threads are frozen,
 // and one of them owns the logger's file handle.
 
@@ -208,7 +204,7 @@ pub fn calcRelAddr(from: usize, to: usize, insn_len: usize) i32 {
     return @as(i32, @intCast(@as(isize, @bitCast(to)) - @as(isize, @bitCast(from)) - @as(isize, @intCast(insn_len))));
 }
 
-// ── staged application ───────────────────────────────────────────────────────
+// staged application
 // A chain stages its bytes here and commit() writes them in one go, so live code is
 // never half-patched. The staging area is module state rather than part of the (copied,
 // value-type) builder: patches are built and committed by one expression on one thread
@@ -312,19 +308,12 @@ pub fn revertAll() void {
     original_count = 0;
 }
 
-// ── fluent patch builder ─────────────────────────────────────────────────────
-// Charon-style `MemoryPatch(addr) << CALL(..) << NOP_TO(..)`, as a Zig method
-// chain. Each step writes immediately at the cursor (which starts at `addr`) and
-// returns the advanced builder, so call order == memory layout. `commit()`
-// returns whether every step succeeded; originals are still saved for revertAll().
-//
-//   _ = MemoryPatch(0x47c4e4)
-//       .pushad()
-//       .movEcxEax()
-//       .call(@intFromPtr(&SetPlayerCount))
-//       .popad()
-//       .nopTo(0x47c50e)
-//       .commit();
+// Fluent patch builder — Charon-style `MemoryPatch(addr) << CALL(..) << NOP_TO(..)` as a Zig
+// method chain. Each step writes at the cursor (starts at `addr`) and returns the advanced
+// builder, so call order == memory layout. `commit()` reports success; originals are still saved
+// for revertAll(). Example:
+//   _ = MemoryPatch(0x47c4e4).pushad().movEcxEax().call(@intFromPtr(&SetPlayerCount))
+//       .popad().nopTo(0x47c50e).commit();
 
 /// Builder returned by MemoryPatch(addr). Value type — copy/return is free.
 pub const Patch = struct {

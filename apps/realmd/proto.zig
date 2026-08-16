@@ -4,18 +4,12 @@
 //! rather than panicking a connection thread — a server must not crash on input.
 const std = @import("std");
 
-/// Bounds-checked packet builder.
-///
-/// Every write is capacity-checked and a write that would not fit is DROPPED, with the
-/// writer latching `overflowed`. It used to write straight through `@memcpy` with no check
-/// at all, which in a safe build is an out-of-bounds slice — i.e. a panic that takes the
-/// connection thread, or the process, down. A server does not get to crash because a reply
-/// grew: a friends list with enough entries, or a userdata read with enough keys, is
-/// ordinary input and every one of those buffers is a fixed stack array.
-///
-/// Truncating is not silently fine either — a short packet is a protocol error — so
-/// callers that can produce unbounded output should check `overflowed` and say so. What
-/// this guarantees is that the failure is a bad reply rather than a dead server.
+/// Bounds-checked packet builder. Every write is capacity-checked and a write that would not fit
+/// is DROPPED, latching `overflowed`, instead of the old unchecked `@memcpy` (an OOB slice panic
+/// in a safe build, taking down the connection thread or process on ordinary input like an
+/// oversized friends list or userdata read). Truncating silently is also not fine — callers that
+/// can produce unbounded output should check `overflowed`; the guarantee is a bad reply, not a
+/// dead server.
 pub const Writer = struct {
     buf: []u8,
     pos: usize = 0,

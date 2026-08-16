@@ -1,14 +1,11 @@
-//! Shared in-process state: the realm session table.
+//! Shared in-process state: the realm session table. THE stateful seam — today an in-memory fixed
+//! table guarded by a spinlock (single instance); for multi-instance this same API gets backed by
+//! a shared Store (Postgres/Redis) so any realmd can resolve a session another created, keeping
+//! the protocol handlers above stateless. Keep all durable cross-connection state behind here.
 //!
-//! This is THE stateful seam. Today it is an in-memory fixed table guarded by a
-//! spinlock (single instance). For multi-instance, this same API gets backed by
-//! a shared Store (Postgres/Redis) so any realmd can resolve a session another
-//! created — the protocol handlers above it stay stateless. Keep all durable
-//! cross-connection state behind here.
-//!
-//! A session is minted by bnetd at realm logon (SID_LOGONREALMEX) and resolved
-//! by d2cs at MCP_STARTUP. Because we own both ends, the realm handoff carries a
-//! plain session id in the MCP chunk — no pvpgn-style shared-secret crypto.
+//! A session is minted by bnetd at realm logon (SID_LOGONREALMEX) and resolved by d2cs at
+//! MCP_STARTUP. Since we own both ends, the realm handoff carries a plain session id in the MCP
+//! chunk — no pvpgn-style shared-secret crypto.
 const std = @import("std");
 const Lock = @import("realm_infra").lock.Lock;
 const store = @import("store.zig");

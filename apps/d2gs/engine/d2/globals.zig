@@ -89,10 +89,8 @@ pub fn divisor() *c_int {
     return @ptrFromInt(0x711254);
 }
 
-// ============================================================================
 // sgtDataTable txt pointers (base address: 0x0096bc30)
 // For tables without a dedicated GetLine function, we read the pointer directly.
-// ============================================================================
 
 /// Generic txt table accessor: reads pointer at addr, indexes by id * record_size
 fn txtGetLine(comptime ptr_addr: usize, comptime record_size: usize, id: i32) ?[*]u8 {

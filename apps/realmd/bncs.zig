@@ -1109,18 +1109,10 @@ fn onLogonRealm(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// SID_GETFILETIME (0x33): the client asking how old a server file is (bnserver-D2DV.ini,
-// the terms-of-service text, ...) before deciding whether to fetch it over BNFTP.
-//
-// The timestamp is the whole answer. NET_SID_CLIENT_Incoming_GetFileTime @0x521110 hands
-// it straight to the download layer, which compares it against whatever the client already
-// has cached — so a zero means "older than anything you own" and the file never transfers.
-// This used to reply zero unconditionally, which denied every file, INCLUDING the ones
-// realmd is sitting on and happily serves the moment it is asked. So a file dropped into
-// <data_dir>/bnftp/ could only ever be fetched by a client that already knew to ask.
-//
-// Now: the real modification time when we have the file, and zero only when we genuinely
-// do not.
+// SID_GETFILETIME (0x33): client asks how old a server file is (bnserver-D2DV.ini, ToS, ...)
+// before fetching via BNFTP. NET_SID_CLIENT_Incoming_GetFileTime @0x521110 compares the
+// timestamp against its cache; zero means "older than anything owned" -> never fetched.
+// Reply with the real mtime when we have the file, zero only when we genuinely don't.
 fn onGetFileTime(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU32();
@@ -1251,23 +1243,20 @@ fn onClientId2(c: *Conn, tag: []const u8) void {
 
 // SID_QUERYADURL (0x41): the client asks for an ad URL { u32 adType }. We serve no
 // ads: reply ad-id 0 + an empty URL string.
-// ── banner ads ───────────────────────────────────────────────────────────────
-// The banner above the chat window. The client drives the whole thing:
 //
+// Banner ad flow:
 //   C->S SID_CHECKAD (0x15)  { platform "IX86", product, last-ad-id, unix time }
 //   S->C SID_CHECKAD (0x15)  { u32 adId, u32 fileExtension, FILETIME fileTime,
 //                              cstr filename, cstr url }
-//   ...client downloads `filename` over BNFTP, then reports SID_DISPLAYAD (0x21),
-//   and on a click sends SID_CLICKAD (0x16) followed by SID_QUERYADURL (0x41) to
-//   ask where to point the browser.
+//   client downloads `filename` over BNFTP, reports SID_DISPLAYAD (0x21), and on a
+//   click sends SID_CLICKAD (0x16) then SID_QUERYADURL (0x41) for the browser target.
 //
-// NET_SID_CLIENT_Incoming_CheckAd @0x521150 only acts when the packet is longer than
-// 0x10 bytes, the ad id differs from the one it already has, and BOTH strings are
-// non-empty — any of those unmet and it silently keeps the current banner. That is why
-// the old empty reply was indistinguishable from having no ads at all.
+// NET_SID_CLIENT_Incoming_CheckAd @0x521150 only redraws when the packet is > 0x10
+// bytes, the ad id differs, and both strings are non-empty — else the empty reply
+// looked indistinguishable from having no ads.
 //
-// Set by main() from REALMD_AD_FILE / REALMD_AD_URL. The file is served by the same
-// BNFTP listener that serves the version-check MPQ, so it lives in <data_dir>/bnftp/.
+// Set by main() from REALMD_AD_FILE / REALMD_AD_URL; served from <data_dir>/bnftp/
+// by the same BNFTP listener as the version-check MPQ.
 pub var ad_file: []const u8 = "";
 pub var ad_url: []const u8 = "";
 
@@ -1388,14 +1377,10 @@ fn onChangeEmail(c: *Conn, tag: []const u8, body: []const u8) void {
     log.line(tag, "changeemail '{s}'", .{acct});
 }
 
-// SID_AUTHACCOUNTLOGON (0x53): the NLS/SRP secure-logon path. The 1.14d client
-// only sends this when its g_nBNetClientToken == 1 (a client-side config, not the
-// default) — RE-confirmed reachable via BNCLIENT_SendLogonRequest. Standard D2
-// closed-realm uses OLS (LOGONRESPONSE2 0x3a), which we implement; realmd does NOT
-// implement NLS/SRP. So instead of leaving an NLS-mode client hanging on its logon
-// reply, fail it cleanly: SID_AUTHACCOUNTLOGON reply = u32 status, 1 = "account
-// does not exist" (on failure no salt/serverKey follows). The user gets a defined
-// error, not a hang. (Full NLS/SRP would be a separate feature.)
+// SID_AUTHACCOUNTLOGON (0x53): NLS/SRP secure-logon path, sent only when the client's
+// g_nBNetClientToken == 1 (non-default; RE-confirmed via BNCLIENT_SendLogonRequest).
+// realmd implements OLS (LOGONRESPONSE2 0x3a) only, not NLS/SRP, so fail cleanly instead
+// of hanging: reply = u32 status, 1 = "account does not exist" (no salt/serverKey follows).
 fn onAuthAccountLogon(c: *Conn, tag: []const u8) void {
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, SID_AUTHACCOUNTLOGON);
@@ -1410,12 +1395,10 @@ const PRODUCT_D2XP: u32 = @bitCast([4]u8{ 'D', '2', 'X', 'P' });
 // SID_FRIENDSLIST (0x65): this account's friends. Per entry: cstr name, u8 status flags,
 // u8 location (0=offline, 1=online), u32 product, cstr location string.
 //
-// A 1.14d client CANNOT RECEIVE THIS. Its incoming dispatch
-// (NET_SID_CLIENT_IncomingPacketHandler @0x521b00) drops anything with an id >= 0x5e
-// before looking at the table, and 0x65 is past that — so nothing we put here reaches the
-// game's UI. The friends feature reaches a real player only as chat text, which is what
-// handleFriendCmd sends. This is kept because it is correct, cheap, and the clientless
-// tooling and other Battle.net clients do speak it; it is not the D2 path.
+// A 1.14d client CANNOT RECEIVE THIS: NET_SID_CLIENT_IncomingPacketHandler @0x521b00
+// drops any id >= 0x5e before the table lookup. Kept because clientless tooling and other
+// Battle.net clients do speak it; real D2 players get friend status via handleFriendCmd
+// chat text instead.
 const FRIEND_STATUS_DND: u8 = 0x01;
 const FRIEND_STATUS_AWAY: u8 = 0x02;
 

@@ -213,9 +213,7 @@ fn decodeStatstring(ss: []const u8, e: *CharEntry) void {
     if (ss.len >= 28) e.flags = dec14(ss[26], ss[27]);
 }
 
-// ---------------------------------------------------------------------------
 // RealmClient: bnetd handshake -> d2cs session
-// ---------------------------------------------------------------------------
 pub const RealmClient = struct {
     bnet: ?Socket = null,
     d2cs: ?Socket = null,
@@ -858,9 +856,7 @@ pub const AdInfo = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
 // character store
-// ---------------------------------------------------------------------------
 /// Put a character where a game server would: into redis, marked for the realm's flush worker.
 /// Fixture staging for the tests that need a character to exist before logging onto it — the realm
 /// has no listener to hand one to any more, so this writes what the store holds.

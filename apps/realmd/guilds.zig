@@ -1,9 +1,7 @@
-//! Guild service — applies the cut Guild Halls operations against persisted Guild
-//! records: create / invite / kick / promote / deposit (Steeg Stone) / upgrade /
-//! disband, with rank-based permissions. The data model + upgrade economy live in
-//! realm_proto's guild.zig; this layer adds permissions + persistence (the store
-//! facade). The membership/lobby half of the original feature never shipped (it
-//! ran on Blizzard's bnet servers), so this side is fresh, wiki-guided.
+//! Guild service — the cut Guild Halls operations against persisted Guild records, with rank-based
+//! permissions. Data model + upgrade economy live in realm_proto's guild.zig; this layer adds
+//! permissions + persistence. The membership/lobby half never shipped (it ran on Blizzard's bnet
+//! servers), so this side is fresh, wiki-guided.
 const std = @import("std");
 const guild = @import("realm_proto").guild;
 const store = @import("store.zig");
@@ -79,7 +77,7 @@ fn removeMember(g: *Guild, who: []const u8) bool {
     return false;
 }
 
-// ── operations ───────────────────────────────────────────────────────────────
+// operations
 
 /// Found a guild. `actor` becomes the Guildmaster. (The wiki's "char must have
 /// completed the game once" gate is the caller's to enforce.)

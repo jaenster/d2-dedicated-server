@@ -1,17 +1,14 @@
-//! Guild (Guild Hall) data model — the cut Diablo II "Guild Halls" feature,
-//! reconstructed from the beta/1.00 binaries (D2Common\Guilds\Guilds.cpp data
-//! layer + D2Client\UI\GuildStone.cpp panel) and the diablowiki Guild Halls
-//! archive. 1.14d ships ZERO guild code, so this is a clean reimplementation,
-//! NOT a binary-faithful port — fields are idiomatic, not original byte offsets.
+//! Guild (Guild Hall) data model — the cut Diablo II "Guild Halls" feature, reconstructed from
+//! the beta/1.00 binaries (D2Common\Guilds\Guilds.cpp + D2Client\UI\GuildStone.cpp) and the
+//! diablowiki Guild Halls archive. 1.14d ships ZERO guild code, so this is a clean
+//! reimplementation, NOT a binary-faithful port — fields are idiomatic, not original offsets.
 //!
-//! Authoritative state lives in realmd (the create/membership/persistence layer
-//! never shipped publicly — it ran on Blizzard's bnet servers). The GS reads it
-//! for in-game display; the client renders the Steeg Stone panel from it.
+//! Authoritative state lives in realmd (create/membership/persistence never shipped publicly —
+//! it ran on Blizzard's bnet servers); GS reads it for display, client renders Steeg Stone from it.
 //!
-//! RE provenance (original pGuild offsets, for traceability):
-//!   +0x123 name buffer · +0x225 3-byte tag · +0x22a hall level (0..5) ·
-//!   +0x22c flags (0x10=dirty) · +0x230 u64 treasury (Steeg Stone gold) ·
-//!   +0x654 member list. pMember: name[16] · +0x14 rank(bits5-7)+status(bits0-3).
+//! RE provenance (original pGuild offsets): +0x123 name buffer, +0x225 3-byte tag, +0x22a hall
+//! level (0..5), +0x22c flags (0x10=dirty), +0x230 u64 treasury, +0x654 member list; pMember:
+//! name[16], +0x14 rank(bits5-7)+status(bits0-3).
 
 const std = @import("std");
 

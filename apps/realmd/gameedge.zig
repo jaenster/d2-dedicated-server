@@ -1,16 +1,11 @@
 //! Embedded game-traffic edge — the lightweight, in-realmd version of d2ingress.
 //!
-//! Same trick: clients connect to ONE public :4000; we speak `0xAF00` on behalf of the
-//! not-yet-dialled GS, read the GAMELOGON (0x68) token, look up {gs_ip,gs_port,gameid}
-//! in the IN-PROCESS store (no redis hop — realmd already owns it), rewrite the token to
-//! the GS's real engine gameid, dial the GS, replay the rewritten first packet, then
-//! byte-splice both directions.
-//!
-//! Thread-per-connection (realmd's net model) keeps it tiny: no poll loop, no buffer
-//! pool, no async redis — unlike the standalone `d2ingress`, which keeps that machinery
-//! for scale-out. This is the single-binary / small-deploy path; enable with
-//! REALMD_GAME_PORT (0 = off). The token-route is recorded by d2cs on CREATE/JOIN, so
-//! the recording side is shared with d2ingress — only the splice is duplicated here.
+//! Clients dial one public :4000; we speak `0xAF00` for the not-yet-dialled GS, read the
+//! GAMELOGON (0x68) token, look up {gs_ip,gs_port,gameid} in the in-process store (no redis
+//! hop), rewrite the token to the GS's real engine gameid, dial the GS, replay the first
+//! packet, then splice both directions. Thread-per-connection fits the single-binary path;
+//! enable with REALMD_GAME_PORT (0=off). d2cs records the token-route on CREATE/JOIN, shared
+//! with d2ingress — only the splice is duplicated here.
 const std = @import("std");
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;

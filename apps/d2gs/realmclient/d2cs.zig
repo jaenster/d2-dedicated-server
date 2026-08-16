@@ -94,12 +94,10 @@ fn sendJoinGameReply(seq: u32, result: u32, gameid: u32) void {
     reply(seq, std.mem.asBytes(&r));
 }
 
-// ── game name -> gameid tracking (for CLOSEGAME on destroy) ───────────────────
-// We know the gameid createGame returned — the same id realmd indexed the game by.
-// Remember name->gameid on create so that when the engine destroys the game later
-// (srvtrace's game-destroy hook hands us the NAME), we can tell realmd which gameid
-// to drop. Without this, dead games linger in realmd's join list until their redis
-// TTL (~hours) and clients joining one get "game name and password don't match".
+// game name -> gameid tracking (for CLOSEGAME on destroy): createGame's gameid is the id realmd
+// indexed the game by. Remember name->gameid on create, since the engine's destroy hook
+// (srvtrace) hands us only the NAME — without this, dead games linger in realmd's join list until
+// their redis TTL (~hours), and clients joining one get "game name and password don't match".
 const GameSlot = struct { name: [16]u8 = undefined, len: u8 = 0, gameid: u32 = 0, used: bool = false };
 var games_lock: Lock = .{};
 var games_tracked = [_]GameSlot{.{}} ** 256;
@@ -285,7 +283,7 @@ fn handleJoinGame(seq: u32, body: []const u8) void {
     log.hex("d2cs: JOINGAME ack for gameid=0x", gameid);
 }
 
-// ── the request queue ────────────────────────────────────────────────────────
+// the request queue
 
 /// Drained on its OWN thread, never from the engine tick.
 ///
@@ -325,7 +323,7 @@ pub fn pumpQueue() void {
     }
 }
 
-// ── publishing this server ───────────────────────────────────────────────────
+// publishing this server
 
 const heartbeat_ttl_s: u32 = 90;
 var last_publish_ms: u32 = 0;

@@ -26,7 +26,7 @@ pub fn run(task: *const fn () void) void {
     oog.run(task);
 }
 
-// ── named bot registry ──────────────────────────────────────────────────────
+// named bot registry
 
 const Entry = struct {
     name: []const u8,
@@ -69,7 +69,7 @@ fn eql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-// ── sample bot: trade with the nearest vendor ───────────────────────────────
+// sample bot: trade with the nearest vendor
 
 /// Optional target vendor class id; 0 = nearest vendor of any kind. Set via
 /// `setTradeClass` before running for a specific NPC (Akara=148, Charsi=154, Gheed=147).

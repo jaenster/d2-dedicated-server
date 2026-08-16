@@ -69,7 +69,7 @@ fn find(gsid: u32) ?store.GsRec {
     return null;
 }
 
-// ── dispatch ─────────────────────────────────────────────────────────────────
+// dispatch
 
 const REPLY_TIMEOUT_US: u64 = 5_000_000;
 
@@ -205,7 +205,7 @@ pub fn notifyJoin(gsid: u32, gameid: u32, token: u32, charname: []const u8, acco
     return dispatch(gsid, buf[0..pos], seq).ok;
 }
 
-// ── events (game server -> realm) ────────────────────────────────────────────
+// events (game server -> realm)
 
 /// Apply one event. Shape and meaning are unchanged from when these travelled a socket; what
 /// changed is that any instance may be the one to apply it.

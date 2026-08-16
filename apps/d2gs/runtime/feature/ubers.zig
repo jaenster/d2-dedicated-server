@@ -1,19 +1,13 @@
-//! Ubers (server) — Pandemonium event + Uber Tristram. Ported from Charon's
-//! Ubers.cpp, EXCLUDING all Diablo Clone functionality (no SoJ-sale announce, no
-//! SPAWN_UniqueMonster hook, no anni drop, no gameServerLoop).
+//! Ubers (server) — Pandemonium event + Uber Tristram. Ported from Charon's Ubers.cpp,
+//! EXCLUDING Diablo Clone (no SoJ-sale announce, no SPAWN_UniqueMonster hook, no anni drop).
 //!
-//! What it does:
-//!   - roomInit: spawn the uber minions/bosses by preset in the Pandemonium levels
-//!     (133 Lilith, 134 Duriel, 135 Izual) and Uber Tristram (136: Meph/Baal/Diablo
-//!     at the Cain-cage preset 26). Per-game "spawned" flags so each spawns once.
-//!   - CubeKeys/CubeOrgans intercepts: opening the cube with 3 keys / 3 organs spawns
-//!     the Pandemonium / Tristram red portals (Hell only). Per-game portal flags.
-//!   - KillMonster detour: track uber Meph/Diablo/Baal kills in level 136; when all
-//!     three die, drop the Hellfire Torch ("cm2 ", unique txt 400) + a "std " — once.
-//!   - Boss-AI replacements: the uber bosses summon random adds, then run the base AI.
+//! roomInit spawns uber minions/bosses once per game by preset: Pandemonium (133 Lilith, 134
+//! Duriel, 135 Izual) and Uber Tristram (136: Meph/Baal/Diablo at Cain-cage preset 26).
+//! CubeKeys/CubeOrgans intercepts spawn the matching red portals (Hell only, once per game).
+//! KillMonster tracks uber Meph/Diablo/Baal kills in level 136 and drops the Hellfire Torch
+//! ("cm2 ", unique txt 400) + a "std " once all three die. Boss AIs summon random adds first.
 //!
-//! Engine addresses + struct offsets verified against recon session 9df5e900
-//! (Diablo2Lod/windows/1.14d/Game.exe). See notes inline where Charon differs.
+//! Addresses + struct offsets verified against recon session 9df5e900 (1.14d Game.exe).
 const std = @import("std");
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");
@@ -27,7 +21,7 @@ const Room1 = types.Room1;
 const POINT = types.POINT;
 const ItemQuality = types.ItemQuality;
 
-// ── hook / jump sites (recon-verified) ───────────────────────────────────────
+// hook / jump sites (recon-verified)
 const CUBE_KEYS_HOOK: usize = 0x565A90; // 5-byte JMP thunk (CUBE_SpecialOutput_Unused2)
 const CUBE_ORGANS_HOOK: usize = 0x565AA0; // 5-byte JMP thunk (CUBE_SpecialOutput_Unused3)
 const KILLMONSTER_ENTRY: usize = 0x57CCB0; // SERVER_KillMonster
@@ -38,7 +32,7 @@ const UBER_BAAL_AI: usize = 0x5FD200; // AI_Function1_UberBaal (empty `ret 4` st
 const DURABILITY_NOP_FROM: usize = 0x559009; // ITEM_CreateItemInstance durability setup
 const DURABILITY_NOP_TO: usize = 0x559025; // next clean instruction (PUSH EDI)
 
-// ── per-game flags ───────────────────────────────────────────────────────────
+// per-game flags
 // Fixed-size registry keyed by the game's unique token (D2GameStrc.nToken @0x00).
 // NOTE vs Charon: Charon keys its map by pGame+0x4 ("seed"), which the recon labels
 // pHashLink1 (a hash-chain pointer, NOT a seed). nToken @0x00 is the documented
@@ -79,7 +73,7 @@ fn flagsFor(token: u32) *GameFlags {
     return &registry[0].flags;
 }
 
-// ── RNG (mt19937 substitute) ─────────────────────────────────────────────────
+// RNG (mt19937 substitute)
 // std Math.random is unavailable here and CRT rand() is forbidden (and gives the
 // same sequence every launch). Use a 64-bit SplitMix-style xorshift seeded from a
 // monotonically-advancing counter, so item seeds differ across spawns and launches.
@@ -110,7 +104,7 @@ fn randSeed() i32 {
     return @intCast(rngNext() & 0x7FFFFFFF);
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// helpers
 
 fn getActFromRoom(room: *Room1) u32 {
     const room2 = room.pRoom2 orelse return 0;
@@ -174,7 +168,7 @@ fn spawnUber(pGame: *d2types.D2GameStrc, room: *Room1, x: i32, y: i32, class_id:
     return u != null;
 }
 
-// ── CubeKeys / CubeOrgans intercepts (__fastcall: ECX=pGame, EDX=pUnit) ───────
+// CubeKeys / CubeOrgans intercepts (__fastcall: ECX=pGame, EDX=pUnit)
 // Return TRUE → cube consumes the items (the desired behaviour). The engine
 // thunk site is a 5-byte JMP, so we JUMP-replace it cleanly.
 
@@ -265,7 +259,7 @@ fn cubeOrgansShim() callconv(.naked) void {
         : .{ .ecx = true, .edx = true, .memory = true });
 }
 
-// ── KillMonster detour (relocated-prologue, like roominit) ────────────────────
+// KillMonster detour (relocated-prologue, like roominit)
 // __fastcall(pGame ECX, pVictim EDX, pAttacker [esp+4], bRemove [esp+8]).
 // Original is callee-clean `ret 8`. Our shim re-runs the original (reloc stub),
 // then calls our handler, then `ret 8`.
@@ -337,7 +331,7 @@ fn killMonsterShim() callconv(.naked) void {
         : .{ .eax = true, .ecx = true, .edx = true, .memory = true });
 }
 
-// ── Uber boss AI replacements (__fastcall: ECX=pGame, EDX=pUnit, [esp+4]=pAi) ──
+// Uber boss AI replacements (__fastcall: ECX=pGame, EDX=pUnit, [esp+4]=pAi)
 // The stub functions are empty `ret 4`; we JUMP-replace them. Each summons random
 // adds at the target/self, then runs the real boss AI, then callee-clean `ret 4`.
 
@@ -398,7 +392,7 @@ fn AiShim(comptime handler: anytype) type {
     };
 }
 
-// ── roomInit hook (fanned out by runtime/roominit.zig) ────────────────────────
+// roomInit hook (fanned out by runtime/roominit.zig)
 
 /// `room` is the D2RoomStrc* (Room1) handed by the roominit driver.
 pub fn roomInit(ctx: *const feature.GameCtx, room: *anyopaque) void {
@@ -458,7 +452,7 @@ pub fn roomInit(ctx: *const feature.GameCtx, room: *anyopaque) void {
     }
 }
 
-// ── install ──────────────────────────────────────────────────────────────────
+// install
 
 pub fn install() void {
     comptime {

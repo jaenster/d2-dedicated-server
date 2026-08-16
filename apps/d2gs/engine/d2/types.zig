@@ -532,7 +532,7 @@ pub const RoomTile = extern struct {
     nNum: ?*DWORD, // 0x10
 };
 
-// ── Ubers: item generation + AI params (recon 9df5e900) ──────────────────────
+// Ubers: item generation + AI params (recon 9df5e900)
 
 /// D2ItemGenContextStrc (recon /D2Game, 132 bytes) — Charon "ItemGenerationData".
 /// Fed to SpawnItemWithStruct (ITEM_CreateItemInstance). Field offsets verified

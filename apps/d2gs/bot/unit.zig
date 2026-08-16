@@ -72,7 +72,7 @@ pub const Unit = struct {
     }
 };
 
-// ── finders over the server-side unit hash tables ───────────────────────────
+// finders over the server-side unit hash tables
 
 /// First unit of `unit_type` in the hash table, or null if the table is empty.
 pub fn first(unit_type: u32) ?Unit {

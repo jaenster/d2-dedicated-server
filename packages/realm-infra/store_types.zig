@@ -63,11 +63,9 @@ pub const Route = struct {
 };
 
 /// Token-keyed route — the NAT-proof replacement for source-IP routing. realmd mints a
-/// realm-globally-unique u16 token per CREATE/JOIN, hands it to the client, and records
-/// it here against the GS that owns the game plus the engine's real gameid. The d2ingress
-/// reads the token from the client's first GAMELOGON packet, looks this up, rewrites the
-/// token in the packet to `gameid`, and splices to gs_ip:gs_port. Globally-unique tokens
-/// mean two clients behind one public IP never collide.
+/// realm-globally-unique u16 token per CREATE/JOIN, hands it to the client, and records it here
+/// against the owning GS plus the engine's real gameid. d2ingress reads the token off the
+/// client's first GAMELOGON packet, rewrites it to `gameid`, and splices to gs_ip:gs_port.
 pub const TokenRoute = struct {
     gs_ip: [4]u8,
     gs_port: u16 = 4000,

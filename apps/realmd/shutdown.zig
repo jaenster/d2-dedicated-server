@@ -1,12 +1,10 @@
-//! Graceful shutdown for k8s. On SIGTERM/SIGINT we flip `draining`, which makes the
-//! health endpoint report /readyz as 503 so the cluster removes this pod from the
-//! Service endpoints (stops sending it new connections). After a grace period — long
-//! enough for the load balancer to converge and in-flight requests to finish — the
-//! process exits 0. GS control links simply drop on exit; each GS reconnects to a
-//! surviving realmd.
+//! Graceful shutdown for k8s: SIGTERM/SIGINT flips `draining`, which makes /readyz report 503 so
+//! the cluster removes this pod from Service endpoints. After a grace period (long enough for the
+//! LB to converge and in-flight requests to finish) the process exits 0; GS control links just drop
+//! and each GS reconnects to a surviving realmd.
 //!
-//! The signal handler does only an async-signal-safe atomic store; a monitor thread
-//! observes the flag and performs the (sleep + exit) drain off the signal context.
+//! The signal handler only does an async-signal-safe atomic store; a monitor thread observes the
+//! flag and performs the sleep+exit drain off the signal context.
 const std = @import("std");
 const log = @import("realm_infra").log;
 

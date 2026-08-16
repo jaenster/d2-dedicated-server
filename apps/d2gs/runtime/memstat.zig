@@ -1,14 +1,9 @@
-//! What the GS process is actually holding, and which boot step took it.
-//!
-//! The engine's own pool census (poolstat.zig) accounts for a few MB; the rest of an ~83 MB
-//! idle GS is data tables, string tables, MPQ handles and the image itself. "Strip things out
-//! to save memory" needs to know WHICH step spent it before anything is cut, so this samples
-//! the working set around each bootstrap phase and reports the delta per phase.
-//!
-//! Note what this can and cannot buy: games are capped by the count of Fog pool managers
-//! (eight, one per game — see poolstat.zig), not by bytes, so trimming the baseline never
-//! yields an eighth game on one process. It yields a smaller pod, i.e. more GS processes per
-//! node, which is where the fleet actually scales.
+//! What the GS process is actually holding, and which boot step took it. poolstat.zig's pool
+//! census covers a few MB; the rest of an ~83 MB idle GS is data tables, string tables, MPQ
+//! handles and the image, so this samples the working set per bootstrap phase to find WHICH
+//! step spent it. Games are capped by the count of Fog pool managers (eight, one per game),
+//! not by bytes, so trimming the baseline yields a smaller pod (more GS per node), not an
+//! eighth game on one process.
 
 const std = @import("std");
 const log = @import("../log.zig");
@@ -64,14 +59,10 @@ extern "kernel32" fn HeapWalk(heap: ?*anyopaque, entry: [*]u8) callconv(.winapi)
 extern "kernel32" fn HeapLock(heap: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn HeapUnlock(heap: ?*anyopaque) callconv(.winapi) i32;
 
-/// Sum the BUSY (allocated) bytes across every heap in the process.
-///
-/// RSS cannot tell a leak from allocator slack, and the engine's pool census only covers memory
-/// that went through Fog. Anything malloc'd directly — by the engine's CRT or by wine on our
-/// behalf — is invisible to both. This walks the actual heaps, so "idle RSS crept 2 KB per game"
-/// can be answered with "and here is how much of it is live allocations".
-///
-/// Walking is O(number of blocks) and takes the heap lock, so call it at IDLE, never per tick.
+/// Sum the BUSY (allocated) bytes across every heap in the process. RSS can't tell a leak from
+/// allocator slack, and the pool census only covers memory that went through Fog — anything
+/// malloc'd directly (engine CRT, wine) is invisible to both, so this walks the actual heaps.
+/// O(number of blocks) and takes the heap lock — call it at IDLE, never per tick.
 pub fn heapBusyBytes(out_heaps: *u32, out_blocks: *u32) usize {
     var heaps: [32]?*anyopaque = undefined;
     const n = GetProcessHeaps(heaps.len, &heaps);
@@ -149,13 +140,9 @@ extern "user32" fn GetGuiResources(process: ?*anyopaque, flags: u32) callconv(.w
 const GR_GDIOBJECTS: u32 = 0;
 const GR_USEROBJECTS: u32 = 1;
 
-/// GDI and USER handle counts for this process.
-///
-/// These live in the window manager, not in any heap — so a leaked window, DC, brush or bitmap is
-/// invisible to both the pool census and the heap walk, and would show up only as resident bytes
-/// with no owner. A headless GS still creates a hidden window, so "something UI-shaped is
-/// allocated per game outside the FOG arena" is a real hypothesis, and this is what tests it: if
-/// these climb per game, that is the leak; if they are flat, the UI is exonerated.
+/// GDI and USER handle counts for this process. These live in the window manager, not any heap,
+/// so a leaked window/DC/brush/bitmap is invisible to both the pool census and the heap walk. A
+/// headless GS still creates a hidden window; if these climb per game, that is the leak.
 pub fn guiCensus(tag: []const u8) void {
     const me = GetCurrentProcess();
     log.hex2(tag, GetGuiResources(me, GR_GDIOBJECTS), GetGuiResources(me, GR_USEROBJECTS));

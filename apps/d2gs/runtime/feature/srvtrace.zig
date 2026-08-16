@@ -1,20 +1,13 @@
-//! Server-side event tracing — a fat bundle of entry-detour hooks on the engine's
-//! discrete server actions (game lifecycle, combat, items, skills, warps, monster/
-//! portal spawns). Always on. Each hook DECODES the real engine structs and emits a
-//! structured JSON line via evlog.zig, e.g.
-//!   {"evt":"damage","atk":"EpicAma","vic":"Mephisto"}
-//!   {"evt":"monster_spawn","class":242,"x":17500,"y":8100}
-//! so a Grafana/Loki pipeline can scrape d2gs_log.txt and query every event.
+//! Server-side event tracing — entry-detour hooks on the engine's discrete server actions (game
+//! lifecycle, combat, items, skills, warps, monster/portal spawns). Always on. Each hook decodes
+//! the real engine structs and emits a structured JSON line via evlog.zig (e.g.
+//! {"evt":"damage","atk":"EpicAma","vic":"Mephisto"}) for a Grafana/Loki pipeline to scrape.
 //!
-//! Mechanism: each hook relocates the target's first `prologue` bytes into a
-//! trampoline (trampoline.zig fixes up E8/E9), drops a 5-byte JMP at the entry to a
-//! per-hook naked shim that captures up to three args (registers / [esp+k] / byte-
-//! deref), then calls that hook's `handler(a,b,c)` decoder, restores, and resumes
-//! the original. ECX/EDX are never clobbered (only EAX is used transiently for a
-//! deref), so the original ABI survives untouched. The handlers run on the engine
-//! thread mid-call and only READ engine state (+ pure GetUnitName), so they're safe.
-//!
-//! Adding a trace point: write a `handler` decoder + one row in the `hooks` table.
+//! Mechanism: relocate the target's first `prologue` bytes into a trampoline (trampoline.zig
+//! fixes up E8/E9), drop a 5-byte JMP to a per-hook naked shim that captures up to three args
+//! (registers/[esp+k]/byte-deref), calls `handler(a,b,c)`, restores, resumes. ECX/EDX are never
+//! clobbered, so the ABI survives. Handlers run on the engine thread mid-call and only READ
+//! state, so they're safe. Add a trace point: write a `handler` + one row in `hooks`.
 const std = @import("std");
 const patch = @import("../patch.zig");
 const trampoline = @import("../trampoline.zig");
@@ -30,7 +23,7 @@ extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, si
 extern "kernel32" fn EnterCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
 extern "kernel32" fn LeaveCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
 
-// ── decode helpers ───────────────────────────────────────────────────────────
+// decode helpers
 
 fn unit(v: usize) ?*t.UnitAny {
     return if (v == 0) null else @ptrFromInt(v);
@@ -172,7 +165,7 @@ fn putClient(e: *evlog.Event, pclient: usize) void {
     e.int("slot", readU32(pclient, CL_SLOT));
 }
 
-// ── active-game tracking + per-game tick heartbeat ───────────────────────────
+// active-game tracking + per-game tick heartbeat
 // We can't cheaply walk the engine's intrusive game list, so we track live games
 // off the join/destroy hooks and read their fields directly each heartbeat.
 // D2GameStrc offsets: nToken@0, szGameName@42, nClientsCount@140, dwSpawnedPlayers@144,
@@ -233,7 +226,7 @@ pub fn serverTick() void {
     }
 }
 
-// ── per-event handlers ───────────────────────────────────────────────────────
+// per-event handlers
 // Signature is always fn(a1, a2, a3) callconv(.c); each interprets the captured
 // args (see the hooks table for what a1/a2/a3 hold for that hook).
 
@@ -243,12 +236,10 @@ fn onGameCreate(token_map: usize, _: usize, _: usize) callconv(.c) void {
     e.end();
 }
 
-/// EVENT_AllocTimerQueue(pGame) — the first point in game creation where the struct is
-/// finished: pMemoryPool, name, token and difficulty are all set by then, and it is
-/// reached exactly once per game (only GAME_CreateBattleNetGame and its single-player
-/// twin call it). CreateGame @0x451000, which `game_create` above hooks, is an entry
-/// detour on the allocator itself and so has no game to hand anyone yet — this is why
-/// the registry's gameCreate rides here instead.
+/// EVENT_AllocTimerQueue(pGame) — first point in game creation where the struct is finished
+/// (pMemoryPool, name, token, difficulty all set), reached exactly once per game. CreateGame
+/// @0x451000 (`game_create` above) is an entry detour on the allocator itself with no game to
+/// hand anyone yet — this is why the registry's gameCreate rides here instead.
 fn onGameAlloc(pgame: usize, _: usize, _: usize) callconv(.c) void {
     trackGame(pgame);
     var e = ev("game_alloc");
@@ -275,13 +266,10 @@ fn onGameDestroy(token: usize, pgame: usize, _: usize) callconv(.c) void {
     if (on_game_destroy) |cb| cb(ascii(pgame + GAME_NAME, 16));
 }
 
-/// Optional observer fired when a game's population changes, with the game's name and
-/// the client count once the change has settled. The realm GS client subscribes so
-/// realmd's join list shows a live PLAYERS column — realmd on its own only ever sees
-/// joins go through it, never leaves, so without this the column only counts up.
-/// The character it happened to comes along, because realmd's join-screen detail panel
-/// lists a game's players by name, level and class, and the GS is the only side that
-/// knows who is actually in there.
+/// Optional observer fired when a game's population changes, with the game's name and client
+/// count once settled. The realm GS client subscribes so realmd's join list shows a live
+/// PLAYERS column — realmd alone only sees joins, never leaves. The character comes along too,
+/// since realmd's join-screen panel lists players by name/level/class and the GS alone knows.
 pub var on_players_changed: ?*const fn (game: []const u8, players: u32, joined: bool, char: []const u8, level: u32, class: u32) void = null;
 
 /// Level and class of the character behind a D2ClientStrc, read off its player unit
@@ -569,22 +557,18 @@ fn onItemUse(pplayer: usize, _: usize, _: usize) callconv(.c) void {
     e.end();
 }
 
-// ── DRLG oracle ──────────────────────────────────────────────────────────────
-// Hooked at DRLG_ApplyRoomExStateFlags(D2DrlgLevelStrc* pLevel) @0x642390, which
-// InitLevel @0x6424A0 calls in EVERY generation path (maze/preset/wilderness) AFTER
-// the per-type generator has linked the rooms. (We do NOT hook InitLevel's entry:
-// there pLevel->pRoomExFirst is still null because InitLevel BUILDS the rooms, so a
-// v1 entry hook always saw roomCount 0.) pLevel arrives in EDX (fastcall-style; a1 =
-// .edx). We dump the full room layout as a single JSON line so a separate Zig DRLG
-// reimplementation can be verified offset-for-offset against the real 1.14d engine.
+// DRLG oracle
+// Hooked at DRLG_ApplyRoomExStateFlags(D2DrlgLevelStrc* pLevel) @0x642390, called by InitLevel
+// @0x6424A0 in EVERY generation path AFTER the per-type generator has linked the rooms (NOT at
+// InitLevel's entry — pRoomExFirst is still null there since InitLevel BUILDS the rooms). pLevel
+// arrives in EDX (fastcall-style; a1=.edx). We dump the full room layout as one JSON line so a
+// separate Zig DRLG reimplementation can be verified offset-for-offset against the real engine.
 //
-// At this hook the level's own sSeed has ALREADY been consumed by generation, so we
-// do NOT read pLevel->sSeed. Instead we recompute the INITIAL level seed exactly as
+// The level's sSeed is ALREADY consumed by generation here, so we recompute the INITIAL seed as
 // InitLevel did: pLevel->pDrlg->dwStartSeed + pLevel->eD2LevelId.
 //
 // D2DrlgLevelStrc: +0x00 eDrlgType(i32), +0x08 nRoomExCount(i32), +0x10 pRoomExFirst,
-//   +0x1C sCoordsAndSize (POINT WorldPos@+0x1C, POINT WorldSize@+0x24),
-//   +0x1B4 pDrlg(D2DrlgStrc*), +0x1D0 eD2LevelId(i32).
+//   +0x1C sCoordsAndSize (WorldPos@+0x1C, WorldSize@+0x24), +0x1B4 pDrlg, +0x1D0 eD2LevelId.
 // D2DrlgStrc: +0x470 dwStartSeed(u32).
 // D2RoomExStrc: +0x14 sSeed.nSeedLow, +0x24 pRoomExNext, +0x34 sCoords (WorldPos@+0x34,
 //   WorldSize@+0x3C).
@@ -599,25 +583,22 @@ const DRLG_ROOM_CAP: usize = 4096;
 /// Per-room near/orth array cap (defensive).
 const DRLG_NEAR_CAP: i32 = 64;
 
-/// Native engine entry points, both __stdcall (verified by disassembly of the
-/// prologues: args read from [EBP+8...], RET n). Used by the optional dump-all
-/// pass to force every level in the current act to generate.
-///   GetLevelAndAlloc(pDrlg, eLevelId) -> pLevel   @0x642BB0  (RET 8)
-///   InitLevel(pLevel)                              @0x6424A0  (RET 4) — runs the
-///     DRLG generator, which calls DRLG_ApplyRoomExStateFlags → our hook → dump.
-///   FreeAct(pDrlgAct)                             @0x61afd0  (RET 4) — frees the
-///     act struct and all its DRLG data (D2DrlgActMisc, rooms, environment).
-///     __stdcall verified: @calling annotation in Dungeon.cpp reconstruction.
+/// Native engine entry points, both __stdcall (verified by disassembly: args from [EBP+8...],
+/// RET n). Used by the optional dump-all pass to force every level in the current act to generate.
+///   GetLevelAndAlloc(pDrlg, eLevelId) -> pLevel  @0x642BB0  (RET 8)
+///   InitLevel(pLevel)                             @0x6424A0  (RET 4) — runs the DRLG generator,
+///     which calls DRLG_ApplyRoomExStateFlags -> our hook -> dump.
+///   FreeAct(pDrlgAct)                            @0x61afd0  (RET 4) — frees the act struct and
+///     all its DRLG data (D2DrlgActMisc, rooms, environment); __stdcall per Dungeon.cpp recon.
 const GetLevelAndAlloc: *const fn (usize, i32) callconv(.winapi) usize = @ptrFromInt(0x642BB0);
 const InitLevel: *const fn (usize) callconv(.winapi) void = @ptrFromInt(0x6424A0);
 const FreeActFn: *const fn (usize) callconv(.winapi) void = @ptrFromInt(0x61afd0);
 
 /// Engine globals for data-driven act/level ranges (no hardcoded ids).
-///   0x6E7D1C: int[5] town-level id per act (read by GetTownLevelIdFromActNo via
-///             `[EAX*4 + 0x6e7d1c]`) = {1, 40, 75, 103, 109}.
-///   0x744304: -> sgptDataTable; [+0xC5C] = nTxtLevelsSize (Levels.txt row count),
-///             the exclusive upper bound for valid level ids (TXT_LevelDefs_GetLine
-///             returns null past it → AllocDrlgLevel would null-deref).
+///   0x6E7D1C: int[5] town-level id per act (`[EAX*4 + 0x6e7d1c]`) = {1, 40, 75, 103, 109}.
+///   0x744304: -> sgptDataTable; [+0xC5C] = nTxtLevelsSize (Levels.txt row count), the
+///     exclusive upper bound for valid level ids (TXT_LevelDefs_GetLine returns null past it,
+///     else AllocDrlgLevel null-derefs).
 const TOWN_ID_TABLE: usize = 0x6E7D1C;
 const DATATABLE_PTR: usize = 0x744304;
 const DATATABLE_LEVELS_SIZE_OFF: usize = 0xC5C;
@@ -626,14 +607,12 @@ fn readU8(base: usize, off: usize) u8 {
     return @as(*const u8, @ptrFromInt(base + off)).*;
 }
 
-/// InitDrlgAct(pGame, nActNo) @0x53AC70 — the server's own "create act N for this
-/// game" routine: derives the town level id, calls AllocAct with the game's init
-/// seed / difficulty / memory pool, stores pGame->pAct[nActNo], and inits the act's
-/// quest state. One game init seed (pGame->pInitSeed) deterministically derives each
-/// act's independent dwStartSeed inside AllocDrlgActMisc. Custom register convention
-/// (verified by disassembly): pGame in ESI, nActNo in BL, no stack args. We overwrite
-/// ESI/EBX so they are marked clobbered (Zig saves the caller's); [buf] stays in a
-/// non-clobbered reg (EDI/EBP, both callee-saved by InitDrlgAct).
+/// InitDrlgAct(pGame, nActNo) @0x53AC70 — server's "create act N for this game" routine:
+/// derives the town level id, calls AllocAct with the game's seed/difficulty/pool, stores
+/// pGame->pAct[nActNo], inits quest state. pGame->pInitSeed deterministically derives each
+/// act's dwStartSeed inside AllocDrlgActMisc. Custom convention (verified by disassembly):
+/// pGame in ESI, nActNo in BL, no stack args — we mark ESI/EBX clobbered; [buf] stays in a
+/// non-clobbered reg (EDI/EBP, callee-saved).
 fn initDrlgAct(pGame: usize, nActNo: u8) void {
     var buf = [3]u32{ @truncate(pGame), nActNo, 0x53AC70 };
     asm volatile (
@@ -653,13 +632,12 @@ fn levelsTxtCount() i32 {
     return s32(readU32(tbl, DATATABLE_LEVELS_SIZE_OFF));
 }
 
-/// DefineRoomsNear(pMemory, pRoomEx) @0x66BC20 builds a room's geometric near-room
-/// list (nDrlgRoomsExNearCount @0x2C + ppDrlgRoomsExNear @0x08). The engine only
-/// calls this at room-activation, never during DRLG layout, so at our hook the list
-/// is empty — we invoke it ourselves to capture authoritative adjacency. Custom ABI:
-/// pRoomEx in EDI, pMemory pushed as the single stack arg (RET 4 cleans it), and the
-/// callee clobbers EBX/ESI/EDI without restoring, so we save/restore them here and
-/// only report EAX/ECX/EDX clobbered to Zig.
+/// DefineRoomsNear(pMemory, pRoomEx) @0x66BC20 builds a room's geometric near-room list
+/// (nDrlgRoomsExNearCount @0x2C + ppDrlgRoomsExNear @0x08). The engine only calls this at
+/// room-activation, never during DRLG layout, so at our hook the list is empty — we invoke
+/// it ourselves for authoritative adjacency. Custom ABI: pRoomEx in EDI, pMemory as the single
+/// stack arg (RET 4 cleans it); callee clobbers EBX/ESI/EDI without restoring, so we
+/// save/restore them and report only EAX/ECX/EDX clobbered to Zig.
 fn defineRoomsNear(pMemory: usize, pRoomEx: usize) void {
     // buf[0]=pMemory (the stack arg), buf[1]=pRoomEx (-> EDI), buf[2]=call target.
     // EDI is marked clobbered so the allocator never puts [buf] there (we overwrite
@@ -826,22 +804,21 @@ fn emitLevel(pLevel: usize) void {
     e.endRaw(); // raw sink: these lines can be 100s of KB; must not be wrapped/capped
 }
 
-// ── DRLG per-tile GRID CELL dump (CollMap fidelity diff) ─────────────────────
-// For levels 57 (Act2 tomb) and 80 (Act3 Kurast) we emit, per preset room, the
-// engine's actual DRLG grid cell values so a clean-room port's CollMap can be
-// diffed cell-for-cell. CollMap bits derive from these grid cells via FillTileData:
+// DRLG per-tile GRID CELL dump (CollMap fidelity diff)
+// For levels 57 (Act2 tomb) and 80 (Act3 Kurast), emit per preset room the engine's actual
+// DRLG grid cell values so a clean-room CollMap port can be diffed cell-for-cell. CollMap bits
+// derive from these via FillTileData:
 //   CollMap 0x01 WALL    <- nFlags 0x40 <- grid cell bit 17 (0x00020000)
 //   CollMap 0x04 MISSILE <- nFlags 0x80 <- grid cell bit 16 (0x00010000)
 //   CollMap 0x10 ALT     <- nFlags 0x02 <- grid cell bit 28 (0x10000000)
-// We only emit cells with any of those bits set (mask below) to keep lines sane.
+// Only cells with any of those bits set are emitted (mask below).
 //
 // Grid access (GetGridFlags 0x67c570): value = pCellsFlags[nX + pCellsRowOffsets[nY]].
-// D2DrlgGridStrc (20B): pCellsFlags@0x00(int*), pCellsRowOffsets@0x04(int*),
-//   nWidth@0x08, nHeight@0x0C, bIsSubGrid@0x10.
-// pRoomExData is D2DrlgPresetRoomStrc (room+0x20 when nPresetType==2):
-//   nLevelPrest@0x00, nPickedFile@0x04, pMap@0x08, nFlags@0x0C,
-//   pWallGrid[4]@0x10, pOrientationGrid[4]@0x60, pFloorGrid[2]@0xB0, pCellGrid@0xD8.
-// We read grid[0] of wall/orient/floor.
+// D2DrlgGridStrc (20B): pCellsFlags@0x00(int*), pCellsRowOffsets@0x04(int*), nWidth@0x08,
+//   nHeight@0x0C, bIsSubGrid@0x10.
+// pRoomExData is D2DrlgPresetRoomStrc (room+0x20 when nPresetType==2): nLevelPrest@0x00,
+//   nPickedFile@0x04, pMap@0x08, nFlags@0x0C, pWallGrid[4]@0x10, pOrientationGrid[4]@0x60,
+//   pFloorGrid[2]@0xB0, pCellGrid@0xD8. We read grid[0] of wall/orient/floor.
 const GRID_INTEREST_MASK: u32 = 0x10030000; // bit28 | bit17 | bit16
 const GRID_DIM_CAP: i32 = 512;
 const PRDATA_WALLGRID0: usize = 0x10;
@@ -849,15 +826,12 @@ const PRDATA_ORIENTGRID0: usize = 0x60;
 const PRDATA_FLOORGRID0: usize = 0xB0;
 
 /// DRLGPRESET_InitGridsFromDS1File(pRoomEx) @0x6667d0 — fills a preset room's wall/
-/// orientation/floor/cell grids from its picked DS1 file layers, then moves the DS1's
-/// preset units into the room. The engine only calls this at ROOM ACTIVATION (via
-/// InitRoomEx→InitGridCells), never during DRLG layout, so at our post-generation hook
-/// the grids' pCellsFlags are still NULL. We invoke it ourselves to materialise the
-/// grids for capture. It derives everything from pRoomEx (pLevel->pDrlg->pMemoryPool,
-/// pRoomExData->pMap->pDrlgFile) — a standard __fastcall (pRoomEx in ECX, RET 0). The
-/// grid flag values are DS1-derived (deterministic, no RNG), so they don't depend on
-/// the room seed. The trailing AddAndSetPresetUnits only relinks per-room preset-unit
-/// lists (no pRoom deref, no alloc), so it is safe here.
+/// orientation/floor/cell grids from its picked DS1 file layers, then moves the DS1's preset
+/// units into the room. The engine only calls this at ROOM ACTIVATION (InitRoomEx→InitGridCells),
+/// never during DRLG layout, so at our post-generation hook pCellsFlags is still NULL — we
+/// invoke it ourselves to materialise the grids. Standard __fastcall (pRoomEx in ECX, RET 0);
+/// grid values are DS1-derived (deterministic, no RNG). The trailing AddAndSetPresetUnits only
+/// relinks per-room lists (no pRoom deref, no alloc), so it's safe here.
 fn initGridsFromDS1File(pRoomEx: usize) void {
     var buf = [2]u32{ @truncate(pRoomEx), 0x6667d0 };
     asm volatile (
@@ -960,26 +934,23 @@ fn emitGridForLevel(pLevel: usize) void {
     }
 }
 
-// ── Resolved-tile capture (DT1 variant chosen per cell) ──────────────────────
-// The CollMap residual is not grid values (the port decodes bits 17/16/28 faithfully)
-// but DT1 TILE RESOLUTION: DRLGROOMTILE_GetTileLibraryEntry 0x66d820 may pick a
-// different DT1 tile variant (by rarity/seed order) → a different 25-byte subtile
-// collision block → missing/extra 0x01. To confirm, we observe the engine's actual
-// resolved tile per cell by hooking DRLGROOMTILE_FillTileData 0x66dde0 (called by the
-// tile-build in canonical cell order with the room's own seed). Args at entry (EBP
-// frame, __fastcall): ECX=pRoomEx, [esp+4]=nPosX, [esp+8]=nPosY, [esp+0xC]=nGridFlags,
-// [esp+0x10]=pTileLibEntry. Gated to levels 57 & 80. This fires only when a room is
-// ACTIVATED, so the capture warps the player through L57/L80 (see warpAndDumpColl).
+// Resolved-tile capture (DT1 variant chosen per cell)
+// The CollMap residual isn't grid values (bits 17/16/28 are decoded faithfully) but DT1 TILE
+// RESOLUTION: DRLGROOMTILE_GetTileLibraryEntry 0x66d820 may pick a different DT1 tile variant
+// (by rarity/seed order) -> a different 25-byte subtile collision block -> missing/extra 0x01.
+// We observe the engine's actual resolved tile per cell by hooking DRLGROOMTILE_FillTileData
+// 0x66dde0 (called in canonical cell order with the room's own seed). Args at entry (EBP frame,
+// __fastcall): ECX=pRoomEx, [esp+4]=nPosX, [esp+8]=nPosY, [esp+0xC]=nGridFlags,
+// [esp+0x10]=pTileLibEntry. Gated to levels 57 & 80; fires only on room ACTIVATION, so capture
+// warps the player through L57/L80 (see warpAndDumpColl).
 //
-// D2TileLibraryEntryStrc (Ghidra 62fbfe69, /Diablo2/GFX): nDirection@0x00,
-// nFlags(short)@0x06, nOrientation@0x14, nIndex@0x18 (main/roomType), nSubIndex@0x1C,
-// nFrame_Rarity@0x20, dwBlockOffset_pBlock@0x2C, pParent(DT1 record)@0x38,
-// dwBlockDataOffset@0x48 (archive byte offset of the block data — a STABLE
-// discriminator of WHICH dt1 tile block was selected).
-// FillTileData is hooked via the proven generic hook table (see `hooks`), capturing
-// nPosX/nPosY (stack args) + pTileLibEntry. It fires for EVERY activated room, so we
-// gate emission to a target level set by warpAndDumpColl just before it warps the
-// player into L57/L80. -1 = capture off (all other room activations ignored cheaply).
+// D2TileLibraryEntryStrc (Ghidra 62fbfe69, /Diablo2/GFX): nDirection@0x00, nFlags(short)@0x06,
+// nOrientation@0x14, nIndex@0x18 (main/roomType), nSubIndex@0x1C, nFrame_Rarity@0x20,
+// dwBlockOffset_pBlock@0x2C, pParent(DT1 record)@0x38, dwBlockDataOffset@0x48 (archive byte
+// offset of the block data — a STABLE discriminator of WHICH dt1 tile block was selected).
+// FillTileData is hooked via the generic hook table (see `hooks`), capturing nPosX/nPosY +
+// pTileLibEntry; it fires for EVERY activated room, so emission is gated to the target level set
+// by warpAndDumpColl just before it warps the player into L57/L80 (-1 = capture off).
 var tile_gate_level: i32 = -1;
 
 /// Handler for the FillTileData generic hook. a1=nPosX, a2=nPosY, a3=pTileLibEntry
@@ -1051,15 +1022,14 @@ fn dumpActLevels(pDrlg: usize) void {
     }
 }
 
-/// Drive DRLG generation for ALL FIVE acts of the game in a single pass. The spawn
-/// act (whose town gen invoked us, still mid-init) uses the live pDrlg directly; the
-/// other four are created the server way via InitDrlgAct(pGame, act) when absent,
-/// then force-generated. pGame = pDrlg->pGame @0x9C; pGame->pAct[5] @0xBC;
-/// D2DrlgActStrc->pDrlg @0x48; pDrlg->nActNo @0x480.
+/// Drive DRLG generation for ALL FIVE acts in a single pass. The spawn act (whose town gen
+/// invoked us, still mid-init) uses the live pDrlg directly; the other four are created via
+/// InitDrlgAct(pGame, act) when absent, then force-generated. pGame = pDrlg->pGame @0x9C;
+/// pGame->pAct[5] @0xBC; D2DrlgActStrc->pDrlg @0x48; pDrlg->nActNo @0x480.
 ///
-/// Multi-seed mode: if D2GS_DRLG_SEED_LO + D2GS_DRLG_SEED_HI are set, after the
-/// first-seed pass this function calls runSeedLoop to iterate the full [lo, hi] range,
-/// freeing and recreating all acts per seed. Pair with D2GS_DRLG_DUMPALL=1.
+/// Multi-seed mode: if D2GS_DRLG_SEED_LO/HI are set, after the first-seed pass this calls
+/// runSeedLoop to iterate [lo, hi], freeing/recreating all acts per seed. Pair with
+/// D2GS_DRLG_DUMPALL=1.
 fn runDumpAll(pSpawnDrlg: usize) void {
     const pGame = readU32(pSpawnDrlg, 0x9C);
     const spawnActNo = readU8(pSpawnDrlg, 0x480);
@@ -1150,14 +1120,11 @@ fn emitSeedMarker(seed: u32, diff: u8) void {
     e.endRaw(); // raw sink: keep consistent with drlg_level so capture tools can grep both
 }
 
-/// Multi-seed capture loop: for each seed in [lo, hi] (inclusive), free and recreate
-/// all acts with that seed then dump all their levels. Runs synchronously after the
-/// first-seed dumpall pass has finished, so the game is idle (no players). Memory is
-/// stable: FreeAct returns each act's allocations to the game pool, and InitDrlgAct
-/// re-uses the same pool, so RSS stays bounded for any range size.
-///
-/// pGame->pInitSeed.nSeedLow @0x7C is what InitDrlgAct → AllocAct reads; we write it
-/// directly alongside GAME_SEED_GLOBAL so both bookkeeping paths agree on the seed.
+/// Multi-seed capture loop: for each seed in [lo, hi], free and recreate all acts with that
+/// seed then dump their levels. Runs synchronously after the first-seed dumpall pass, so the
+/// game is idle. Memory is stable: FreeAct returns allocations to the game pool and InitDrlgAct
+/// re-uses it, so RSS stays bounded for any range size. pGame->pInitSeed.nSeedLow @0x7C is what
+/// InitDrlgAct -> AllocAct reads; we write it directly alongside GAME_SEED_GLOBAL so both agree.
 fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
     log.hex2("srvtrace: DRLG seed loop", lo, hi);
     // Hold pGame->lpCriticalSection (@0x18) across the entire seed loop.
@@ -1231,22 +1198,18 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
     log.hex("srvtrace: DRLG seed loop done, seeds captured up to 0x", hi);
 }
 
-// ── Runtime CollMap (pColl) capture ──────────────────────────────────────────
-// The DRLG oracle above dumps the LAYOUT layer (D2DrlgLevelStrc/D2RoomExStrc),
-// where the runtime collision map does NOT exist yet: pColl lives on Room1, and
-// Room1 is only built when a room is ACTIVATED (AddRoomData). The direct-load
-// seed loop never activates rooms (no unit ever enters), so it cannot see pColl.
+// Runtime CollMap (pColl) capture
+// The DRLG oracle above dumps the LAYOUT layer, where the runtime collision map doesn't exist
+// yet: pColl lives on Room1, built only when a room is ACTIVATED (AddRoomData). The direct-load
+// seed loop never activates rooms, so it can't see pColl.
 //
-// This capture therefore runs on a LIVE game: once a player unit is present, we
-// walk its runtime act (pAct->pMisc->pLevelFirst), activate every room of every
-// level (AddRoomData), read Room1->pColl->pMapStart, dump it, then RemoveRoomData
-// to leave the game state untouched. This is the same walk mapreveal.zig uses for
-// the in-game automap, sourced from the SERVER player-unit hash instead of the
-// client's local player. One game covers the act(s) that game has loaded; for a
-// full multi-seed golden run one game per seed (pin the seed via the forced-seed
-// global / D2GS_DRLG_SEED). Gate: D2GS_DRLG_COLL=1. Optional D2GS_DRLG_COLL_FORCE=1
-// force-inits levels the game hasn't loaded yet (fns.InitLevel on a null-room2
-// level) for fuller coverage — off by default since forcing is the riskier path.
+// This capture runs on a LIVE game instead: once a player unit is present, walk its runtime act
+// (pAct->pMisc->pLevelFirst), activate every room of every level (AddRoomData), read
+// Room1->pColl->pMapStart, dump it, then RemoveRoomData to leave state untouched — same walk
+// mapreveal.zig uses for the automap, sourced from the SERVER player-unit hash. One game covers
+// the act(s) it loaded; for a full multi-seed golden run, one game per seed (pin via
+// D2GS_DRLG_SEED). Gate: D2GS_DRLG_COLL=1. D2GS_DRLG_COLL_FORCE=1 force-inits unloaded levels
+// for fuller coverage — off by default as the riskier path.
 
 const UNITLIST_OFF: usize = 0x1120; // D2GameStrc.pUnitList[5][128]; type 0 = players
 const COLL_ROWS_BUDGET: u32 = 20000; // cells per drlg_coll line (row-strip), keeps EventN(131072) from overflowing
@@ -1473,7 +1436,7 @@ fn pinDrlgSeed() void {
     log.hex("srvtrace: DRLG game seed pinned to 0x", seed);
 }
 
-// ── hook framework ───────────────────────────────────────────────────────────
+// hook framework
 
 /// Where a captured value comes from at function entry. `.stack` is the original
 /// [esp+k] BEFORE the shim pushed anything (we correct for pushal/pushfl + our own
@@ -1568,7 +1531,7 @@ fn TraceHook(comptime h: Hook) type {
     };
 }
 
-// ── trace points ─────────────────────────────────────────────────────────────
+// trace points
 // 1.14d retail addresses (base 0x400000); `prologue` = verified relocatable bytes.
 // Keep to DISCRETE actions — never per-frame/per-unit AI ticks.
 const hooks = [_]Hook{

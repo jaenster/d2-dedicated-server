@@ -48,14 +48,10 @@ fn parseIp4(text: []const u8) ![4]u8 {
 
 /// Stop a write to a hung-up peer from killing the process.
 ///
-/// The default disposition of SIGPIPE is to terminate, and a network server writes to closed
-/// sockets constantly — it is the normal shape of a client that walked away mid-reply. Left
-/// unhandled it exits 141 with nothing in the log, which reads as a crash and gets blamed on
-/// whatever the last connection happened to be doing. With it ignored, `write` returns EPIPE and
-/// the existing error paths handle it.
-///
-/// Every server here calls this before it listens, so a new one that forgets is the exception
-/// rather than the rule.
+/// SIGPIPE defaults to terminate, and a network server writes to closed sockets constantly — the
+/// normal shape of a client that walked away mid-reply. Unhandled it exits 141 silently, which
+/// reads as a crash. Ignored, `write` returns EPIPE and the existing error paths handle it. Every
+/// server here calls this before it listens.
 pub fn ignoreBrokenPipes() void {
     const act: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.IGN },

@@ -1,13 +1,7 @@
-//! Bindings into 1.14d Game.exe's built-in dedicated-server engine.
-//!
-//! All addresses are absolute in the Game.exe 1.14d image (image base 0x00400000,
-//! no ASLR). We still rebase off the actual module base defensively in case the
-//! loader ever relocates the image.
-//!
-//! Source of truth: a decompiled/reconstructed map of retail 1.14d Game.exe
-//! (D2Game/Game/Server.cpp, Fog/QServer/*, D2Client/ClientModeInGame.cpp).
-//! Every address tagged `// VERIFIED` was cross-checked against the
-//! reconstruction or disassembly of the retail binary — see VERIFY.md.
+//! Bindings into 1.14d Game.exe's built-in dedicated-server engine. Addresses are absolute in
+//! the Game.exe 1.14d image (base 0x00400000, no ASLR); rebased off the actual module base
+//! defensively. Source: decompiled/reconstructed retail 1.14d Game.exe (D2Game/Game/Server.cpp,
+//! Fog/QServer/*, D2Client/ClientModeInGame.cpp). `// VERIFIED` = cross-checked, see VERIFY.md.
 
 const std = @import("std");
 const feature = @import("feature.zig");
@@ -34,7 +28,7 @@ fn stdcall(comptime abs_addr: usize, comptime Fn: type) *const Fn {
     return @ptrFromInt(at(abs_addr));
 }
 
-// ── enums (src/d2_enums.h) ──────────────────────────────────────────────────
+// enums (src/d2_enums.h)
 pub const ConnectionType = enum(u32) {
     server = 0, // CONNECTIONTYPE_SERVER       — dedicated D2GS path
     singleplayer = 1,
@@ -49,7 +43,7 @@ pub const GameType = enum(u32) {
     bnet_internal = 4,
 };
 
-// ── verified function bindings ──────────────────────────────────────────────
+// verified function bindings
 // D2Game/Game/Server.cpp
 
 /// Allocate + wire the QServer (port 0xfa0 = 4000) with the D2Game packet
@@ -59,13 +53,10 @@ pub fn QSERVER_CreateAndInit(conn: ConnectionType, game: GameType) void {
     stdcall(0x0052b7a0, fn (u32, u32) callconv(StdcallConv) void)(@intFromEnum(conn), @intFromEnum(game)); // VERIFIED
 }
 
-/// void NET_SetPlayersCount(int) — despite the name, the one thing this sets is
-/// D2QServerStrc.nPerIpConnectionLimit, which QServerNT's accept path spends three ways:
-/// `IsPerIpLimitReached` refuses the (n+1)th concurrent connection from one address,
-/// `CheckIpConnectionRate` fails past `n * 2 + 3` attempts from it inside 15 seconds, and failing
-/// that calls `BanIpAddress`. A NEGATIVE value turns off all three (`IsPerIpLimitReached` returns
-/// false on `< 0`, `CheckIpConnectionRate` only runs its window on `> 0`), which is why the
-/// argument is signed here.
+/// void NET_SetPlayersCount(int) — despite the name, sets D2QServerStrc.nPerIpConnectionLimit.
+/// QServerNT's accept path uses it three ways: `IsPerIpLimitReached` refuses the (n+1)th
+/// connection from one address, `CheckIpConnectionRate` fails past `n*2+3` attempts in 15s, then
+/// `BanIpAddress`. Negative disables all three, hence the signed argument.
 pub fn NET_SetPlayersCount(n: i32) void {
     stdcall(0x0052b250, fn (i32) callconv(StdcallConv) void)(n); // VERIFIED
 }
@@ -100,11 +91,9 @@ pub fn QSERVER_DispatchAndCleanup(pn: usize, n: u32) void {
     _ = stdcall(0x0052fd90, fn (usize, u32) callconv(StdcallConv) u32)(pn, n); // VERIFIED 0052fd90
 }
 
-/// Create a battle.net (realm) game in the engine. Requires gpQServerGameState
-/// (set by the bootstrap). `flags` (eD2ArenaFlags) encodes difficulty in bits
-/// 12-14, expansion via ARENAFLAG_Expansion, gametype in bit 21. `p_game_id` is
-/// an OUT pointer that receives the server token (the gameid) — must NOT be null.
-/// Returns 1 on success (and *p_game_id set), 0 on failure.
+/// Create a battle.net (realm) game. Requires gpQServerGameState (set by bootstrap). `flags`
+/// (eD2ArenaFlags) encodes difficulty bits 12-14, expansion via ARENAFLAG_Expansion, gametype
+/// bit 21. `p_game_id` OUT pointer receives the gameid — must NOT be null. Returns 1/0 ok/fail.
 ///   BOOL GAME_CreateBattleNetGame(name, pass, desc, flags, template, reserved, ladder, WORD* pGameId)
 pub fn GAME_CreateBattleNetGame(
     name: ?[*:0]const u8,
@@ -129,22 +118,19 @@ pub fn GAME_CreateBattleNetGame(
     );
 }
 
-// eD2ArenaFlags bits used by GAME_CreateBattleNetGame (VERIFIED from the
-// eD2ArenaFlags enum). GAME_CreateBattleNetGame sets pGame->bExpansion =
-// (flags & ARENAFLAG_Expansion) != 0; a char with the expansion status bit can
-// only join an expansion game (else error 0x18), so this bit MUST be right.
-/// Bit 2 gates UpdateClients (ARENA_GetClientUpdateFlag = (eArenaFlags>>2)&1);
-/// must be set or ticking the game asserts.
+// eD2ArenaFlags bits used by GAME_CreateBattleNetGame (VERIFIED). Sets pGame->bExpansion =
+// (flags & ARENAFLAG_Expansion) != 0; an expansion-status char can only join an expansion game
+// (else error 0x18), so this bit MUST be right.
+/// Bit 2 gates UpdateClients (ARENA_GetClientUpdateFlag = (eArenaFlags>>2)&1); must be set or
+/// ticking the game asserts.
 pub const ARENAFLAG_ClientUpdate: u32 = 0x04;
 pub const ARENAFLAG_Hardcore: u32 = 0x800; // 2048
 pub const ARENAFLAG_Expansion: u32 = 0x10_0000; // 1048576
-// Bit 21 -> pGame->eGameType (GAME_CreateBattleNetGame: eGameType = (flags>>0x15)&1).
-// Setting it marks the game NOT single-player, which would make the 0x01 GameFlags packet
-// tell the client to render online NPC positions (e.g. Deckard Cain by the Act 5 waypoint).
-// BUT it also routes CLIENT_LoadCharacterAndSendGameData down a different validation branch
-// that refuses the join with nReason 0x19 (verified live: flag on -> every join refused;
-// flag off -> joins succeed). So leave it CLEAR until that char-load path is understood —
-// a working join beats Cain's cosmetic position.
+// Bit 21 -> pGame->eGameType (eGameType = (flags>>0x15)&1). Setting it marks the game NOT
+// single-player (0x01 GameFlags packet renders online NPCs, e.g. Cain by the Act 5 waypoint),
+// BUT also routes CLIENT_LoadCharacterAndSendGameData into a branch that refuses joins with
+// nReason 0x19 (verified live: on -> all joins refused, off -> joins succeed). Leave CLEAR
+// until that char-load path is understood — a working join beats Cain's cosmetic position.
 pub const ARENAFLAG_Multiplayer: u32 = 0x20_0000; // 2097152 (bit 21) — intentionally NOT set
 pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
     var f: u32 = @as(u32, difficulty) << 12; // difficulty in bits 12-14
@@ -154,7 +140,7 @@ pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
     return f;
 }
 
-// ── realm communication (D2CS / D2DBS bridge) ───────────────────────────────
+// realm communication (D2CS / D2DBS bridge)
 // The GS calls back into this table to talk to the realm/database — same model
 // as the 1.13 D2GS↔D2CS↔D2DBS. We implement the slots we need and register the
 // table with SetupAsBnetServer; until then BattleNetServerService is null and
@@ -227,11 +213,10 @@ pub fn QSERVER_InitializeServerState() void {
     stdcall(0x00530690, fn () callconv(StdcallConv) void)(); // VERIFIED 0053 0690
 }
 
-/// Load + compile all D2Common data tables (txt/bin) — items, monsters, missiles,
-/// skills, levels, etc. Game creation (RollSeed/Alloc*Control) needs these. The
-/// client app-mode entry normally calls this; for a server-only boot we call it
-/// ourselves. pMemory=0 is what retail passes (memory manager uses its pool id).
-/// Depends on the memory managers + string tables already being initialized.
+/// Load + compile all D2Common data tables (items, monsters, missiles, skills, levels, etc.).
+/// Game creation (RollSeed/Alloc*Control) needs these. Client app-mode normally calls this; for
+/// a server-only boot we call it ourselves. pMemory=0 matches retail. Depends on memory
+/// managers + string tables already being initialized.
 ///   void TXT_InitTxtFiles(D2PoolManagerStrc*, int nZero2, int bGametypeIsOBNetHost)
 pub fn TXT_InitTxtFiles(p_mem: usize, n_zero2: u32, b_obnet_host: u32) void {
     stdcall(0x00619300, fn (usize, u32, u32) callconv(StdcallConv) void)(p_mem, n_zero2, b_obnet_host); // VERIFIED 0061 9300
@@ -246,7 +231,7 @@ pub fn SUNITPROXY_InitAllNpcItemTables() void {
     stdcall(0x00536f80, fn () callconv(StdcallConv) void)(); // VERIFIED 0053 6f80
 }
 
-// ── engine globals (static, retail addresses; base 0x400000, no ASLR) ────────
+// engine globals (static, retail addresses; base 0x400000, no ASLR)
 // From zig-output/data/data_symbols.json.
 pub const globals = struct {
     /// D2QServerGameStateStrc (104 bytes) — the server game-state struct.
@@ -282,23 +267,20 @@ pub fn bootstrapRealmServer(realm: ?*const BnetServerService) void {
     if (realm) |t| SetupAsBnetServer(t);
     QSERVER_CreateAndInit(.server, .bnet); // allocs pQServer, opens :4000 listener
     // Every client reaches this GS through d2ingress, so the engine sees ONE peer address for the
-    // whole realm. Stock 8 therefore caps the entire server at eight concurrent connections and
-    // bans its own gateway at twenty joins per fifteen seconds — and it refuses by closing the
-    // socket straight after accepting it, with nothing written, so a client is left holding an
-    // established connection that answers nothing. Indistinguishable from a game that was never
-    // created, which is what made it expensive to find.
+    // whole realm. Stock 8 caps the entire server at eight connections and bans the gateway at
+    // twenty joins/15s — refusing by closing the socket right after accept with nothing written,
+    // indistinguishable from a game that was never created (expensive to find).
     NET_SetPlayersCount(PER_IP_UNLIMITED);
     NET_HACK_SetUseQServerHack(0);
     QSERVER_SetGlobalInstance(@ptrFromInt(at(globals.gQServerGameState)), 1); // cookie≠0 → no halt
     gptr(globals.gbQServerRunning, u32).* = 1;
     QSERVER_InitializeServerState();
     memstat.phase("mem: after QSERVER init (KB, +KB):");
-    // Game-data tables load AFTER server-state init. Loading them BEFORE the whole server
-    // bootstrap (the retail app-mode order) corrupts pool state and breaks the network join
-    // path (tables load into a NULL pool because the 52-entry LoadDataForGame init never ran).
-    // So keep the proven post-init order — but QSERVER_InitializeServerState's NPC-vendor table
-    // build (SUNITPROXY_InitAllNpcItemTables) ran with MonStats unloaded and bailed, leaving
-    // vendors empty. Re-run it here, now that the data is loaded, to populate the vendor tables.
+    // Game-data tables load AFTER server-state init: loading them BEFORE (the retail app-mode
+    // order) corrupts pool state and breaks join (tables load into a NULL pool, the 52-entry
+    // LoadDataForGame init never ran). Keep this order, but QSERVER_InitializeServerState's
+    // NPC-vendor build (SUNITPROXY_InitAllNpcItemTables) then ran with MonStats unloaded and
+    // bailed, leaving vendors empty — re-run it here now that data is loaded.
     TXT_InitTxtFiles(0, 0, 1);
     memstat.phase("mem: after TXT_InitTxtFiles (KB, +KB):");
     SUNITPROXY_InitAllNpcItemTables();

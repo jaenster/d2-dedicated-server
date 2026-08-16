@@ -1,13 +1,9 @@
-//! Deferred injection of blizzhackers D2BS.dll (kolbot's bot engine).
+//! Deferred injection of blizzhackers D2BS.dll (kolbot's bot engine). Enabled by `--d2bs <winpath>`.
 //!
-//! D2BS ships with its own loader that injects into an ALREADY-RUNNING D2 with a
-//! valid game window (`d2bs --inject <pid>` — see d2bs/HISTORY.txt; the startup
-//! thread calls FindWindowW and reads engine globals at once). LoadLibrary'ing it
-//! at DLL_PROCESS_ATTACH (before WinMain / before the window exists) makes that
-//! startup thread throw an uncaught C++ exception (0xe06d7363) and kill Game.exe.
-//!
-//! So we mirror the loader: a thread polls FindWindowA(NULL, "Diablo II") and only
-//! LoadLibrary's D2BS once the window is up. Enabled by `--d2bs <winpath>`.
+//! D2BS's own loader expects an ALREADY-RUNNING D2 with a valid window (its startup thread calls
+//! FindWindowW and reads engine globals at once). LoadLibrary at DLL_PROCESS_ATTACH (before the
+//! window exists) throws an uncaught C++ exception (0xe06d7363) and kills Game.exe. So mirror the
+//! loader: poll FindWindowA(NULL, "Diablo II") on a thread and LoadLibrary only once it's up.
 
 const std = @import("std");
 const log = @import("../log.zig");

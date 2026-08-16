@@ -1,15 +1,10 @@
-//! d2gs.dll — injected payload that boots 1.14d Game.exe as a headless dedicated
-//! game server by driving the engine's built-in QServer/D2Game code.
+//! d2gs.dll — injected payload that boots 1.14d Game.exe as a headless dedicated game server by
+//! driving the engine's built-in QServer/D2Game code.
 //!
-//! Loaded into the live Game.exe process by a dbghelp.dll proxy that
-//! LoadLibrary's it via `--loaddll <winpath>`. Flags:
-//!   --d2gs        attach + log (safe; proves injection)
-//!   --d2gs-boot   ALSO run the engine bootstrap + tick loop (calls into the
-//!                 real engine — only safe once init timing is confirmed; this
-//!                 is intentionally separate so the injection test can't crash
-//!                 the host)
-//!
-//! Run with `--headless` so no renderer/window is created.
+//! Loaded by a dbghelp.dll proxy via `--loaddll <winpath>`. `--d2gs` attaches + logs (safe, proves
+//! injection); `--d2gs-boot` also runs the engine bootstrap + tick loop (only safe once init timing
+//! is confirmed — kept separate so the injection test can't crash the host). Run with `--headless`
+//! so no renderer/window is created.
 
 const std = @import("std");
 const win = std.os.windows;
@@ -401,21 +396,15 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         d2cs.start(gs_public_ip, gs_public_port, gs_max_games, gsid);
     }
 
-    // Idle fast-path: the engine's per-tick server work (packet handling + stepping
-    // every game) runs flat-out even with zero games — pure overhead that pegs ~0.7
-    // of a core on the cluster. When no game is live we skip it and the GS idles like
-    // a bare Sleep loop. The control path (command/realm) is still pumped every tick,
-    // so a realm CREATEGAME runs and bumps d2cs's live count (set at create, before
-    // the join) — we resume full ticking before the joining client ever connects.
+    // Idle fast-path: the engine's per-tick server work runs flat-out even with zero games (~0.7
+    // core of pure overhead), so we skip it when idle and idle like a bare Sleep loop. The
+    // control path (command/realm) still pumps every tick, so a realm CREATEGAME bumps d2cs's
+    // live count (set at create, before join) and full ticking resumes before the client connects.
     //
-    // d2cs's count covers the whole create→join→destroy span; a join-based count
-    // would deadlock (the join can't be serviced while we skip the network). Open
-    // mode has no d2cs control path (clients connect to QServer to host), so it can't
-    // be gated safely — keep full ticking there. A rare safety tick guards against a
-    // count that's ever wrong: the GS steps slowly rather than freezing.
-    // Idle pacing: retail's own loop (QSERVER_CooperativeThreadMain) sleeps 10 ms when nothing
-    // is running, so a client arriving at an empty GS is noticed promptly. The safety tick then
-    // lands at ~1 Hz, which is only there to accept and reap, not to simulate.
+    // d2cs's count spans create->join->destroy; a join-based count would deadlock (join can't be
+    // serviced while networking is skipped). Open mode has no d2cs control path, so it always
+    // ticks fully. A ~1 Hz safety tick (retail's QSERVER_CooperativeThreadMain sleeps 10ms idle)
+    // guards a count that's ever wrong by stepping slowly instead of freezing.
     const IDLE_SLEEP_MS: u32 = 10;
     const IDLE_TICKS_PER_SAFETY: u64 = 100;
     var idle_ticks: u64 = 0;

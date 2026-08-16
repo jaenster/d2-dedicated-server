@@ -1,25 +1,19 @@
-//! The pthread imports that cannot be forwarded, and why each one cannot.
+//! The pthread imports that cannot be forwarded, and why. POSIX threads port unchanged
+//! (`pthread_create`, `pthread_self`, mutex calls live in libc.zig); what cannot port is anything
+//! where the game owns the storage or reads back a constant — Darwin and Linux disagree on both:
 //!
-//! POSIX threads port across almost unchanged — `pthread_create`, `pthread_self` and the mutex
-//! calls are in libc.zig for exactly that reason. What does not port is anything where the game
-//! owns the storage or reads back a constant, because Darwin and Linux picked different sizes and
-//! different numbers for both:
+//!   pthread_cond_t       Darwin i386 28B, glibc/musl i386 48B — game allocates 28, forwarded
+//!                        init would write 20B past it.
+//!   pthread_mutex_t      Darwin i386 44B, glibc/musl i386 24B — reverse direction, so mutex
+//!                        calls DO forward (host writes inside the game's allocation).
+//!   pthread_mutexattr_t  Darwin i386 12B vs Linux 4B — forwards for the same reason.
+//!   PTHREAD_MUTEX_*      RECURSIVE=2 Darwin/1 Linux, ERRORCHECK mirrored — untranslated
+//!                        `settype` turns a recursive mutex into one that fails the 2nd lock.
+//!   sigset_t             Darwin: one 32-bit word vs host's 8 bytes; signal numbers differ too
+//!                        (SIGBUS 10 vs 7, SIGUSR1/2 30/31 vs 10/12); `how` constants also 1- vs
+//!                        0-based.
 //!
-//!   pthread_cond_t       Darwin i386 28 bytes, glibc/musl i386 48. The game allocates 28, so a
-//!                        forwarded `pthread_cond_init` writes 20 bytes into whatever follows.
-//!   pthread_mutex_t      Darwin i386 44 bytes, glibc/musl i386 24. The other way round, so the
-//!                        host writes inside the game's allocation and the mutex calls forward.
-//!   pthread_mutexattr_t  Darwin i386 12 bytes, Linux 4. Forwards for the same reason.
-//!   PTHREAD_MUTEX_*      RECURSIVE is 2 on Darwin and 1 on Linux, and ERRORCHECK is the mirror of
-//!                        that, so an untranslated `settype` turns a recursive mutex into one that
-//!                        fails the second lock.
-//!   sigset_t             Darwin's is one 32-bit word; the host reads eight bytes for the same
-//!                        argument. The signal NUMBERS differ too — SIGBUS is 10 there and 7 here,
-//!                        SIGUSR1/SIGUSR2 are 30/31 rather than 10/12 — and so do the three `how`
-//!                        constants, which Darwin counts from 1 and Linux from 0.
-//!
-//! Return values here are Darwin's errno numbers, not the host's: the game compares against its own
-//! `errno.h`, where ETIMEDOUT is 60 rather than Linux's 110.
+//! Return values are Darwin's errno numbers, not the host's (e.g. ETIMEDOUT is 60, not Linux 110).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -77,7 +71,7 @@ pub fn address(name: []const u8) ?usize {
     return null;
 }
 
-// ── condition variables ──
+// condition variables
 
 /// What the shim keeps in the game's 28 bytes: a tag and the host condvar this package owns. The
 /// object is ours, so its size is the host's and the game never sees it.
@@ -189,7 +183,7 @@ pub fn condBroadcast(cond: *anyopaque) callconv(.c) c_int {
     return if (std.c.pthread_cond_broadcast(c) == .SUCCESS) 0 else EINVAL;
 }
 
-// ── signal masks ──
+// signal masks
 
 /// Darwin's signal numbers, in host order: `darwin_signal[n - 1]` is what the host calls Darwin's
 /// signal n. The first six agree and then they part company — Darwin kept the BSD numbering, where
@@ -203,12 +197,9 @@ const darwin_signal = [31]u8{
     12, // USR2
 };
 
-/// Signals that must reach the process however the game masks them.
-///
-/// Blocking a fault is not a way of surviving one: the kernel forces the default action for a
-/// synchronous SIGSEGV that arrives blocked, which is death with no handler run and no diagnostics
-/// — the crash reporter never gets to print an address. SIGUSR2 is on the list because that is the
-/// signal it takes to produce the same trace on demand, and a trace nobody can ask for is not one.
+/// Signals that must reach the process however the game masks them. Blocking a fault doesn't
+/// survive it: the kernel forces the default action for a blocked synchronous SIGSEGV — death with
+/// no handler and no diagnostics. SIGUSR2 is included because it produces the same trace on demand.
 const never_blocked: u64 = sigbit(4) | sigbit(5) | sigbit(7) | sigbit(8) | sigbit(10) | sigbit(11) | sigbit(12);
 
 fn sigbit(host_signal: u6) u64 {
@@ -278,7 +269,7 @@ pub fn sigmask(how: c_int, set: ?*const u32, oset: ?*u32) callconv(.c) c_int {
     return 0;
 }
 
-// ── mutex attributes ──
+// mutex attributes
 
 extern fn pthread_mutexattr_settype(attr: *anyopaque, kind: c_int) c_int;
 
@@ -302,7 +293,7 @@ fn hostMutexType(darwin_kind: c_int) ?c_int {
     };
 }
 
-// ── the Darwin-only _np calls ──
+// the Darwin-only _np calls
 
 const hostSetName = switch (builtin.os.tag) {
     .linux => struct {

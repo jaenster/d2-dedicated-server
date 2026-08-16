@@ -46,12 +46,11 @@ pub const Loaded = struct {
 /// Map every segment. Nothing is executable yet and no fixup has been applied — the image is inert
 /// until `applyFixups` and `protect` have run.
 ///
-/// With a descriptor, each segment is mapped from the file rather than copied into anonymous
-/// memory, and only the pages a fixup lands on go private. That is most of the image: it is 6.1 MB
-/// across 1575 pages, the rebases and binds cluster in a few dozen of them, and everything else was
-/// being made private dirty per process for no reason. Pass -1 to copy instead — the fallback for a
-/// segment whose file offset or length is not a whole number of pages, where a mapping would either
-/// be refused or would round over the next segment.
+/// With a descriptor, each segment is mapped from the file instead of copied into anonymous memory,
+/// and only the pages a fixup lands on go private (most of the image: 6.1 MB across 1575 pages, with
+/// rebases/binds clustered in a few dozen). Pass -1 to copy instead — the fallback when a segment's
+/// file offset or length isn't a whole number of pages, where a mapping would be refused or round
+/// over the next segment.
 pub fn map(img: *const image.Image, fd: c_int) Error!Loaded {
     const page = std.heap.page_size_min;
     const span = img.span();
@@ -172,16 +171,13 @@ pub fn applyFixups(loaded: *Loaded, resolve: Resolver) Error!void {
     }
 }
 
-/// dyld runs the C++ static constructors between binding and the entry point. Nothing else does,
-/// so skipping this leaves the game's globals at zero and the first thing that reads one crashes a
-/// long way from the cause.
+/// dyld runs the C++ static constructors between binding and the entry point. Skipping this leaves
+/// the game's globals at zero and the first thing that reads one crashes far from the cause.
 ///
-/// The image's own `start` is not used to get here: it reads argc off a Darwin process stack and
-/// then does nothing with it but call PreInitApplication, so the host calls that directly rather
-/// than emulating a stack layout for the sake of a discarded loop.
-/// `trace` is called with each constructor's index and address before it runs. One of these will
-/// eventually be the last thing a crashed process did, and the caller is the only one that knows
-/// how to record that.
+/// The image's own `start` is not used to get here: it reads argc off a Darwin process stack then
+/// does nothing but call PreInitApplication, so the host calls that directly instead of emulating a
+/// stack layout for a discarded loop. `trace` gets each constructor's index and address before it
+/// runs — useful since one of these may be the last thing a crashed process did.
 pub fn runInitializers(loaded: *const Loaded, trace: ?*const fn (usize, u32) void) void {
     const sec = loaded.img.initializers() orelse return;
     const low = loaded.img.span().low;

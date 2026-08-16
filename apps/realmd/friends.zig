@@ -1,18 +1,9 @@
-//! Friend lists + presence for the realm. Per-account friend lists (who you added)
-//! and a set of currently-online accounts, so SID_FRIENDSLIST can report each friend's
-//! online/offline location. Guarded by a spinlock — bnet connections touch this from
-//! their own threads.
-//!
-//! The two halves have deliberately different lifetimes. PRESENCE is per-run by nature:
-//! who is online is a fact about live connections, and a restart makes every one of them
-//! false, so keeping it in memory is not a shortcut. The friend LIST is the opposite — a
-//! player added someone once and expects it to still be there tomorrow — so it is written
-//! through to the durable per-account key/value store on every change and read back on
-//! demand. Storing it under the same account-scoped keys the BNCS profile uses means no
-//! new schema and no new backend surface; every backend already serves it.
-//!
-//! The in-memory pair table stays as the working set so reads don't hit the store, and is
-//! seeded lazily the first time an account's list is touched after a restart.
+//! Friend lists + presence for the realm: per-account friend lists plus a set of currently-online
+//! accounts, so SID_FRIENDSLIST can report each friend's location. Spinlock-guarded — bnet
+//! connections touch this from their own threads. Different lifetimes on purpose: PRESENCE is
+//! per-run (restart clears it), the friend LIST is durable, written through to the per-account
+//! key/value store under the same account-scoped keys the BNCS profile uses. The in-memory pair
+//! table is the working set, seeded lazily on first touch after a restart.
 const std = @import("std");
 const Lock = @import("realm_infra").lock.Lock;
 const store = @import("store.zig");
@@ -219,10 +210,9 @@ pub const FriendInfo = struct {
 
 /// Snapshot `owner`'s friends into `out`, with where each one is. Returns the count.
 ///
-/// Two passes on purpose: the names come out under the friends lock, then presence is
-/// resolved with that lock RELEASED, because it lives in the chat registry behind a
-/// different lock. Holding both at once would work today and be a deadlock the first time
-/// anything took them in the other order.
+/// Two passes on purpose: names come out under the friends lock, then presence is resolved with that
+/// lock RELEASED, since it lives in the chat registry behind a different lock. Holding both would
+/// work today and be a deadlock the first time anything took them in the other order.
 pub fn list(owner: []const u8, out: []FriendInfo) usize {
     var n: usize = 0;
     {
@@ -251,7 +241,7 @@ pub fn list(owner: []const u8, out: []FriendInfo) usize {
     return n;
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
+// tests
 //
 // The durable half is not unit-tested here any more, and deliberately not faked. A friend list
 // lives in the account's profile, which is Postgres, and the only honest test of "it survives a

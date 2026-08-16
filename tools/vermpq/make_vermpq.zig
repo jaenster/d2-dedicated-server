@@ -1,15 +1,13 @@
 //! make_vermpq — build a version-check MPQ for realmd to serve over BNFTP.
 //!   make_vermpq <out.mpq> <local-dll> <archive-name>
 //!
-//! Adds the (Authenticode-signed) CheckRevision DLL into a fresh MPQ under the
-//! name the client extracts (<mpq-basename>.dll), then applies the Blizzard WEAK
-//! signature (StormLib has the factored key built in) so the client's
-//! SFILE_VerifyFileSignature accepts it. See ../../apps/realmd/assets/README.md.
-//!
-//! Links StormLib (a C library); built by build.sh via `zig build-exe`.
+//! Adds the Authenticode-signed CheckRevision DLL under the name the client extracts
+//! (<mpq-basename>.dll), then applies the Blizzard WEAK signature (StormLib's factored key)
+//! so SFILE_VerifyFileSignature accepts it. See ../../apps/realmd/assets/README.md. Links
+//! StormLib (C); built by build.sh via `zig build-exe`.
 const std = @import("std");
 
-// ── StormLib C ABI ───────────────────────────────────────────────────────────
+// StormLib C ABI
 const HANDLE = ?*anyopaque;
 const DWORD = u32;
 const BOOL = c_int;

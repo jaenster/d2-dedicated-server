@@ -1,26 +1,12 @@
-//! The Carbon Process Manager, and the two toolbox calls that stand next to it on the boot path.
+//! The Carbon Process Manager, plus the two toolbox calls the boot path can't route around: a
+//! StormMac constructor and `PreInitApplication` both query process identity before anything else.
 //!
-//! A headless server has no business in Carbon at all, so nothing is here speculatively. The process
-//! calls are here because the game reaches them: a StormMac constructor and `PreInitApplication`
-//! itself both ask who they are before doing anything else, and there is no way past that question.
+//! Identity/front/menu calls report success or "none" truthfully — a headless process has no
+//! Dock/front/menu to move, so that already is its state, and the caller treats `GetNewMBar` and
+//! `AEInstallEventHandler` results as optional anyway.
 //!
-//! All of them have an honest answer for a process with no windowing session. A serial number is an
-//! identity, and this process has exactly one to give. `TransformProcessType` and `SetFrontProcess`
-//! move an application between the Dock and the background and put it in front — a process with no
-//! Dock and no front is already where they would put it, so reporting success is describing the
-//! state, not faking it. `GetProcessInformation` and `GetProcessBundleLocation` are asked where the
-//! application lives, and the File Manager's volume root is that answer.
-//!
-//! `GetNewMBar` and `AEInstallEventHandler` are the two the caller already treats as optional: the
-//! whole menu block sits behind `if (GetNewMBar(...) != 0)` and the Apple Event results are dropped
-//! on the floor. Reporting "no menu bar" is therefore a supported outcome rather than a stub that
-//! lies, and it is why no Menu Manager exists here.
-//!
-//! The clocks and the event pump are the opposite case, and the reason they are here at all: an
-//! import whose entire job is to produce a value or to consume time cannot be answered with a bare
-//! zero. `Microseconds` and `TickCount` read as stopped clocks rather than absent ones, and
-//! `WaitNextEvent` returning without writing its record leaves the caller reading uninitialised
-//! stack — which is how a loop that intended to idle ends up spinning a core instead.
+//! `Microseconds`/`TickCount`/`WaitNextEvent` can't answer with a bare zero: those are read as a
+//! live clock or as "queue empty", and a stopped one drives the idle loop into a spin instead.
 
 const std = @import("std");
 const files = @import("files.zig");
@@ -302,17 +288,13 @@ fn reportNullEvent(event: ?*EventRecord) void {
     };
 }
 
-/// The call the event pump is built around, and the second import with no honest zero answer. The
-/// generic thunk returns 0 without touching the record, and `MACSETUP_RunEventLoop` loops until
-/// `what` is zero — so the pump's exit condition was reading uninitialised stack.
+/// The event pump's core call; a generic stub returning 0 without touching the record left
+/// `MACSETUP_RunEventLoop` (which loops until `what` is zero) reading uninitialised stack.
 ///
-/// `sleep` is a tick budget: permission to block that long waiting for an event. Nothing in this
-/// process can ever queue one, so the entire budget is spent rather than returned from — a call
-/// that was asked to wait and came back instantly is the shape that turns a paced loop into a spin.
-/// At `sleep == 0` the call is defined as non-blocking and must not add a delay of its own; the
-/// callers that pass 0 do their own pacing (`UI_DISPLAY_RunEventLoop` sleeps out the rest of its
-/// 40 ms frame, `CLIENTMODE_RunFrameLoop` sleeps 10 ms), and stalling here would throttle the game
-/// loop instead of the idle one.
+/// `sleep` is a tick budget to block waiting for an event; since nothing ever queues one, the full
+/// budget is spent. At `sleep == 0` the call must not add its own delay — callers that pass 0 pace
+/// themselves (`UI_DISPLAY_RunEventLoop` sleeps out its 40ms frame remainder, `CLIENTMODE_RunFrameLoop`
+/// sleeps 10ms), so stalling here would throttle the game loop instead of the idle one.
 pub fn waitNextEvent(eventMask: u16, event: ?*EventRecord, sleep: u32, mouseRgn: ?*anyopaque) callconv(.c) u8 {
     _ = .{ eventMask, mouseRgn };
     if (sleep != 0) {
@@ -323,25 +305,15 @@ pub fn waitNextEvent(eventMask: u16, event: ?*EventRecord, sleep: u32, mouseRgn:
     return 0;
 }
 
-/// Why a correct `WaitNextEvent` is still not enough to idle, and what this does about it.
+/// Why a correct `WaitNextEvent` alone doesn't idle: the menu loop never reaches its own sleep. It
+/// sits in `if (SEVENT_ProcessNextMessage(..) == 0)` and only sleeps in the "no message" arm, but
+/// Storm's queue reports a message every pass (an elapsed timer is re-reported until consumed, and
+/// nothing headless ever consumes it) — measured at 1.15M iterations/sec, all through here.
 ///
-/// The loops that drive this pump all pace themselves — `CLIENTMODE_RunFrameLoop` sleeps 10 ms per
-/// frame, `UI_DISPLAY_RunEventLoop` sleeps out the remainder of a 40 ms one — so on paper there is
-/// nothing here to fix. The menu loop never reaches its sleep. It sits in
-/// `if (SEVENT_ProcessNextMessage(..) == 0)`, and the sleep is in the "no message" arm; Storm's
-/// queue reports a message on every single pass, because a timer whose period has elapsed is
-/// re-reported until something consumes it and nothing headless ever does. Measured, that loop ran
-/// 1.15 million iterations a second, all of them through here, none of them reaching a sleep.
-///
-/// Fixing that where it actually lives means changing Storm's timer semantics, which is a much
-/// larger and riskier change than the one symptom warrants. So the throttle goes here instead, and
-/// the thing it must not do is throttle a loop that was pacing itself correctly — the game loop has
-/// to stay fast. The tell is the gap between calls, not the fact that there was no event: a caller
-/// that slept a frame comes back milliseconds later, a caller in a tight loop comes back in under a
-/// microsecond. Only a run of the latter earns a sleep, and one paced call resets it.
-///
-/// Single-threaded state by construction: the event pump is the main thread's, and this is only
-/// ever reached from it. A race would cost one extra millisecond of sleep, not correctness.
+/// Fixing Storm's timer semantics is riskier than the symptom warrants, so the throttle lives here
+/// instead. It must not catch correctly-paced loops (game loop must stay fast): the tell is the gap
+/// between calls — a paced caller returns ms later, a spinning one in under a microsecond. Only a
+/// run of sub-microsecond calls earns a sleep; single-threaded by construction (main thread only).
 var last_call_us: u64 = 0;
 var spin_run: u32 = 0;
 

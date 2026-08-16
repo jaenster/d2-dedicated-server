@@ -1,13 +1,12 @@
 //! What one server tick costs, against how many games are live.
 //!
-//! `QSERVER_TickAllGames` steps EVERY game on this process on ONE thread, and D2 logic runs at
-//! 25 fps — so the budget for a whole tick is 40 ms no matter how many games share it. That
-//! makes CPU, not memory, the thing most likely to cap games per process: raising Fog's
-//! eight-manager ceiling buys nothing if seven games already eat the frame.
+//! `QSERVER_TickAllGames` steps EVERY game on ONE thread; D2 logic runs at 25 fps, so the
+//! budget for a whole tick is 40 ms no matter how many games share it — CPU, not memory, is
+//! the likely cap on games per process (raising Fog's eight-manager ceiling buys nothing if
+//! seven games already eat the frame).
 //!
-//! So measure before cutting into the allocator. This reports average and worst tick time per
-//! game count, which extrapolates directly: if N games cost T ms, the ceiling is where T hits
-//! 40 ms.
+//! Reports average/worst tick time per game count, which extrapolates directly: if N games
+//! cost T ms, the ceiling is where T hits 40 ms.
 
 const std = @import("std");
 const log = @import("../log.zig");

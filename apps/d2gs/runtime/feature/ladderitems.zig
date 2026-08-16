@@ -1,14 +1,11 @@
-//! Enable ladder-only content (runewords, cube recipes, unique items) in our realm,
-//! regardless of a game's ladder flag. Ported from Charon's TxtOverride.cpp.
-//!
-//! The engine builds each TXT table via CompileTxt @0x6122f0 (a.k.a. CreateTxtTableArray,
-//! __stdcall(pMemory, szTableName, pBinFieldInput, int* nTxtTableSize, nLineLength) ->
-//! table*). We JMP its entry to a stdcall intercept that runs the original through a
-//! relocated-prologue stub, then clears the ladder gate on the rows it just built:
+//! Enable ladder-only content regardless of a game's ladder flag. Ported from Charon's
+//! TxtOverride.cpp. CompileTxt @0x6122f0 (a.k.a. CreateTxtTableArray, __stdcall(pMemory,
+//! szTableName, pBinFieldInput, int* nTxtTableSize, nLineLength) -> table*) is JMP'd to a stdcall
+//! intercept: run the original through a relocated-prologue stub, then clear the ladder gate on the
+//! rows it built (offsets verified against the 1.14d structs, Ghidra session 62fbfe69):
 //!   runes        D2RuneTableStrc   (288B)  server @129  -> 0   (runeword usable off-ladder)
 //!   cubemain     D2CubeMainTxt     (328B)  nLadder @1   -> 0   (recipe usable off-ladder)
 //!   uniqueitems  D2UniqueItemsTxt  (332B)  flags @44 bit3(0x08) cleared (unique usable off-ladder)
-//! Offsets verified against the 1.14d structs (Ghidra session 62fbfe69).
 const std = @import("std");
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");

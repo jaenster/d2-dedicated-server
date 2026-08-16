@@ -1,14 +1,11 @@
-//! In-world collision-diff overlay (debug maphack). At every subtile where our
-//! CLEAN-ROOM collision map (libd2) disagrees with the real engine's CollMap for
-//! SEED 1, draws a colored dot on the automap AND a colored iso outline on the
-//! ground near the player, plus a HUD line with this level's mismatch count and
-//! the world-delta to the nearest cell (sparse cells are walkable-to that way).
-//! At seed 1 the game's live collision equals the golden the diff was baked
-//! against, so a lit cell is a real bug in our reconstruction.
+//! In-world collision-diff overlay (debug maphack). At every subtile where our clean-room
+//! collision map (libd2) disagrees with the real engine's CollMap for SEED 1, draws a colored
+//! dot on the automap and a colored iso outline near the player, plus a HUD line with the
+//! level's mismatch count and world-delta to the nearest cell. At seed 1 the game's live
+//! collision equals the golden the diff was baked against, so a lit cell is a real bug.
 //!
-//! Data: colldiff.bin — u32 count, then sorted records {level:u16, x:u16, y:u16,
-//! type:u8} (LE), generated offline from the ours-vs-golden diff (steady-state
-//! all-rooms-active goldens). ONLY valid for seed 1.
+//! Data: colldiff.bin — u32 count, then sorted records {level:u16, x:u16, y:u16, type:u8} (LE),
+//! generated offline from the ours-vs-golden diff. ONLY valid for seed 1.
 const std = @import("std");
 const d2 = struct {
     const functions = @import("../../engine/d2/functions.zig");

@@ -1,19 +1,14 @@
 //! The Mac File Manager, backed by ordinary Linux files.
 //!
-//! HFS addresses a file as (volume, directory id, leaf name) rather than by path, so the shim has to
-//! own the mapping between the two. There is one volume here, its root is the process working
-//! directory, and a directory id is an index into a table of absolute paths. Nothing else in the
-//! model is invented: `FSSpec` is read field by field by Storm and copied into parameter blocks, so
-//! it keeps Carbon's 68k packing exactly.
+//! HFS addresses a file as (volume, directory id, leaf name), not by path, so the shim owns that
+//! mapping: one volume rooted at the process working directory, directory id = index into a table
+//! of absolute paths. `FSSpec` is read field-by-field by Storm into parameter blocks, so it keeps
+//! Carbon's 68k packing exactly; `FSRef` is opaque by contract, so it's just a magic word + the
+//! same table index.
 //!
-//! `FSRef` is the opposite case — opaque by contract, never inspected — so it carries a magic word
-//! and the same table index.
-//!
-//! Two things that look out of place are here because they are the same model seen from another
-//! angle. `CFURLCreateFromFSRef`/`CFURLGetFileSystemRepresentation` are the FSRef-to-path leg of the
-//! working-directory lookup and have nothing to do with the rest of Core Foundation. The Resource
-//! Manager entries are here because a resource fork does not exist on Linux: a resource file is a
-//! plain file, and a resource refnum is a file refnum.
+//! `CFURLCreateFromFSRef`/`GetFileSystemRepresentation` are the FSRef-to-path leg of that lookup
+//! (unrelated to Core Foundation otherwise). Resource Manager entries exist because a resource
+//! fork doesn't exist on Linux: a resource file is a plain file, a resource refnum is a file refnum.
 
 const std = @import("std");
 
@@ -74,7 +69,7 @@ pub fn address(name: []const u8) ?usize {
     return null;
 }
 
-// ── the volume ──
+// the volume
 
 /// One volume, and a negative reference number because that is what a real one has: positive values
 /// are working-directory references, which this shim never hands out.
@@ -193,7 +188,7 @@ fn splitPath(path: []const u8) struct { par: i32, leaf: []const u8 } {
     return .{ .par = dirId(dir), .leaf = path[cut + 1 ..] };
 }
 
-// ── Pascal strings ──
+// Pascal strings
 
 fn pascalRead(p: [*]const u8) []const u8 {
     return p[1..][0..p[0]];
@@ -237,7 +232,7 @@ fn pascalWrite(out: []u8, text: []const u8) void {
     @memcpy(out[1..][0..n], text[0..n]);
 }
 
-// ── FSSpec and FSRef ──
+// FSSpec and FSRef
 
 /// Carbon's `#pragma options align=mac68k` puts `parID` on an odd two-byte boundary, so every field
 /// carries its own alignment: 70 bytes, not the 72 a naturally-aligned struct would be. The game
@@ -328,7 +323,7 @@ pub fn getCatalogSpec(ref: *const FSRef, out: *FSSpec) OSErr {
     return noErr;
 }
 
-// ── path resolution ──
+// path resolution
 
 const f_ok: c_uint = 0;
 
@@ -402,7 +397,7 @@ fn resolveName(start: []const u8, name: []const u8, dir_buf: []u8, leaf_buf: []u
     return .{ .dir = dir_buf[0..dir_len], .leaf = leaf_buf[0..leaf.len] };
 }
 
-// ── open files ──
+// open files
 
 const max_files = 64;
 
@@ -472,7 +467,7 @@ fn sizeOf(f: *OpenFile) u64 {
     return if (end < 0) 0 else @intCast(end);
 }
 
-// ── File Manager ──
+// File Manager
 
 /// Builds an `FSSpec` from a directory and a name. Reporting `fnfErr` for a name that does not exist
 /// yet is not a failure: the spec is filled either way, and that is exactly how every create call
@@ -766,7 +761,7 @@ fn resolveAliasFileWithMountFlags(
     return if (exists(p)) noErr else fnfErr;
 }
 
-// ── parameter blocks ──
+// parameter blocks
 
 /// `ParamBlockRec` keeps 68k packing, so four-byte fields sit on odd two-byte boundaries and the
 /// variants overlay each other. Addressing by explicit offset rather than through a struct is what
@@ -1002,7 +997,7 @@ fn pbFlushFileSync(paramBlock: ?[*]u8) callconv(.c) OSErr {
     return noErr;
 }
 
-// ── Resource Manager ──
+// Resource Manager
 
 /// The Resource Manager reports through a separate call rather than a return value, so the last
 /// result has to be kept. `PreInitApplication` checks it straight after creating its resource file
@@ -1033,7 +1028,7 @@ fn closeResFile(refNum: i16) callconv(.c) void {
     last_res_error = release(refNum);
 }
 
-// ── the FSRef-to-path leg of Core Foundation ──
+// the FSRef-to-path leg of Core Foundation
 
 const cfurl_magic: u32 = 0x4432_5552;
 

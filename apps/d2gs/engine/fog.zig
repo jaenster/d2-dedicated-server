@@ -1,13 +1,11 @@
 //! D2's own FOG memory pools, wrapped as a `std.mem.Allocator`.
 //!
-//! The point of this module is per-game lifetime: each D2 game has its own FOG
-//! pool, so allocating a feature's state from *that game's* pool binds the state
-//! to the game — when the engine tears the game's pool down, the memory is freed
-//! and any `registerCleanup` callback fires. That's how a feature "hangs data on
-//! the game" without tracking lifetimes by hand.
+//! Per-game lifetime: each D2 game has its own FOG pool, so allocating a feature's state from *that
+//! game's* pool binds the state to the game — when the engine tears the pool down the memory is
+//! freed and any `registerCleanup` callback fires.
 //!
-//! Ported from aether's fog_allocator.zig (was ~Zig 0.15) to this repo's 0.16:
-//! x86_* callconvs and the current `Allocator.VTable` shape (Alignment + remap).
+//! Ported from aether's fog_allocator.zig (~Zig 0.15) to 0.16: x86_* callconvs and the current
+//! `Allocator.VTable` shape (Alignment + remap).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -33,12 +31,11 @@ const ADDR_POOL_FREE: usize = 0x00409AB0; // __fastcall (this ECX, void** EDX, c
 const ADDR_POOL_REALLOC: usize = 0x0040A1F0; // __fastcall (this, void*, size, char*, i32) -> void*
 const ADDR_FREE_MEMORY_POOL: usize = 0x00409C80; // single-arg (this ECX) — the teardown hook target
 
-// Fog::Memory::Alloc/Free/Realloc are __fastcall (ECX=this, EDX=2nd arg): the size/pointer MUST
-// land in EDX. Zig's own x86 fastcall callconv is broken (ziglang/zig#10363) — declaring the fn
-// pointer `callconv(.x86_fastcall)` mis-places the 2nd arg, so the engine reads a stale register
-// as the size (a ~2GB request -> malloc fails -> POOL_AllocOverflowBlock OOM assert, Fog/Memory
-// line 904 -> headless GS dies on game entry). We build every call in inline asm via
-// fastcall_call instead, which puts arg0->ECX, arg1->EDX, the rest on the stack by hand.
+// Fog::Memory::Alloc/Free/Realloc are __fastcall (ECX=this, EDX=2nd arg): the size/pointer MUST land
+// in EDX. Zig's x86 fastcall callconv is broken (ziglang/zig#10363) — `callconv(.x86_fastcall)`
+// mis-places the 2nd arg, so the engine reads a stale register as the size (~2GB request -> malloc
+// fails -> POOL_AllocOverflowBlock OOM assert, Fog/Memory line 904 -> GS dies on game entry). Hence
+// fastcall_call inline asm: arg0->ECX, arg1->EDX, the rest on the stack by hand.
 const AllocCall = fastcall.fastcall_call(ADDR_POOL_ALLOC, fn (*D2PoolManagerStrc, usize, [*:0]const u8, i32) ?[*]BYTE);
 const FreeCall = fastcall.fastcall_call(ADDR_POOL_FREE, fn (*D2PoolManagerStrc, *?[*]BYTE, [*:0]const u8, i32) void);
 const ReallocCall = fastcall.fastcall_call(ADDR_POOL_REALLOC, fn (*D2PoolManagerStrc, ?[*]BYTE, usize, [*:0]const u8, i32) ?[*]BYTE);
@@ -74,7 +71,7 @@ pub fn getPool() ?*D2PoolManagerStrc {
     return d2gs_pool;
 }
 
-// ── pool teardown notifications ──────────────────────────────────────────────
+// pool teardown notifications
 
 const CleanupFn = *const fn (?*anyopaque) void;
 
@@ -138,7 +135,7 @@ pub fn registerCleanup(pool: *D2PoolManagerStrc, callback: CleanupFn, ctx: ?*any
     return true;
 }
 
-// ── FreeMemoryPool hook ──────────────────────────────────────────────────────
+// FreeMemoryPool hook
 // Intercept FreeMemoryPool to run cleanup callbacks before the pool is destroyed.
 
 var free_pool_trampoline: ?trampoline.Trampoline = null;
@@ -173,7 +170,7 @@ pub fn installFreePoolHook() void {
     }
 }
 
-// ── std.mem.Allocator interface ──────────────────────────────────────────────
+// std.mem.Allocator interface
 
 fn fogAlloc(pool: *D2PoolManagerStrc, n: usize, alignment: usize) ?[*]u8 {
     // FOG pools use power-of-2 bucket sizes; alignment <= word size is natural.
@@ -237,7 +234,7 @@ pub fn forPool(pool: *D2PoolManagerStrc) Allocator {
     return .{ .ptr = @ptrCast(pool), .vtable = &fog_vtable };
 }
 
-// ── bootstrap allocator ──────────────────────────────────────────────────────
+// bootstrap allocator
 // Static 64KB bump for DLL_PROCESS_ATTACH, before FOG pools are available.
 
 var bootstrap_buf: [64 * 1024]u8 align(16) = undefined;

@@ -1,16 +1,10 @@
-//! ExperienceMod (server) — scale awarded experience and drive the feature
-//! framework's expAward hook. Ported from Charon's ExperienceMod.cpp (exp half;
-//! the players-count override is a separate follow-up).
+//! ExperienceMod (server) — scale awarded experience via feature.fanExpAward. Ported from
+//! Charon's ExperienceMod.cpp (exp half only).
 //!
-//! SERVER_CalculateExperienceForUnit calls CALC_Experience @0x57e3f0 at 0x57e4fa
-//! (`call`, verified recon 9df5e900). CALC_Experience is callee-clean (`ret 8`,
-//! custom-reg args: pUnit=ECX, nParam2=EAX, pGame/nParam on the stack). We replace
-//! that call with a shim that re-invokes the original with the same frame, then
-//! scales the result and threads it through feature.fanExpAward.
-//!
-//! The whole wrap lives on the stack (no globals): save pUnit, re-push the two
-//! stack args for the original call, restore, then call our cdecl scaler and
-//! `ret 8` ourselves (matching CALC's callee-clean contract).
+//! SERVER_CalculateExperienceForUnit calls CALC_Experience @0x57e3f0 at 0x57e4fa (verified
+//! recon 9df5e900), callee-clean `ret 8` with custom-reg args (pUnit=ECX, nParam2=EAX,
+//! pGame/nParam on stack). The call is replaced with a shim that re-invokes the original,
+//! scales the result, fans it out, and `ret 8`s itself to match CALC's contract.
 const std = @import("std");
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");

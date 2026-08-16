@@ -1,42 +1,14 @@
 //! Feature registry — d2gs's Charon-style extensibility surface, Zig-native.
 //!
-//! A *feature* is just a module (namespace). It opts into a hook by declaring a
-//! `pub fn` of that name — there is no base type to inherit and no vtable:
-//! dispatch is a comptime `inline for` over `registry` that calls `f.mod.<hook>(...)`
-//! only on the features that declare it (`@hasDecl`). "Overriding" a hook = declaring
-//! the function; the default is to not declare it. This is the Zig analog of
-//! Charon's `Feature` virtuals.
+//! A *feature* is a module that opts into a hook by declaring a `pub fn` of that name — no base
+//! type or vtable; a comptime `inline for` over `registry` calls `f.mod.<hook>(...)` only where
+//! `@hasDecl` finds it (Zig analog of Charon's `Feature` virtuals). Modules stay pure behaviour;
+//! all config (name/flag/default) lives in the `registry` table below. `enabled[i]` gates dispatch
+//! at runtime, settable via setEnabled().
 //!
-//! Feature modules stay PURE — they contain only behaviour (`install()` + hooks).
-//! All config (name, toggle flag, default state) lives in ONE place: the `registry`
-//! table below. That table is the single source of truth for "what features exist
-//! and how they're toggled".
-//!
-//! Features are runtime-toggleable: `enabled[i]` gates every dispatch, settable by
-//! name via setEnabled() (from flags now, realm/redis config later).
-//!
-//! ── Hook contract (a feature declares any subset) ────────────────────────────
-//!   Lifecycle:
-//!     pub fn install() void              // apply byte-patches / set up (gated by enabled)
-//!     pub fn postInit() void             // after engine init completes
-//!     pub fn deinit() void
-//!   Client frame loops (driven by runtime/gameloop.zig):
-//!     pub fn gameFrame() void            // each in-game frame
-//!     pub fn oogFrame() void             // each out-of-game (menu) frame
-//!   Dedicated-server domain (driven by engine/server.zig + runtime/pkttrace.zig):
-//!     pub fn serverTick() void                        // each server tick
-//!     pub fn gameCreate(ctx: *const GameCtx) void     // a game was created
-//!     pub fn gameDestroy(ctx: *const GameCtx) void    // a game is being torn down
-//!     pub fn gameServerLoop(ctx: *const GameCtx) void // per-game, per-tick
-//!     pub fn roomInit(ctx: *const GameCtx, room: *anyopaque) void
-//!     pub fn expAward(ctx: *const GameCtx, unit: *anyopaque, exp: u32) u32 // transform: return new exp
-//!     pub fn itemRoll(ctx: *const GameCtx, item: *anyopaque) void // an item finished generating
-//!     pub fn packetIn(bytes: []const u8) bool         // false = consume (stop dispatch)
-//!     pub fn packetOut(bytes: []const u8) void
-//!     pub fn playerJoin(ctx: *const GameCtx, client: u32) void
-//!     pub fn playerLeave(ctx: *const GameCtx, client: u32) void
-//!
-//! See runtime/template.zig for a copy-paste starting point.
+//! Hooks: install/postInit/deinit; gameFrame/oogFrame (client, via gameloop.zig); serverTick/
+//! gameCreate/gameDestroy/gameServerLoop/roomInit/expAward/itemRoll/packetIn/packetOut/playerJoin/
+//! playerLeave (server domain). See runtime/template.zig for signatures + a starting point.
 
 const std = @import("std");
 const fog = @import("fog.zig");
@@ -129,7 +101,7 @@ pub fn applyFlags(comptime hasFlag: anytype) void {
     }
 }
 
-// ── lifecycle dispatch ───────────────────────────────────────────────────────
+// lifecycle dispatch
 
 /// Run each enabled feature's install() (byte-patches / setup). Call once at
 /// process attach, after flags have set the enable bits. `server` is true only
@@ -157,7 +129,7 @@ pub fn deinitAll() void {
     }
 }
 
-// ── client frame dispatch ────────────────────────────────────────────────────
+// client frame dispatch
 
 pub fn fanGameFrame() void {
     inline for (registry, 0..) |f, i| {
@@ -171,10 +143,9 @@ pub fn fanOogFrame() void {
     }
 }
 
-// ── client draw dispatch (driven by runtime/drawing.zig) ─────────────────────
-// Only the automap hooks have a driver so far; the rest of Charon's draw surface
-// (gameUnitPreDraw/PostDraw, gamePostDraw, oogPostDraw, allPostDraw, allFinalDraw,
-// preDraw) lands with the full Drawing driver when a feature needs it.
+// client draw dispatch (driven by runtime/drawing.zig). Only the automap hooks have a driver so
+// far; the rest of Charon's draw surface (gameUnitPreDraw/PostDraw, gamePostDraw, oogPostDraw,
+// allPostDraw, allFinalDraw, preDraw) lands with the full Drawing driver when a feature needs it.
 
 /// Just before the engine renders the automap (good place to inject cells).
 pub fn fanGameAutomapPreDraw() void {
@@ -198,7 +169,7 @@ pub fn fanGamePostDraw() void {
     }
 }
 
-// ── server domain dispatch ───────────────────────────────────────────────────
+// server domain dispatch
 
 pub fn fanServerTick() void {
     inline for (registry, 0..) |f, i| {

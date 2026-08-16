@@ -1,9 +1,6 @@
-//! Server-side diagnostic feature — the first consumer of the server hook surface
-//! (engine/feature.zig). Off unless `--srvdiag`. Logs server lifecycle events and
-//! demonstrates hanging per-game state on the game's own FOG pool.
-//!
-//! Pure feature module: no engine byte-hooks of its own. The fan-out drivers
-//! (engine/server.zig tick(), the per-game loop) call these.
+//! Server-side diagnostic feature (engine/feature.zig consumer). Off unless `--srvdiag`. Logs
+//! server lifecycle events and hangs per-game state on the game's own FOG pool. No engine
+//! byte-hooks of its own: the fan-out drivers (engine/server.zig tick(), per-game loop) call these.
 const std = @import("std");
 const log = @import("../../log.zig");
 const GameCtx = @import("../../engine/ctx.zig").GameCtx;

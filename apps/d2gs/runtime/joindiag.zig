@@ -1,10 +1,8 @@
 //! Join diagnostics — log why the engine refuses a join.
 //!
-//! When CLIENT_LoadCharacterAndSendGameData fails, NET_D2GS_SERVER_SrvJoinAct
-//! sends 0xB4 ConnectionRefused(nClientId, nReason) and cleans the client up. We
-//! intercept that call site to log nReason (the load-error code) before letting
-//! the original send proceed, so a refused join tells us exactly which check
-//! tripped (0x13/0x14/0x15 hardcore, 0x17/0x18 expansion, else save-load error).
+//! When CLIENT_LoadCharacterAndSendGameData fails, NET_D2GS_SERVER_SrvJoinAct sends 0xB4
+//! ConnectionRefused(nClientId, nReason). That call site is intercepted to log nReason before the
+//! original send: 0x13/0x14/0x15 hardcore, 0x17/0x18 expansion, else save-load error.
 
 const patch = @import("patch.zig");
 const log = @import("../log.zig");
@@ -59,18 +57,11 @@ fn b4Intercept() callconv(.naked) void {
     );
 }
 
-// ── which gate of IsValidChecks refused a GAMELOGON ──────────────────────────
-//
-// The 0xB4 hook above only sees refusals that got as far as SrvJoinAct. Everything
-// NET_D2GS_SERVER_IsValidChecks @0x52c690 turns away never reaches it: each of its checks
-// branches to one shared reject label that returns zero through GuardStack, so the client is
-// simply never answered. Eight checks share that label, which makes "the join was refused"
-// the only fact available and none of them tell you which one it was.
-//
-// So intercept the four that are calls (the other four are inline compares on the character's
-// class, language and name, which are the same on every attempt by the same client) and say
-// which one said no. Each intercept runs the engine's own check and reports only when it fails,
-// so an accepted join costs one jump.
+// Which gate of IsValidChecks refused a GAMELOGON. The 0xB4 hook above only sees refusals that
+// reach SrvJoinAct; NET_D2GS_SERVER_IsValidChecks @0x52c690's eight checks all branch to one
+// shared reject label with no reply, so "refused" is otherwise the only fact available.
+// Intercept the four that are calls (others are inline compares, constant per client); report
+// only on failure, so an accepted join costs one jump.
 const NAME_LEN_CALLSITE: usize = 0x0052c6d5; // ECX=szCharName, EDX=16 -> length is within bounds
 const STRING_LENGTH_CHECK: usize = 0x0053efc0;
 const NAME_BY_ID_CALLSITE: usize = 0x0052c6fe; // ECX=nClientId -> the connection has a name

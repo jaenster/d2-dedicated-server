@@ -1,15 +1,9 @@
-//! Redis, from inside the game server.
-//!
-//! The DLL is built for x86-windows and given `realm_proto`, `resp` and `obs` — deliberately not
-//! `realm_infra`, so libc sockets never enter this build. That exclusion is why the framing lives
-//! in `packages/resp` as a pure codec: this file is only the socket half, and the wire format is
-//! the same implementation realmd parses with. A second RESP parser growing in here is exactly
-//! what that split exists to prevent.
-//!
-//! One connection, opened lazily and dropped on any IO error so the next call reconnects. The
-//! engine calls this from its own thread while servicing a game, so a call must never block
-//! forever: the socket carries a receive timeout and a failed op returns rather than retrying
-//! inside the game's tick.
+//! Redis, from inside the game server. Built x86-windows against `realm_proto`/`resp`/`obs`,
+//! deliberately not `realm_infra`, so libc sockets never enter this build — framing lives in
+//! `packages/resp` as a pure codec shared with realmd's parser, this file is only the socket half.
+//! One connection, opened lazily and dropped on any IO error so the next call reconnects. Called
+//! from the engine's own thread while servicing a game, so it must never block forever: the
+//! socket carries a receive timeout and a failed op returns rather than retrying mid-tick.
 const std = @import("std");
 const resp = @import("resp");
 
@@ -44,16 +38,11 @@ const INADDR_NONE: u32 = 0xffff_ffff;
 /// connection cannot stall a game's tick for a noticeable time.
 const io_timeout_ms: u32 = 2000;
 
-/// One connection, and more than one thread reaching for it. The heartbeat runs on the server
-/// tick while a character fetch runs on the join path, and a command/reply cycle cannot be
-/// interleaved: the second caller reads the first one's reply, the connection desyncs, and reads
-/// start coming back empty while writes still look fine. That is not hypothetical — it is what
-/// removing the d2dbs fallback exposed, as joins failing with the character sitting readable in
-/// redis.
-///
-/// A spin with a yield rather than a real lock: contention is a heartbeat every thirty seconds
-/// against an occasional fetch, and the DLL has no lock primitive of its own — realm_infra, which
-/// has one, is deliberately not in this build.
+/// One connection, more than one thread reaching for it (heartbeat on the server tick, character
+/// fetch on the join path); an interleaved command/reply cycle desyncs the connection — observed
+/// as joins failing with the character sitting readable in redis, once the d2dbs fallback was
+/// removed. Spin-with-yield rather than a real lock: contention is light, and the DLL has no lock
+/// primitive of its own (realm_infra, which has one, is deliberately not in this build).
 var busy = std.atomic.Value(bool).init(false);
 
 fn lock() void {
@@ -209,7 +198,7 @@ fn readReply(s: SOCKET) ?Reply {
     }
 }
 
-// ── the operations the game server actually needs ────────────────────────────
+// the operations the game server actually needs
 
 /// Fetch a character save into `out`, returning its length. 0 if absent or unreadable.
 pub fn getChar(account: []const u8, charname: []const u8, out: []u8) usize {

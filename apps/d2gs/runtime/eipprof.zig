@@ -1,25 +1,17 @@
 //! CPU-weighted sampling profiler for the engine, from inside the engine's own process.
 //!
 //! No host profiler can see this: the 32-bit guest runs under wine, translated on Apple
-//! silicon, so a host sampler only ever sees the translator. From in here we are at the
-//! guest's own fixed addresses (image base 0x400000, no ASLR), and every address has a name
-//! in the 1.14d database — better than a PDB, since the symbols already exist and only the
-//! program counter was missing.
+//! silicon, so a host sampler only ever sees the translator. From in here we're at the guest's
+//! own fixed addresses (image base 0x400000, no ASLR), resolvable via the 1.14d database.
 //!
-//! Two things this must get right, both of which a naive version gets wrong:
+//! Two things a naive version gets wrong: (1) must sample ALL threads, not just the tick
+//! thread — it frame-paces and is asleep almost always, while QServer does its work on an
+//! IOCP worker pool; (2) must weight by CPU time, not wall time — SuspendThread+GetThreadContext
+//! reports where a thread IS regardless of blocked state, so each round instead reads
+//! GetThreadTimes and credits the observed EIP with microseconds actually burned since last round.
 //!
-//! ALL threads, not just the tick thread. The tick thread frame-paces and is asleep almost
-//! always; QServer does its work on an IOCP worker pool. Sampling only the ticker measures
-//! Sleep.
-//!
-//! CPU time, not wall time. SuspendThread+GetThreadContext reports where a thread IS,
-//! blocked or not, so counting samples uniformly measures where threads WAIT. Instead each
-//! round reads GetThreadTimes and credits the observed EIP with the microseconds that thread
-//! actually burned since the last round. A thread that did not run contributes nothing.
-//!
-//! Addresses are reported raw; resolving them to names is a Ghidra lookup done offline.
-//! Off unless --eipprof: suspending threads a few hundred times a second is cheap but not
-//! free, and is not for a live realm.
+//! Addresses reported raw; name resolution is an offline Ghidra lookup. Off unless --eipprof:
+//! suspending threads a few hundred times a second is cheap but not free, not for a live realm.
 
 const std = @import("std");
 const log = @import("../log.zig");
@@ -160,12 +152,10 @@ fn sampler(_: ?*anyopaque) callconv(.winapi) DWORD {
             log.hex2("eipprof: threads tracked / first-thread cpu us:", @intCast(thread_n), @intCast(probe));
         }
         for (threads[0..thread_n]) |*t| {
-            // Wine on this host reports 0 for GetThreadTimes kernel+user, so CPU-weighting is
-            // not available: every sample counts as one and the result is WALL-CLOCK within
-            // engine code. Samples landing outside the image (wine, ntdll, a blocked wait) are
-            // counted separately and excluded from the histogram, so what remains answers "of
-            // the time spent executing D2 code, where is it" -- not "what fraction of the
-            // process is D2 code", which this cannot tell you.
+            // Wine on this host reports 0 for GetThreadTimes kernel+user, so CPU-weighting isn't
+            // available: every sample counts as one, giving wall-clock within engine code.
+            // Samples outside the image (wine, ntdll, blocked wait) are counted separately and
+            // excluded, so this answers "where in D2 code", not "what fraction is D2 code".
             const delta: u64 = 1;
 
             @memset(buf[0..CONTEXT_SIZE], 0);

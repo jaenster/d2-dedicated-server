@@ -1,19 +1,14 @@
 //! Persistence — the domain's storage vocabulary, in D2 ubiquitous language. Callers say
 //! `getCharD2s` / `registerGame` / `putSession`; where it lands is not their business.
 //!
-//! There are exactly two places anything can go, and no way to configure a third:
+//! Two places, no way to configure a third: Postgres is the store of record (characters, accounts,
+//! profiles, guilds), Redis is what is in flight (sessions, games, the fleet and its queues, and
+//! the live character in front of Postgres). The old per-half backend choice defaulted to the
+//! filesystem, which quietly put account flags, profiles and guilds on one instance's local disk
+//! while everything else was shared; removing the option removes the mistake.
 //!
-//!   * **Postgres** is the store of record — characters, accounts, profiles, guilds.
-//!   * **Redis** is what is in flight — sessions, games, the fleet and its queues, and the
-//!     live character in front of Postgres.
-//!
-//! It used to be a choice of three backends per half, with a filesystem default. That default is
-//! what let account flags, profiles and guilds quietly land on one instance's local disk while
-//! everything else was shared, and no amount of care at the call sites would have caught it — the
-//! call sites all looked right. Removing the option removes the mistake.
-//!
-//! BNFTP assets are the one exception and are not in here at all (see realm-store/assets.zig):
-//! read-only image content, identical everywhere, nothing to keep in sync.
+//! BNFTP assets are the exception and live in realm-store/assets.zig — read-only, identical
+//! everywhere, nothing to keep in sync.
 const std = @import("std");
 const d2s = @import("d2s.zig");
 const adapter = @import("realm_store");
@@ -52,7 +47,7 @@ pub fn init(cfg: Config) void {
     pg.init(cfg.pg_dsn);
 }
 
-// ── characters (durable) ─────────────────────────────────────────────────────
+// characters (durable)
 
 /// Read the live character. Redis first, because that is where a game's most recent save lands
 /// and Postgres may still be a flush behind it — reading Postgres first would hand back a stale
@@ -136,7 +131,7 @@ pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
     return pg.deleteCharD2s(account, charname);
 }
 
-// ── per-account userdata (BNCS profile: SID_READ/WRITEUSERDATA 0x26/0x27) ─────
+// per-account userdata (BNCS profile: SID_READ/WRITEUSERDATA 0x26/0x27)
 // Key-path addressed ("profile\\sex").
 pub fn getUserData(account: []const u8, key: []const u8, out: []u8) usize {
     return pg.getUserData(account, key, out);
@@ -169,14 +164,9 @@ pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []co
 /// Result of a classic -> expansion conversion.
 pub const UpgradeResult = enum { upgraded, already_expansion, no_such_char, failed };
 
-/// Convert a character to Lord of Destruction by setting the expansion bit in its .d2s
-/// status byte and repairing the checksum. That bit is the whole conversion as far as a
-/// save file is concerned — everything else an expansion character gains, the game
-/// materializes on load, the same way a freshly created character grows from a bare
-/// 335-byte header on first play.
-///
-/// Already-expansion characters report that rather than failing: the client's only test
-/// is result == 0, so re-running it must not look like an error.
+/// Convert to Lord of Destruction by setting the expansion bit in the .d2s status byte and
+/// repairing the checksum; the game materializes the rest on load. Already-expansion characters
+/// report that rather than failing, since the client's only test is result == 0.
 pub fn upgradeCharToExpansion(account: []const u8, charname: []const u8) UpgradeResult {
     var buf: [max_d2s]u8 = undefined;
     const n = getCharD2s(account, charname, &buf);
@@ -189,7 +179,7 @@ pub fn upgradeCharToExpansion(account: []const u8, charname: []const u8) Upgrade
     return if (saveCharD2s(account, charname, buf[0..n])) .upgraded else .failed;
 }
 
-// ── accounts (durable) ───────────────────────────────────────────────────────
+// accounts (durable)
 
 /// Create an account. `pwhash` null = password-less. Returns false if it exists.
 pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
@@ -248,7 +238,7 @@ pub fn bnftpMtime(filename: []const u8) ?i64 {
     return assets.bnftpMtime(filename);
 }
 
-// ── guilds (durable) ─────────────────────────────────────────────────────────
+// guilds (durable)
 // The cut Guild Halls feature; the service layer (guilds.zig) owns the blob format.
 
 pub fn saveGuild(name: []const u8, bytes: []const u8) bool {
@@ -267,7 +257,7 @@ pub fn listGuilds(names: []Name) usize {
     return pg.listGuilds(names);
 }
 
-// ── sessions (ephemeral) ─────────────────────────────────────────────────────
+// sessions (ephemeral)
 
 pub fn saveSession(id: u64, account: []const u8) bool {
     return redis.saveSession(id, account, session_ttl_s);
@@ -281,7 +271,7 @@ pub fn expireSession(id: u64) void {
     redis.expireSession(id);
 }
 
-// ── games (ephemeral) ────────────────────────────────────────────────────────
+// games (ephemeral)
 
 pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8) bool {
     return redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, game_ttl_s);
@@ -314,7 +304,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
     return redis.snapshotGames(out);
 }
 
-// ── routes (ephemeral) ───────────────────────────────────────────────────────
+// routes (ephemeral)
 // {client source IP → backend GS addr}, recorded by realmd on JOINGAME and looked
 // up by the d2ingress per connection to splice game traffic to the right GS.
 
@@ -326,7 +316,7 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
     return redis.lookupRoute(client_ip);
 }
 
-// ── token routes (ephemeral) ─────────────────────────────────────────────────
+// token routes (ephemeral)
 // {realm-global token → backend GS addr + engine gameid}, recorded by realmd on
 // CREATE/JOIN and looked up by the d2ingress from the token in the client's first
 // GAMELOGON packet. NAT-proof: the token is unique across the realm so two clients
@@ -357,7 +347,7 @@ pub fn durableReachable() bool {
     return pg.healthy();
 }
 
-// ── dispatch ─────────────────────────────────────────────────────────────────
+// dispatch
 //
 // Create and join reach a game server through the store rather than down the socket one instance
 // happens to hold. Redis only, and not a gap: dispatch that is not shared is exactly what keeps
@@ -395,7 +385,7 @@ pub fn pushGsEvent(packet: []const u8) bool {
     return redis.pushGsEvent(packet, gs_event_cap, gs_event_ttl_s);
 }
 
-// ── save durability ──────────────────────────────────────────────────────────
+// save durability
 //
 // Redis is the mem-cache holding the live character; Postgres is the store of record. A save is
 // marked dirty when redis has bytes Postgres has not seen, and the flush worker (any instance)
@@ -421,14 +411,10 @@ pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64
     return redis.clearDirtyIfUnchanged(account, charname, ver);
 }
 
-// ── character ownership ──────────────────────────────────────────────────────
-//
-// A character belongs to one game at a time, and the lock records WHICH — so a second login can
-// be refused with a reason rather than issued and then silently dropped by the game server.
-//
-// Redis only, and that is not a limitation to route around: a lock that is not shared does not
-// enforce anything across instances. On fs/pg `lockChar` reports success so a single instance
-// behaves exactly as it did before this existed.
+// character ownership
+// A character belongs to one game at a time; the lock records WHICH, so a second login can be
+// refused with a reason instead of silently dropped by the game server. Redis only — a lock not
+// shared enforces nothing across instances. On fs/pg `lockChar` just reports success.
 
 /// How long a character stays claimed without a refresh. Long enough to outlive a slow join,
 /// short enough that a game server lost mid-session frees its characters within a game's length.
@@ -493,12 +479,9 @@ pub fn charLockOwner(account: []const u8, charname: []const u8, out: []u8) ?[]co
     return redis.charLockOwner(account, charname, out);
 }
 
-// ── the game-server fleet (ephemeral, shared) ────────────────────────────────
-//
-// Only redis carries this: the point of publishing the fleet is that an instance which does NOT
-// hold a server's control connection can still see it. fs and pg have no cross-instance story, so
-// they report an empty fleet and every caller falls back to its own in-process registry — which is
-// exactly right for a single instance, and is what those backends already imply.
+// the game-server fleet (ephemeral, shared)
+// Redis only: the point is an instance without a server's control connection can still see it.
+// fs/pg report an empty fleet and callers fall back to their own in-process registry.
 
 pub const GsRec = types.GsRec;
 
@@ -544,7 +527,7 @@ pub fn lookupTokenRoute(token: u16) ?TokenRoute {
     return redis.lookupTokenRoute(token);
 }
 
-// ── health ───────────────────────────────────────────────────────────────────
+// health
 
 /// Ready only if both stores answer. Neither is optional: without redis nothing coordinates, and
 /// without Postgres nothing is kept.
@@ -552,7 +535,7 @@ pub fn healthy() bool {
     return redis.healthy() and pg.healthy();
 }
 
-// ── chat (cross-instance) ────────────────────────────────────────────────────
+// chat (cross-instance)
 //
 // The room is shared; the sockets are not. An instance keeps its own members and publishes them
 // here, and anything that has to reach someone else's member goes to that instance's inbox.

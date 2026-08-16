@@ -74,12 +74,9 @@ fn d2sWithProgression(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8,
     return out;
 }
 
-/// A save with a real attribute section: the header, then the "gf" marker and a packed
-/// list holding level and experience. Experience is not a header field — it is an entry in
-/// that list — so a fixture without one cannot exercise ranking by it.
-///
-/// Widths are ItemStatCost.txt's CSvBits: id is 9 bits, level 7, experience 32, and the
-/// list ends with id 0x1FF.
+/// A save with a real attribute section: header, then "gf" marker + a packed list holding
+/// level and experience (not a header field; a fixture without this can't rank by it).
+/// Widths are ItemStatCost.txt's CSvBits: id 9 bits, level 7, experience 32, list ends id 0x1FF.
 fn d2sWithExperience(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, experience: u32) []const u8 {
     @memset(buf, 0);
     std.mem.writeInt(u32, buf[0..4], D2S_SIGNATURE, .little);
@@ -109,9 +106,7 @@ fn d2sWithExperience(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, 
     return buf[0 .. 0x32 + (bit + 7) / 8];
 }
 
-// ---------------------------------------------------------------------------
 // Scenarios
-// ---------------------------------------------------------------------------
 
 fn scLogin() Result {
     const name = "login";
@@ -585,15 +580,11 @@ fn awaitPlayers(
     return false;
 }
 
-/// Every rejection the join screen can render, checked against the code the 1.14d client
-/// actually switches on (OOG_PollJoinCreatePump @0x441770). These were wrong in a way no
-/// existing test could catch: a swap between two plausible-looking codes shows the player
-/// "Game name and password don't match" for a game that was never there, and an unlisted
-/// code renders nothing at all.
-/// The join screen's detail panel. It used to answer token -1 unconditionally, which is
-/// the client's "no info" branch — it returns before reading anything else, so the panel
-/// stayed blank for every game. Now it carries the real thing, which means the packet has
-/// to be laid out the way Incoming0x06 scatters it.
+/// Every rejection code is checked against what the 1.14d client actually switches on
+/// (OOG_PollJoinCreatePump @0x441770) — a swap between two plausible codes used to show
+/// the wrong rejection message, or render nothing. The join screen's detail panel used to
+/// answer token -1 unconditionally (the client's "no info" branch), leaving it blank for
+/// every game; now it carries the real thing, laid out the way Incoming0x06 scatters it.
 fn scGameInfo() Result {
     const name = "game_info_panel";
     var gs = FakeGS{ .gsid = 0x1F0, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 909 };
@@ -851,20 +842,13 @@ fn scGetFileTime() Result {
     return .{ .name = name, .status = .pass, .msg = msg("held file reports a real FILETIME ({d}); an absent one reports 0", .{held}) };
 }
 
-/// Since the channel list started showing characters, the name a player can SEE is not the
-/// account. Everything that takes a name — whisper, /whois, /ignore — has to accept it, or
-/// the one name in front of them is the one name that does not work.
-/// Load: a full friends list, every entry online and in a channel. The reply is built into
-/// a fixed stack buffer, and this is the shape that overflows it — 50 entries at the
-/// longest name and channel is ~2.8KB, against the 2048 it used to be given. Before the
-/// bounds-checked writer that was an out-of-bounds slice, i.e. the server going down
-/// because somebody had too many friends.
-/// Concurrency. Everything the realm keeps — the chat registry, the session table, the
-/// game table, the per-game rosters — sits behind spinlocks touched from one thread per
-/// connection, and every scenario up to here has been essentially single-file. This runs
-/// many clients at once through login, chat and disconnect, then checks the realm is still
-/// coherent rather than merely still running: a fresh client must log in, and the channel
-/// must not still be holding people who left.
+/// The channel list shows characters, not accounts, so whisper/whois/ignore must accept the
+/// name the player actually sees. Load test: a full friends list, every entry online/in a
+/// channel — 50 entries at max name+channel length is ~2.8KB against the 2048-byte buffer it
+/// used to get; before the bounds-checked writer that was an OOB slice (server down because
+/// someone had too many friends). Concurrency: everything the realm keeps (chat registry,
+/// session table, game table, rosters) sits behind per-connection spinlocks; this runs many
+/// clients at once and checks the realm stays coherent, not just running.
 const stress_clients = 64;
 
 const StressWorker = struct {
@@ -916,12 +900,10 @@ fn scConcurrentClients() Result {
     // serving rather than merely slowed down.
     if (succeeded * 4 < spawned * 3) return fail(name, "only {d}/{d} concurrent clients completed", .{ succeeded, spawned });
 
-    // They have all disconnected. The realm must still take a new client — the check that
-    // the listener and the tables survived the churn, not just that the process is up.
-    //
-    // The wait is for the server to NOTICE: each worker's socket close has to be observed
-    // by its own read loop before the member is gone, and joining them here only proves
-    // our side finished. Probing too early reads teardown-in-progress as a leak.
+    // All disconnected; the realm must still take a new client (listener + tables survived the
+    // churn). The wait is for the server to NOTICE: each socket close must be observed by its
+    // own read loop, and joining our workers only proves our side finished — probing too early
+    // reads teardown-in-progress as a leak.
     _ = net.usleep(1_500_000);
     var after = rc.RealmClient{};
     defer after.close();
@@ -1421,9 +1403,7 @@ fn skip(name: []const u8, m: []const u8) Result {
     return .{ .name = name, .status = .skip, .msg = m };
 }
 
-// ---------------------------------------------------------------------------
 // realmd child management
-// ---------------------------------------------------------------------------
 fn waitPort(port: u16, deadline_ms: u32) bool {
     var waited: u32 = 0;
     while (waited < deadline_ms) : (waited += 100) {
@@ -1436,17 +1416,10 @@ fn waitPort(port: u16, deadline_ms: u32) bool {
 /// A single REALMD_* env override (name/value) applied before fork+execve.
 const EnvVar = struct { name: [*:0]const u8, value: [*:0]const u8 };
 
-/// fork+execve a realmd child, applying `envs` to our environ first (the child
-/// inherits the augmented environ). Returns the child pid. Waits up to 10s for
-/// `wait_port` to listen; exits the harness if it never comes up.
-/// Spawn a realmd with `envs` set, WITHOUT leaving them set in this process afterwards.
-///
-/// The child inherits the environment across fork+execve, so the values have to be in our
-/// own environ at the moment we fork — but leaving them there reconfigures every scenario
-/// that runs later. That is not hypothetical: a scenario spawning an instance with its own
-/// REALMD_DATA_DIR silently redirected every subsequent scenario's idea of where the
-/// harness's data lives, so files staged for a test went to one directory while the realmd
-/// under test read another. Snapshot, fork, put it back.
+/// fork+execve a realmd child with `envs` applied (child inherits our environ, so the values
+/// must be set at fork time), then restored afterwards — a scenario spawning its own
+/// REALMD_DATA_DIR once silently redirected every later scenario's idea of where data lives.
+/// Returns the child pid; waits up to 10s for `wait_port` to listen, exits the harness if not.
 fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
     // COPY the old values: getenv returns a pointer into the environ block, and the
     // setenv below overwrites that very entry, so keeping the pointer would restore
@@ -1539,11 +1512,9 @@ fn stopStores() void {
 
 fn maybeStartRealmd() !?c_int {
     if (net.portOpen(rc.HOST_BNET)) {
-        // Reusing whatever answers on the port is convenient when you are iterating
-        // against a realm you already have up — and a trap the rest of the time. That
-        // server is not the binary that was just built, was not given this harness's
-        // data dir, admin token or permissive-auth setting, and carries state from
-        // whatever else has been talking to it. Failures then look like code bugs.
+        // Reusing whatever answers on the port is convenient when iterating against a realm
+        // already up, and a trap otherwise: that server isn't the binary just built, wasn't
+        // given this harness's data dir/admin token/permissive-auth, and carries other state.
         // Set E2E_NO_REUSE=1 to refuse instead of guessing.
         std.debug.print(
             \\
@@ -1726,13 +1697,11 @@ fn scBannerAd() Result {
     return .{ .name = name, .status = .pass, .msg = msg("ad 0x{x} '{s}' ({d}B body, stable id) clicks through to {s}", .{ ad.id, ad.filename, ad.body_len, click.url }) };
 }
 
-/// Friends have to outlive the process that heard about them. The list used to be an
-/// in-memory table, so every restart silently emptied everyone's friends.
-///
-/// A second realmd over the same data dir is a stronger test than a restart: it has an
-/// empty table AND never saw the /f add, so the only way it can list the friend is by
-/// reading it back from the store. Presence is deliberately NOT asserted — who is online
-/// is a fact about live connections, and the friend has none on that instance.
+/// Friends must outlive the process that heard about them (the list used to be in-memory,
+/// so restarts silently emptied it). A second realmd over the same data dir is a stronger
+/// test than a restart: its table is empty and it never saw the /f add, so it can only list
+/// the friend by reading the store. Presence is deliberately NOT asserted — that's a fact
+/// about live connections, and the friend has none on that instance.
 fn scFriendsPersist() Result {
     const name = "friends_persist";
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
@@ -2032,11 +2001,10 @@ fn scMultiInstance() Result {
 }
 
 // A tiny echo TCP server standing in for a real backend GS :4000 game port. Binds an
-// ephemeral port (read back via getsockname) and accepts connections in a loop, each on
-// its own thread, echoing whatever it reads. Looping (not one-shot) matters: the d2ingress
-// port-probe opens a throwaway connection that the d2ingress splices through to us, so the
-// real test connection must still get its own accept. `got`/`got_len` capture the first
-// non-empty payload so the scenario can assert bytes reached the backend.
+// ephemeral port (read via getsockname), accepts in a loop, one thread per connection,
+// echoing what it reads. Looping (not one-shot) matters: d2ingress opens a throwaway
+// port-probe connection first, so the real test connection still needs its own accept.
+// `got`/`got_len` capture the first non-empty payload so the scenario can assert delivery.
 const c_read = @extern(*const fn (c_int, [*]u8, usize) callconv(.c) isize, .{ .name = "read" });
 const c_write = @extern(*const fn (c_int, [*]const u8, usize) callconv(.c) isize, .{ .name = "write" });
 
@@ -2151,18 +2119,15 @@ fn spawnD2ingress(ingress_port: u16) !c_int {
 // d2ingress's TOKEN_OFFSET: nId(u8) ++ nGameHash(u32) ++ nGameToken(u16) → byte 5.
 const INGRESS_TOKEN_OFFSET: usize = 5;
 
-// Prove the NAT-proof gateway path: realmd mints a globally-unique token on JOIN and the
-// d2ingress translates it — rewriting the in-packet token to the GS's real gameid — then
-// splices the client's game connection to the right backend.
-//   1. an echo server stands in for the backend GS game port (ephemeral port P), and
-//      captures the first packet it receives so we can assert the rewritten token.
-//   2. a FakeGS registers with ip=127.0.0.1 / gs_port=P and a known gameid=3.
-//   3. a client create+joins — realmd records {token T -> 127.0.0.1:P, gameid 3} and
-//      returns T in the join reply.
-//   4. spawn the d2ingress on :14000, pointed at the same redis realmd wrote the route to.
-//   5. connect to :14000 and send a crafted GAMELOGON: buf[0]=0x68, token T at offset 5,
-//      tail "PAYLOAD". Assert the echo server received byte[0]==0x68, the u16 at offset 5
-//      == 3 (the GS gameid — proves the rewrite), and the tail matches (proves splice).
+// Prove the NAT-proof gateway path: realmd mints a globally-unique token on JOIN, d2ingress
+// rewrites the in-packet token to the GS's real gameid, then splices to the right backend.
+//   1. echo server stands in for the backend GS game port (ephemeral port P), captures the
+//      first packet so we can assert the rewritten token.
+//   2. FakeGS registers with ip=127.0.0.1 / gs_port=P and a known gameid=3.
+//   3. client create+joins — realmd records {token T -> 127.0.0.1:P, gameid 3}, returns T.
+//   4. spawn d2ingress on :14000, pointed at the same redis realmd wrote the route to.
+//   5. connect to :14000, send GAMELOGON buf[0]=0x68, token T @offset 5, tail "PAYLOAD".
+//      Assert echo got byte[0]==0x68, u16@5==3 (rewrite proof), tail matches (splice proof).
 fn scD2ingressTokenTranslate() Result {
     const name = "d2ingress_token_translate";
     const INGRESS_PORT: u16 = 14000;

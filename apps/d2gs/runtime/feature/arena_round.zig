@@ -73,7 +73,7 @@ pub const Round = struct {
     }
 };
 
-// ── tests ────────────────────────────────────────────────────────────────────
+// tests
 const testing = std.testing;
 
 // Tiny config so tests don't loop thousands of ticks.

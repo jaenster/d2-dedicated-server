@@ -1,14 +1,9 @@
-//! D2CS — the realm/character server, client-facing side, muxed onto the BNCS port. After
-//! bnetd's realm handoff the client connects here, proves who it is with the
-//! session bnetd minted (MCP_STARTUP), lists/selects a character, and
-//! creates/joins games.
+//! D2CS — realm/character server, client-facing, muxed onto the BNCS port. After bnetd's realm
+//! handoff the client connects here, proves itself with the session bnetd minted (MCP_STARTUP),
+//! lists/selects a character, and creates/joins games.
 //!
-//! Framing: `<len:u16 LE> <id:u8>` where len includes the 3-byte header. The
-//! first byte on the socket is a protocol selector (0x01), consumed once.
-//!
-//! The STARTUP handler resolving a session another listener (bnetd) created is
-//! the proof that the front is stateless over shared state — i.e. that a second
-//! realmd instance could resolve it too once the session table is a shared Store.
+//! Framing: `<len:u16 LE> <id:u8>`, len includes the 3-byte header. The first byte on the socket
+//! is a protocol selector (0x01), consumed once.
 const std = @import("std");
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
@@ -39,19 +34,13 @@ const MCP_CHARRANK = @intFromEnum(mcp.Op.charrank);
 const MCP_CHARUPGRADE = @intFromEnum(mcp.Op.charupgrade);
 const MCP_CHARLIST2 = @intFromEnum(mcp.Op.charlist2);
 
-// MCP result codes, taken from the client's own switch statements in
-// OOG_PollJoinCreatePump @0x441770 (D2Client/OOGUtilities.cpp), with the string-table id
-// each one resolves to.
-//
-// The important part is what the client does with a code that ISN'T here: the switch
-// falls to `default:`, which returns without showing a popup or changing state — the
-// player is left staring at a frozen join screen. An unlisted code is worse than a wrong
-// one, so every failure path below must pick from this list.
-//
+// MCP result codes from OOG_PollJoinCreatePump @0x441770 (D2Client/OOGUtilities.cpp), with the
+// string-table id each resolves to. A code not in this list falls to `default:`: no popup, no
+// state change, player frozen on the join screen.
 // CREATEGAME (0x03) replies:
 const CREATE_OK: u32 = @intFromEnum(mcp.CreateResult.created);
 const CREATE_INVALID_NAME: u32 = @intFromEnum(mcp.CreateResult.invalid_name); // str 0x1411 "Invalid Game Name"
-const CREATE_NAME_TAKEN: u32 = @intFromEnum(mcp.CreateResult.already_exists); // str 0x1412 "A Game Already Exists With That Name"
+const CREATE_NAME_TAKEN: u32 = @intFromEnum(mcp.CreateResult.already_exists); // str 0x1412 "Game Already Exists"
 const CREATE_SERVER_DOWN: u32 = @intFromEnum(mcp.CreateResult.servers_down); // str 0x1413 "Server Down"
 // There is NO "servers are full" code on the create path: JoinOrCreateGame @0x441500 bounds the
 // switch at 0x20 and sends everything else to str 0x1415 "Error Creating Game" (0x2b "Game is
@@ -64,15 +53,15 @@ const CREATE_ERROR_GENERIC: u32 = @intFromEnum(mcp.CreateResult.generic); // > 0
 // guess from the numbers, and realmd had them the wrong way round: 0x29 is the PASSWORD
 // failure and 0x2a is the MISSING-GAME failure.
 const JOIN_OK: u32 = @intFromEnum(mcp.JoinResult.ok);
-const JOIN_BAD_PASSWORD: u32 = @intFromEnum(mcp.JoinResult.password_incorrect); // str 0x1428 "Game name and password don't match."
+const JOIN_BAD_PASSWORD: u32 = @intFromEnum(mcp.JoinResult.password_incorrect); // str 0x1428 "password don't match"
 const JOIN_NO_SUCH_GAME: u32 = @intFromEnum(mcp.JoinResult.no_such_game); // str 0x1427 "Game does not exist."
 const JOIN_FULL: u32 = @intFromEnum(mcp.JoinResult.game_full); // str 0x1429 "Game is Full."
-const JOIN_HARDCORE_MIX: u32 = @intFromEnum(mcp.JoinResult.hardcore_mix); // str 0x1426 hardcore and normal may not share a game
-const JOIN_CLASSIC_INTO_EXPANSION: u32 = @intFromEnum(mcp.JoinResult.classic_into_expansion); // str 0x2775 classic char, expansion game
-const JOIN_EXPANSION_INTO_CLASSIC: u32 = @intFromEnum(mcp.JoinResult.expansion_into_classic); // str 0x2776 expansion char, classic game
-const JOIN_LADDER_MISMATCH: u32 = @intFromEnum(mcp.JoinResult.ladder_mismatch); 
-const JOIN_NEED_NIGHTMARE: u32 = @intFromEnum(mcp.JoinResult.need_nightmare); // str 0x14f4/0x5522 "must kill Diablo/Baal to play Nightmare"
-const JOIN_NEED_HELL: u32 = @intFromEnum(mcp.JoinResult.need_hell); // str 0x14f3/0x5521 "...in Nightmare difficulty to play Hell" // str 0x2ab1/0x2ab2 (client picks by its own ladder flag)
+const JOIN_HARDCORE_MIX: u32 = @intFromEnum(mcp.JoinResult.hardcore_mix); // str 0x1426 hc/normal mix
+const JOIN_CLASSIC_INTO_EXPANSION: u32 = @intFromEnum(mcp.JoinResult.classic_into_expansion); // str 0x2775
+const JOIN_EXPANSION_INTO_CLASSIC: u32 = @intFromEnum(mcp.JoinResult.expansion_into_classic); // str 0x2776
+const JOIN_LADDER_MISMATCH: u32 = @intFromEnum(mcp.JoinResult.ladder_mismatch);
+const JOIN_NEED_NIGHTMARE: u32 = @intFromEnum(mcp.JoinResult.need_nightmare); // str 0x14f4/0x5522 need Diablo/Baal kill
+const JOIN_NEED_HELL: u32 = @intFromEnum(mcp.JoinResult.need_hell); // str 0x14f3/0x5521, str 0x2ab1/0x2ab2 by ladder flag
 
 /// Character status bits as they sit in the .d2s header at 0x24 — the same bits the
 /// CharSel statstring and MCP_CHARCREATE speak in. A game stores the creator's, so a
@@ -82,15 +71,11 @@ const STATUS_EXPANSION: u8 = 0x20;
 const STATUS_LADDER: u8 = 0x40;
 const STATUS_JOIN_MASK: u8 = STATUS_HARDCORE | STATUS_EXPANSION | STATUS_LADDER;
 
-/// How far a character has to have got to be let into a harder game.
-///
-/// These are the client's OWN thresholds, not a guess. CharSel @0x4349b0 decides whether to
-/// offer a difficulty at all with `progression > 3` for classic and `> 4` for expansion, and
-/// UIMENU_SelectDifficultySinglePlayerOrTcpip @0x439780 reveals the Hell button on
-/// `progression > 7` / `> 9`. Progression is the .d2s byte at 0x25 — the same value the
-/// CharSel statstring carries in bits 8..12 of the character flags.
-///
-/// Expansion needs one more step than classic at each gate because its acts are counted too.
+/// How far a character has to have got to be let into a harder game — the client's OWN
+/// thresholds. CharSel @0x4349b0 offers a difficulty at `progression > 3` (classic) / `> 4`
+/// (expansion); UIMENU_SelectDifficultySinglePlayerOrTcpip @0x439780 reveals Hell at `> 7` / `> 9`.
+/// Progression is the .d2s byte at 0x25, the same value the CharSel statstring carries in bits
+/// 8..12 of the character flags. Expansion needs one more step per gate: its acts are counted too.
 const progression_nightmare_classic: u8 = 4;
 const progression_nightmare_expansion: u8 = 5;
 const progression_hell_classic: u8 = 8;
@@ -313,12 +298,10 @@ fn dispatch(c: *DConn, tag: []const u8, id: u8, body: []const u8) void {
         MCP_LADDERDATA => onLadderData(c, tag, body),
         MCP_CANCELCREATE => onCancelCreate(c, tag, body),
         MCP_CHARRANK => onCharRank(c, tag, body),
-        // The dispatch above is the COMPLETE 1.14d client surface. Its MCP senders are
-        // 0x01-0x07, 0x0a, 0x11-0x13, 0x16, 0x18 and 0x19, all handled. The build also
-        // contains senders for 0x08, 0x09, 0x0b, 0x0c, 0x0d, 0x0f and 0x10, and those are
-        // DEAD — zero xrefs to any of them in Game.exe, so nothing can reach them. They are
-        // deliberately not implemented rather than overlooked; if one ever shows up here it
-        // means the assumption changed and the hexdump is the thing to look at.
+        // The dispatch above is the COMPLETE 1.14d client surface: senders 0x01-0x07, 0x0a,
+        // 0x11-0x13, 0x16, 0x18, 0x19, all handled. The build also has senders for 0x08, 0x09,
+        // 0x0b, 0x0c, 0x0d, 0x0f, 0x10 — DEAD, zero xrefs in Game.exe, so deliberately not
+        // implemented. One showing up here means the assumption changed; look at the hexdump.
         else => {
             log.line(tag, "unhandled MCP 0x{x:0>2} ({d} bytes)", .{ id, body.len });
             if (body.len > 0) log.hexdump(tag, body);
@@ -397,33 +380,16 @@ fn enc14(w: *proto.Writer, v: u32) void {
     w.putU8(@intCast(((v >> 7) & 0x7F) | 0x80));
 }
 
-// Character statstring — the per-char blob in the MCP_CHARLIST2 (0x19) reply that the
-// client's char-select screen renders each character from. Layout fully reverse-engineered
-// from the 1.14d client (Game.exe), parser CHARSEL_ParseRealmCharList @0x43aab0 →
-// SAVEFILE_ParseSaveData @0x438ad0. Offsets from the statstring start:
-//   [0..2]   realm char count   (14-bit encoded — SAVEFILE_ReadEncodedInt14Bit)
-//   [2..13]  equip slot 1 (11)  → body-component GRAPHIC codes (see below)
-//   [13]     class + 1          (parser subtracts CLASS_SORCERESS=1)
-//   [14..25] equip slot 2 (11)  → component color TRANSFORMS (tints)
-//   [25]     level
-//   [26..28] character flags    (14-bit; bit2=0x04 expansion, bit3=0x08 ladder/hardcore mix)
-//   [28..30] field9             (14-bit)
-//   [30]     act (0xFF->0), [31..33] two fields (0xFF->0), [33..36] guild tag (3 bytes)
-// Every byte must stay NON-ZERO (the statstring is sent as a C-string; a 0 truncates it) —
-// that's why 14-bit ints set the high bit and "none" is 0xFF, not 0x00.
-//
-// Rendering: the client builds the 3D char preview via AllocCharSelectComponent @0x5066c0
-// (class, expansion-mode, slot1 [graphic codes], slot2 [transforms]). The 16-entry equip
-// loop treats a code of 0 / 0xFF / >= max as an EMPTY body slot. Weapons live at slot1[5]
-// (right) and slot1[6] (left); D2COMP_ResolveWeaponClass @0x504af0 returns 1 (unarmed) when
-// both are 0xFF, so an all-0xFF statstring renders a VALID NAKED character of the right
-// class/level — it is not broken, just bare. To show real equipped gear, parse the .d2s
-// item list (JM section) into gaCompCharacterCompositeItems indices and fill slot1/slot2
-// (a future "char portrait" feature; the GS has the items in memory on save and could
-// supply the portrait, like real pvpgn d2cs does).
-// Emit the 11-byte equip slot from a .d2s appearance block. The statstring is a
-// C-string, so a 0x00 byte would truncate it — map 0x00 (and any missing byte, e.g. a
-// naked char with an empty slice) to 0xFF = "no component in this slot".
+// Character statstring — per-char blob in the MCP_CHARLIST2 (0x19) reply char-select renders
+// from. RE'd from CHARSEL_ParseRealmCharList @0x43aab0 -> SAVEFILE_ParseSaveData @0x438ad0.
+// Offsets: [0..2] realm char count (14-bit), [2..13] equip slot1 (11, GRAPHIC codes),
+// [13] class+1 (parser subtracts CLASS_SORCERESS=1), [14..25] equip slot2 (11, color TRANSFORMS),
+// [25] level, [26..28] flags (14-bit; bit2=0x04 expansion, bit3=0x08 ladder/hardcore mix),
+// [28..30] field9 (14-bit), [30] act (0xFF->0), [31..33] two fields (0xFF->0), [33..36] guild tag.
+// Every byte must stay non-zero (C-string); 14-bit ints set the high bit, "none" is 0xFF not 0x00.
+// Rendering: AllocCharSelectComponent @0x5066c0. Weapons are slot1[5]/[6]; unarmed (both 0xFF)
+// renders a valid naked character — real gear needs parsing .d2s items, not done yet.
+// putEquipSlot: 11-byte equip slot from .d2s appearance block; map 0x00/missing to 0xFF.
 fn putEquipSlot(w: *proto.Writer, app: []const u8) void {
     var k: usize = 0;
     while (k < 11) : (k += 1) {
@@ -612,12 +578,10 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const expansion = (status & STATUS_EXPANSION) != 0;
     const hardcore = (status & STATUS_HARDCORE) != 0;
     const ladder: u8 = if ((status & STATUS_LADDER) != 0) 1 else 0;
-    // NOT gated here, deliberately. The CREATEGAME reply has three codes — invalid name,
-    // name taken, server down — and none of them means "you have not unlocked that
-    // difficulty", so refusing here could only report a reason that isn't the reason. The
-    // client sends JOINGAME immediately after a successful create, and that path has both
-    // the same check and a code that says the true thing (0x73 / 0x74), so an ineligible
-    // character is still turned away — with the right message, one packet later.
+    // NOT gated here, deliberately. CREATEGAME's three codes (invalid name, name taken, server
+    // down) cannot say "you have not unlocked that difficulty". The client sends JOINGAME right
+    // after a successful create, and that path has the same check plus a code that says the true
+    // thing (0x73 / 0x74) — so an ineligible character is still turned away, one packet later.
     log.line(tag, "create game '{s}' desc='{s}' diff={d} status=0x{x:0>2} (flags=0x{x})", .{ name, desc, difficulty, status, create_flags });
     // Claim the name BEFORE dispatching. A game is only recorded once the server accepts the
     // create, and in that gap a second client asking for the same name is told it is free, loses
@@ -654,13 +618,11 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return fail(c, &w, CREATE_SERVER_DOWN);
     }
     const rr = routed.?;
-    // 1 player: the creator. That seed and the join-time bump below are guesses that keep
-    // the list responsive before the game exists on the GS; once it does, the GS's own
-    // UPDATEGAMEINFO overwrites them with the count that also goes back down.
-    // Without the record the game exists on the GS but nowhere the realm can find it, and the
-    // client's very next packet is a JOINGAME for this name — which would come back "game does
-    // not exist" right after we reported success. Fail the create instead; the GS reaps the
-    // orphaned empty game on its own idle timer.
+    // 1 player: the creator. That seed and the join-time bump keep the list responsive until the
+    // GS's own UPDATEGAMEINFO overwrites them. Without the record the game exists on the GS but
+    // nowhere the realm can find it, and the client's very next packet is a JOINGAME for this name
+    // — "game does not exist" right after reporting success. Fail the create instead; the GS reaps
+    // the orphaned empty game on its own idle timer.
     if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc)) {
         store.releaseGameName(name);
         log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it", .{ name, rr.gameid });
@@ -762,14 +724,11 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "join game '{s}' (account={s}) -> FULL ({d} players)", .{ name, c.accountName(), g.players });
         return rejectJoin(c, &w, JOIN_FULL);
     }
-    // A character is in one game at a time. Checked HERE, upfront, because the game server's
-    // own refusal answers nothing: the realm issues the join, the engine declines it silently,
-    // and the player sits at a loading screen until the client times out.
-    //
-    // Taking the lock IS the check — SET NX cannot report free and then be taken by someone
-    // else, whereas a separate look-then-take could. Re-taking a character this same game
-    // already holds succeeds, so a client re-entering its own game is not shut out by its own
-    // previous session.
+    // A character is in one game at a time. Checked HERE, upfront, because the game server's own
+    // refusal answers nothing: the realm issues the join, the engine declines it silently, and the
+    // player sits at a loading screen until the client times out. Taking the lock IS the check —
+    // SET NX cannot report free and then be taken by someone else. Re-taking a character this same
+    // game already holds succeeds, so a client re-entering its own game is not shut out.
     var job: [32]u8 = undefined;
     const jowner = store.gameOwnerId(&job, g.gameid);
     // A seat is released when the player leaves, and the engine takes a moment to notice a socket
@@ -790,12 +749,11 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (!claimed) {
         var whob: [64]u8 = undefined;
         const holder = store.charLockOwner(c.accountName(), c.charName(), &whob) orelse "another game";
-        // There is NO result code for "that character is already in a game" — the client's
-        // switch (OOG_PollJoinCreatePump @0x441770) does not have one. An unlisted code is worse
-        // than a wrong one: it falls to `default:` and the player gets no popup at all, which is
-        // the silent freeze this check exists to remove. "Game is Full." is the least-bad listed
-        // code — it is untrue about this game, but it does refuse visibly and tells the player to
-        // try another. Replace it the moment a truer code is found.
+        // There is NO result code for "that character is already in a game" — the client's switch
+        // (OOG_PollJoinCreatePump @0x441770) has none, and an unlisted code falls to `default:`:
+        // no popup at all, the silent freeze this check exists to remove. "Game is Full." is the
+        // least-bad listed code: untrue here, but it refuses visibly. Replace it if a truer one
+        // is found.
         log.line(tag, "join game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
         return rejectJoin(c, &w, JOIN_FULL);
     }
@@ -829,21 +787,14 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// MCP_GAMELIST (0x05). Request body: u16 reqid, u32 difficulty filter, cstr search
-// (NET_MCP_CLIENT_Send_0x05_GameList @0x44a590).
-//
-// The realm game list is delivered ONE GAME PER 0x05 PACKET, not one concatenated reply.
-// Client side: each packet -> NET_MCP_CLIENT_Incoming0x05 @0x44b2d0 stores it in the
-// g_CharSelectBuffer struct; JoinOrCreateGame polls it and calls OOGMENU_AddGameToCache
-// once per game. A final packet whose token field == -2 (0xFFFFFFFE) maps to result 0x33
-// = end-of-list, which triggers OOGMENU_RefreshGameListDisplay() to redraw the list.
-//
-// Per-game 0x05 payload (offsets are from the type byte the client sees as pBytes[0]):
-//   +1   u16 reqid   (must equal the request's seq or the client drops it)
-//   +3   u32 gameid  (low u16 is the AddGameToCache dedup key)
-//   +7   u8  player count (the join screen's PLAYERS column; cache+0x14, read as u16)
-//   +8   u32 token   (must NOT be -1/-2 for a real game)
-//   +0xc cstr name, then cstr description
+// MCP_GAMELIST (0x05). Request: u16 reqid, u32 difficulty filter, cstr search
+// (NET_MCP_CLIENT_Send_0x05_GameList @0x44a590). ONE GAME PER 0x05 PACKET, not concatenated:
+// each packet -> NET_MCP_CLIENT_Incoming0x05 @0x44b2d0 -> g_CharSelectBuffer, polled by
+// JoinOrCreateGame -> OOGMENU_AddGameToCache per game. Final packet token == -2 (0xFFFFFFFE)
+// -> result 0x33 end-of-list -> OOGMENU_RefreshGameListDisplay().
+// Per-game payload (offsets from pBytes[0]): +1 u16 reqid (must echo), +3 u32 gameid (low u16
+// = dedup key), +7 u8 player count (PLAYERS column), +8 u32 token (not -1/-2), +0xc cstr name
+// then cstr description.
 fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
@@ -893,28 +844,14 @@ fn onCharDelete(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// MCP_GAMEINFO (0x06). Request: u16 reqid, cstr gamename. Fills the join screen's detail
-// panel. Layout reversed from NET_MCP_CLIENT_Incoming0x06 @0x44aca0 together with its only
-// consumer, OOGMENU_DisplayGameDetails @0x443ba0 — the handler scatters the packet into
-// g_CharSelectBuffer and the display function reads it back, so the two together name every
-// field. Offsets below are from the id byte, as the client sees them:
-//
-//   +0x00  u8      id (0x06)
-//   +0x01  u16     reqid — MUST echo the request's, or the client drops the packet whole
-//   +0x03  i32     token: -1 => "no info", -2 => end-of-list, anything else => a real entry
-//   +0x07  u32     game uptime in seconds (rendered h:mm:ss)
-//   +0x0b  u8      the game's reference character level
-//   +0x0c  u8      allowed level difference; 0 means "no restriction" and shows one level
-//   +0x0d  u8      max players (shown only when 1..7)
-//   +0x0e  u8      player count — the bound on BOTH per-player loops below
-//   +0x0f  u8[16]  per-player class id
-//   +0x1f  u8[16]  per-player level
-//   +0x2f  cstr    game description
-//                  then `player count` consecutive cstrs: the player names
-//
-// The count at +0x0e is load-bearing twice over: at 0 the client stops right after the
-// description, and above 0 it reads exactly that many name strings — so the count and the
-// number of trailing strings have to agree or it walks off the end of the packet.
+// MCP_GAMEINFO (0x06). Request: u16 reqid, cstr gamename. Fills the join screen's detail panel.
+// RE'd from NET_MCP_CLIENT_Incoming0x06 @0x44aca0 + OOGMENU_DisplayGameDetails @0x443ba0.
+// Offsets from id byte: +0x00 u8 id(0x06), +0x01 u16 reqid (must echo), +0x03 i32 token
+// (-1=no info, -2=end-of-list), +0x07 u32 uptime secs, +0x0b u8 ref char level, +0x0c u8 level
+// diff (0=no restriction), +0x0d u8 max players (shown 1..7), +0x0e u8 player count (bounds
+// both loops below), +0x0f u8[16] per-player class, +0x1f u8[16] per-player level, +0x2f cstr
+// description then `player count` cstrs of player names. Count at +0x0e is load-bearing: 0 stops
+// after description, else exactly that many name strings must follow or client reads OOB.
 fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
@@ -974,20 +911,14 @@ fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// MCP_LADDERDATA (0x11). Request: u8 mode, u16 reqid. Reply with the realm's characters
-// ranked by level. Wire format reversed from NET_MCP_CLIENT_Incoming0x11 @0x44afc0 +
-// CHATDLG_HandleChatListClick @0x4403f0: after the id, [u8 flag][u16 total][u16 chunk]
-// [u16 offset][data]; `data` (sent as one chunk) = [u32 rankBase=0][u32 count][u32 entrySize]
-// then count entries of [u32 expLo][u32 expHi][u32 charStats][entrySize-byte name]. charStats
-// = class(&0xf) | died<<4 | expansion<<5 | hardcore<<6 | progression<<8 | level<<16. Empty
-// realm -> the all-zero "empty ladder" form. count/entrySize are capped (<=256 / <=16) by the
-// client parser.
-//
-// Experience is what a ladder is actually ordered by, and it does NOT live in the header —
-// it is an entry in the packed attribute list, which has to be walked to reach (see
-// d2s.attribute). Ranking on the header's level byte instead, as this did, ties every
-// character at the same level into an arbitrary order and puts a fresh level 90 above one
-// most of the way to 91.
+// MCP_LADDERDATA (0x11). Request: u8 mode, u16 reqid; reply ranks the realm's characters. Wire
+// format from NET_MCP_CLIENT_Incoming0x11 @0x44afc0 + CHATDLG_HandleChatListClick @0x4403f0:
+// after the id, [u8 flag][u16 total][u16 chunk][u16 offset][data]; `data` (one chunk) =
+// [u32 rankBase=0][u32 count][u32 entrySize] then count entries of [u32 expLo][u32 expHi]
+// [u32 charStats][entrySize-byte name]. charStats = class(&0xf) | died<<4 | expansion<<5 |
+// hardcore<<6 | progression<<8 | level<<16. Empty realm -> the all-zero form; count/entrySize
+// are capped (<=256 / <=16) by the client parser. Ordering is by experience, which is NOT in the
+// header but in the packed attribute list (see d2s.attribute); the level byte alone ties.
 const ladder_max = 200;
 const ladder_entry_size: u32 = 16; // name field width
 

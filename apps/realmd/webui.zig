@@ -1,13 +1,9 @@
-//! Serves the embedded admin web UI on the health/admin HTTP listener (health.zig
-//! routes every non-probe, non-/admin path here). The UI is a single self-contained
-//! HTML file (Vite + React, bundled by vite-plugin-singlefile) embedded at build time:
-//!
-//!   - `zig build -Dwebui=true` builds webui/ and embeds dist/index.html
-//!   - otherwise a stub page is embedded (the JSON API still works)
-//!
-//! The page itself is NOT token-gated — it's static and harmless; every data call it
-//! makes hits /admin/* which IS bearer-token gated (admin.zig). It's a single-page app,
-//! so any unmatched path returns the same HTML.
+//! Serves the embedded admin web UI on the health/admin HTTP listener (health.zig routes every
+//! non-probe, non-/admin path here). Single self-contained HTML file (Vite + React via
+//! vite-plugin-singlefile), embedded at build time: `zig build -Dwebui=true` builds webui/ and
+//! embeds dist/index.html, otherwise a stub page is embedded (JSON API still works). The page
+//! itself is NOT token-gated — every data call hits /admin/* which IS (admin.zig) — and is a
+//! single-page app, so any unmatched path returns the same HTML.
 const std = @import("std");
 const net = @import("realm_infra").net;
 
