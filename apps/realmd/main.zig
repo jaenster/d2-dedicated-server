@@ -179,6 +179,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .pg_dsn = cfg.pg_dsn,
     });
     log.line("realmd", "store: durable={s} ephemeral={s}", .{ @tagName(cfg.durable_store), @tagName(cfg.ephemeral_store) });
+    // Redis is not one backend among several any more — it is where the realm's shared truth
+    // lives. Characters, the seat each one holds, game tokens and the fleet all coordinate
+    // through it, and every one of those fails in a way that reads as a game bug rather than a
+    // missing dependency. So it is checked here, once, and named.
+    //
+    // The DURABLE store stays a choice: pg for a deployment, fs for a single host. Neither is
+    // load-bearing for coordination, and requiring postgres would only make local iteration
+    // slower for nothing.
+    if (cfg.ephemeral_store != .redis) {
+        log.line("realmd", "FATAL REALMD_EPHEMERAL_STORE must be redis (got {s}): the realm coordinates through it", .{@tagName(cfg.ephemeral_store)});
+        return error.RedisRequired;
+    }
+    if (!store.ephemeralReachable()) {
+        log.line("realmd", "FATAL redis at '{s}' did not answer", .{cfg.redis_addr});
+        return error.RedisUnreachable;
+    }
     // Seed a break-glass admin from REALMD_ADMIN_BOOTSTRAP=name[:password] (idempotent).
     if (cfg.admin_bootstrap.len > 0) {
         const sep = std.mem.indexOfScalar(u8, cfg.admin_bootstrap, ':');

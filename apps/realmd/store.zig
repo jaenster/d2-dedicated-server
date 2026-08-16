@@ -388,6 +388,16 @@ pub fn flushCharToDurable(account: []const u8, charname: []const u8) bool {
     };
 }
 
+/// Is the shared store actually reachable? Asked once at startup, because everything the realm
+/// coordinates through it — characters, the seat a character holds, tokens, the fleet — fails in a
+/// way that looks like a game bug rather than a missing dependency.
+pub fn ephemeralReachable() bool {
+    return switch (ephemeral) {
+        .redis => redis.ping(),
+        .fs, .pg => true,
+    };
+}
+
 // ── save durability ──────────────────────────────────────────────────────────
 //
 // Redis is the mem-cache holding the live character; Postgres is the store of record. A save is

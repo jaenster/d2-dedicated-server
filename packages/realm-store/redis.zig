@@ -1336,6 +1336,19 @@ pub fn charLockOwner(account: []const u8, charname: []const u8, out: []u8) ?[]co
     };
 }
 
+/// Does redis answer? Used once at startup so an unreachable store is reported as itself rather
+/// than as every join mysteriously failing later.
+pub fn ping() bool {
+    const s2 = acquire();
+    defer release(s2);
+    var r: Reader = undefined;
+    const rep = command(s2, &r, &.{"PING"}) orelse return false;
+    return switch (rep) {
+        .status => true,
+        else => false,
+    };
+}
+
 /// Next realm-global game token, or null if redis could not answer.
 ///
 /// The token is what a client presents to the gateway, so it has to be unique across the whole
