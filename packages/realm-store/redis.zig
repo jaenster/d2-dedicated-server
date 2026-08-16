@@ -900,6 +900,150 @@ fn tokenRouteKey(buf: []u8, token: u16) []const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "troute:{x}", .{token}) catch unreachable;
 }
 
+// ── save durability ──────────────────────────────────────────────────────────
+//
+// Redis holds the live character; Postgres is the store of record. Between a save landing here
+// and reaching Postgres there is a window, and losing that window loses a player's progress —
+// the one failure in this design that cannot be repaired afterwards.
+//
+// So the dirty set is not a queue of saves, it is a set of NAMES. A flusher reads whatever bytes
+// are current rather than bytes carried in a message, which makes duplicated and out-of-order
+// work harmless: every flusher writes the newest save. That is what removes the need for
+// exactly-once delivery, acknowledgements, or ordering.
+//
+// This is deliberately NOT the character lock. That lock says which game owns a character and is
+// about gameplay; this says the stored copy is newer than Postgres and is about durability. A
+// lock cannot do this job: the writer never contends for it, so holding one would not stop a save
+// landing mid-flush. Only the version does.
+//
+// TWO RULES, or the rest is theatre:
+//   * a dirty blob must NEVER carry a TTL — expiry would delete the only copy
+//   * redis must not be allowed to evict these keys (noeviction, or their own instance)
+
+fn charVerKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "charver:{s}/{s}", .{ account, charname }) catch buf[0..0];
+}
+
+/// Record that the stored character is newer than Postgres, and return the version stamped on it.
+/// Callers keep that version so the flusher can tell whether it flushed THIS save or an older one.
+pub fn markCharDirty(account: []const u8, charname: []const u8) ?u64 {
+    var vb: [128]u8 = undefined;
+    const verkey = charVerKey(&vb, account, charname);
+    if (verkey.len == 0) return null;
+    var mb: [96]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return null;
+
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return null;
+    // One round trip: this runs on every save.
+    var c = CmdBuf{ .fd = fd };
+    c.add(&.{ "INCR", verkey });
+    c.add(&.{ "SADD", prefix ++ "dirty", member });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return null;
+    }
+    var r: Reader = .{ .fd = fd };
+    const rep = readReply(&r) orelse {
+        dropConn(s);
+        return null;
+    };
+    const ver: u64 = switch (rep) {
+        .int => |v| @intCast(@max(v, 0)),
+        else => {
+            dropConn(s);
+            return null;
+        },
+    };
+    if (readReply(&r) == null) dropConn(s); // drain SADD, or the connection desyncs
+    return ver;
+}
+
+/// Up to `out.len` characters whose stored copy is newer than Postgres. Not a claim: several
+/// flushers may take the same name and each will write the same current bytes.
+pub fn dirtyChars(out: [][]u8, lens: []usize) usize {
+    var cb: [16]u8 = undefined;
+    const cnt = std.fmt.bufPrint(&cb, "{d}", .{out.len}) catch return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "SRANDMEMBER", prefix ++ "dirty", cnt }) orelse return 0;
+    const count = switch (rep) {
+        .array_len => |n| if (n <= 0) return 0 else @as(usize, @intCast(n)),
+        else => return 0,
+    };
+    var n: usize = 0;
+    for (0..count) |_| {
+        const er = readReply(&r) orelse {
+            dropConn(s);
+            return n;
+        };
+        const member = switch (er) {
+            .bulk => |b| b orelse continue,
+            else => {
+                dropConn(s);
+                return n;
+            },
+        };
+        if (n >= out.len) continue;
+        const ln = @min(member.len, out[n].len);
+        @memcpy(out[n][0..ln], member[0..ln]);
+        lens[n] = ln;
+        n += 1;
+    }
+    return n;
+}
+
+/// Current version of a character's stored copy, 0 if it has never been saved.
+pub fn charVersion(account: []const u8, charname: []const u8) u64 {
+    var vb: [128]u8 = undefined;
+    const verkey = charVerKey(&vb, account, charname);
+    if (verkey.len == 0) return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", verkey }) orelse return 0;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk 0;
+            break :blk std.fmt.parseInt(u64, v, 10) catch 0;
+        },
+        else => 0,
+    };
+}
+
+/// Clear the dirty flag, but ONLY if no newer save landed while we were flushing.
+///
+/// This is the whole correctness argument for the flusher. Clearing unconditionally would drop
+/// the flag for a save that reached redis mid-flush and never reached Postgres. Compare and clear
+/// in one script so nothing can land between the two.
+pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64) bool {
+    var vb: [128]u8 = undefined;
+    const verkey = charVerKey(&vb, account, charname);
+    if (verkey.len == 0) return false;
+    var mb: [96]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    var nb: [24]u8 = undefined;
+    const vstr = std.fmt.bufPrint(&nb, "{d}", .{ver}) catch return false;
+
+    const script =
+        \\if redis.call('GET', KEYS[1]) == ARGV[1] then
+        \\  return redis.call('SREM', KEYS[2], ARGV[2])
+        \\end
+        \\return 0
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", verkey, prefix ++ "dirty", vstr, member }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
+        else => false,
+    };
+}
+
 // ── character ownership ──────────────────────────────────────────────────────
 //
 // A character may be in exactly one game. The holder writes its own id into the lock, so the

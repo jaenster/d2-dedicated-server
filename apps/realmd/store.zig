@@ -334,6 +334,44 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 // GAMELOGON packet. NAT-proof: the token is unique across the realm so two clients
 // behind one public IP never collide (unlike the source-IP route map above).
 
+// ── save durability ──────────────────────────────────────────────────────────
+//
+// Redis is the mem-cache holding the live character; Postgres is the store of record. A save is
+// marked dirty when redis has bytes Postgres has not seen, and the flush worker (any instance)
+// walks that set. The mark carries a VERSION, which is what makes the flush safe: the flag is
+// only cleared if no newer save landed while the flush was in flight.
+//
+// Redis-only for the same reason as the char lock — one instance's idea of "dirty" is not a
+// durability mechanism. On fs/pg the durable backend is written directly, so nothing is pending.
+
+pub fn markCharDirty(account: []const u8, charname: []const u8) ?u64 {
+    return switch (ephemeral) {
+        .redis => redis.markCharDirty(account, charname),
+        .fs, .pg => null,
+    };
+}
+
+pub fn dirtyChars(out: [][]u8, lens: []usize) usize {
+    return switch (ephemeral) {
+        .redis => redis.dirtyChars(out, lens),
+        .fs, .pg => 0,
+    };
+}
+
+pub fn charVersion(account: []const u8, charname: []const u8) u64 {
+    return switch (ephemeral) {
+        .redis => redis.charVersion(account, charname),
+        .fs, .pg => 0,
+    };
+}
+
+pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64) bool {
+    return switch (ephemeral) {
+        .redis => redis.clearDirtyIfUnchanged(account, charname, ver),
+        .fs, .pg => true,
+    };
+}
+
 // ── character ownership ──────────────────────────────────────────────────────
 //
 // A character belongs to one game at a time, and the lock records WHICH — so a second login can
