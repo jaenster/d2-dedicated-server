@@ -1,18 +1,26 @@
-# Builds the deploy images and pushes them to ghcr.io. GitHub runners are amd64, so
-# everything builds natively (no QEMU) — including the wine `gs` image. The built-in
-# GITHUB_TOKEN pushes to this account's ghcr packages.
+# Builds the deploy images, runs the real-GS stress e2e against them, and only then promotes
+# `:latest`. GitHub runners are amd64, so everything builds natively (no QEMU) — including the
+# wine `gs` image. The built-in GITHUB_TOKEN pushes to this account's ghcr packages.
 #
 #   ghcr.io/jaenster/realmd    — clean-room Zig realm server (scratch, static musl)
-#   ghcr.io/jaenster/d2gs      — headless wine GS runtime (game files mounted at runtime)
-#   ghcr.io/jaenster/qqserver  — token-translating game-traffic gateway (scratch, musl)
-#   ghcr.io/jaenster/d2gs-native — wine-free GS: the Mac 1.14d image loaded in-process (scratch)
+#   ghcr.io/jaenster/d2gs      — headless wine GS runtime (game data supplied at runtime,
+#                                 by default via the d2-gamedata initContainer below)
+#   ghcr.io/jaenster/d2ingress — token-translating game-traffic gateway (scratch, musl)
+#   ghcr.io/jaenster/d2gs-native — wine-free GS: the Mac 1.14d image loaded in-process,
+#                                 minimal game data baked in (scratch)
+#   ghcr.io/jaenster/d2-gamedata — the minimal 1.14d data set alone (windows), at /gamedata;
+#                                 what deploy/chart's load-gamedata initContainer copies in.
+#                                 Rebuilds only on a Dockerfile change or workflow_dispatch —
+#                                 the source tarball lives outside this repo (files.typeguru.nl)
+#                                 and isn't otherwise watched for updates.
 #
-# The cluster pulls these anonymously (public packages) — flip a NEW package to public
-# once under github.com/users/jaenster/packages. The PRIVATE d2gs-deploy repo's ArgoCD
-# app rolls them out (imagePullPolicy: Always on :latest).
+# The cluster pulls these anonymously (public packages) — flip a NEW package to public once
+# under github.com/users/jaenster/packages. The PRIVATE d2gs-deploy repo's ArgoCD app rolls out
+# `:latest` (imagePullPolicy: Always), which `promote-latest` below is the only thing that moves.
 name: build
 # Build images only when it matters, not on every commit/branch:
-#  - push to main or a vN.N.N tag (the canonical/published images)
+#  - a PR against main (build + e2e only — see push: false below; nothing to publish yet)
+#  - push to main or a vN.N.N tag (build + e2e, then promote-latest moves :latest)
 #  - ONLY when an image input actually changes (source/Dockerfile/entrypoint/webui) —
 #    deploy manifests + the Helm chart don't affect images, so they don't trigger.
 #  - manual (workflow_dispatch) for ad-hoc builds off any branch during dev.
@@ -21,7 +29,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths:
+    paths: &image-paths
       - apps/**
       - packages/**
       - webui/**
@@ -30,6 +38,9 @@ on:
       - build.zig
       - build.zig.zon
       - .github/workflows/build.yml
+  pull_request:
+    branches: [main]
+    paths: *image-paths
   workflow_dispatch: {}
 
 concurrency:
@@ -51,17 +62,21 @@ jobs:
             image: realmd
           - target: gs
             image: d2gs
-          - target: qqserver
-            image: qqserver
+          - target: d2ingress
+            image: d2ingress
           # The wine-free GS: one static i386 ELF in scratch. The image claims linux/amd64 like
           # the rest — containerd matches an image's platform against the node's and refuses a
           # linux/386 image outright, while that same node's kernel runs the i386 binary.
           - target: gs-native
             image: d2gs-native
+          - target: gamedata
+            image: d2-gamedata
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        # A PR doesn't push, so a fork PR (read-only GITHUB_TOKEN, no packages:write) still builds.
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -72,13 +87,92 @@ jobs:
           file: deploy/Dockerfile
           target: ${{ matrix.target }}
           platforms: linux/amd64
-          push: true
-          # `latest` follows main and the commit sha is the immutable handle a deploy pins; a
-          # vN.N.N push additionally publishes that version, so a chart can name a release rather
-          # than a hash. An empty line here is ignored, which is what the non-tag case produces.
+          push: ${{ github.event_name != 'pull_request' }}
+          # No `:latest` here — the commit sha is the immutable handle this job publishes, and
+          # `:latest` only moves once `promote-latest` confirms e2e passed on THIS sha. A vN.N.N
+          # push additionally publishes that version. An empty line here is ignored, which is
+          # what the non-tag case produces.
           tags: |
-            ghcr.io/jaenster/${{ matrix.image }}:latest
             ghcr.io/jaenster/${{ matrix.image }}:${{ github.sha }}
             ${{ github.ref_type == 'tag' && format('ghcr.io/jaenster/{0}:{1}', matrix.image, github.ref_name) || '' }}
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,scope=${{ matrix.target }},mode=max
+
+  # Real-GS stress e2e (tools/stress-e2e, run-stress.sh's round loop ported to Zig against a real
+  # GS instead of a bash + subprocess fleet — see that tool's doc comment). The test client runs
+  # AS A CONTAINER on the same compose network as realmd/gs-native (deploy/compose.e2e.yaml),
+  # dialling them by service name — no published host ports, no host-side wait loop (the binary's
+  # own --wait-ms probe handles readiness). Builds its own images straight from the working tree
+  # via compose rather than pulling what `build` just pushed: simpler than threading registry
+  # auth / sha-pinned image refs through compose for a job that already needs `build` to have
+  # succeeded first, at the cost of one extra compile. gs-native, not the wine `gs`, is the CI
+  # target: it bakes its own game data in and needs no wine/Xvfb on the runner.
+  e2e:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE: docker compose -f deploy/compose.yaml -f deploy/compose.e2e.yaml --profile native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build the stack images
+        run: $COMPOSE build realmd gs-native stress-e2e
+      - name: bring up realmd + gs-native
+        run: $COMPOSE up -d redis postgres realmd gs-native
+      - name: seed the test account's characters
+        # REALMD_PERMISSIVE_AUTH auto-registers the `tester` account on first login (set in
+        # compose.e2e.yaml) — only the characters need seeding, the same way
+        # tools/realmd-test/e2e-game.sh seeds its own (wine-based) full e2e: straight onto the
+        # fs data dir. `docker compose cp` needs the destination directory to already exist for
+        # a single-FILE copy, but happily creates missing parents for a DIRECTORY copy — hence
+        # assembling the tree locally first rather than cp-ing the two fixtures individually.
+        run: |
+          mkdir -p /tmp/seed-chars/chars/tester
+          cp tools/realmd-test/fixtures/EpicSorc.d2s tools/realmd-test/fixtures/EpicAma.d2s /tmp/seed-chars/chars/tester/
+          $COMPOSE cp /tmp/seed-chars/chars realmd:/data/
+      - name: stress e2e
+        run: |
+          $COMPOSE run --rm stress-e2e --host realmd --rounds 5 --clients 2 --runs 2 \
+            --account tester:tester --chars EpicSorc:1,EpicAma:0
+      - name: check the servers' own logs agree with what the client saw
+        # The stress-e2e result only proves the CLIENT's view; REALMD_LOG_JSON (set in
+        # compose.e2e.yaml) gives realmd's own structured account of the same run to cross-check
+        # against. Not byte-exact — loose presence/absence checks, not fixed counts, since a
+        # retried CREATEGAME or a probe game is normal and not a failure.
+        if: always()
+        run: |
+          $COMPOSE logs --no-log-prefix realmd    > /tmp/realmd.log    2>&1 || true
+          $COMPOSE logs --no-log-prefix gs-native  > /tmp/gs-native.log 2>&1 || true
+          fatal=$(jq -Rc 'fromjson? | select(.msg? // "" | test("FATAL|panic"; "i"))' /tmp/realmd.log /tmp/gs-native.log)
+          if [ -n "$fatal" ]; then echo "$fatal"; echo "FATAL/panic in a server log"; exit 1; fi
+          registered=$(jq -Rc 'fromjson? | select(.tag=="gs" and (.msg | test("registered")))' /tmp/realmd.log | wc -l)
+          logons_ok=$(jq -Rc 'fromjson? | select(.msg | test("char logon .* -> ok"))' /tmp/realmd.log | wc -l)
+          games_ok=$(jq -Rc 'fromjson? | select(.msg | test("create game .* -> gameid="))' /tmp/realmd.log | wc -l)
+          echo "realmd logged: gs registrations=$registered, successful char logons=$logons_ok, games created=$games_ok"
+          [ "$registered" -ge 1 ] || { echo "no GS ever registered over gs-link"; exit 1; }
+          [ "$logons_ok"  -ge 1 ] || { echo "realmd never logged a successful char logon"; exit 1; }
+          [ "$games_ok"   -ge 1 ] || { echo "realmd never logged a successful game create"; exit 1; }
+      - name: tear down
+        if: always()
+        run: $COMPOSE down -v
+
+  # Moves `:latest` to the sha `build` just pushed — a manifest copy, no rebuild. Only after e2e
+  # passes, and only on a real push to main (never a PR: there's nothing to promote yet).
+  promote-latest:
+    needs: [build, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [realmd, d2gs, d2ingress, d2gs-native, d2-gamedata]
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: |
+          docker buildx imagetools create \
+            -t ghcr.io/jaenster/${{ matrix.image }}:latest \
+            ghcr.io/jaenster/${{ matrix.image }}:${{ github.sha }}
