@@ -19,6 +19,7 @@ const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
 const obs = @import("realm_infra").obs;
 const state = @import("state.zig");
+const store = @import("store.zig");
 const Lock = @import("realm_infra").lock.Lock;
 const p = @import("realm_proto").protocol;
 
@@ -167,6 +168,24 @@ pub var registry: GsRegistry = .{};
 /// internal Gs struct — only the fields the API exposes).
 pub const GsInfo = struct { gsid: u32, ip: [4]u8, port: u16, maxgame: u32, live: u32 };
 
+/// Publish this server into the shared fleet view, so instances that do not hold its control
+/// connection can still see that it exists and how loaded it is. Called wherever its load or
+/// capacity changes, and on the link's own echo so a healthy server keeps its record alive.
+///
+/// Best-effort on purpose: the local registry is what dispatch actually uses, so a store that is
+/// down degrades the realm to what it was before this existed rather than failing a create.
+fn publish(g: *Gs) void {
+    if (!g.registered.load(.acquire)) return;
+    _ = store.registerGs(.{
+        .gsid = g.gsid,
+        .gs_ip = g.ip(),
+        .gs_port = g.port,
+        .maxgame = g.maxgame,
+        .live_games = g.live_games.load(.acquire),
+        .full = g.full.load(.acquire),
+    });
+}
+
 /// Snapshot the registered GSes into `buf` under the registry lock; returns the
 /// number filled (capped at buf.len).
 pub fn snapshot(buf: []GsInfo) usize {
@@ -222,6 +241,9 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     };
     defer {
         const was_registered = g.registered.load(.acquire);
+        // Its control connection is gone, so no instance can dispatch to it: take it out of
+        // the shared view now rather than waiting for the record to expire.
+        if (g.gsid != 0) store.removeGs(g.gsid);
         registry.release(g);
         // Only a connection that got as far as ADDRINFO owns any games. Anything else is
         // a port probe — `nc -z`, a k8s readiness check, run-stack's own await — and it
@@ -298,6 +320,7 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
             // stay taken forever and create-game rejects them as duplicates.
             state.global.expireGamesByGs(g.gsid);
             g.registered.store(true, .release);
+            publish(g);
             const a = g.ip();
             log.line(tag, "GS ADDRINFO gsid=0x{x} addr={d}.{d}.{d}.{d}:{d} maxgame={d} -> registered", .{ g.gsid, a[0], a[1], a[2], a[3], g.port, g.maxgame });
         },
@@ -305,6 +328,7 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
             var hbuf: [8]u8 = undefined;
             writeHeader(&hbuf, 8, TYPE_ECHO, nextSeq(g));
             _ = sendPacket(g, &hbuf);
+            publish(g); // keeps the shared record from expiring while the link is healthy
         },
         TYPE_CREATEGAME, TYPE_JOINGAME => {
             // GS reply to our request: result, gameid.
@@ -343,6 +367,7 @@ fn onPacket(tag: []const u8, g: *Gs, typ: u16, body: []const u8) void {
             // while the slot it wanted had already been given back.
             if (g.live_games.load(.acquire) > 0) _ = g.live_games.fetchSub(1, .monotonic);
             g.full.store(false, .release); // a slot came free — this GS can host again
+            publish(g);
             state.global.removeGameById(gameid);
             log.line(tag, "GS CLOSEGAME gameid={d}", .{gameid});
         },
@@ -450,12 +475,18 @@ pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, la
             if (r.result == proto_create_server_full) {
                 last_create_failure = .all_full;
                 g.full.store(true, .release);
+                publish(g);
                 continue;
             }
             last_create_failure = .refused;
             return null;
         }
         _ = g.live_games.fetchAdd(1, .monotonic);
+        // Deliberately NOT published here. Everything between the GS accepting a create and this
+        // returning is time in which the game exists but the realm has not recorded it yet, and a
+        // second client creating the same name loses the race and then cannot join what it was
+        // told already exists. A store round trip in that gap made every stress round fail.
+        // The count reaches the shared view on the next echo, which is soon enough for a view.
         return .{ .gsid = g.gsid, .gameid = r.gameid, .ip = g.ip(), .port = g.port };
     }
     return null;

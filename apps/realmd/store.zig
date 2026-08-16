@@ -334,6 +334,42 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 // GAMELOGON packet. NAT-proof: the token is unique across the realm so two clients
 // behind one public IP never collide (unlike the source-IP route map above).
 
+// ── the game-server fleet (ephemeral, shared) ────────────────────────────────
+//
+// Only redis carries this: the point of publishing the fleet is that an instance which does NOT
+// hold a server's control connection can still see it. fs and pg have no cross-instance story, so
+// they report an empty fleet and every caller falls back to its own in-process registry — which is
+// exactly right for a single instance, and is what those backends already imply.
+
+pub const GsRec = types.GsRec;
+
+/// How long a published game server survives without a refresh. Comfortably longer than the
+/// control link's own liveness traffic, so a healthy server never blinks out, and short enough
+/// that one lost with its realmd disappears within a game's lifetime.
+pub const gs_ttl_s: u32 = 90;
+
+pub fn registerGs(rec: GsRec) bool {
+    return switch (ephemeral) {
+        .redis => redis.registerGs(rec, gs_ttl_s),
+        .fs, .pg => false,
+    };
+}
+
+pub fn removeGs(gsid: u32) void {
+    switch (ephemeral) {
+        .redis => redis.removeGs(gsid),
+        .fs, .pg => {},
+    }
+}
+
+/// The fleet as the whole realm sees it. 0 means "nothing shared" — not "no servers".
+pub fn snapshotGs(out: []GsRec) usize {
+    return switch (ephemeral) {
+        .redis => redis.snapshotGs(out),
+        .fs, .pg => 0,
+    };
+}
+
 /// Process-local fallback counter for the backends that cannot mint across instances.
 var local_token_ctr = std.atomic.Value(u16).init(1);
 

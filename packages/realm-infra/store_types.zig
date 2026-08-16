@@ -74,6 +74,26 @@ pub const TokenRoute = struct {
     gameid: u32,
 };
 
+/// One game server as the whole realm sees it, rather than as the instance holding its control
+/// connection sees it. Published by whichever realmd owns that connection and refreshed on the
+/// link's own liveness traffic, so it expires by itself if that realmd dies with the socket.
+///
+/// This is the fleet's *view*, not its *reachability*: dispatch still travels the control socket,
+/// so an instance can read a record here for a server it cannot itself talk to. What it buys is
+/// that every instance sees the same capacity and load — without it a second realmd sees an empty
+/// fleet and refuses every create.
+pub const GsRec = struct {
+    gsid: u32,
+    gs_ip: [4]u8,
+    gs_port: u16 = 4000,
+    /// Advertised capacity; 0 means the server did not say, i.e. unlimited.
+    maxgame: u32 = 0,
+    live_games: u32 = 0,
+    /// The server itself answered "full" — it knows about slots still held by the reap window,
+    /// which `live_games` cannot see.
+    full: bool = false,
+};
+
 /// A game enumerated from the shared store (name + record) — used to serve /admin/games
 /// when sessions/games live in redis/pg rather than the per-instance in-memory table.
 pub const NamedGame = struct {

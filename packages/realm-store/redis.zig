@@ -914,6 +914,194 @@ pub fn mintToken() ?u16 {
     return @intCast(@as(u64, @bitCast(n)) % 65535 + 1);
 }
 
+// ── the game-server fleet, as every instance sees it ─────────────────────────
+//
+// One key per server plus a set to enumerate them, the same shape the game index uses. The record
+// carries a TTL and the owning realmd refreshes it on the control link's own liveness traffic, so
+// a realmd that dies with its sockets takes its servers out of the shared view without anyone
+// having to notice and clean up.
+
+fn gsKey(buf: []u8, gsid: u32) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "gs:{x}", .{gsid}) catch buf[0..0];
+}
+
+/// Publish (or refresh) one game server. Called on registration and whenever its load changes.
+pub fn registerGs(rec: types.GsRec, ttl_s: u32) bool {
+    var kb: [64]u8 = undefined;
+    const key = gsKey(&kb, rec.gsid);
+    if (key.len == 0) return false;
+    // ip[4] ++ port(u16) ++ maxgame(u32) ++ live(u32) ++ full(u8) = 15 bytes.
+    var vb: [15]u8 = undefined;
+    @memcpy(vb[0..4], &rec.gs_ip);
+    std.mem.writeInt(u16, vb[4..6], rec.gs_port, .little);
+    std.mem.writeInt(u32, vb[6..10], rec.maxgame, .little);
+    std.mem.writeInt(u32, vb[10..14], rec.live_games, .little);
+    vb[14] = @intFromBool(rec.full);
+
+    var idb: [16]u8 = undefined;
+    const idstr = std.fmt.bufPrint(&idb, "{x}", .{rec.gsid}) catch return false;
+
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return false;
+    // SET + SADD in one round trip: this runs on every game create and close.
+    var c = CmdBuf{ .fd = fd };
+    if (ttl_s > 0) {
+        var pb: [16]u8 = undefined;
+        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        c.add(&.{ "SET", key, &vb, "PX", px });
+    } else {
+        c.add(&.{ "SET", key, &vb });
+    }
+    c.add(&.{ "SADD", prefix ++ "gs", idstr });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return false;
+    }
+    var r: Reader = undefined;
+    r = .{ .fd = fd };
+    var ok = true;
+    for (0..2) |_| {
+        if (readReply(&r) == null) {
+            dropConn(s);
+            ok = false;
+            break;
+        }
+    }
+    return ok;
+}
+
+/// Drop a game server from the shared view — its control connection is gone.
+pub fn removeGs(gsid: u32) void {
+    var kb: [64]u8 = undefined;
+    const key = gsKey(&kb, gsid);
+    if (key.len == 0) return;
+    var idb: [16]u8 = undefined;
+    const idstr = std.fmt.bufPrint(&idb, "{x}", .{gsid}) catch return;
+
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return;
+    var c = CmdBuf{ .fd = fd };
+    c.add(&.{ "DEL", key });
+    c.add(&.{ "SREM", prefix ++ "gs", idstr });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return;
+    }
+    var r: Reader = .{ .fd = fd };
+    for (0..2) |_| {
+        if (readReply(&r) == null) {
+            dropConn(s);
+            return;
+        }
+    }
+}
+
+/// Every game server the realm can currently see, from any instance. Members whose record has
+/// TTL'd out are pruned from the index as they are found, the same as `snapshotGames`.
+pub fn snapshotGs(out: []types.GsRec) usize {
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "SMEMBERS", prefix ++ "gs" }) orelse return 0;
+    const count = switch (rep) {
+        .array_len => |nn| if (nn <= 0) return 0 else @as(usize, @intCast(nn)),
+        else => return 0,
+    };
+    var ids: [max_gs_snapshot][16]u8 = undefined;
+    var idlen: [max_gs_snapshot]u8 = undefined;
+    var got: usize = 0;
+    for (0..count) |_| {
+        const er = readReply(&r) orelse {
+            dropConn(s);
+            return 0;
+        };
+        const member = switch (er) {
+            .bulk => |b| b orelse continue,
+            else => {
+                dropConn(s);
+                return 0;
+            },
+        };
+        if (got >= ids.len) continue;
+        const ln: u8 = @intCast(@min(member.len, 16));
+        @memcpy(ids[got][0..ln], member[0..ln]);
+        idlen[got] = ln;
+        got += 1;
+    }
+    if (got == 0) return 0;
+
+    const fd = s.fd orelse return 0;
+    var c = CmdBuf{ .fd = fd };
+    for (0..got) |i| {
+        var gk: [64]u8 = undefined;
+        const key = std.fmt.bufPrint(&gk, prefix ++ "gs:{s}", .{ids[i][0..idlen[i]]}) catch {
+            c.ok = false;
+            break;
+        };
+        c.add(&.{ "GET", key });
+    }
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return 0;
+    }
+
+    var expired = [_]bool{false} ** max_gs_snapshot;
+    var any_expired = false;
+    var synced = true;
+    var n: usize = 0;
+    for (0..got) |i| {
+        const grep = readReply(&r) orelse {
+            dropConn(s);
+            synced = false;
+            break;
+        };
+        const val = switch (grep) {
+            .bulk => |b| b orelse {
+                expired[i] = true;
+                any_expired = true;
+                continue;
+            },
+            else => continue,
+        };
+        if (val.len < 15 or n >= out.len) continue;
+        out[n] = .{
+            .gsid = std.fmt.parseInt(u32, ids[i][0..idlen[i]], 16) catch continue,
+            .gs_ip = .{ val[0], val[1], val[2], val[3] },
+            .gs_port = std.mem.readInt(u16, val[4..6], .little),
+            .maxgame = std.mem.readInt(u32, val[6..10], .little),
+            .live_games = std.mem.readInt(u32, val[10..14], .little),
+            .full = val[14] != 0,
+        };
+        n += 1;
+    }
+
+    if (any_expired and synced) {
+        var args: [max_gs_snapshot + 2][]const u8 = undefined;
+        args[0] = "SREM";
+        args[1] = prefix ++ "gs";
+        var na: usize = 2;
+        for (0..got) |i| {
+            if (expired[i]) {
+                args[na] = ids[i][0..idlen[i]];
+                na += 1;
+            }
+        }
+        if (na > 2) {
+            var rr: Reader = undefined;
+            _ = command(s, &rr, args[0..na]);
+        }
+    }
+    return n;
+}
+
+/// Bound on one fleet snapshot — mirrors gslink's own `max_gs`.
+const max_gs_snapshot = 64;
+
 pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
     const key = tokenRouteKey(&kb, token);
