@@ -140,6 +140,20 @@ fn sleepMs(ms: u32) void {
 pub var game_ip: [4]u8 = .{ 0, 0, 0, 0 };
 pub var route_ttl_s: u32 = 60;
 
+/// Largest character this will stage. A real 1.14d save is a few KB; a read that exactly filled a
+/// smaller buffer could not be told from a truncated one, and the store refuses to cache those.
+const max_stage_d2s = 32 * 1024;
+
+/// Pull a character into the shared store so the game server can find it there.
+///
+/// The read itself is the mechanism: the store populates its cache on a miss, and does so only
+/// when nothing is cached, so this can never put an older copy over a newer save.
+fn warmChar(account: []const u8, charname: []const u8) void {
+    var buf: [max_stage_d2s]u8 = undefined;
+    const n = store.getCharD2s(account, charname, &buf);
+    if (n == 0) log.line("d2cs", "warm '{s}/{s}' -> no such character", .{ account, charname });
+}
+
 /// Mint the next game token. realmd OWNS the token it hands the client — two clients behind one
 /// public IP get distinct ones, which is what makes the gateway's translation NAT-proof. The
 /// counter lives in the store so it is realm-global rather than per-process; see
@@ -786,6 +800,10 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         return rejectJoin(c, &w, JOIN_FULL);
     }
     _ = store.addGameChar(g.gameid, c.accountName(), c.charName());
+    // Stage the character into the shared store before the game server goes looking. The server
+    // reads redis and nothing else, so a character that has only ever been in postgres would come
+    // back missing — this read is what promotes it, and it is a no-op once it is there.
+    warmChar(c.accountName(), c.charName());
     // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
     // both directions) as soon as the player is actually in the game.
     _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc());
