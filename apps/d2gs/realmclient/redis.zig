@@ -36,12 +36,33 @@ extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
 extern "ws2_32" fn setsockopt(s: SOCKET, level: i32, name: i32, val: [*]const u8, len: i32) callconv(.winapi) i32;
 extern "ws2_32" fn htons(v: u16) callconv(.winapi) u16;
 extern "ws2_32" fn inet_addr(cp: [*:0]const u8) callconv(.winapi) u32;
+extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
 const INADDR_NONE: u32 = 0xffff_ffff;
 
 /// Long enough that a busy redis is not mistaken for a dead one, short enough that a wedged
 /// connection cannot stall a game's tick for a noticeable time.
 const io_timeout_ms: u32 = 2000;
+
+/// One connection, and more than one thread reaching for it. The heartbeat runs on the server
+/// tick while a character fetch runs on the join path, and a command/reply cycle cannot be
+/// interleaved: the second caller reads the first one's reply, the connection desyncs, and reads
+/// start coming back empty while writes still look fine. That is not hypothetical — it is what
+/// removing the d2dbs fallback exposed, as joins failing with the character sitting readable in
+/// redis.
+///
+/// A spin with a yield rather than a real lock: contention is a heartbeat every thirty seconds
+/// against an occasional fetch, and the DLL has no lock primitive of its own — realm_infra, which
+/// has one, is deliberately not in this build.
+var busy = std.atomic.Value(bool).init(false);
+
+fn lock() void {
+    while (busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) Sleep(0);
+}
+
+fn unlock() void {
+    busy.store(false, .release);
+}
 
 var host_buf: [256]u8 = [_]u8{0} ** 256;
 var host_len: usize = 0;
@@ -122,6 +143,8 @@ var rx: [16384]u8 = undefined;
 /// Send one command and read one reply. Null on any IO or framing failure, with the connection
 /// dropped so the next call starts clean — a desynced connection can never be reasoned about.
 pub fn command(args: []const []const u8) ?Reply {
+    lock();
+    defer unlock();
     const s = ensure() orelse return null;
     var tx: [1024]u8 = undefined;
     // A command whose arguments do not fit is a programming error here, not a runtime condition:
@@ -137,6 +160,8 @@ pub fn command(args: []const []const u8) ?Reply {
 /// Same, but the LAST argument may be arbitrarily large — a .d2s save is bigger than any sane
 /// command buffer, so its header is encoded and the payload streamed straight after it.
 pub fn commandBig(head: []const []const u8, tail: []const u8) ?Reply {
+    lock();
+    defer unlock();
     const s = ensure() orelse return null;
     var tx: [1024]u8 = undefined;
     var n: usize = 0;
