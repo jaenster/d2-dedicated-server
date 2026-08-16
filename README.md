@@ -47,8 +47,10 @@ Not "it has a Dockerfile". The design decisions that matter:
   every game server needs its own client-routable address and the fleet can never outgrow the
   IPs you own. d2ingress does what an HTTP ingress does with the `Host` header -- one layer down,
   on the game protocol. The fleet lives on pod IPs.
-- **No shared disk.** On a join the game server **fetches the character over the network** from
-  realmd's d2dbs. No RWX volume, no shared game-data mount between pods.
+- **No shared disk, and no character through the realm.** realmd stages a character into redis on
+  join; the game server reads it from there, plays, and writes it back, and a flush worker in
+  whichever realmd notices moves it to the store of record. No RWX volume, no shared game-data
+  mount, and no save waiting on a database.
 - **Scale the thing that actually has a ceiling.** Seven concurrent games per `Game.exe` is a
   hard engine limit, so capacity comes from adding game-server pods, not tuning one --
   see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
@@ -59,10 +61,13 @@ Not "it has a Dockerfile". The design decisions that matter:
 - **Small.** Two of the three ship as `scratch` images with static musl binaries and sit at
   ~1--6 MiB resident. The realm costs about `1m` CPU.
 
-One honest exception: a game server holds its gs-link control connection to exactly **one**
-realmd, and create/join is a synchronous request over that socket. So **run realmd as a single
-replica** today; the chart does, and says why. Multi-instance HA needs the fleet dialling every
-pod, or dispatch relayed through the store.
+One honest exception, and it is now the only one: a game server holds its gs-link control
+connection to exactly **one** realmd, and create/join is a synchronous request over that socket.
+Everything else a realmd needs is in redis — it can read the whole fleet, resolve any session,
+and serve any character — but it can only dispatch to servers whose socket it holds. So **run
+realmd as a single replica** today; the chart does, and says why. What closes it is moving
+dispatch itself into the store, which is the last piece of that migration
+([`docs/redis.md`](docs/redis.md)).
 
 realmd and d2ingress sit behind public LoadBalancers on stable floating IPs (only 6112 + 4000
 open); Redis + Postgres behind them; an internal GS fleet whose pods register their own pod IP:
@@ -77,25 +82,34 @@ open); Redis + Postgres behind them; an internal GS fleet whose pods register th
    login + realm  |  (BNCS + MCP on ONE        |  game traffic
                   v   port, like real bnet)    v  (D2Net)
        +----------------------+        +----------------------+
-       |  realmd              |        |  d2ingress            |
+       |  realmd              |        |  d2ingress           |
        |  :6112  login, realm |        |  :4000  public game  |
        |  :8080  health / UI  |        |         ingress      |
        +----------+-----------+        +-----------+----------+
-            ^   ^      writes token route (redis)  |
-  internal: |   +----------------------------------+
-  gs-link   |              splice to the owning GS |
-  :6115     |                                      v
-  d2dbs     |   register + fetch     +----------------------+
-  :6114     +------------------------|  Game.exe + d2gs.dll |
-                character bytes      |  fleet 1..N          |
-                                     |  internal :4000      |
-                                     +----------------------+
+            |     |                                |
+            |     |  create/join dispatch          |  splice to the owning GS
+            |     |  (gs-link :6115)               |
+            |     +--------------------+           |
+            |                          v           v
+            |                  +----------------------+
+            |  stages the      |  Game.exe + d2gs.dll |
+            |  character       |  fleet 1..N          |
+            v                  +----------+-----------+
+       +---------------------------+      | reads the character, writes it back,
+       |  redis                    |<-----+ publishes its own heartbeat
+       |  characters, seats,       |
+       |  tokens, routes, fleet    |
+       +------------+--------------+
+                    | flush worker (any realmd)
+                    v
+            +----------------+
+            |  postgres / fs |   the store of record
+            +----------------+
 ```
 
 The client only ever uses two ports: **6112** (login + realm) and **4000** (game). Everything
-else is internal traffic between the fleet and realmd: gs-link (6115) for create/join dispatch,
-and d2dbs (6114), which is legacy — the game server reads and writes characters straight from
-redis, and nothing reaches that listener any more.
+else is internal: gs-link (6115), which carries create/join dispatch to the fleet. Characters do
+not travel it — the game server reads and writes them straight from redis.
 
 Game traffic always crosses an ingress -- the token realmd hands the client is realm-global, and
 only an ingress can translate it to the id the engine knows. On one host realmd can be that
@@ -152,8 +166,8 @@ check uses **BNFTP** on the same port.
 
 Behind that one client port, realmd also exposes two **internal** endpoints the fleet uses
 (never the client): a **gs-link** (`:6115`) the fleet registers over and that routes create/join
-to a server, and **d2dbs** (`:6114`), now legacy: characters live in redis and the game server
-reads and writes them itself, so nothing reaches it. See [`docs/redis.md`](docs/redis.md).
+to a server. Characters do not pass through realmd at all: it stages one into redis on join and
+the game server reads, plays and writes it back there. See [`docs/redis.md`](docs/redis.md).
 
 More: [`REALMD.md`](REALMD.md) (configuration, trust model) and
 [`apps/realmd/README.md`](apps/realmd/README.md) (internals).

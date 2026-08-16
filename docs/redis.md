@@ -6,6 +6,12 @@ every realmd instance agrees through, so that no instance owns anything the othe
 This is a migration in progress. What is here is live and tested; the last section says plainly
 what has not moved yet and what that still costs.
 
+**How a character reaches a game.** The realm stages it into redis on join — the read itself is the
+mechanism, since the store populates its cache on a miss. The game server then reads it from redis
+directly, plays, and writes it back there; a flush worker in whichever realmd notices moves it to
+the store of record afterwards. No character ever travels through the realm, which is why the
+d2dbs listener is gone.
+
 ## Keys
 
 All under a `realmd:` prefix.
@@ -127,6 +133,18 @@ request/reply cycle. Two threads sharing it without that desyncs the connection:
 reads the first one's reply, and afterwards reads come back empty while writes still appear to
 work. That failure looked exactly like a missing character.
 
+## Ports that went away
+
+**6113** (the standalone d2cs listener) and **6114** (d2dbs) are both gone. MCP was always muxed
+onto the BNCS port the way real Battle.net does it, so no client ever dialled 6113 — only our own
+test harness did. And characters now come from redis, so nothing reaches d2dbs.
+
+Retiring d2dbs took three attempts, and the first two failed in a way worth remembering: the engine
+path dialled the listener BEFORE fetching, and treated a failed dial as "no source". The fetch had
+already moved to redis, but was never reached — so removing the listener produced "char fetch
+FAILED" with the character sitting readable in the store, which reads exactly like a broken store.
+When a component looks like it ignores a change, check whether something upstream gates it.
+
 ## What has not moved yet
 
 Create and join **dispatch still travels each game server's control socket** (gs-link, 6115). That
@@ -134,8 +152,5 @@ is the last thing keeping realmd a single replica: an instance can see the whole
 can only dispatch to servers whose socket it holds, and the join-context notify silently does
 nothing on an instance that does not — so a second replica would not degrade, it would tell a
 client yes and let the game server refuse them.
-
-The d2dbs listener (6114) is also still up, though nothing reaches it: the game server served zero
-fetches through it across a six-game run. Removing it is cleanup, not migration.
 
 Until dispatch moves, **run realmd as one replica.**

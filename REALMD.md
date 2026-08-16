@@ -30,7 +30,6 @@ Only **6112** is for the client. The rest are internal (the GS fleet talks to re
 | Port | Facing | Role |
 |-|-|-|
 | 6112 | client | bnetd login + MCP realm (list/select/create/join), muxed on one port |
-| 6114 | internal | d2dbs: legacy character fetch. The game server reads redis directly now and served zero fetches here across a six-game run; the listener is pending removal |
 | 6115 | internal | gs-link: the game-server fleet registers here and create/join is routed |
 | 8080 | ops | health/readiness + admin API + (optional) embedded web UI |
 
