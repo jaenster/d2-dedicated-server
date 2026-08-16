@@ -1702,7 +1702,7 @@ fn scBannerAd() Result {
         _ = waitpid(pid, null, 0);
     }
 
-    var c = rc.RealmClient{ .bnet_port = 20112, .d2cs_port = 20113 };
+    var c = rc.RealmClient{ .bnet_port = 20112, .d2cs_port = 20112 };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1774,7 +1774,7 @@ fn scFriendsPersist() Result {
         _ = waitpid(writer_pid, null, 0);
     }
 
-    var c = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21113 };
+    var c = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21112 };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1805,7 +1805,7 @@ fn scFriendsPersist() Result {
         _ = waitpid(cold_pid, null, 0);
     }
 
-    var cold = rc.RealmClient{ .bnet_port = 22112, .d2cs_port = 22113 };
+    var cold = rc.RealmClient{ .bnet_port = 22112, .d2cs_port = 22112 };
     defer cold.close();
     cold.connectBnet() catch |e| return fail(name, "cold {s}", .{@errorName(e)});
     cold.auth() catch |e| return fail(name, "cold {s}", .{@errorName(e)});
@@ -1826,7 +1826,7 @@ fn scFriendsPersist() Result {
     // A friend who is actually in a channel should be reported as being there. This is the
     // only part of the friends feature a real 1.14d client can see, since it arrives as
     // chat text — the structured 0x65 reply is dropped by the client outright.
-    var pal = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21113 };
+    var pal = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21112 };
     defer pal.close();
     pal.connectBnet() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
     pal.auth() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
@@ -1875,7 +1875,6 @@ fn scMultiInstance() Result {
         .{ .name = "REALMD_INSTANCE", .value = "A" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
         .{ .name = "REALMD_BNET_PORT", .value = "16112" },
-        .{ .name = "REALMD_D2CS_PORT", .value = "16113" },
         .{ .name = "REALMD_D2DBS_PORT", .value = "16114" },
         .{ .name = "REALMD_GS_PORT", .value = "16115" },
         .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
@@ -1913,7 +1912,7 @@ fn scMultiInstance() Result {
     if (!gs.isRegistered()) return fail(name, "FakeGS did not register with instance A", .{});
 
     // Mint a session on instance A (bnetd 16112 -> d2cs handoff lives in shared store).
-    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16113 };
+    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16112 };
     defer a.close();
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
@@ -1923,7 +1922,7 @@ fn scMultiInstance() Result {
 
     // Resolve A's session on instance B's d2cs (17113). Copy A's session fields
     // into B's client so its STARTUP carries A's cookie/status/lo/hi/account.
-    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17113 };
+    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17112 };
     defer b.close();
     b.cookie = a.cookie;
     b.status = a.status;
@@ -2210,7 +2209,7 @@ fn scEmbeddedGameEdge() Result {
     defer gs.stop();
     if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
 
-    var c = rc.RealmClient{ .bnet_port = 18112, .d2cs_port = 18113, .d2dbs_port = 18114 };
+    var c = rc.RealmClient{ .bnet_port = 18112, .d2cs_port = 18112, .d2dbs_port = 18114 };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});

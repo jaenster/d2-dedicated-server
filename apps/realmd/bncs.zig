@@ -34,7 +34,9 @@ const xsha1 = @import("libd2").bnet.xsha1;
 pub var realm_name: []const u8 = "TypeGuru";
 pub var realm_desc: []const u8 = "D2 Closed Realm";
 pub var d2cs_ip: [4]u8 = .{ 127, 0, 0, 1 };
-pub var d2cs_port: u16 = 6113;
+/// The port the realm tells clients to reach MCP on. Muxed onto BNCS, so it is the BNCS port;
+/// main() sets it from the configured one.
+pub var d2cs_port: u16 = 6112;
 
 // Comma-separated account names that get Battle.net-admin + operator flags in chat
 // (the "@"/Blizzard-rep style ops). Set from REALMD_ADMINS. Case-insensitive.

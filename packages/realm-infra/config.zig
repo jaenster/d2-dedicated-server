@@ -13,7 +13,6 @@ pub const Config = struct {
     instance_id: []const u8 = "realmd-0",
     bind: []const u8 = "0.0.0.0",
     bnet_port: u16 = 6112,
-    d2cs_port: u16 = 6113,
     d2dbs_port: u16 = 6114,
 
     /// Realm advertised to clients (what bnetd hands back as the realm address).
@@ -147,7 +146,6 @@ pub fn fromEnv() Config {
     if (env("REALMD_INSTANCE")) |v| c.instance_id = v;
     if (env("REALMD_BIND")) |v| c.bind = v;
     c.bnet_port = envPort("REALMD_BNET_PORT", c.bnet_port);
-    c.d2cs_port = envPort("REALMD_D2CS_PORT", c.d2cs_port);
     c.d2dbs_port = envPort("REALMD_D2DBS_PORT", c.d2dbs_port);
     c.gs_port = envPort("REALMD_GS_PORT", c.gs_port);
     if (env("REALMD_GS_ADDR")) |v| c.gs_addr = v;

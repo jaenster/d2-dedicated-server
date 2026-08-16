@@ -27,7 +27,6 @@ spec:
   # ClusterIP Service below — not exposed here.
   ports:
     - { port: 6112, targetPort: 6112, name: bnetd }
-    - { port: 6113, targetPort: 6113, name: d2cs }
 ---
 # Internal gs-link Service. realmd reports NotReady until a GS registers (REQUIRE_GS),
 # but a normal Service only routes to Ready pods — so the GS could never reach the

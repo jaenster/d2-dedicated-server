@@ -148,8 +148,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     log.json = cfg.log_json;
     obs.nowMsFn = &nowMs; // span durations
     if (runSubcommand(cfg, init.args)) return;
-    log.line("realmd", "starting instance={s} bind={s} bnet={d} d2cs={d} d2dbs={d} realm={s}@{s} capture={}", .{
-        cfg.instance_id, cfg.bind,       cfg.bnet_port,  cfg.d2cs_port,
+    log.line("realmd", "starting instance={s} bind={s} bnet={d} d2dbs={d} realm={s}@{s} capture={}", .{
+        cfg.instance_id, cfg.bind,       cfg.bnet_port,
         cfg.d2dbs_port,  cfg.realm_name, cfg.realm_addr, cfg.capture,
     });
     // Graceful shutdown for k8s rolling updates + readiness gating.
@@ -210,9 +210,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     bncs.ad_url = cfg.ad_url;
     if (cfg.ad_file.len > 0 and cfg.ad_url.len > 0)
         log.line("realmd", "banner ad '{s}' -> {s} (served from {s}/bnftp/)", .{ cfg.ad_file, cfg.ad_url, cfg.data_dir });
-    // Advertise the realm/MCP address on the BNCS port: bncs.handle selector-muxes
-    // MCP (0x01 + non-0xFF) onto :6112, like real bnet. The standalone d2cs listener
-    // on cfg.d2cs_port stays up for back-compat / direct tests.
+    // The realm speaks MCP on the BNCS port: bncs.handle selector-muxes it (0x01 + non-0xFF)
+    // onto :6112, exactly as real bnet does. There is no second listener — the client was never
+    // told about one, so the only thing the old d2cs port ever served was our own test harness.
     bncs.d2cs_port = cfg.bnet_port;
     gslink.realm_name = cfg.realm_name;
     if (parseIp4(cfg.realm_addr)) |ip| {
@@ -243,20 +243,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.ingress_port, cfg.route_ttl_s });
 
     const bnet_fd = try net.listenTcp(cfg.bind, cfg.bnet_port);
-    const d2cs_fd = try net.listenTcp(cfg.bind, cfg.d2cs_port);
     const d2dbs_fd = try net.listenTcp(cfg.bind, cfg.d2dbs_port);
     const gs_fd = try net.listenTcp(cfg.bind, cfg.gs_port);
     const health_fd = try net.listenTcp(cfg.bind, cfg.health_port);
-    log.line("realmd", "listening on {d}/{d}/{d} (gs link {d}, health {d})", .{ cfg.bnet_port, cfg.d2cs_port, cfg.d2dbs_port, cfg.gs_port, cfg.health_port });
+    log.line("realmd", "listening on {d}/{d} (gs link {d}, health {d})", .{ cfg.bnet_port, cfg.d2dbs_port, cfg.gs_port, cfg.health_port });
 
     // Capture mode hexdumps raw bytes (protocol discovery); otherwise speak it.
     const bnet_handler: net.Handler = if (cfg.capture) net.captureHandler else bncs.handle;
-    const d2cs_handler: net.Handler = if (cfg.capture) net.captureHandler else d2cs.handle;
     const d2dbs_handler: net.Handler = if (cfg.capture) net.captureHandler else d2dbs.handle;
     const gs_handler: net.Handler = if (cfg.capture) net.captureHandler else gslink.handle;
 
     const t_bnet = try std.Thread.spawn(.{}, net.serve, .{ "bnet", bnet_fd, bnet_handler });
-    const t_d2cs = try std.Thread.spawn(.{}, net.serve, .{ "d2cs", d2cs_fd, d2cs_handler });
     const t_dbs = try std.Thread.spawn(.{}, net.serve, .{ "d2dbs", d2dbs_fd, d2dbs_handler });
     const t_health = try std.Thread.spawn(.{}, net.serve, .{ "health", health_fd, health.handle });
 
@@ -280,7 +277,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     health.markStarted(); // all listeners bound → probes may go green
     net.serve("gs", gs_fd, gs_handler); // main thread runs the GS link listener
     t_bnet.join();
-    t_d2cs.join();
     t_dbs.join();
     t_health.join();
     if (t_game) |t| t.join();

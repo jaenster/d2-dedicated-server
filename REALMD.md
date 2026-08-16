@@ -30,7 +30,6 @@ Only **6112** is for the client. The rest are internal (the GS fleet talks to re
 | Port | Facing | Role |
 |-|-|-|
 | 6112 | client | bnetd login + MCP realm (list/select/create/join), muxed on one port |
-| 6113 | internal | standalone d2cs listener, kept for back-compat / direct tests |
 | 6114 | internal | d2dbs: the GS fetches/saves character bytes here |
 | 6115 | internal | gs-link: the game-server fleet registers here and create/join is routed |
 | 8080 | ops | health/readiness + admin API + (optional) embedded web UI |

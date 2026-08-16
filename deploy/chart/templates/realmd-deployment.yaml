@@ -29,7 +29,6 @@ spec:
           imagePullPolicy: {{ .Values.images.realmd.pullPolicy }}
           ports:
             - { containerPort: 6112, name: bnetd }
-            - { containerPort: 6113, name: d2cs }
             - { containerPort: 6114, name: d2dbs }
             - { containerPort: 6115, name: gslink }
             - { containerPort: 8080, name: health }

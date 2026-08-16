@@ -1,7 +1,6 @@
 {{ .Chart.Name }} {{ .Chart.Version }} — realm "{{ .Values.realmName }}" deployed to namespace {{ .Release.Namespace }}.
 
 Components:
-  realmd        x{{ .Values.realmd.replicas }}   (public: bnet 6112 + d2cs 6113; d2dbs/gslink internal on realmd-gslink)
   game server   x{{ .Values.gameServer.replicas }}   (internal pod-IP only, no hostPort; reached via d2ingress)
   postgres      {{ if .Values.postgres.enabled }}in-cluster{{ else }}DISABLED (point realmd at an external DSN){{ end }}
   redis         {{ if .Values.redis.enabled }}in-cluster{{ else }}DISABLED{{ end }}

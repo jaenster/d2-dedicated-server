@@ -1,4 +1,4 @@
-//! D2CS — the realm/character server (port 6113), client-facing side. After
+//! D2CS — the realm/character server, client-facing side, muxed onto the BNCS port. After
 //! bnetd's realm handoff the client connects here, proves who it is with the
 //! session bnetd minted (MCP_STARTUP), lists/selects a character, and
 //! creates/joins games.

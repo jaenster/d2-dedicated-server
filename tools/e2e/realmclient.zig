@@ -11,14 +11,16 @@ const Socket = net.Socket;
 // happens to be sitting on 6112 — which silently turns the whole suite into a test of
 // someone else's server.
 pub var HOST_BNET: u16 = 6112;
-pub var HOST_D2CS: u16 = 6113;
+/// MCP is muxed onto the BNCS port, as real Battle.net does it, so this is the same port.
+/// The standalone d2cs listener it used to name is gone.
+pub var HOST_D2CS: u16 = 6112;
 pub var HOST_D2DBS: u16 = 6114;
 pub var HOST_GS: u16 = 6115;
 
 /// Move the block to `base`..`base+3`.
 pub fn setPortBase(base: u16) void {
     HOST_BNET = base;
-    HOST_D2CS = base + 1;
+    HOST_D2CS = base; // muxed onto BNCS
     HOST_D2DBS = base + 2;
     HOST_GS = base + 3;
 }

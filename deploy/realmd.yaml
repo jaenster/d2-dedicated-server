@@ -132,7 +132,6 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - { containerPort: 6112, name: bnetd }
-            - { containerPort: 6113, name: d2cs }
             - { containerPort: 6114, name: d2dbs }
             - { containerPort: 6115, name: gslink }
             - { containerPort: 8080, name: health }
@@ -188,6 +187,5 @@ spec:
   selector: { app: realmd }
   ports:
     - { port: 6112, targetPort: 6112, name: bnetd }
-    - { port: 6113, targetPort: 6113, name: d2cs }
     - { port: 6114, targetPort: 6114, name: d2dbs }
     - { port: 6115, targetPort: 6115, name: gslink }
