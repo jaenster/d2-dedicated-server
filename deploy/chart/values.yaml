@@ -103,7 +103,11 @@ redis:
 # ── gameServer: the d2gs fleet (internal pod-IP only; d2ingress fronts game traffic) ──
 gameServer:
   replicas: 1
-  maxGames: 50
+  # Unset: the server advertises what it can actually host. Fog's pool allocator keeps 8 managers
+  # and the Global Pool System holds one, so seven games is the engine's ceiling — and the server
+  # raises its own figure if poolgrow gets it more. Setting a number here overrides both, including
+  # upwards, which only produces games the realm dispatches and the engine cannot take.
+  maxGames: ""
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: 1000m, memory: 1Gi }

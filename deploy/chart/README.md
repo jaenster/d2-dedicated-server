@@ -72,7 +72,7 @@ game server (`templates/gameserver-statefulset.yaml` — a stateless `Deployment
 | `D2GS_REDIS_ADDR` | `realmd-redis:6379` (its only link to the realm) |
 | `POD_IP` | fieldRef `status.podIP` |
 | `D2GS_GS_ADDR` | `$(POD_IP):4000` (internal pod IP — d2ingress splices to it) |
-| `D2GS_MAX_GAMES` | `.Values.gameServer.maxGames` |
+| `D2GS_MAX_GAMES` | `.Values.gameServer.maxGames` — omitted when empty, so the server advertises its real capacity |
 | `D2GS_EXTRA_DLLS` / `D2GS_EXTRA_ARGS` | optional, `.Values.gameServer.extraDlls` / `extraArgs` |
 
 native game server (`templates/gameserver-native-deployment.yaml`): the same `D2GS_REDIS_ADDR`,
