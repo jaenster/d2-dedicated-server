@@ -109,6 +109,24 @@ const addrinfo = if (@import("builtin").target.os.tag == .linux) extern struct {
 extern "c" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const addrinfo, res: **addrinfo) c_int;
 extern "c" fn freeaddrinfo(res: *addrinfo) void;
 
+/// Resolve `host` (dotted-quad or DNS name) to the four octets, for the callers that put an
+/// address on the wire rather than dial it — bnet hands the client a 4-byte IP, so a name has to
+/// become one somewhere, and startup is the only place it can without changing the protocol.
+/// Resolved ONCE: a client already holding the address is not told when DNS moves.
+pub fn resolve4(host: []const u8) ?[4]u8 {
+    var z: [256]u8 = undefined;
+    if (host.len == 0 or host.len >= z.len) return null;
+    if (parseIp4(host)) |octets| return octets else |_| {}
+    // Something that was meant to be a literal and is not one must fail, not be guessed at.
+    // inet_addr still honours the classic short forms, so "5.75.211" is a valid address to it —
+    // 5.75.0.211 — and that address is then handed to every client as where the realm lives.
+    if (std.mem.indexOfNone(u8, host, "0123456789.") == null) return null;
+    @memcpy(z[0..host.len], host);
+    z[host.len] = 0;
+    const ip = resolve(z[0..host.len :0]) orelse return null;
+    return @bitCast(ip);
+}
+
 /// Resolve `host` (dotted-quad or DNS name) to a network-order IPv4. Null on failure.
 fn resolve(host: [:0]const u8) ?u32 {
     const direct = inet_addr(host.ptr);
@@ -229,4 +247,24 @@ pub fn captureHandler(fd: Socket, tag: []const u8) void {
         log.hexdump(tag, buf[0..n]);
     }
     log.line(tag, "connection closed", .{});
+}
+
+test "an address to advertise may be a dotted quad or a name" {
+    // The literal path has to stay exact: these four bytes go on the wire as the address the
+    // client dials, so a wrong order is a realm nobody reaches.
+    try std.testing.expectEqual([4]u8{ 5, 75, 211, 1 }, resolve4("5.75.211.1").?);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, resolve4("127.0.0.1").?);
+    // A name resolves through the host resolver. localhost is the only one a test may rely on.
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, resolve4("localhost").?);
+    // Nothing usable must read as an address rather than as a failure.
+    try std.testing.expect(resolve4("") == null);
+    try std.testing.expect(resolve4("no-such-host.invalid") == null);
+    // A botched literal is a failure, not 5.75.0.211 — which is what inet_addr's classic short
+    // forms would otherwise hand to every client as the address of the realm.
+    try std.testing.expect(resolve4("5.75.211") == null);
+    try std.testing.expect(resolve4("5.75.211.1.1") == null);
+    try std.testing.expect(resolve4("5.75.211.256") == null);
+    // But only an ALL-numeric string is a botched literal. A name may begin with a digit, and
+    // rejecting it for that would be its own silent outage.
+    try std.testing.expect(resolve4("1.no-such-host.invalid") == null); // resolves as a name, fails there
 }
