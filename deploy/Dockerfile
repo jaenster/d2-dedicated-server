@@ -75,9 +75,10 @@ RUN apk add --no-cache curl && mkdir /gamedata && \
     curl -fsSL "$D2_MINIMAL_WINDOWS_URL" | tar -xz -C /gamedata
 
 # gamedata: the windows minimal set alone, for the chart's load-gamedata initContainer
-# Nothing but data at /gamedata — `gameServer.dataImage.repository` in deploy/chart points
-# here by default, and the initContainer `cp -a /gamedata/. /game/`s it into each gs pod.
-FROM scratch AS gamedata
+# The data at /gamedata is the point, but the image cannot be `scratch`: it runs as the
+# initContainer that copies itself into the gs pod's game volume, so it has to bring the shell
+# and the `cp` that do it. busybox is the smallest thing that does, at about a megabyte.
+FROM busybox:musl AS gamedata
 COPY --from=gamedata-windows /gamedata /gamedata
 
 # gs-native: the same server without wine
