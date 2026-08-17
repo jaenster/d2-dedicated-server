@@ -2,6 +2,7 @@
 
 Components:
   game server   x{{ .Values.gameServer.replicas }}   (internal pod-IP only, no hostPort; reached via d2ingress)
+  gs (native)   {{ if .Values.gameServerNative.enabled }}x{{ .Values.gameServerNative.replicas }}   (wine-free, data baked in; same redis, same fleet){{ else }}DISABLED{{ end }}
   postgres      {{ if .Values.postgres.enabled }}in-cluster{{ else }}DISABLED (point realmd at an external DSN){{ end }}
   redis         {{ if .Values.redis.enabled }}in-cluster{{ else }}DISABLED{{ end }}
   d2ingress      {{ if .Values.d2ingress.enabled }}{{ if .Values.floatingIPs }}PUBLIC gateway on {{ join "," .Values.floatingIPs }}:4000{{ else }}ClusterIP gateway{{ end }}{{ else }}DISABLED{{ end }}

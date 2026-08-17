@@ -1,0 +1,72 @@
+{{- if .Values.gameServerNative.enabled }}
+# The wine-free game server: one static i386 ELF running the 1.14d Mac image in-process, with its
+# minimal game data baked into the image. Deployed alongside the wine `d2gs` fleet rather than
+# instead of it — both publish themselves into the same redis, so realmd places games on either and
+# the two can be compared on one realm.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d2gs-native
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gameserver-native
+spec:
+  replicas: {{ .Values.gameServerNative.replicas }}
+  revisionHistoryLimit: {{ .Values.realmd.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver-native") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver-native") | nindent 8 }}
+    spec:
+      {{- if .Values.gameServerNative.pullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.gameServerNative.pullSecret }}
+      {{- end }}
+      containers:
+        - name: d2gs-native
+          image: "{{ .Values.images.gsNative.repository }}:{{ .Values.images.gsNative.tag }}"
+          imagePullPolicy: {{ .Values.images.gsNative.pullPolicy }}
+          ports:
+            - { containerPort: 4000, name: game }
+          env:
+            # The only link to the realm, exactly as the wine GS: publish here, take work from the
+            # queue here, read and write characters here.
+            - name: D2GS_REDIS_ADDR
+              value: "realmd-redis:6379"
+            # POD_IP must precede D2GS_GS_ADDR for the $(POD_IP) substitution to resolve.
+            - name: POD_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+            - name: D2GS_GS_ADDR
+              value: "$(POD_IP):4000"
+            - name: D2GS_MAX_GAMES
+              value: {{ .Values.gameServerNative.maxGames | quote }}
+          volumeMounts:
+            # The engine writes its resource file into the temporary-items folder during startup.
+            # The image is FROM scratch and has no /tmp; the Dockerfile's VOLUME declaration is what
+            # creates it under docker, and Kubernetes ignores VOLUME entirely.
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            {{- toYaml .Values.gameServerNative.resources | nindent 12 }}
+          # TCP, not HTTP: this server has no health endpoint (the wine GS's health feature is a
+          # d2gs.dll hook, and there is no DLL here). A listening :4000 means the engine booted and
+          # QSERVER is up; it does not prove the redis publish, so a pod that cannot reach the store
+          # still reports Ready and only its absence from the fleet key shows it.
+          startupProbe:
+            tcpSocket: { port: 4000 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: 4000 }
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 4000 }
+            periodSeconds: 15
+            failureThreshold: 4
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

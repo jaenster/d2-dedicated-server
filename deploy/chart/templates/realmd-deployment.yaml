@@ -58,6 +58,11 @@ spec:
               value: {{ ternary "1" "0" .Values.realmd.logJson | quote }}
             - name: REALMD_SHUTDOWN_GRACE_MS
               value: {{ .Values.realmd.shutdownGraceMs | quote }}
+            {{- if .Values.permissiveAuth }}
+            # Presence is what enables it, so it is omitted entirely rather than set to 0.
+            - name: REALMD_PERMISSIVE_AUTH
+              value: "1"
+            {{- end }}
           readinessProbe:
             httpGet: { path: /readyz, port: 8080 }
             periodSeconds: 5
