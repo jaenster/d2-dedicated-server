@@ -6,6 +6,9 @@ This chart deploys a complete, fleet-shaped Diablo II 1.14d realm on Kubernetes:
   a `LoadBalancer`. Scales freely because all state lives in backing services.
 - **game-server fleet (d2gs)** — headless `Game.exe` under wine. Internal (pod-IP only);
   clients never dial it. See Topology.
+- **game server, wine-free (d2gs-native)** — optional (`gameServerNative.enabled`), the same
+  server as one native process with its data baked in. Publishes into the same redis as the wine
+  fleet, so enabling it puts both kinds of server on one realm.
 - **d2ingress** — a token-translating splice gateway, the single public game entry on the
   floating IPs.
 - **Postgres** — durable character saves.
@@ -69,8 +72,14 @@ game server (`templates/gameserver-statefulset.yaml` — a stateless `Deployment
 | `D2GS_REDIS_ADDR` | `realmd-redis:6379` (its only link to the realm) |
 | `POD_IP` | fieldRef `status.podIP` |
 | `D2GS_GS_ADDR` | `$(POD_IP):4000` (internal pod IP — d2ingress splices to it) |
-| `D2GS_MAX_GAMES` | `.Values.gameServer.maxGames` |
+| `D2GS_MAX_GAMES` | `.Values.gameServer.maxGames` — omitted when empty, so the server advertises its real capacity |
 | `D2GS_EXTRA_DLLS` / `D2GS_EXTRA_ARGS` | optional, `.Values.gameServer.extraDlls` / `extraArgs` |
+
+native game server (`templates/gameserver-native-deployment.yaml`): the same `D2GS_REDIS_ADDR`,
+`POD_IP`, `D2GS_GS_ADDR` and `D2GS_MAX_GAMES` contract, minus the wine-only extras. Two differences
+that matter: it has no health endpoint (that is a `d2gs.dll` hook, and there is no DLL here), so its
+probes are `tcpSocket` on 4000; and its image is `FROM scratch`, so an emptyDir is mounted at `/tmp`
+for the resource file the engine writes at startup — Kubernetes ignores the Dockerfile's `VOLUME`.
 
 d2ingress: `REALMD_BIND`, `REALMD_INGRESS_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON`. Its image
 is usually private — set `d2ingress.pullSecret` to a dockerconfigjson secret (e.g. `ghcr`).
@@ -116,6 +125,8 @@ rolls back via git).
 | `postgres.enabled=false` | skip in-cluster Postgres; realmd still reads `realmd-pg/DSN` — override `postgres.auth.*` to point at an external DB |
 | `redis.enabled=false` | skip in-cluster Redis (supply an external `realmd-redis:6379`) |
 | `d2ingress.enabled=false` | skip the gateway |
+| `gameServerNative.enabled=true` | additionally run the wine-free GS (data baked into its image; `gameServerNative.pullSecret` for the private package) |
+| `permissiveAuth=true` | auto-register unknown accounts password-less instead of rejecting them (test realms) |
 | `gameServer.dataImage.repository=<img>` | ship game data via the load-gamedata initContainer + emptyDir (no PVC); defaults to `ghcr.io/jaenster/d2-gamedata`; empty = use the `d2-gamefiles` PVC fallback |
 | `realmd.recreate=true` | force `strategy: Recreate` (not needed any more; RollingUpdate is the default) |
 | `d2ingress.pullSecret=<name>` | imagePullSecret for the (usually private) d2ingress image |

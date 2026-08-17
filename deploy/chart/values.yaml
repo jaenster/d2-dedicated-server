@@ -31,6 +31,10 @@ gameAddr: ""
 # Don't take client traffic until a game server has published itself into redis.
 requireGS: true
 
+# Auto-register an UNKNOWN account password-less on logon instead of rejecting it. Passwords on
+# accounts that have one are verified either way. Convenience for a test realm; leave off otherwise.
+permissiveAuth: false
+
 # Per-component container images.
 images:
   realmd:
@@ -43,6 +47,10 @@ images:
     pullPolicy: Always
   d2ingress:
     repository: ghcr.io/jaenster/d2ingress
+    tag: latest
+    pullPolicy: Always
+  gsNative:
+    repository: ghcr.io/jaenster/d2gs-native
     tag: latest
     pullPolicy: Always
 
@@ -95,7 +103,11 @@ redis:
 # ── gameServer: the d2gs fleet (internal pod-IP only; d2ingress fronts game traffic) ──
 gameServer:
   replicas: 1
-  maxGames: 50
+  # Unset: the server advertises what it can actually host. Fog's pool allocator keeps 8 managers
+  # and the Global Pool System holds one, so seven games is the engine's ceiling — and the server
+  # raises its own figure if poolgrow gets it more. Setting a number here overrides both, including
+  # upwards, which only produces games the realm dispatches and the engine cannot take.
+  maxGames: ""
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: 1000m, memory: 1Gi }
@@ -124,6 +136,22 @@ gameServer:
   extraDlls: ""
   # Extra Game.exe flags — e.g. "-direct -txt" to load a loose /moddata data/ tree.
   extraArgs: ""
+
+# ── gameServerNative: the wine-free GS, alongside the wine fleet above ─────────────
+# Off by default: it runs the 1.14d Mac image in-process and is newer than the wine path, so a
+# realm that enables it will have some games hosted by each. Its data is baked into the image, so
+# there is no dataImage / gameFiles here.
+gameServerNative:
+  enabled: false
+  replicas: 1
+  # One game at a time. Concurrent games fault inside the engine's own CleanUpClient shortly after
+  # a game empties (see apps/d2gs-native/realm.zig); the ceiling is 7 either way.
+  maxGames: 1
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 1000m, memory: 1Gi }
+  # imagePullSecret name — the d2gs-native package is private, unlike realmd/d2gs/d2ingress.
+  pullSecret: ""
 
 # ── d2ingress: token-translating game gateway (public on the FIPs when floatingIPs set) ─
 d2ingress:

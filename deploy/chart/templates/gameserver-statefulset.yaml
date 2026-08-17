@@ -74,8 +74,10 @@ spec:
                 fieldRef: { fieldPath: status.podIP }
             - name: D2GS_GS_ADDR
               value: "$(POD_IP):4000"
+            {{- if .Values.gameServer.maxGames }}
             - name: D2GS_MAX_GAMES
               value: {{ .Values.gameServer.maxGames | quote }}
+            {{- end }}
             {{- if .Values.gameServer.extraDlls }}
             - name: D2GS_EXTRA_DLLS
               value: {{ .Values.gameServer.extraDlls | quote }}

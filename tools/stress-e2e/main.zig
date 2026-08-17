@@ -44,7 +44,7 @@ const Config = struct {
     chars: []const u8 = "EpicSorc:1,EpicAma:0",
     /// How long to retry a full login+create+join+world probe before giving up and starting the
     /// real rounds regardless. realmd's image is `scratch` (no shell, so no Docker HEALTHCHECK)
-    /// and a GS can take a moment to register over gs-link after it starts — this absorbs both
+    /// and a GS can take a moment to publish itself into redis after it starts — this absorbs both
     /// without the caller needing its own wait loop. 0 skips the probe entirely.
     wait_ms: i64 = 20000,
 };
