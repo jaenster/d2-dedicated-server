@@ -18,7 +18,8 @@ The GS publishes itself as `10.24.1.141:4000`. Without
 `D2GS_GS_ADDR` the native GS advertises `127.0.0.1:4000` — d2ingress's own port — and every round
 fails `MCP_CREATEGAME result=0x20`.
 
-Workload: `run-stress.sh` at its default, 20 rounds x 2 clients, one game at a time.
+Workload: the round loop at its default, 20 rounds x 2 clients, one game at a time (`zig build
+stress-e2e`, which was a bash script when these numbers were taken).
 
 Sampling, identical for both, from the container's cgroup so the whole process tree counts:
 
@@ -66,7 +67,7 @@ hosts up to seven, the same ceiling as wine — see "Concurrency" below.
 ## Correction 1: the round times were an artefact, twice over
 
 The round times above were taken with `date +%s`. A round is about four seconds, so every sample
-was quantised by a quarter of itself. `run-stress.sh` now times rounds in milliseconds.
+was quantised by a quarter of itself. The harness now times rounds in milliseconds.
 
 That fixed the clock but not the host. Re-measured in milliseconds, wine still appeared 12-14%
 faster — but only under `qemu-i386` on the arm64 Mac. On **real amd64 hardware** (a Hetzner k3s
@@ -86,7 +87,7 @@ indistinguishable from the effect.
 
 The memory difference is not within noise, and it is the number that decides fleet density.
 
-`run-stress.sh` also does not subtract the dwell, though the first version of it did. The dwell is
+The harness also does not subtract the dwell, though the first version of it did. The dwell is
 not a floor the round sits on: a client starts its dwell clock when it sends 0x6b, so the world
 arrives during it — at `--dwell 0` the client leaves before the world does and every round fails
 — and a longer

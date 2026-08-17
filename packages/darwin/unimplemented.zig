@@ -10,7 +10,7 @@
 
 const std = @import("std");
 
-pub const Error = error{ OutOfThunks, MapFailed };
+pub const Error = error{ OutOfThunks, MapFailed, OutOfReach };
 
 const thunk_size = 16;
 
@@ -60,8 +60,41 @@ pub const Thunks = struct {
     code: []align(std.heap.page_size_min) u8,
     used: usize = 0,
 
+    /// The slab has to land within a rel32 of `dispatch`, so where it goes is not the kernel's
+    /// choice to make. Left a null hint, Linux puts an anonymous mapping far above a static
+    /// binary's code and the call displacement no longer fits in 32 bits — it wrapped, silently,
+    /// into a jump to nowhere. macOS happens to place them close, which is why this only ever
+    /// showed up once the tests ran on Linux.
+    ///
+    /// So ask for space above the dispatcher and check what came back. The hint is advisory — a
+    /// taken range gets silently rehoused wherever the kernel likes — so each attempt steps a long
+    /// way rather than a page: the first few pages above `dispatch` are the binary's own image and
+    /// asking for those only earns a mapping at the far end of the address space.
+    ///
+    /// If nothing near turns up, take whatever mmap offers and let `add` refuse. A thunk that
+    /// cannot reach is a jump to nowhere, and the one thing worse than not having it is having it
+    /// silently.
     pub fn init(capacity: usize) Error!Thunks {
         const size = std.mem.alignForward(usize, capacity * thunk_size, std.heap.page_size_min);
+        const stride = 16 * 1024 * 1024;
+        const anchor = std.mem.alignBackward(usize, @intFromPtr(&dispatch), std.heap.page_size_min);
+
+        var attempt: usize = 1;
+        while (attempt <= 64) : (attempt += 1) {
+            const hint: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(anchor + stride * attempt);
+            const code = std.posix.mmap(
+                hint,
+                size,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+                -1,
+                0,
+            ) catch continue;
+            if (reachable(@intFromPtr(code.ptr)) and reachable(@intFromPtr(code.ptr) + size)) {
+                return .{ .code = code };
+            }
+            std.posix.munmap(code); // too far for a rel32; give it back and ask further along
+        }
         const code = std.posix.mmap(
             null,
             size,
@@ -71,6 +104,12 @@ pub const Thunks = struct {
             0,
         ) catch return Error.MapFailed;
         return .{ .code = code };
+    }
+
+    /// Whether a call at `site` can reach `dispatch` in the 32 bits the encoding has.
+    fn reachable(site: usize) bool {
+        const delta = @as(i128, @intCast(@intFromPtr(&dispatch))) - @as(i128, @intCast(site));
+        return delta >= std.math.minInt(i32) and delta <= std.math.maxInt(i32);
     }
 
     pub fn deinit(self: *Thunks) void {
@@ -90,8 +129,11 @@ pub const Thunks = struct {
         at[5] = 0xe8; // call rel32
         // Displacement is measured from the end of the call, not the end of the thunk.
         const after_call = site + 10;
-        const rel: i32 = @truncate(@as(i64, @intCast(@intFromPtr(&dispatch))) - @as(i64, @intCast(after_call)));
-        std.mem.writeInt(i32, at[6..10], rel, .little);
+        const delta = @as(i64, @intCast(@intFromPtr(&dispatch))) - @as(i64, @intCast(after_call));
+        // Checked, not truncated. A displacement that does not fit is a call into nowhere, and
+        // truncating one produces exactly that with no sign it happened.
+        if (delta < std.math.minInt(i32) or delta > std.math.maxInt(i32)) return Error.OutOfReach;
+        std.mem.writeInt(i32, at[6..10], @intCast(delta), .little);
         // Drop the pushed name and return dispatch's zero to the game.
         at[10] = 0x83; // add esp, 4
         at[11] = 0xc4;

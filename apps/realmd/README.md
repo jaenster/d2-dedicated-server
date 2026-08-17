@@ -28,34 +28,35 @@ and the full model in
 
 ![GS fleet](../../docs/architecture/img/gs_fleet.png)
 
-Kubernetes deployment topology (LoadBalancer-fronted realmd + Redis/Postgres +
-GS StatefulSet with `hostPort 4000`):
+Kubernetes deployment topology (LoadBalancer-fronted realmd + Redis/Postgres + an internal GS
+fleet with no host ports — d2ingress splices to pod IPs):
 
 ![Kubernetes topology](../../docs/architecture/img/k8s_deploy.png)
 
 ## Files
 
 - `main.zig` — entry: config, bind the listeners, spawn the workers.
-- `config.zig` — env-driven config (`REALMD_*`: ports, bind, data dir, realm name/addr, instance id, shared mode).
-- `net.zig` — tiny libc-socket TCP listener/serve loop (zig 0.16 has no std sockets).
 - `proto.zig` — little-endian byte `Reader`/`Writer` (bounds-checked; a bad packet yields zeros, never panics a connection thread).
-- `protocol.zig` — typed protocol enums: chat flags + D2GS message ids (bnetdocs docs 15 / 28).
 - `bncs.zig` — BNCS handlers. MVP policy: we are the authority and trust the client (version/password accepted, accounts auto-create). Includes `SID_AUTH_INFO/CHECK`, `SID_LOGONREALMEX`, `SID_QUERYREALMS2`, BNFTP handoff.
 - `bnftp.zig` — BNFTP v1 file server (serves the version MPQ; **reply-header length is u32**, the client asserts if it reads `>0xff`).
 - `d2cs.zig` — MCP: `MCP_STARTUP`, `MCP_CHARLIST2` (real statstrings), `MCP_CHARLOGON`, `MCP_CREATEGAME`/`MCP_JOINGAME`. On join it remembers the active char and tells the game server the account.
 - `fleet.zig` — the game servers, as the whole realm sees them: create/join dispatch through their store queues, and the event stream they report back on.
 - `charflush.zig` — moves saved characters from the redis cache to the store of record.
-- `state.zig` — in-memory sessions/games, instance-hashed ids for multi-instance.
-- `store.zig` — durable Store seam: `chars/<account>/<char>.d2s` + small session/game records. File-backed today; the seam keeps multi-instance to a shared dir (e.g. a RWX PVC) with no extra service.
-- `lock.zig` — the lock everything here uses (zig 0.16 dropped `Thread.Mutex`). Spins briefly, then yields, then sleeps: several of its callers hold it across IO.
-- `log.zig` — line logger; one line costs one `write`.
+- `chat.zig` — channels, whispers and presence. Members are published into a shared per-channel roster and anything bound for another instance goes to its inbox, so a channel is the whole realm rather than one replica's half of it.
+- `friends.zig` / `guilds.zig` — the friends list (stored in the account profile) and the cut Guild Halls feature.
+- `state.zig` — sessions and games, kept in redis so any instance resolves what another created; instance-hashed ids keep them apart.
+- `store.zig` — the persistence facade. Each domain op has exactly one home: Postgres for the record, redis for what is in flight. No backend selection.
+- `admin.zig` / `webui.zig` — the admin API and its web UI, on the health port.
+- `gameedge.zig` — the optional in-process game-traffic edge (`REALMD_GAME_PORT`), for a single host with no separate d2ingress.
+- `health.zig` / `shutdown.zig` — probes, and the SIGTERM drain.
 - `assets/` — `bnserver-D2DV.ini` (gateway/version config), the factored Blizzard weak-signature key, README.
 
 ## Testing it
 
-`zig build e2e` runs 33 clientless scenarios (it starts its own redis + postgres containers), and
-`../../tools/test-chat.sh` proves chat across two live instances with the real wire client: Alice
-hears Bob from the other instance and does not hear Eva, who is in another channel.
+`zig build e2e` runs 34 clientless scenarios against a real realmd, starting its own redis and
+postgres containers. Two of them cover what this file is mostly about: `chat_across_instances`
+(two instances, one channel — talk and whispers cross, another channel does not) and
+`save_durability` (a save only redis had reaches postgres and survives losing the cache).
 
 ## Protocol notes
 
@@ -68,27 +69,29 @@ hears Bob from the other instance and does not hear Eva, who is in another chann
 
 ## Config (env)
 
-Core: `REALMD_BIND`, `REALMD_BNET_PORT`,
-`REALMD_DATA_DIR`, `REALMD_REALM_NAME`, `REALMD_REALM_ADDR`, `REALMD_GS_ADDR`,
-`REALMD_INSTANCE`, `REALMD_SHARED`, `REALMD_CAPTURE` (hexdump mode).
+Core: `REALMD_BIND`, `REALMD_BNET_PORT`, `REALMD_REALM_NAME`, `REALMD_REALM_ADDR`,
+`REALMD_GAME_ADDR` (required), `REALMD_GS_ADDR`, `REALMD_CAPTURE` (hexdump mode).
+`REALMD_DATA_DIR` supplies the BNFTP assets and nothing else.
 
-Persistence (DDD facade → fs | redis | pg; no adapters): `REALMD_STORE` sets both
-backends at once; `REALMD_DURABLE_STORE` (character saves) and
-`REALMD_EPHEMERAL_STORE` (sessions + games) override each — the common cloud split is
-`durable=pg`, `ephemeral=redis`. `REALMD_REDIS_ADDR` (`host:port`), `REALMD_PG_DSN`
-(`postgres://…`). A redis/pg ephemeral backend is treated as shared (no `REALMD_SHARED`
-needed).
+`REALMD_INSTANCE` must differ per instance: it seeds session ids and dispatch request ids, so two
+instances sharing one would collect each other's replies. In the chart it comes from
+`metadata.name`.
+
+Persistence — both required, neither selectable: `REALMD_REDIS_ADDR` (`host:port`) for everything
+in flight, `REALMD_PG_DSN` (`postgres://…`) for the store of record.
 
 Health / lifecycle: `REALMD_HEALTH_PORT` (default 8080; `/healthz` liveness, `/readyz`
-readiness = store reachable + GS present + not draining), `REALMD_REQUIRE_GS` (gate
-`/readyz` on ≥1 registered GS), `REALMD_LOG_JSON` (JSON log lines),
+readiness = stores reachable + a game server published + not draining), `REALMD_REQUIRE_GS` (gate
+`/readyz` on ≥1 published game server), `REALMD_LOG_JSON` (JSON log lines),
 `REALMD_SHUTDOWN_GRACE_MS` (SIGTERM drain window before exit).
 
 ## Run
 
 ```
-REALMD_DATA_DIR=./realmd-data ./zig-out/bin/realmd
+REALMD_REDIS_ADDR=127.0.0.1:6379 \
+  REALMD_PG_DSN=postgres://realmd:realmd@127.0.0.1:5432/realmd \
+  REALMD_GAME_ADDR=127.0.0.1 REALMD_DATA_DIR=./realmd-data ./zig-out/bin/realmd
 ```
 
-Multi-instance: run several with a shared `REALMD_DATA_DIR` + distinct
-`REALMD_INSTANCE` and `REALMD_SHARED=1`.
+Multi-instance needs nothing extra beyond a distinct `REALMD_INSTANCE`: everything shared is
+already in redis and Postgres. `./run-stack.sh` brings both stores up for you.

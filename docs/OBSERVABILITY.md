@@ -62,8 +62,8 @@ the GS also serves its counters directly, on the port it was already using for p
 The distinction between the first two is the one that matters: a process can be perfectly alive
 with a dead engine, and that GS answers TCP, accepts connections and serves nobody. `/healthz`
 is measured from the tick loop's heartbeat and from nothing else, so that state reads 503. The
-chart wires liveness to `/healthz` and readiness to `/readyz`, so a GS that merely lost its
-control connection leaves the Service (no new games routed to it) without being restarted out
+chart wires liveness to `/healthz` and readiness to `/readyz`, so a GS that can no longer keep
+its record published leaves the Service (no new games routed to it) without being restarted out
 from under the games it is still hosting.
 
 The counters themselves live in

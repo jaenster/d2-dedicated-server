@@ -861,7 +861,9 @@ test "the message flags that mean each other's meaning" {
     try testing.expectEqual(darwin.MSG_PEEK, msgFlagsToHost(darwin.MSG_PEEK));
     try testing.expectEqual(darwin.MSG_DONTROUTE, msgFlagsToHost(darwin.MSG_DONTROUTE));
 
-    try testing.expectEqual(@as(c_int, 0x142), msgFlagsToHost(darwin.MSG_WAITALL | darwin.MSG_PEEK | 0x40000));
+    // Composed, with an unknown bit dropped rather than passed through: WAITALL becomes Linux's
+    // 0x100 and PEEK stays 0x02, while 0x40000 has no counterpart and contributes nothing.
+    try testing.expectEqual(@as(c_int, 0x102), msgFlagsToHost(darwin.MSG_WAITALL | darwin.MSG_PEEK | 0x40000));
     try testing.expectEqual(@as(c_int, 0), msgFlagsToHost(0));
 }
 

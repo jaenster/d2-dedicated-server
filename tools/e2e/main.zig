@@ -5,6 +5,8 @@
 const std = @import("std");
 const net = @import("net.zig");
 const rc = @import("realmclient.zig");
+const gsstore = @import("gsstore.zig");
+const fakegs = @import("fakegs.zig");
 const FakeGS = @import("fakegs.zig").FakeGS;
 
 // libc process control. The 0.16 std.process.spawn API requires an Io instance
@@ -1702,6 +1704,57 @@ fn scBannerAd() Result {
 /// test than a restart: its table is empty and it never saw the /f add, so it can only list
 /// the friend by reading the store. Presence is deliberately NOT asserted — that's a fact
 /// about live connections, and the friend has none on that instance.
+/// A save that only redis has must survive the instance that was going to move it.
+///
+/// The character lives in redis and Postgres is the store of record, so there is always a window
+/// where the only copy of a save is in the cache. If the instance that would have flushed it dies
+/// in that window, the next one has to finish the job — nothing else here loses a player's
+/// progress permanently.
+///
+/// The proof deletes the redis copy afterwards and reads the character back. It can only come from
+/// Postgres at that point, so "the dirty flag cleared" cannot pass for "the save was written".
+fn scSaveDurability() Result {
+    const name = "save_durability";
+    const acct = "DurableAcct";
+    const char = "Durabilis";
+
+    var d2s: [0x40]u8 = undefined;
+    const blob = minimalD2s(&d2s, char, 1, 33); // Sorceress, level 33
+    // storePutChar stages it the way a game server saves — bytes, version, dirty — and waits for a
+    // flush worker to clear the mark, which it only does after Postgres has taken the save.
+    const sr = rc.storePutChar(acct, char, blob) catch |e| return fail(name, "staging {s}", .{@errorName(e)});
+    if (sr != 0) return fail(name, "staging the character failed: result={d}", .{sr});
+
+    // Now take the cache away. Anything that answers from here on is the store of record.
+    var c = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    defer c.close();
+    var kb: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ acct, char }) catch return fail(name, "key", .{});
+    _ = c.cmd(&.{ "DEL", key }) catch |e| return fail(name, "del {s}", .{@errorName(e)});
+    var sb: [192]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{acct}) catch return fail(name, "key", .{});
+    _ = c.cmd(&.{ "SREM", setkey, char }) catch |e| return fail(name, "srem {s}", .{@errorName(e)});
+
+    var cl = rc.RealmClient{};
+    defer cl.close();
+    cl.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    cl.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    cl.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    cl.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    cl.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((cl.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const list = cl.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    for (entries[0..list.count]) |e| {
+        if (!std.mem.eql(u8, e.name, char)) continue;
+        if (e.level != 33) return fail(name, "recovered '{s}' at level {d}, want 33 — the save was altered", .{ char, e.level });
+        return .{ .name = name, .status = .pass, .msg = msg("a save only redis had reached postgres, and survived losing the cache", .{}) };
+    }
+    return fail(name, "'{s}' is gone with the cache — the flush never reached the store of record", .{char});
+}
+
 fn scFriendsPersist() Result {
     const name = "friends_persist";
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
@@ -2379,6 +2432,7 @@ pub fn main() !void {
         scDifficultyGate(),
         scGetFileTime(),
         scBannerAd(),
+        scSaveDurability(),
         scFriendsPersist(),
         scChatAcrossInstances(),
         scMultiInstance(),

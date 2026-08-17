@@ -52,7 +52,9 @@ Useful toggles: `postgres.enabled` / `redis.enabled` (use external backends), `d
 ## Docker Compose
 
 The same `realmd` image and backends you'd run on Kubernetes, on one host: realmd with
-**Postgres** (durable char saves) + **Redis** (ephemeral sessions/games). Full file at
+**Postgres** (the store of record: characters, accounts, profiles, guilds) + **Redis** (everything
+in flight: sessions, games, routes, the fleet and its queues, and the live character in front of
+Postgres). Both are required. Full file at
 [`deploy/compose.yaml`](../deploy/compose.yaml) (it also has a profile-gated `gs` game-server
 service); the core is just:
 
@@ -88,9 +90,11 @@ add `-f deploy/compose.local.yaml`.
 ## Manual (native realmd + wine GS)
 
 ```
-# 1) realm server (native). Char data lives in the configured store, not on the GS:
-#    fs (a data dir, default), or redis/pg via REALMD_*_STORE.
-REALMD_DATA_DIR=./realmd-data ./zig-out/bin/realmd
+# 1) realm server (native). Both stores are required: postgres keeps characters and accounts,
+#    redis keeps what is in flight. REALMD_DATA_DIR only supplies the BNFTP assets.
+REALMD_REDIS_ADDR=127.0.0.1:6379 \
+  REALMD_PG_DSN=postgres://realmd:realmd@127.0.0.1:5432/realmd \
+  REALMD_GAME_ADDR=127.0.0.1 REALMD_DATA_DIR=./realmd-data ./zig-out/bin/realmd
 
 # 2) headless game server (wine). Publishes itself into redis and reads characters from there
 #    -- it never dials realmd, and does NOT read a shared game-data mount.

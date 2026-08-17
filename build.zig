@@ -363,7 +363,7 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("e2e", "Build + run the clientless realmd E2E test harness");
     e2e_step.dependOn(&run_e2e.step);
 
-    // stress-e2e — run-stress.sh's round loop against a REAL GS (clientless's d2-realm/d2-session,
+    // stress-e2e — a round loop against a REAL GS (clientless's d2-realm/d2-session,
     // not FakeGS): each round spawns --clients threads that log in once and play --runs games.
     // Manual: `zig build stress-e2e -- --rounds N --clients N` against a running realm+GS.
     // Lazy: only fetches/builds clientless when this step is actually requested.
@@ -387,7 +387,7 @@ pub fn build(b: *std.Build) void {
         const install_stress_e2e = b.addInstallArtifact(stress_e2e, .{});
         const run_stress_e2e = b.addRunArtifact(stress_e2e);
         if (b.args) |args| run_stress_e2e.addArgs(args);
-        const stress_e2e_step = b.step("stress-e2e", "Round-loop real-GS stress test (see run-stress.sh for the bash original)");
+        const stress_e2e_step = b.step("stress-e2e", "Round-loop real-GS stress test");
         stress_e2e_step.dependOn(&install_stress_e2e.step);
         stress_e2e_step.dependOn(&run_stress_e2e.step);
     }

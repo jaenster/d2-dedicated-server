@@ -22,6 +22,16 @@
             .url = "git+https://github.com/jaenster/libd2?ref=v0.6.2#a053e4c7730e56b6394ea11f1758c3d925c55e10",
             .hash = "libd2-0.6.2-wboU7SHEogEpJA80W-hJEq9SdHdSDHMFu5AHl03ZNlV8",
         },
+        // The real GS-join + world-decode leg, for tools/stress-e2e: d2-realm and d2-session are
+        // published from there specifically so a second Zig program can drive real games without
+        // re-implementing BNCS/MCP/GS session handling a third time (tools/e2e/realmclient.zig is
+        // already a second, from-scratch implementation of the realm half of this). Lazy because
+        // nothing else here needs it — a plain `zig build` for the deploy images shouldn't fetch it.
+        .clientless = .{
+            .url = "git+https://github.com/jaenster/d2-clientless#1a3cac5bec9e2145b7027d108803f730ae2d5ad4",
+            .hash = "clientless-0.1.0-lyHu8k-lAwAgCW7n3vP3Zl2iLux4aiNrewVL8b-NYg-l",
+            .lazy = true,
+        },
     },
     .paths = .{""},
     .fingerprint = 0x515f5350c25b80ed,

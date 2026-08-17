@@ -1,0 +1,61 @@
+# Overlay for the real-GS stress e2e (tools/stress-e2e) — layers on top of compose.yaml so the
+# test client runs AS A CONTAINER on the same network as realmd/gs-native, dialling them by
+# their compose service names. No host ports involved at all, so it can't collide with a local
+# dev stack already bound to 6112/4000/etc (see run-stack.sh), and there's nothing to wait for
+# from the host side — the stress-e2e binary's own --wait-ms probe handles readiness.
+#
+# Nothing needs seeding: the client creates its own characters (stress-e2e's chooseOrCreate), and
+# permissive auth registers the account on first login. That also keeps this working with the
+# characters in Postgres, where a .d2s copied onto a data dir would have achieved nothing.
+#
+#   docker compose -f deploy/compose.yaml -f deploy/compose.e2e.yaml --profile native \
+#     up -d redis postgres realmd gs-native
+#   docker compose -f deploy/compose.yaml -f deploy/compose.e2e.yaml --profile native \
+#     run --rm stress-e2e --host realmd --rounds 5 --clients 2 --runs 2
+services:
+  realmd:
+    # REALMD_GAME_ADDR is embedded as a raw IPv4 in the MCP JOINGAME reply (the real client wire
+    # protocol has no room for a hostname there — realmd itself rejects anything else with a
+    # FATAL GameAddrInvalid at boot), so it can't just be "realmd" the way D2GS_GS_ADDR can. Give
+    # it a FIXED address on a dedicated subnet instead of the compose-assigned one, which isn't
+    # known until the container exists.
+    image: e2e-realmd:ci
+    networks:
+      default:
+        ipv4_address: 172.28.238.10
+    environment:
+      # The base file advertises 127.0.0.1 for a real 1.14d client running on the HOST; the e2e
+      # client instead runs as a container on this same network, so the join ticket's gs_ip has
+      # to resolve there instead — see the fixed-IP note above. REALMD_PERMISSIVE_AUTH
+      # auto-registers `tester` on first login, so the e2e run needs no separate
+      # account-creation step (only the characters are seeded, above).
+      REALMD_GAME_ADDR: "172.28.238.10"
+      REALMD_PERMISSIVE_AUTH: "1"
+
+  gs-native:
+    # Named so `up` uses the image the build job handed over (docker load) instead of building one.
+    # A service with only a `build:` gets a derived name compose will happily rebuild into.
+    image: e2e-gs-native:ci
+    environment:
+      # The native server ships capped at ONE game, which a round of two clients exceeds before it
+      # has played anything: the second create is refused with "game servers are down" and the
+      # round fails for a reason that has nothing to do with the code under test. A finished game
+      # also holds its slot through the reap window, so the cap has to clear concurrency AND
+      # overlap.
+      D2GS_MAX_GAMES: "7"
+
+  stress-e2e:
+    profiles: ["native"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: e2e-runner
+    depends_on:
+      realmd: { condition: service_started }
+      gs-native: { condition: service_started }
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.238.0/24

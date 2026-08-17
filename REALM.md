@@ -1,7 +1,9 @@
 # Realm communications (D2CS / D2DBS bridge)
 
-How the dedicated GS talks to the realm  -  identical model to the 1.13
-D2GS<->D2CS<->D2DBS, just that the "host" calling into the GS is now our Zig DLL.
+How the dedicated GS talks to the realm. The ENGINE's model is the 1.13
+D2GS<->D2CS<->D2DBS one and this file describes that vtable as the engine defines it — but on
+our side the slots are served locally: a character comes from redis, not from a database service
+the GS dials. There is no D2DBS, and no connection to the realm at all (see docs/redis.md).
 
 ## The bridge: `D2BattleNetEventCallbackTable`
 The GS calls back into a 25-slot vtable to reach the realm/database. We implement
@@ -89,8 +91,8 @@ case) byte-for-byte. `realm.zig` stages `findPlayerTokenImpl` + its shim, and
 The callback table is implemented and registered: `realm.zig` populates the slots
 (`fpGetDatabaseCharacter`, `fpSaveDatabaseCharacter`, `fpFindPlayerToken`, ...) and calls
 `SetupAsBnetServer(&table)` during bootstrap. The realm path is live end to end -- a real
-client logs in, creates/joins a game on the headless GS, and the character loads from
-d2dbs and spawns in-world (see the top-level README Status).
+client logs in, creates/joins a game on the headless GS, and the character loads from the
+shared store and spawns in-world (see the top-level README Status).
 
 Remaining refinement, not blockers:
 - Tighten `fpFindPlayerToken` validation against D2CS (currently accepts the engine's
