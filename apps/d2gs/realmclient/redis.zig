@@ -30,6 +30,16 @@ extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
 extern "ws2_32" fn setsockopt(s: SOCKET, level: i32, name: i32, val: [*]const u8, len: i32) callconv(.winapi) i32;
 extern "ws2_32" fn htons(v: u16) callconv(.winapi) u16;
 extern "ws2_32" fn inet_addr(cp: [*:0]const u8) callconv(.winapi) u32;
+extern "ws2_32" fn gethostbyname(name: [*:0]const u8) callconv(.winapi) ?*const hostent;
+
+/// Winsock's `hostent`. Only the address list is read; the rest is here so the offsets are right.
+const hostent = extern struct {
+    h_name: ?[*:0]const u8,
+    h_aliases: ?[*]const ?[*:0]const u8,
+    h_addrtype: i16,
+    h_length: i16,
+    h_addr_list: ?[*]const ?*const u32,
+};
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
 const INADDR_NONE: u32 = 0xffff_ffff;
@@ -59,9 +69,9 @@ var port: u16 = 6379;
 var sock: SOCKET = INVALID_SOCKET;
 var configured = false;
 
-/// `addr` is "host:port"; the host must be a dotted quad here. Unlike the control link this is not
-/// given a DNS resolver: the address comes from the same environment the rest of the realm wiring
-/// does, and a name that needs resolving can be resolved there.
+/// `addr` is "host:port". The host may be a dotted quad or a name — in a cluster it is a Service
+/// name, and resolving it is this file's job: a GS that cannot reach the store never publishes
+/// itself, so it stays out of the fleet and takes no games, silently.
 pub fn configure(addr: []const u8) void {
     var host = addr;
     if (std.mem.lastIndexOfScalar(u8, addr, ':')) |i| {
@@ -86,16 +96,28 @@ fn drop() void {
     }
 }
 
+/// The configured host as a network-order IPv4, by literal first and by name second. Not cached:
+/// a Service name outlives the address behind it, and one lookup per reconnect is nothing next to
+/// the connect it precedes.
+fn resolve() ?u32 {
+    const literal = inet_addr(@ptrCast(&host_buf));
+    if (literal != INADDR_NONE) return literal;
+    const ent = gethostbyname(@ptrCast(&host_buf)) orelse return null;
+    if (@as(i32, ent.h_addrtype) != AF_INET or ent.h_length != 4) return null;
+    const list = ent.h_addr_list orelse return null;
+    const first = list[0] orelse return null;
+    return first.*;
+}
+
 fn ensure() ?SOCKET {
     if (sock != INVALID_SOCKET) return sock;
     if (!configured) return null;
     const s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) return null;
-    const ip = inet_addr(@ptrCast(&host_buf));
-    if (ip == INADDR_NONE) {
+    const ip = resolve() orelse {
         _ = closesocket(s);
         return null;
-    }
+    };
     // Both directions: a send that blocks forever wedges the tick just as surely as a read.
     const tv = std.mem.toBytes(io_timeout_ms);
     _ = setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, @sizeOf(u32));
