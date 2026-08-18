@@ -1,0 +1,63 @@
+; Our Fog.dll. Only the 53 ordinals D2Game and D2Common actually import, measured from their import
+; tables, plus the two data symbols they read directly. Ordinals are the ABI here — the engine
+; resolves everything by number, so these must match the real 1.10f Fog exactly.
+LIBRARY Fog
+EXPORTS
+    FOG_csprintf @10018 NONAME
+    FOG_DisplayAssert @10023 NONAME
+    FOG_DisplayHalt @10024 NONAME
+    FOG_DisplayWarning @10025 NONAME
+    FOG_DisplayError @10026 NONAME
+    FOG_Trace @10029 NONAME
+    FOG_TraceF @10030 NONAME
+    FOG_Alloc @10042 NONAME
+    FOG_Free @10043 NONAME
+    FOG_AllocPool @10045 NONAME
+    FOG_FreePool @10046 NONAME
+    FOG_ReallocPool @10047 NONAME
+    FOG_EnterCriticalSection @10050 NONAME
+    FOG_GetSyncTime @10055 NONAME
+    FOG_Cos_LUT @10083 NONAME
+    FOG_Sin_LUT @10084 NONAME
+    FOG_Encode14BitsToString @10086 NONAME
+    FOG_FOpenFile @10102 NONAME
+    FOG_FCloseFile @10103 NONAME
+    FOG_FReadFile @10104 NONAME
+    FOG_FGetFileSize @10105 NONAME
+    FOG_GetSavePath @10115 NONAME
+    BITMANIP_SetBitState @10118 NONAME
+    BITMANIP_GetBitState @10119 NONAME
+    BITMANIP_MaskBitstate @10120 NONAME
+    BITMANIP_Initialize @10126 NONAME
+    BITMANIP_GetSize @10127 NONAME
+    BITMANIP_Write @10128 NONAME
+    BITMANIP_ReadSigned @10129 NONAME
+    BITMANIP_Read @10130 NONAME
+    BITMANIP_GoToNextByte @10131 NONAME
+    FOG_ComputeStringCRC16 @10137 NONAME
+    FOG_CreateNewPoolSystem @10142 NONAME
+    FOG_DestroyMemoryPoolSystem @10143 NONAME
+    FOG_GetMemoryUsage @10147 NONAME
+    FOG_10207 @10207 NONAME
+    FOG_CreateBinFile @10208 NONAME
+    FOG_FreeBinFile @10209 NONAME
+    FOG_GetRecordCountFromBinFile @10210 NONAME
+    FOG_AllocLinker @10211 NONAME
+    FOG_FreeLinker @10212 NONAME
+    FOG_GetLinkIndex @10213 NONAME
+    FOG_GetStringFromLinkIndex @10214 NONAME
+    FOG_AddCodeToLinkingTable @10215 NONAME
+    FOG_AddRecordToLinkingTable @10216 NONAME
+    FOG_GetRowFromTxt @10217 NONAME
+    FOG_IsExpansion @10227 NONAME
+    FOG_ComputeChecksum @10229 NONAME
+    FOG_PopCount @10230 NONAME
+    FOG_LeadingZeroesCount @10252 NONAME
+    DATATBLS_CalcEvaluateExpression @10253 NONAME
+    DATATBLS_CompileExpression @10254 NONAME
+    FOG_10255 @10255 NONAME
+    gdwBitMasks @10259 DATA
+    gdwInvBitMasks @10260 DATA
+    ; Not called. See FOG_ordinal_ceiling in fog.zig — pins where mingw's auto-exported
+    ; decorated aliases start, clear of every ordinal the real Fog uses (max 10264).
+    FOG_ordinal_ceiling @10900 NONAME

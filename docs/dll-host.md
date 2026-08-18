@@ -1,0 +1,441 @@
+# Hosting the pre-1.14 DLLs
+
+A game server built on the real `D2Game.dll` instead of the 1.14d monolith. The interesting result
+of the investigation: **the host contract is the one d2gs already implements.** It did not change
+between 1.10f and 1.14d, so `engine/realm.zig` is most of the port already.
+
+## The two calls that start a server
+
+Both live in `D2Game.dll` and are exported by ordinal, so no offsets are needed:
+
+|ordinal|function|what the host must pass|
+|-|-|-|
+|10002|`GAME_InitGameDataTable`|two host-allocated structures: the game-data table and the game-list handle. D2Game asserts both non-null (`ptGameDataTbl`, `phGameList`)|
+|10023|`GAME_SetServerCallbackFunctions`|a pointer to the callback table below|
+
+Verified against the real 1.10f binary rather than taken from D2MOO: `GAME_SetServerCallbackFunctions`
+@`0x6FC358E0` **stores the pointer** (`DAT_6fd45830 = param_1`) and sets a validity flag — it does
+**not** copy the struct. The host therefore has to keep the table alive for the life of the process;
+a stack temporary would leave D2Game calling into freed memory.
+
+## The callback table
+
+`D2ServerCallbackFunctions`, 0x40 bytes, 16 pointers, `#pragma pack(1)`. `__fastcall` unless noted.
+
+|slot|callback|already in `engine/realm.zig`|
+|-|-|-|
+|0x00|`pfCloseGame(u16 gameId, u32 product, u32 spawnedPlayers, i32 frame)`|yes|
+|0x04|`pfLeaveGame(...)` — 14 args, ends with the save timestamp|yes|
+|0x08|`pfGetDatabaseCharacter(clientInfo**, charName, clientId, accountName)`|**yes** — the one that drives the join|
+|0x0C|`pfSaveDatabaseCharacter(clientInfo**, charName, accountName, saveData, size, token)`|yes|
+|0x10|`pfServerLogMessage(i32 level, fmt, ...)` — **cdecl varargs**|no|
+|0x14|`pfEnterGame(u16 gameId, charName, classId, level, flags)`|yes|
+|0x18|`pfFindPlayerToken(charName, tokenId, gameId, outAccount, outToken, a6, a7)`|yes|
+|0x1C|`pfSaveDatabaseGuild` — unused|no|
+|0x20|`pfUnlockDatabaseCharacter(gameData*, charName, accountName)`|no|
+|0x24|unknown, unused|no|
+|0x28|`pfUpdateCharacterLadder(charName, classId, level, exp, 0, flags, timestamp)`|no|
+|0x2C|`pfUpdateGameInformation(u16 gameId, charName, classId, level)`|no|
+|0x30|`pfHandlePacket(packet*, size)`|no|
+|0x34|`pfSetGameData() -> u32`|no|
+|0x38|`pfRelockDatabaseCharacter(clientInfo**, charName, accountName)`|no|
+|0x3C|`pfLoadComplete(i32)` — **stdcall**, unused|no|
+
+Slots 0x00–0x18 match d2gs's independently reverse-engineered 1.14d table exactly, including
+`pfGetDatabaseCharacter` at 0x08. Two independent derivations agreeing on the layout is the strongest
+evidence available that the interface is stable across the whole DLL era.
+
+**1.14d is a superset.** d2gs also fills `fpGetDatabaseFileTime` at slot **0x54**, past the end of the
+0x40 struct — 1.14d grew the table. So the ladder-timestamp workaround d2gs needs (`nReason 0x1a`
+refusals) has no 1.10f equivalent and can be dropped when hosting 1.10f.
+
+Mixed calling conventions matter: most entries are `__fastcall`, `pfServerLogMessage` is cdecl
+varargs, `pfLoadComplete` is stdcall. Zig needs naked-asm shims for the fastcall ones.
+
+## Which modules to load
+
+From the real import tables (`~/code/d2-patch-extract/1.13c-lod/IMPORTS.txt`):
+
+|module|why|surface|
+|-|-|-|
+|**D2Game**|the server logic itself|—|
+|**D2Common**|units, tables, collision, path, items|**716 symbols — cannot be faked**|
+|Fog|pool allocator, MPQ, asserts|71 ordinals|
+|Storm|archives, memory|18 ordinals|
+|D2Net|packet send/recv|11 ordinals|
+|D2Lang|`Unicode::` string helpers|13 ordinals|
+|D2CMP|cel decompression|9 ordinals|
+
+Load D2Game + D2Common for real; the other five are cheaper to implement than to keep per-version.
+Implementing them is also how the host gets to own the allocator, the MPQ reads and the socket layer
+— which is most of what a server wants control of anyway.
+
+Measured, this is what satisfying D2Game+D2Common actually costs:
+
+|module|exports|D2Game+D2Common import|
+|-|-|-|
+|D2Net|40|11|
+|D2CMP|107|8|
+|Storm|361|10|
+|D2Lang|63|4|
+
+**The Fog surface is the union over every module loaded, not over D2Game+D2Common.** That is 92
+ordinals, against the 53 those two import — and 31 of the difference exists solely because Blizzard's
+D2Net is present (10149 `FOG_InitializeServer`, 10151-10187, 10219-10224: its QServer and socket
+layer), with 7 more for D2CMP. Getting this wrong is not a soft failure: wine aborts the process on a
+call to an unimplemented export, so a short export list reads as a hard kill with a dialog.
+
+Which settles the order to replace them in. Standing up our own D2Net costs **14 functions** (the 11
+D2Game+D2Common import, plus the 3 the host calls) and *removes* 31 Fog ordinals of Blizzard
+networking we would otherwise have to write purely to keep a module we intend to replace. It is
+strictly less work than keeping it, and it is the layer where our own realm integration belongs.
+
+Not needed at all: D2Client, D2Win, D2gfx, D2DDraw, D2Direct3D, D2Glide, D2Gdi, D2Sound, D2Launch,
+D2Multi, D2MCPClient, Bnclient, Binkw32, D2VidTst.
+
+## Init order — from Blizzard's own host
+
+No guesswork needed. `D2Server.dll` (retail 1.00, in the Ghidra project at `/server/D2Server.dll`)
+**is** the original closed-realm game server: it imports 26 D2Game ordinals, 32 Fog, 11 Storm, 6
+D2Net, 5 D2Common, and its `WinMain` @`0x10009EA0` is the startup sequence verbatim:
+
+```
+FOG_10139()                          Fog pre-init
+LoadMPQArchives()                    MPQ FIRST, before anything else
+<C++ static init table walk>
+CreateDialogParamA / ShowWindow      the server UI (a headless host skips this)
+FOG_InitErrorMgr()                   the HOST installs the error manager
+ParseIniFile()
+LoadBnClientDll()                    only when the char server is enabled
+D2LANG_10000()                       D2Lang init
+DATATBLS_LoadAllTxts(lang, 1, 0)     the data tables
+D2NET_SERVER_Initialize(0, 0)
+D2NET_SERVER_SetMaxClientsPerGame(n) n from the ini
+D2NET_SERVER_SetHackListEnabled(1)
+D2GAME_10046()                       D2Game module init
+ConnectToCharServer() + wait         realm link, before the callbacks are installed
+GAME_SetServerCallbackFunctions(&table)
+GAME_InitGameDataTable(&p1, &p2)
+TASK_InitializeClock()
+CreateThread(McpServiceThread)       the realm (MCP) link
+N x CreateThread(GameWorkerThread)   N = CPU count, read from FOG_GetSystemInfo()+0x28
+<Win32 message loop>
+```
+
+Shutdown is the mirror: `PurgeAllGames` → `TASK_FreeAllQueueSlots` → `D2NET_SERVER_Release` →
+`D2GAME_10050` → `DATATBLS_UnloadAllBins` → `D2LANG_10001` → `D2COMMON_10983` → `UnloadMPQArchives`.
+
+Three things this corrects about the obvious guess:
+
+- **`SetServerCallbackFunctions` comes BEFORE `InitGameDataTable`**, not after.
+- **The host calls `FOG_InitErrorMgr`**, early and itself — it is not something D2Game does for you.
+- **Games tick on N worker threads**, one per CPU, running `TASK_ProcessGame` / `D2GAME_10043`. The
+  main thread only pumps messages. A headless host replaces the message loop, not the workers.
+
+The host-facing D2Game ordinals are stable across the DLL era: 1.00's D2Server imports 10002, 10023,
+10039, 10046, 10047 — the same numbers 1.10f uses.
+
+## `apps/d2host` — the spike, and it runs
+
+`zig build d2host` produces an x86-windows console exe; `wine d2host.exe <dir-with-the-dlls>` loads
+the seven modules, resolves both ordinals, installs a table of reporting stubs, and calls the two init
+functions. **Verified working against real 1.10f binaries under wine:** all seven load, ordinals
+resolve at `0x6FC35880` / `0x6FC358E0` exactly as Ghidra said, and both calls return.
+
+Nothing calls back during init, so the stubs stay silent — which is itself the answer to "what does
+D2Game need at startup": only the two structures and a table it merely stores.
+
+## Bring-up log: what the spike proved, in order
+
+Each step below was found by running it, not by reading code — the value of the spike is that a
+failure names its own cause.
+
+1. **All seven modules load** and both ordinals resolve at the addresses Ghidra predicted.
+2. **`GAME_InitGameDataTable` + `GAME_SetServerCallbackFunctions` both return.** No callback fires
+   during this, so startup asks nothing of the host beyond the two structures and the table.
+3. **`GAME_CreateNewEmptyGame` (@10047) blocked forever** — 0% CPU, state `S`. `WINEDEBUG=+relay`
+   named the cause exactly:
+   `RtlpWaitForCriticalSection section 6FD45800 "?" ... blocked by 0000` — an *uninitialised*
+   critical section, owned by nobody. That address is `DAT_6fd45800`, the game-list lock the
+   decompile shows `GAME_CreateNewEmptyGame` taking on its first line via Fog's `@10050`.
+4. **The missing call is D2Game `@10046`**, now named `GAME_InitServerModule` in the database. It is
+   the module init and must run *first*: `InitializeCriticalSection(&DAT_6fd45800)`, clear the
+   0x400-entry game array, `CLIENTS_Initialize`, `FOG_InitErrorMgr(handler)`,
+   `SUNITPROXY_FillGlobalItemCache`. Correct order is **10046 → 10002 → 10023**.
+5. With 10046 wired in, the hang is gone and the failure moves on: **segfault in Fog at `0x6FF56FB8`**,
+   instruction `MOV [ECX + 0xbbc], EAX`, faulting address `0xbbc` — so `ECX` is null. `0xbbc` is an
+   offset into the `0xc4c`-byte structure that **`FOG_InitializeServer` (@10149)** allocates.
+
+**Next missing call: Fog's own init, before D2Game's.** This is exactly the documented order — Fog
+pool first — which the spike skipped. `FOG_InitializeServer` takes 8 arguments and creates sockets,
+so its parameters need establishing before the next attempt; 1.14d's fully-named `Game.exe` performs
+the equivalent sequence and is the cheapest place to read them off.
+
+6. **Our Fog now serves files, and the failure became specific.** With the real calling conventions
+   and a file layer in place, `DATATBLS_LoadAllTxts` gets as far as `FOG_AllocLinker` and then names
+   what it wants: `Error opening file: DATA\GLOBAL\EXCEL\compcode.bin`. A missing-input failure
+   rather than a broken-ABI one.
+7. **Fog reads the MPQs, and the table and tile load completes.** Serving files out of the archives
+   rather than an extracted tree is a correctness requirement, not a convenience: a listfile is an
+   ordinary, optional member and retail's `Patch_D2.mpq` has none, so extraction only recovers
+   members someone already knew to name. `data\global\excel\CompCode.bin` is the proof — absent from
+   every listing, present in the archive, required by the loader. Lookup is by name hash, so the
+   archive answers for unlisted members. Against the minimal 1.14d archives (12 MB of the retail
+   256 MB), 1.10f's D2Common opens **2,640 files with one miss** and gets through the whole table
+   load and the DT1 tile load into level init.
+8. **The one miss and its sibling are server-only tables.** `runessrv` and `cubeserver` appear in no
+   shipped archive and are absent from a 40,700-entry community listfile of every D2 MPQ — Blizzard
+   built them into server distributions only. A `.bin` is a `u32` record count followed by fixed
+   records (`CompCode.bin` is 115 x 4 + 4; `montype.bin` is 59 x 12 + 4), so an empty table is four
+   zero bytes and the loader accepts it.
+9. **Next: the export set must cover every loaded module.** The abort after the tile load is
+   `Fog.dll.10149` — reached from D2Net, not from D2Game. See the module table above.
+
+## Supporting more than one version
+
+Measured from the export and import tables of the real DLLs — 1.00, 1.06b, 1.07, 1.09d, 1.10f —
+rather than assumed. The result is that far less varies than the version count suggests.
+
+**Ordinals are a hand-maintained ABI, not linker output.** D2Game has holes at exactly
+10030/10031/10032 in every version from 1.00 to 1.10f, and D2Common's export table has 137 holes by
+1.10f against none in 1.06b: numbers are retired and never reused, new work is appended. So all
+eight host-facing D2Game entries (10002, 10010, 10023, 10039, 10043, 10046, 10047, 10050) are
+present, at the same numbers, in every version.
+
+Ordinals imported by D2Game+D2Common, and the overlap at each step:
+
+|provider|1.00|1.06b|1.07|1.09d|1.10f|
+|-|-|-|-|-|-|
+|Fog|34|40|49|49|53|
+|Storm|17|12|11|10|10|
+|D2Net|9|11|11|11|11|
+|D2Lang|3|3|4|4|4|
+|D2CMP|8|8|8|8|8|
+
+|boundary|Fog|Storm|D2Net|D2Lang|D2CMP|
+|-|-|-|-|-|-|
+|1.00 → 1.06b|33/34|12/12|9/9|3/3|8/8|
+|1.06b → 1.07|**9/40**|10/11|11/11|3/3|8/8|
+|1.07 → 1.09d|46/49|10/10|11/11|4/4|8/8|
+|1.09d → 1.10f|**49/49 ⊂ 53**|10/10|11/11|4/4|8/8|
+
+**Fog renumbered exactly once, at the LoD boundary.** Everything else holds across the whole range,
+including that boundary. 1.09d's Fog imports are an exact subset of 1.10f's; the four additions are
+10252–10255 (popcount, CLZ, the Calc expression compiler). So there are two Fog numberings —
+`classic` (1.00–1.06b) and `lod` (1.07 onward) — not one per version.
+
+### Rewriting import tables instead of shipping a Fog per family
+
+A by-ordinal import is a bare `0x80000000 | n` in the thunk array: a `u32` in the file, no
+relocation, no size change. So a version's `D2Game.dll`/`D2Common.dll` can be retargeted onto one
+canonical Fog numbering before load, and we ship a single Fog. `lod` is canonical — it is the
+numbering already implemented and named.
+
+The mapping table is keyed by **name**, with one column per numbering, and serves three uses: the
+import rewrite, our own calls into the engine (necessary, because D2Common's numbering does drift —
+D2Game's D2Common imports go 740 → 711 across 1.09d → 1.10f, 72 retired and 43 new), and naming
+1.06b/1.09d exports in Ghidra from the 1.10f corpus.
+
+The RE debt this leaves is small and specific: Storm/D2Net/D2Lang/D2CMP and D2Game need **no rows at
+all**, the LoD Fog column is identity, and D2Common needs a row only per ordinal the host itself
+calls. What is genuinely unknown is **31 classic-era Fog ordinals** (40 imported, 9 already coincide
+with LoD). Those are a fingerprinting job, not hand work: match against 1.10f's named Fog on which
+Storm ordinals a function calls (Storm's numbering is stable across the whole range, so it is a
+version-proof anchor), the string literals it references, and its opcode sequence with immediates
+and relocations masked.
+
+One trap to design against: a wrong row fails as a *silently wrong call*, not a missing import. So
+the rewriter must refuse an ordinal with no entry rather than pass it through — the same discipline
+`stackArgs` uses for uncounted callback slots.
+
+### 1.10 is where compiled tables start
+
+Only 1.10f's D2Common contains `%s\%s.bin`; 1.00, 1.06b, 1.07 and 1.09d build `%s\%s%s` and read
+`.txt`. Retail's archives ship no `.bin` at all, so 1.10f needs a 1.10-era `patch_d2.mpq` that has
+them, while everything earlier can be fed the text tables.
+
+That inverts the bring-up order. 1.10f was chosen first for its naming density, but the blocker
+turned out to be data, and **1.09d is the cheaper first boot**: same Fog family as 1.10f (49/49
+identity, so every Fog ordinal already implemented applies unchanged), same D2Game host ordinals,
+and text tables we already have. Its only new cost is counting `stack_args` at its callback call
+sites — which `callbacks.stackArgs` refuses to guess.
+
+`packages/d2engine/version.zig` holds all of the above as data.
+
+## The base addresses collide — plan for relocation
+
+1.10f's own link layout is self-conflicting, from the PE headers:
+
+|module|preferred base|SizeOfImage|end|
+|-|-|-|-|
+|D2Net|0x6FC00000|0x00D000|0x6FC0D000|
+|D2Lang|0x6FC10000|0x015000|0x6FC25000|
+|**D2Game**|0x6FC30000|0x127000|**0x6FD57000**|
+|**D2Common**|**0x6FD40000**|0x0B4000|**0x6FDF4000**|
+|**D2CMP**|**0x6FDF0000**|0x107000|0x6FEF7000|
+|Fog|0x6FF50000|0x056000|0x6FFA6000|
+|Storm|0x6FFB0000|0x045000|0x6FFF5000|
+
+D2Game overruns D2Common by **92 KB** (it grew 160 KB in 1.10), and D2Common overruns D2CMP by 16 KB.
+Whoever loads first keeps its link address and the loser gets relocated, so **D2Game and D2Common can
+never both be at their preferred bases.** Measured both ways: the order in `main.zig` costs one
+relocation (D2Common → `0x1e10000`, D2Game keeps `0x6FC30000`), while loading D2Common first costs two
+(D2CMP *and* D2Game move, D2Game landing at `0x1f60000`).
+
+Consequences:
+
+- **Resolve everything by ordinal.** RVAs survive relocation; absolute addresses do not. The spike
+  proved this — after relocation the ordinals still resolved, at base + the same RVA.
+- D2MOO's annotated addresses and the Ghidra databases are **preferred-base** addresses. Correct for
+  static analysis, wrong at runtime for whichever module moved. Any runtime hook must add the actual
+  `HMODULE` base to an RVA, never use the literal.
+- This is not a wine artifact — it is in Blizzard's own headers, so the retail 1.10f client relocates
+  a module too.
+
+## Where the binaries are
+
+`~/code/d2-1.10f-binaries/` (also `extracted/LODPatch_110/` on the NAS). Every version 1.01–1.13d is
+under `Diablo 2/patch/extracted/<installer>/`, rebuilt with `tools/d2patch`.
+
+1.10f is the version to build against first: it is the only pre-1.14 version with a dense naming
+corpus (4,108 D2MOO addresses, all applied to the Ghidra project), so when something misbehaves the
+disassembly is readable.
+
+## Open questions
+
+- The true table size in 1.10f is taken from D2MOO's 0x40. A scan of the 41 xref sites to
+  `DAT_6fd45830` only recovered slots 0x08, 0x0C and 0x20 — the lookahead heuristic was too narrow to
+  size the struct, not evidence that the rest are unused.
+- Whether `pfHandlePacket` (0x30) is the D2GS↔realm control channel or something else.
+- The **third** method D2Game uses to reach the host, past the 16-slot callback table: what its four
+  virtual methods do. See below.
+
+## What is left
+
+In dependency order. Each line is blocked by the ones above it, except where noted.
+
+1. **Our own `D2Net.dll` — 14 functions.** The 11 D2Game+D2Common import plus the 3 the host
+   calls (`10003` SERVER_Initialize, `10026` SetMaxClientsPerGame, `10023` SetHackListEnabled).
+   This is the current hard stop: `D2Net @10003` calls `Fog @10149` and the process aborts.
+   Replacing it is less work than implementing the 31 Fog networking ordinals it needs, and it is
+   where our own transport belongs.
+2. ~~**Get through game creation.**~~ **Done.** `GAME_CreateNewEmptyGame` returns game id 1,
+   `GAME_GetGamesCount` reports 1, the engine calls `pfSetGameData` on our table, and the host
+   ticks frames with no assert, crash or hang.
+3. **Wire the 16 callbacks to the realm.** Mostly reuse: `apps/d2gs/engine/realm.zig` already
+   implements them for 1.14d and `packages/d2engine` holds the shared layout. Needs `stack_args`
+   counted for the target version — `callbacks.stackArgs` refuses to guess.
+4. **A real client joins and plays.** The transport is up and a socket client round-trips through
+   the engine; what is missing is meaning — packet framing (the stream is delivered in `recv`-sized
+   chunks, not split into packets) and the realm-backed callbacks from 3.
+
+Independent of the above:
+
+- **Own D2CMP (8 functions), Storm (10) and D2Lang (4, plus the string-table init).** Drops the
+  last modules we do not control and takes their Fog imports with them, leaving D2Game and
+  D2Common as the only Blizzard code loaded.
+- **Fill the classic Fog rosetta column — 31 ordinals** — and build the import rewriter, so one
+  Fog serves 1.00-1.06b as well as 1.07+. Nothing before 1.07 runs until this exists.
+- **Count `stack_args` for 1.09d, 1.08 and 1.06b** at their D2Game call sites.
+- **Implement `FOG @10207`** (txt → record decode, needs the `D2BinFieldStrc` column
+  descriptors) or reverse the 1.10f record layouts, then generate `runessrv.bin` and
+  `cubeserver.bin`. Until then runewords and cube recipes are empty — non-fatal, and the only
+  known data gap.
+
+
+## The game-data table is an object, not a buffer
+
+`GAME_InitGameDataTable`'s first argument is not opaque storage. D2Game reaches into it by fixed
+offset *and calls virtual methods on it*, so the host implements an interface rather than allocating
+space. This is a second host seam alongside the callback table, and nothing documents it — it was
+recovered by running into each field in turn.
+
+From 1.10f's `GAME_CreateNewEmptyGame` (@0x6fc35e70) and its helper (@0x6fc3b590):
+
+|offset|what the engine does with it|
+|-|-|
+|+0x00|**vtable pointer.** `eax = [esi]; call *[eax+4]` — the engine invokes the second virtual method|
+|+0x10|a counter it decrements in threes, floored at zero|
+|+0x1c|pointer to an array of 12-byte slots, indexed `edx*12`|
+|+0x24|**a power-of-two mask**, not a capacity: `edx = [+0x24] & counter`. Range-checked against 0x3FF|
+|+0x44|passed by address to the helper|
+|+0x48|incremented per creation; on wraparound to 0 it sets +0x4C to 1|
+|+0x4C|flag paired with +0x48|
+|+0x50|`CRITICAL_SECTION`, entered at 0x6fc35f59 and left at 0x6fc35fb2 — **D2Game never initialises it**|
+
+Blizzard's host confirms every one of these. In 1.00's `D2Server.dll` the two structures are statics
+0x70 apart (`0x10029688` and `0x100296F8`), registered as C++ statics with a constructor at
+`0x1000A240` that sets the vtable to `0x1001F004`, `[+0x10] = 0`, `[+0x24] = 3` and points `[+0x1c]`
+at four 12-byte slots — a mask of 3 for 4 slots, which is what makes `+0x24` a mask rather than a
+count.
+
+The vtable has **four methods** (the fifth entry is null):
+
+```
+0x1001F004:  +0x00 0x100010FA   +0x04 0x100012DF  <- the one CreateNewEmptyGame calls
+             +0x08 0x100012A3   +0x0C 0x10001244
+```
+
+`apps/d2host` builds the struct fields and initialises the lock, which took game creation from a
+deadlock on zeroed memory to a null vtable call. Implementing the four methods is what is left; the
+signature of the second is `__thiscall (this, slot*, arg, arg) -> int`, whose result is added to
+`[+0x04]` when non-zero.
+
+
+## Bring-up log, part two: a game exists
+
+Continuing the numbering above.
+
+10. **Our own D2Net cleared the abort.** 14 stdcall entries, arities read off the real binary's
+    `RET n`. The engine took to it immediately — `D2NET_10019` is called during
+    `GAME_InitServerModule`.
+11. **The game-data table needed building, and then implementing.** Two failures in a row, both
+    from handing D2Game a zeroed buffer: it deadlocked on the uninitialised `CRITICAL_SECTION` at
+    `+0x50`, then segfaulted on the null slot array at `+0x1c`. With the fields built it reached
+    the virtual call, and with the four methods implemented it went straight through.
+12. **`GAME_CreateNewEmptyGame` returns 1.** The engine allocates a record through our
+    `alloc_record`, links it into the list at `+0x08`, calls `pfSetGameData` — the first callback
+    of ours it has ever used — and reports one live game.
+13. **The network pump drains on -1, not 0.** `D2Game @10003` (@0x6fc38530) is three loops of
+    `eax = ReadFromMessageList(buf, 0x200); if (eax == -1) break`. The return is a **client id**, so
+    0 is a real one: our stubs returning 0 made the engine process a phantom zero-length message
+    forever, which presented as a hang in the pump rather than a wrong value. With -1 the loops
+    drain and the frame completes.
+
+State: seven modules loaded, three of them ours (Fog, D2Net, and the game-data table object),
+2,636 files served from the archives, one game created, five frames ticked, zero asserts.
+
+14. **A real client reaches the engine, and the engine answers.** `SERVER_Initialize` opens the
+    listener; accept and recv are polled from inside the read path rather than a thread, since the
+    host already ticks and keeping every socket touch on one thread means none of it needs locking.
+    A message is handed over as `[clientId:u32][payload]` on list 2, whose processor is the one
+    that consults the callback table.
+
+    **It does not bind 4000.** That is d2ingress's — the port the client hardcodes — and it splices
+    game traffic through to whatever port a GS advertises in its store record, which realmd copies
+    into the per-game route. Binding it here would collide with the ingress and stop a fleet
+    sharing a host. The default is 4100 and the override is `D2GS_GS_ADDR`, matching `apps/d2gs`.
+    Note the difference in cost: the injected 1.14d server has to rewrite a hardcoded `push 0xfa0`
+    inside the engine to move off 4000 (`apps/d2gs/runtime/gsport.zig`); owning D2Net makes it a
+    variable.
+
+    Connecting with a plain TCP socket and sending five bytes:
+
+    ```
+    d2net: client 0 connected
+    d2net: client 0 -> 5 bytes
+    d2host: engine called pfHandlePacket
+    d2net: -> client 0, 357 bytes (kind 2)
+    ```
+
+    The whole loop closes: our Fog feeds the archives, our D2Net delivers the packet, D2Game parses
+    it, calls our callback table, and replies through our `SERVER_Send`. Zero asserts, zero crashes.
+
+The send signature came from the engine's own call site rather than a guess: `push nLen; push pBuf;
+push clientId; push 2` at 0x6fc381a2 makes it `SERVER_Send(kind, clientId, pData, nLen)`, and the
+`@10016` called immediately after a rejection send is the disconnect.
+
+What this does *not* do yet: mean anything at the protocol level. The bytes we send are arbitrary,
+the stream is handed over in whatever chunks `recv` returns rather than split into packets, and the
+callbacks are still reporting stubs rather than realm calls. But the transport seam is ours, end to
+end, which was the point of replacing D2Net.

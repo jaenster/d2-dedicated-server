@@ -9,6 +9,7 @@ const d2cs = @import("../realmclient/d2cs.zig");
 const memstat = @import("../runtime/memstat.zig");
 const poolstat = @import("../runtime/poolstat.zig");
 const log = @import("../log.zig");
+const callbacks = @import("d2engine").callbacks;
 
 extern "kernel32" fn GetModuleHandleA(name: ?[*:0]const u8) callconv(.winapi) ?*anyopaque;
 
@@ -145,33 +146,9 @@ pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
 // as the 1.13 D2GS↔D2CS↔D2DBS. We implement the slots we need and register the
 // table with SetupAsBnetServer; until then BattleNetServerService is null and
 // the realm system-message path no-ops. Layout: D2Client/D2BattleNetEventCallbackTable.h
-pub const BnetServerService = extern struct {
-    fpCloseGame: ?*const anyopaque = null, // 0x00
-    fpLeaveGame: ?*const anyopaque = null, // 0x04
-    fpGetDatabaseCharacter: ?*const anyopaque = null, // 0x08 (client*, charName, clientId, accountName)
-    fpSaveDatabaseCharacter: ?*const anyopaque = null, // 0x0C
-    fpServerLogMessage: ?*const anyopaque = null, // 0x10
-    fpEnterGame: ?*const anyopaque = null, // 0x14
-    fpFindPlayerToken: ?*const anyopaque = null, // 0x18 — validate the token D2CS issued
-    fpSaveDatabaseGuild: ?*const anyopaque = null, // 0x1C
-    fpUnlockDatabaseCharacter: ?*const anyopaque = null, // 0x20
-    fpReserved1: ?*const anyopaque = null, // 0x24
-    fpUpdateCharacterLadder: ?*const anyopaque = null, // 0x28
-    fpUpdateGameInformation: ?*const anyopaque = null, // 0x2C
-    fpReserved2_systemMsg: ?*const anyopaque = null, // 0x30
-    fpSetGameData: ?*const anyopaque = null, // 0x34
-    fpRelockDatabaseCharacter: ?*const anyopaque = null, // 0x38
-    fpLoadComplete: ?*const anyopaque = null, // 0x3C
-    fpReserved3: ?*const anyopaque = null, // 0x40
-    fpReserved4: ?*const anyopaque = null, // 0x44
-    fpReserved5: ?*const anyopaque = null, // 0x48
-    fpReserved6: ?*const anyopaque = null, // 0x4C
-    fpReserved7: ?*const anyopaque = null, // 0x50
-    fpGetDatabaseFileTime: ?*const anyopaque = null, // 0x54 — char timestamp for save-conflict resolution
-    fpReserved8: ?*const anyopaque = null, // 0x58
-    fpReserved9: ?*const anyopaque = null, // 0x5C
-    fpReserved10: ?*const anyopaque = null, // 0x60
-};
+/// 1.14d's table: the 16 slots shared with the DLL-era D2Game (`.base`) plus the ones 1.14d
+/// appended past 0x40 (`.ext`, fpGetDatabaseFileTime at 0x54).
+pub const BnetServerService = callbacks.Table114d;
 
 /// Register the realm callback table → sets BattleNetServerService + IsBattleNetServer=1.
 /// Pass null to clear. void SetupAsBnetServer(D2BattleNetEventCallbackTable*)

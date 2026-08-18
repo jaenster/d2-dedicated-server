@@ -99,20 +99,32 @@ fn buildCallAsm(comptime n: usize) []const u8 {
 }
 
 pub fn fastcall_call(comptime addr: usize, comptime FnType: type) type {
+    return struct {
+        pub inline fn call(args: std.meta.ArgsTuple(FnType)) blk: {
+            break :blk @typeInfo(FnType).@"fn".return_type orelse void;
+        } {
+            return fastcallAt(FnType).call(addr, args);
+        }
+    };
+}
+
+/// The same call, to an address only known at runtime — an ordinal resolved by GetProcAddress
+/// rather than a hooked offset in a known image.
+pub fn fastcallAt(comptime FnType: type) type {
     const info = @typeInfo(FnType).@"fn";
     const params = info.params;
     const n = params.len;
     const Ret = info.return_type orelse void;
     const Tuple = std.meta.ArgsTuple(FnType);
     return struct {
-        pub inline fn call(args: Tuple) Ret {
+        pub inline fn call(addr: usize, args: Tuple) Ret {
             var buf: [if (n > 0) n else 1]u32 = undefined;
             inline for (0..n) |i| buf[i] = argToU32(params[i].type.?, args[i]);
             const a = comptime buildCallAsm(n);
             const raw = asm volatile (a
                 : [ret] "={eax}" (-> u32),
                 : [buf] "r" (&buf),
-                  [func] "r" (@as(usize, addr)),
+                  [func] "r" (addr),
                 : .{ .ecx = true, .edx = true, .memory = true });
             return u32ToRet(Ret, raw);
         }

@@ -14,7 +14,7 @@
 //! `<ip>\0<timezone>\0<name>\0`, MULTI_SZ double-null.
 const std = @import("std");
 const patch = @import("patch.zig");
-const fastcall = @import("fastcall.zig");
+const fastcall = @import("fastcall");
 const log = @import("../log.zig");
 
 const GETGATEWAYLIST_ADDR: usize = 0x00518190;
