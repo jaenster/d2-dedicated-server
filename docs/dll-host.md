@@ -250,9 +250,26 @@ the rewriter must refuse an ordinal with no entry rather than pass it through �
 
 ### 1.10 is where compiled tables start
 
-Only 1.10f's D2Common contains `%s\%s.bin`; 1.00, 1.06b, 1.07 and 1.09d build `%s\%s%s` and read
-`.txt`. Retail's archives ship no `.bin` at all, so 1.10f needs a 1.10-era `patch_d2.mpq` that has
-them, while everything earlier can be fed the text tables.
+**Corrected by running it.** 1.09d's `CompileTxt` has *both* paths — the `.bin` strings are right
+there in its D2Common — and picks between them on `DAT_6fdc5bc0`, which is **1 in the image and
+never written**. So 1.09d always reads `.bin`, its `.txt` branch is dead code, and a live 1.09d run
+opens `playerclass.bin`, `states.bin` and the rest exactly like 1.10f does.
+
+That inverts the conclusion below. Retail's archives ship no `.bin`, so 1.09d cannot be fed retail
+data directly — it needs 1.09-era compiled tables, and the engine asserts rather than coping when
+given 1.14d-era ones:
+
+```
+assert "nLoadedValue < MAX_SKILL_RESTRICTED_STATES"  DataTbls.cpp:561
+```
+
+Those `.bin` files can be *generated*, and by this engine: `CompileTxt`'s first branch, gated on
+`DAT_6fde1cec` (0 in the image, and written by an exported setter at 0x6fd47950), reads the `.txt`,
+decodes it, and **writes the `.bin` back out** — which is how Blizzard built the server
+distributions. It needs `FOG @10207`, the txt→record decode, which we still stub. So one piece of
+work unblocks both: implement 10207, run 1.09d once in compile mode against retail text tables, and
+keep the `.bin` files it emits. 1.09d hardcodes most of its limits and ships few tables, so the set
+to generate is small.
 
 That inverts the bring-up order. 1.10f was chosen first for its naming density, but the blocker
 turned out to be data, and **1.09d is the cheaper first boot**: same Fog family as 1.10f (49/49
@@ -367,7 +384,14 @@ has:
   Still uncounted for 1.09d: every other callback slot's stack-arg count, and whether the worker
   loop / task re-arm / `ARENAFLAG_ClientUpdate` requirement behave the same (probably yes — same
   engine family — but "probably" is exactly what this file exists to replace with "measured").
-- **1.06b and 1.00: not yet started.** Same investigation, classic Fog family. The Fog rosetta gap
+- **1.06b: the callback ABI is measured, the Fog rosetta is not.** `callbacks.v106b` is complete —
+  swept from table global 0x6fd74aa4 — and it is the widest dispatch set of any build: 1.06b is the
+  only one that calls `fpSaveDatabaseGuild` (0x1C, one stack arg, @0x6fd383b1) and the unnamed 0x24,
+  both of which the LoD builds never reach. Several arities are narrower than LoD's, and
+  `fpLeaveGame` is **12** here against 13 on both LoD builds — which is where this file's old, wrong
+  1.10f value came from. It is not runnable: `hostapi.clientFields` has no 1.06b row, and the Fog
+  rosetta gap below still blocks it, so the readiness gate refuses it.
+- **1.00: not yet started.** Same investigation, classic Fog family. The Fog rosetta gap
   documented below (31 unmapped classic-era ordinals) blocks these before the callback ABI would
   even matter.
 - **1.08: not yet started**, no binaries confirmed on hand.

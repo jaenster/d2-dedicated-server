@@ -82,7 +82,7 @@ const lod_modules = classic_modules;
 pub fn spec(comptime v: Version) Spec {
     return switch (v) {
         .v100 => .{ .name = "1.00", .fog = .classic, .expansion = false, .modules = &classic_modules, .stack_args = .{} },
-        .v106b => .{ .name = "1.06b", .fog = .classic, .expansion = false, .modules = &classic_modules, .stack_args = .{} },
+        .v106b => .{ .name = "1.06b", .fog = .classic, .expansion = false, .modules = &classic_modules, .stack_args = callbacks.v106b },
         .v107 => .{ .name = "1.07", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = .{} },
         .v108 => .{ .name = "1.08", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = .{} },
         .v109d => .{ .name = "1.09d", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v109d },

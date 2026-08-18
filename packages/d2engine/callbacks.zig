@@ -296,6 +296,45 @@ pub const v109d: StackArgs = .{
     .fpRelockDatabaseCharacter = .{ .args = 1 }, // @0x6fc7e091
 };
 
+/// 1.06b, swept the same way against the rebuilt 1.06b-classic `D2Game.dll` (table global
+/// 0x6fd74aa4, whose setter @10023 is a bare one-line store — no ready flag, no forwarding, unlike
+/// 1.10f's).
+///
+/// The widest dispatch set of any build measured, and the only one that reaches two slots the LoD
+/// versions never do:
+///
+///   - `fpSaveDatabaseGuild` (0x1C) is genuinely called here, @0x6fd383b1 with one stack arg. The
+///     Guild Halls feature was cut later, which is why 1.09d and 1.10f have no site for it.
+///   - The unnamed 0x24 is called too, @0x6fcf9b52 with none.
+///
+/// Several arities are narrower than LoD's, which is the direction you would expect from the older
+/// ABI: `fpGetDatabaseCharacter` takes 1 where LoD takes 2, `fpUnlockDatabaseCharacter` and
+/// `fpRelockDatabaseCharacter` take 0 where 1.10f takes 1.
+///
+/// `fpLeaveGame` is 12 here against 13 on both LoD builds — worth stating because 12 is exactly the
+/// number this file used to carry for 1.10f. The old value was not invented, it was the right
+/// number for the wrong version.
+///
+/// Not runnable yet: 1.06b is the classic Fog family, and the 31 classic-era Fog ordinals have no
+/// rosetta row. `hostapi.clientFields` has no 1.06b entry either, so `d2host`'s readiness gate
+/// still refuses it — this records the ABI half of the work, not a claim that it boots.
+pub const v106b: StackArgs = .{
+    .fpCloseGame = .{ .args = 0 }, // @0x6fcb8a4d
+    .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fcb2787 and @0x6fcb2832, both 12
+    .fpGetDatabaseCharacter = .{ .args = 1 }, // two sites @0x6fcb5fea and @0x6fcb6a8e, both 1
+    .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fcf74ef
+    .fpEnterGame = .{ .args = 2 }, // @0x6fcb7fda
+    .fpFindPlayerToken = .{ .args = 3 }, // @0x6fcb667c, same as 1.09d
+    .fpSaveDatabaseGuild = .{ .args = 1 }, // @0x6fd383b1 — the only build that calls it
+    .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fcb690a
+    .fpReserved0x24 = .{ .args = 0 }, // @0x6fcf9b52 — likewise the only build that calls it
+    .fpUpdateCharacterLadder = .{ .args = 0 }, // two sites, both 0
+    .fpUpdateGameInformation = .{ .args = 0 }, // @0x6fceb3a1
+    .fpHandlePacket = .no_site_found,
+    .fpSetGameData = .{ .args = 0 }, // @0x6fcb21db (its one PUSH is the ESI prologue)
+    .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcf73e8
+};
+
 /// 1.14d grew the table past 0x40. fpGetDatabaseFileTime is the only appended slot known to be
 /// called — CalculateGetFlags @0x569d80 calls it with no IsBadCodePtr guard, so null is a
 /// call-to-zero during the character load. Pre-1.14 has no equivalent.
@@ -355,6 +394,18 @@ test "stack-arg counts are per version, not shared" {
     // one of them.
     try std.testing.expectEqual(2, stackArgs(v110f, .fpCloseGame));
     try std.testing.expectEqual(0, stackArgs(v109d, .fpCloseGame));
+}
+
+test "the cut Guild Halls slot was real once" {
+    // 0x1C and 0x24 have no dispatch site on either LoD build, and both are genuinely called on
+    // 1.06b — so "no site found" is a fact about a version, not about the slot.
+    try std.testing.expectEqual(1, stackArgs(v106b, .fpSaveDatabaseGuild));
+    try std.testing.expectEqual(0, stackArgs(v106b, .fpReserved0x24));
+    try std.testing.expect(!dispatches(v110f, .fpSaveDatabaseGuild));
+    try std.testing.expect(!dispatches(v109d, .fpSaveDatabaseGuild));
+    // And 12 was the right number all along — for the wrong version.
+    try std.testing.expectEqual(12, stackArgs(v106b, .fpLeaveGame));
+    try std.testing.expectEqual(13, stackArgs(v110f, .fpLeaveGame));
 }
 
 test "a slot with no dispatch site is an answer, not a gap" {
