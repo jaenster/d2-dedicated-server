@@ -117,6 +117,15 @@ rolls back via git).
   `/game/Game.exe` is missing.
 - **`REALMD_REQUIRE_GS` gates client traffic** until a game server publishes itself, so
   clients never connect to a realm with no games behind it.
+- **A hostname in `realmAddr`/`gameAddr` is resolved by realmd, inside the cluster.** Both are
+  advertised to clients, so the name must resolve the same in the cluster as on the internet.
+  Split-horizon DNS breaks this silently — a CoreDNS rewrite pointing the cluster's own domains
+  at the ingress Service gives realmd a ClusterIP, which it then hands to every external client.
+  Nothing looks wrong: realmd is healthy, the fleet is registered, and no one can log in. Verify
+  from a pod (`kubectl run dns --rm -i --restart=Never --image=busybox -- nslookup <name>`), and
+  use the IP if the answer is not the public address. Everything the realm dials *internally* —
+  redis, Postgres, the game servers' pod IPs — is unaffected; it is only the advertised
+  addresses that have to be resolvable from outside.
 
 ## Toggles
 

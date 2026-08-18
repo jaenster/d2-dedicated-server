@@ -16,6 +16,14 @@ realmName: MyRealm
 # there is nowhere in the protocol to put a name. So DNS is how you write the address down, not
 # how it fails over: moving the record needs a realmd restart to take effect. A floating IP that
 # moves between nodes keeps working without one, which is why it is still the better front door.
+#
+# A name is resolved BY REALMD, so it must resolve the same inside the cluster as outside. Under
+# split-horizon DNS it does not, and the failure is silent: a CoreDNS rewrite that points the
+# cluster's own domains at the ingress Service hands realmd a ClusterIP, which it then advertises
+# to every client on the internet. realmd stays healthy, the game servers stay registered, and
+# nobody can log in. Check it before using a name, from a pod, not from your laptop:
+#   kubectl run dns --rm -i --restart=Never --image=busybox -- nslookup <name>
+# If that answers with anything but the public address, use the IP here.
 realmAddr: ""
 
 # Stable public IPs (e.g. cloud floating IPs) used as Service externalIPs on the public
