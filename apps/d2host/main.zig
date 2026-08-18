@@ -19,15 +19,6 @@ const hostapi = @import("d2engine").hostapi;
 const gameflags = @import("d2engine").gameflags;
 const d2version = @import("d2engine").version;
 
-/// The one line that names which build this host drives. Every ABI-dependent constant below —
-/// callback stack-arg counts, the client-struct field offsets, which D2Game ordinal answers a
-/// character load — is keyed off this, specifically so that driving a different version is
-/// "change this line" rather than "hunt down every place 1.10f's numbers were typed in by hand".
-/// A version whose slots are not yet counted (`packages/d2engine/callbacks.zig`) fails to compile
-/// rather than silently reusing 1.10f's — see `target_spec.stack_args` below.
-const target_version: d2version.Version = .v110f;
-const target_spec = d2version.spec(target_version);
-
 /// `fpSaveDatabaseGuild` has never been observed called on any version, so its arity is a guess
 /// carried over from the cut Guild Halls feature rather than a measurement — named so a reader does
 /// not mistake it for data the way the other slots' counts are.
@@ -155,44 +146,173 @@ var load_filetimes: [2]u32 = undefined;
 
 var pending: [8]Pending = @splat(.{});
 
-/// Slot 0x08. `__fastcall`, ECX = &pClient->pRealm.
+/// Everything version-specific the callback table needs, generated once per `version`. This is
+/// the actual mechanism behind "the version is a suggestion, not a rebuild": `run()` below is
+/// itself generic over `comptime version`, and picking a different (measured) version at runtime
+/// means the *same binary* instantiates a *different* `Binding`, with no source edit — the two
+/// things that differ between engine builds (a callback's stack-arg count, and where the client
+/// struct's fields sit relative to ECX) are exactly the two things this closes over.
 ///
-/// The offsets from ECX to the name/account fields are per-version — `hostapi.clientFields` — not a
-/// fixed 1.14d constant: pRealm's own position in the client struct moves (1.10f +0x68, 1.09d
-/// +0x54), which shifts the ECX-relative distance even though both versions keep the fields
-/// themselves at the same +0x0D/+0x1D within the struct. Measured per version, not assumed shared.
-const client_fields = hostapi.clientFields(target_version) orelse
-    @compileError("no client field offsets measured for this version — see hostapi.clientFields");
+/// Two guardrails, not one: `hostapi.clientFields` already refuses to build for a version with no
+/// measured offsets (`orelse @compileError`). The `comptime` asserts below catch a narrower but
+/// just as real mistake — a *future* version whose measured arity for one of these two slots
+/// differs from what this specific template's function body was written for. Without them, adding
+/// a version with (say) a 3-stack-arg `fpFindPlayerToken` would silently reuse this 5-arg
+/// `findPlayerToken`, reading three real values and two words of engine stack garbage instead of
+/// failing to compile. A version whose arity genuinely differs needs its own override here, the
+/// same way `apps/d2gs/engine/realm.zig` has its own 1.14d-specific implementations.
+fn Binding(comptime version: d2version.Version) type {
+    const spec = d2version.spec(version);
+    const client_fields = hostapi.clientFields(version) orelse
+        @compileError(@tagName(version) ++ ": no client field offsets measured — see hostapi.clientFields");
 
-fn getDatabaseCharacter(ecx: usize, edx: usize, client_id: usize, account: usize) callconv(.c) usize {
-    _ = .{ edx, account };
-    const sz_char: [*:0]const u8 = @ptrFromInt(ecx -% client_fields.name);
-    const sz_acct: [*:0]const u8 = @ptrFromInt(ecx -% client_fields.account);
-    const char_name = std.mem.sliceTo(sz_char, 0);
-    // The realm's JOINGAME is the only place the account is known; the engine leaves its own field
-    // empty on this path, so fall back to it only if we were never told.
-    const acct_name = accountFor(char_name) orelse std.mem.sliceTo(sz_acct, 0);
-    if (acct_name.len == 0) {
-        // Nothing told us the account: the engine leaves its field empty on this path and no
-        // JOINGAME for this character reached us. Say so, because the alternative is a fetch
-        // against `realmd:char::<char>` that misses for a reason nothing explains.
-        sayFmt("d2host: no account known for '{s}' — the realm sent no JOINGAME for it", .{char_name});
+    comptime {
+        const token_args = cb.stackArgs(spec.stack_args, .fpFindPlayerToken);
+        if (token_args != 5) @compileError(std.fmt.comptimePrint(
+            "{s}: fpFindPlayerToken takes {d} stack args, but Binding's findPlayerToken is written " ++
+                "for 5 (1.10f's count) — add a version-specific override instead of reusing this one",
+            .{ @tagName(version), token_args },
+        ));
+        const char_args = cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter);
+        if (char_args != 2) @compileError(std.fmt.comptimePrint(
+            "{s}: fpGetDatabaseCharacter takes {d} stack args, but Binding's getDatabaseCharacter " ++
+                "is written for 2 — add a version-specific override instead of reusing this one",
+            .{ @tagName(version), char_args },
+        ));
     }
 
-    const slot = for (&pending) |*p| {
-        if (!p.used) break p;
-    } else {
-        say("d2host: no free character slot — refusing this join");
-        return 0;
-    };
+    return struct {
+        /// Slot 0x08. `__fastcall`, ECX = &pClient->pRealm.
+        ///
+        /// The offsets from ECX to the name/account fields are per-version, not a fixed 1.14d
+        /// constant: pRealm's own position in the client struct moves (1.10f +0x68, 1.09d +0x54),
+        /// which shifts the ECX-relative distance even though both versions keep the fields
+        /// themselves at the same +0x0D/+0x1D within the struct.
+        pub fn getDatabaseCharacter(ecx: usize, edx: usize, client_id: usize, account: usize) callconv(.c) usize {
+            _ = .{ edx, account };
+            const sz_char: [*:0]const u8 = @ptrFromInt(ecx -% client_fields.name);
+            const sz_acct: [*:0]const u8 = @ptrFromInt(ecx -% client_fields.account);
+            const char_name = std.mem.sliceTo(sz_char, 0);
+            // The realm's JOINGAME is the only place the account is known; the engine leaves its
+            // own field empty on this path, so fall back to it only if we were never told.
+            const acct_name = accountFor(char_name) orelse std.mem.sliceTo(sz_acct, 0);
+            if (acct_name.len == 0) {
+                // Nothing told us the account: the engine leaves its field empty on this path and
+                // no JOINGAME for this character reached us. Say so, because the alternative is a
+                // fetch against `realmd:char::<char>` that misses for a reason nothing explains.
+                sayFmt("d2host: no account known for '{s}' — the realm sent no JOINGAME for it", .{char_name});
+            }
 
-    // pClient+0x60, which is ECX-8. The engine checks this against pClient[0x18] when the save
-    // comes back and removes the client if it disagrees.
-    const container_slot: *const usize = @ptrFromInt(ecx -% 8);
-    slot.* = .{ .used = true, .client_id = @intCast(client_id), .container = container_slot.* };
-    slot.len = @intCast(store.getChar(acct_name, char_name, &slot.save));
-    sayHex("d2host: fpGetDatabaseCharacter — save bytes ", slot.len);
-    return 0;
+            const slot = for (&pending) |*p| {
+                if (!p.used) break p;
+            } else {
+                say("d2host: no free character slot — refusing this join");
+                return 0;
+            };
+
+            // pClient+0x60, which is ECX-8. The engine checks this against pClient[0x18] when the
+            // save comes back and removes the client if it disagrees.
+            const container_slot: *const usize = @ptrFromInt(ecx -% 8);
+            slot.* = .{ .used = true, .client_id = @intCast(client_id), .container = container_slot.* };
+            slot.len = @intCast(store.getChar(acct_name, char_name, &slot.save));
+            sayHex("d2host: fpGetDatabaseCharacter — save bytes ", slot.len);
+            return 0;
+        }
+
+        /// Slot 0x18, the closed-realm join gate. `__fastcall` with five stack args on 1.10f.
+        ///
+        /// Called from `GAME_VerifyJoinGame`. Five stack args is from the call site's five pushes,
+        /// which is the reliable count — the decompiler renders the indirect call with fewer
+        /// because it cannot know an unnamed pointer's signature.
+        ///
+        /// **Nonzero accepts.** Zero makes the engine log
+        /// `[HACKLIST] <D2CLTSYS_JOINGAME> ACCT:%s CLIENT:%s GAMEID:%d TOKEN:%x ERROR: Invalid Token`
+        /// and refuse the join. That message is also where the argument names come from — it is
+        /// built from EBP/EDI/ESI/EBX, the account, character, game id and token — so the
+        /// identities below are read off the engine's own logging rather than guessed, but they
+        /// are inference, unlike the count.
+        ///
+        /// The slot cannot be left null: the engine runs `IsBadCodePtr` on it first and a bad
+        /// pointer is an assert and `exit(-1)`, not a skipped call.
+        ///
+        /// Accepting unconditionally is what the injected 1.14d server does in production today:
+        /// realmd has already authorised this join before the client is told where to connect, so
+        /// the token is a second check rather than the only one. Enforcing it here needs the same
+        /// join-context bookkeeping `apps/d2gs` keeps, which is realm-side state this host does
+        /// not hold yet.
+        pub fn findPlayerToken(
+            ecx: usize,
+            edx: usize,
+            game_id: usize,
+            account: usize,
+            s3: usize,
+            s4: usize,
+            s5: usize,
+        ) callconv(.c) usize {
+            _ = .{ s3, s4, s5 };
+            const char_name: [*:0]const u8 = @ptrFromInt(ecx);
+            const acct_name: [*:0]const u8 = @ptrFromInt(account);
+            sayFmt("d2host: fpFindPlayerToken — {s}/{s} gameid={d} token=0x{x}", .{
+                std.mem.sliceTo(acct_name, 0),
+                std.mem.sliceTo(char_name, 0),
+                game_id,
+                edx,
+            });
+            return 1;
+        }
+
+        // Every arity below routes through `cb.stackArgs(spec.stack_args, .slot)` rather than a
+        // literal, so a Stub for a slot `version` has never had counted is a COMPILE ERROR, not a
+        // silent reuse of another version's number under a different engine. The two slots with no
+        // measurement even for 1.10f (fpSaveDatabaseGuild, the unnamed 0x24) stay literal and say
+        // so — nothing has been observed calling either, so a wrong stack-cleanup there has not
+        // yet cost us a corrupted call, but it is a guess, not data.
+        pub fn buildCallbackTable() CallbackTable {
+            return .{
+                .close_game = Stub("pfCloseGame", cb.stackArgs(spec.stack_args, .fpCloseGame)).ptr,
+                .leave_game = Stub("pfLeaveGame", cb.stackArgs(spec.stack_args, .fpLeaveGame)).ptr,
+                // The one slot that is a real implementation rather than a report: it drives every join.
+                .get_database_character = @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
+                    getDatabaseCharacter,
+                ).shim),
+                .save_database_character = Stub(
+                    "pfSaveDatabaseCharacter",
+                    cb.stackArgs(spec.stack_args, .fpSaveDatabaseCharacter),
+                ).ptr,
+                .server_log_message = @ptrCast(&serverLogMessage),
+                .enter_game = Stub("pfEnterGame", cb.stackArgs(spec.stack_args, .fpEnterGame)).ptr,
+                .find_player_token = @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpFindPlayerToken),
+                    findPlayerToken,
+                ).shim),
+                // Unmeasured for every version so far — literal, and marked as such rather than
+                // routed through stackArgs, which would otherwise make an honest gap look like
+                // counted data.
+                .save_database_guild = Stub("pfSaveDatabaseGuild", unmeasured_guess).ptr,
+                .unlock_database_character = Stub(
+                    "pfUnlockDatabaseCharacter",
+                    cb.stackArgs(spec.stack_args, .fpUnlockDatabaseCharacter),
+                ).ptr,
+                .unk_0x24 = Stub("unk0x24", 0).ptr, // truly unused — nothing calls this slot on any version
+                .update_character_ladder = Stub(
+                    "pfUpdateCharacterLadder",
+                    cb.stackArgs(spec.stack_args, .fpUpdateCharacterLadder),
+                ).ptr,
+                .update_game_information = Stub(
+                    "pfUpdateGameInformation",
+                    cb.stackArgs(spec.stack_args, .fpUpdateGameInformation),
+                ).ptr,
+                .handle_packet = Stub("pfHandlePacket", cb.stackArgs(spec.stack_args, .fpHandlePacket)).ptr,
+                .set_game_data = Stub("pfSetGameData", cb.stackArgs(spec.stack_args, .fpSetGameData)).ptr,
+                .relock_database_character = Stub(
+                    "pfRelockDatabaseCharacter",
+                    cb.stackArgs(spec.stack_args, .fpRelockDatabaseCharacter),
+                ).ptr,
+                .load_complete = @ptrCast(&loadComplete),
+            };
+        }
+    };
 }
 
 /// Hand every fetched save to the engine, outside the join call stack. A zero-length fetch is a
@@ -210,38 +330,6 @@ fn pumpCharacterLoads() void {
         _ = send(p.client_id, &p.save, p.len, p.len, 0, 0, &load_filetimes, p.container);
         sayHex("d2host: character delivered, bytes ", p.len);
     }
-}
-
-/// Slot 0x18, the closed-realm join gate. `__fastcall` with five stack args on 1.10f.
-///
-/// Called from `GAME_VerifyJoinGame` @0x6fc36df0. Five stack args is from the call site's five
-/// pushes, which is the reliable count — the decompiler renders the indirect call with fewer
-/// because it cannot know an unnamed pointer's signature.
-///
-/// **Nonzero accepts.** Zero makes the engine log
-/// `[HACKLIST] <D2CLTSYS_JOINGAME> ACCT:%s CLIENT:%s GAMEID:%d TOKEN:%x ERROR: Invalid Token`
-/// and refuse the join. That message is also where the argument names come from — it is built from
-/// EBP/EDI/ESI/EBX, the account, character, game id and token — so the identities below are read
-/// off the engine's own logging rather than guessed, but they are inference, unlike the count.
-///
-/// The slot cannot be left null: the engine runs `IsBadCodePtr` on it first and a bad pointer is
-/// an assert and `exit(-1)`, not a skipped call.
-///
-/// Accepting unconditionally is what the injected 1.14d server does in production today: realmd
-/// has already authorised this join before the client is told where to connect, so the token is a
-/// second check rather than the only one. Enforcing it here needs the same join-context bookkeeping
-/// `apps/d2gs` keeps, which is realm-side state this host does not hold yet.
-fn findPlayerToken(ecx: usize, edx: usize, game_id: usize, account: usize, s3: usize, s4: usize, s5: usize) callconv(.c) usize {
-    _ = .{ s3, s4, s5 };
-    const char_name: [*:0]const u8 = @ptrFromInt(ecx);
-    const acct_name: [*:0]const u8 = @ptrFromInt(account);
-    sayFmt("d2host: fpFindPlayerToken — {s}/{s} gameid={d} token=0x{x}", .{
-        std.mem.sliceTo(acct_name, 0),
-        std.mem.sliceTo(char_name, 0),
-        game_id,
-        edx,
-    });
-    return 1;
 }
 
 /// Resolved from our own D2Net, by name.
@@ -713,13 +801,12 @@ fn buildGameDataTable() void {
 
 const Module = struct { name: [*:0]const u8, handle: ?HMODULE = null };
 
-fn handleOf(name: []const u8) ?HMODULE {
-    for (modules) |m| {
-        if (std.mem.eql(u8, std.mem.sliceTo(m.name, 0), name)) return m.handle;
-    }
-    return null;
-}
-
+/// Which modules load, and in what order — sourced from `d2version.spec(version).modules` rather
+/// than a literal, so the module set is exactly as version-agnostic as everything else here.
+/// Presently that spec is the same list for every DLL-era version (see `version.zig`), but the
+/// point is that a future version whose set genuinely differs needs a data change there, not a
+/// second copy of this loop.
+///
 /// Load order matters twice over. Initialisation order — allocator and archives before the data
 /// tables that use them, game logic last — is the obvious one.
 ///
@@ -731,22 +818,88 @@ fn handleOf(name: []const u8) ?HMODULE {
 /// This order is the cheapest arrangement, measured: D2Game keeps `0x6FC30000` and only D2Common
 /// moves. Loading D2Common first instead costs two relocations (D2CMP *and* D2Game). Either way,
 /// resolve everything by ordinal — RVAs hold across relocation, absolute addresses do not.
-var modules = [_]Module{
-    .{ .name = "Storm.dll" },
-    .{ .name = "Fog.dll" },
-    .{ .name = "D2Lang.dll" },
-    .{ .name = "D2CMP.dll" },
-    .{ .name = "D2Common.dll" },
-    .{ .name = "D2Net.dll" },
-    .{ .name = "D2Game.dll" },
-};
+fn loadModules(comptime module_names: []const [:0]const u8) ![module_names.len]Module {
+    var modules: [module_names.len]Module = undefined;
+    inline for (module_names, 0..) |name, i| {
+        modules[i] = .{ .name = name };
+        modules[i].handle = LoadLibraryA(name);
+        if (modules[i].handle == null) {
+            say("d2host: FAILED to load a module: " ++ name);
+            sayHex("d2host:   err=", GetLastError());
+            return error.LoadLibraryFailed;
+        }
+        sayHex("d2host: loaded " ++ name ++ ", base=", @intFromPtr(modules[i].handle.?));
+    }
+    return modules;
+}
+
+fn moduleHandle(modules: []const Module, name: []const u8) ?HMODULE {
+    for (modules) |m| {
+        if (std.mem.eql(u8, std.mem.sliceTo(m.name, 0), name)) return m.handle;
+    }
+    return null;
+}
+
+/// Whether a version has everything `run`/`Binding` need to actually build and drive it: every
+/// required callback slot counted, and the client-struct field offsets known. This is the gate
+/// that turns "1.09d isn't finished yet" from a fact someone has to remember into something the
+/// program checks and refuses to violate — a version can be *selected* long before it is *ready*,
+/// and the two are meant to be handled differently: selecting an unknown version is a usage
+/// mistake (reject early), selecting a known-but-incomplete one is expected, ongoing work (reject
+/// clearly, naming exactly what is missing, not a build failure three files away).
+fn ready(comptime v: d2version.Version) bool {
+    return cb.isComplete(d2version.spec(v).stack_args) and hostapi.clientFields(v) != null;
+}
+
+/// `D2GS_ENGINE_VERSION` picks which build this process drives, the same way `D2GS_REDIS_ADDR`
+/// picks the store — a run-time knob, not a source edit. Defaults to 1.10f, the only version
+/// `ready()` currently accepts; naming an unready or unknown one is reported by `main`, not here.
+fn resolveVersion() d2version.Version {
+    var buf: [32]u8 = undefined;
+    const requested = env("D2GS_ENGINE_VERSION", &buf) orelse return .v110f;
+    return d2version.Version.parse(requested) orelse {
+        sayFmt("d2host: D2GS_ENGINE_VERSION='{s}' not a known version, defaulting to 1.10f", .{requested});
+        return .v110f;
+    };
+}
 
 pub fn main() !void {
     _ = AllocConsole();
     out_handle = GetStdHandle(@bitCast(@as(i32, -11))); // STD_OUTPUT_HANDLE
     say("d2host: start");
 
-    if (firstArg()) |dir| {
+    const install_dir = firstArg();
+    const requested = resolveVersion();
+
+    // `inline else` monomorphizes this switch's body once per `d2version.Version` enum value, with
+    // `v` comptime-known inside each generated copy — which is what lets `ready(v)` and
+    // `run(v, ...)` below be ordinary compile-time-checked calls even though `requested` itself is
+    // only known at runtime. The version genuinely is "just a suggestion" in the sense that asked:
+    // the SAME binary carries every measured version's code, and a flag picks among them.
+    switch (requested) {
+        inline else => |v| {
+            if (comptime !ready(v)) {
+                sayFmt("d2host: {s} is not ready yet — missing: {s}", .{
+                    @tagName(v),
+                    comptime cb.missingSlots(d2version.spec(v).stack_args),
+                });
+                return error.VersionNotReady;
+            }
+            sayFmt("d2host: targeting {s}", .{@tagName(v)});
+            return run(v, install_dir);
+        },
+    }
+}
+
+/// The whole bring-up and tick loop, generic over `version`. Selecting a different (measured)
+/// version means the *caller* picks a different `version` to instantiate this with — nothing in
+/// here is 1.10f-specific by name; every fact that differs between engine builds already lives in
+/// `d2version`/`d2engine.hostapi`/`Binding`, and this function just consumes whichever version's
+/// data it was handed.
+fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
+    const spec = comptime d2version.spec(version);
+
+    if (install_dir) |dir| {
         if (SetCurrentDirectoryA(dir) == 0) {
             sayHex("d2host: SetCurrentDirectory failed, err=", GetLastError());
         } else {
@@ -754,22 +907,13 @@ pub fn main() !void {
         }
     }
 
-    for (&modules) |*m| {
-        m.handle = LoadLibraryA(m.name);
-        if (m.handle == null) {
-            say("d2host: FAILED to load a module");
-            sayHex("d2host:   err=", GetLastError());
-            return error.LoadLibraryFailed;
-        }
-        sayHex("d2host: loaded, base=", @intFromPtr(m.handle.?));
-    }
+    var modules = try loadModules(spec.modules);
     say("d2host: all modules loaded");
 
     const d2game = modules[modules.len - 1].handle.?;
-    const d2common = handleOf("D2Common.dll").?;
-    const d2lang = handleOf("D2Lang.dll").?;
-    const d2net = handleOf("D2Net.dll").?;
-
+    const d2common = moduleHandle(&modules, "D2Common.dll").?;
+    const d2lang = moduleHandle(&modules, "D2Lang.dll").?;
+    const d2net = moduleHandle(&modules, "D2Net.dll").?;
 
     const init_table = byOrdinal(d2game, 10002) orelse {
         say("d2host: D2Game ordinal 10002 (GAME_InitGameDataTable) missing");
@@ -782,54 +926,10 @@ pub fn main() !void {
     sayHex("d2host: GAME_InitGameDataTable=", @intFromPtr(init_table));
     sayHex("d2host: GAME_SetServerCallbackFunctions=", @intFromPtr(set_callbacks));
 
-    // Every arity below routes through `cb.stackArgs(target_spec.stack_args, .slot)` rather than a
-    // literal, so a Stub for a slot `target_version` has never had counted is a COMPILE ERROR, not
-    // a silent reuse of 1.10f's number under a different version's engine. The two slots with no
-    // measurement even for 1.10f (fpSaveDatabaseGuild, the unnamed 0x24) stay literal and say so —
-    // nothing has been observed calling either, so a wrong stack-cleanup there has not yet cost us
-    // a corrupted call, but it is a guess, not data.
-    callbacks = .{
-        .close_game = Stub("pfCloseGame", cb.stackArgs(target_spec.stack_args, .fpCloseGame)).ptr,
-        .leave_game = Stub("pfLeaveGame", cb.stackArgs(target_spec.stack_args, .fpLeaveGame)).ptr,
-        // The one slot that is a real implementation rather than a report: it drives every join.
-        .get_database_character = @ptrCast(&fastcall.Callback2(
-            cb.stackArgs(target_spec.stack_args, .fpGetDatabaseCharacter),
-            getDatabaseCharacter,
-        ).shim),
-        .save_database_character = Stub(
-            "pfSaveDatabaseCharacter",
-            cb.stackArgs(target_spec.stack_args, .fpSaveDatabaseCharacter),
-        ).ptr,
-        .server_log_message = @ptrCast(&serverLogMessage),
-        .enter_game = Stub("pfEnterGame", cb.stackArgs(target_spec.stack_args, .fpEnterGame)).ptr,
-        .find_player_token = @ptrCast(&fastcall.Callback2(
-            cb.stackArgs(target_spec.stack_args, .fpFindPlayerToken),
-            findPlayerToken,
-        ).shim),
-        // Unmeasured for every version so far — literal, and marked as such rather than routed
-        // through stackArgs, which would otherwise make an honest gap look like counted data.
-        .save_database_guild = Stub("pfSaveDatabaseGuild", unmeasured_guess).ptr,
-        .unlock_database_character = Stub(
-            "pfUnlockDatabaseCharacter",
-            cb.stackArgs(target_spec.stack_args, .fpUnlockDatabaseCharacter),
-        ).ptr,
-        .unk_0x24 = Stub("unk0x24", 0).ptr, // truly unused — nothing calls this slot on any version
-        .update_character_ladder = Stub(
-            "pfUpdateCharacterLadder",
-            cb.stackArgs(target_spec.stack_args, .fpUpdateCharacterLadder),
-        ).ptr,
-        .update_game_information = Stub(
-            "pfUpdateGameInformation",
-            cb.stackArgs(target_spec.stack_args, .fpUpdateGameInformation),
-        ).ptr,
-        .handle_packet = Stub("pfHandlePacket", cb.stackArgs(target_spec.stack_args, .fpHandlePacket)).ptr,
-        .set_game_data = Stub("pfSetGameData", cb.stackArgs(target_spec.stack_args, .fpSetGameData)).ptr,
-        .relock_database_character = Stub(
-            "pfRelockDatabaseCharacter",
-            cb.stackArgs(target_spec.stack_args, .fpRelockDatabaseCharacter),
-        ).ptr,
-        .load_complete = @ptrCast(&loadComplete),
-    };
+    // Everything version-specific about the table — every slot's arity, and the two real
+    // implementations' internals — lives in `Binding(version)`. `run` is generic, so this line is
+    // the same regardless of which version the current instantiation is for.
+    callbacks = Binding(version).buildCallbackTable();
     say("d2host: callback table built");
 
     // Blizzard's own host (`D2Server.dll`, WinMain @0x10009EA0) defines the minimal init, and this
@@ -925,12 +1025,12 @@ pub fn main() !void {
 
     say("d2host: init sequence survived");
 
-    try createGame(d2game);
+    try createGame(version, d2game);
 }
 
 /// Try to stand a game up and tick it. Every call is announced before it happens, so a hard failure
 /// names the step instead of just killing the process.
-fn createGame(d2game: HMODULE) !void {
+fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     // TASK_InitializeClock @10039 — the game clock the tick functions read.
     if (byOrdinal(d2game, 10039)) |p| {
         const InitClock = *const fn () callconv(.winapi) void;
@@ -956,7 +1056,7 @@ fn createGame(d2game: HMODULE) !void {
 
     // @10007 — the async half of fpGetDatabaseCharacter. Without it a fetched save has nowhere to
     // go and every join stalls, so say so at startup rather than at the first join.
-    if (byOrdinal(d2game, hostapi.sendDatabaseCharacter(target_version).?.ordinal)) |p| {
+    if (byOrdinal(d2game, hostapi.sendDatabaseCharacter(version).?.ordinal)) |p| {
         load_filetimes = .{ @truncate(@intFromPtr(&load_filetime)), 0 };
         send_character = @ptrCast(@alignCast(p));
         say("d2host: D2GSSendDatabaseCharacter @10007 resolved");

@@ -85,7 +85,7 @@ pub fn spec(comptime v: Version) Spec {
         .v106b => .{ .name = "1.06b", .fog = .classic, .expansion = false, .modules = &classic_modules, .stack_args = .{} },
         .v107 => .{ .name = "1.07", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = .{} },
         .v108 => .{ .name = "1.08", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = .{} },
-        .v109d => .{ .name = "1.09d", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = .{} },
+        .v109d => .{ .name = "1.09d", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v109d },
         .v110f => .{ .name = "1.10f", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v110f },
         .v113c => .{ .name = "1.13c", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = .{} },
         // 1.14d is the monolith: no DLLs to load, and it grew the callback table past 0x40.

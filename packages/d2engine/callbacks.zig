@@ -118,6 +118,53 @@ pub fn stackArgs(comptime version: StackArgs, comptime slot: Slot) usize {
     );
 }
 
+/// Every slot a host actually has to build a shim for — i.e. one a live D2Game call site is known
+/// to invoke. `fpSaveDatabaseGuild` (cut Guild Halls) and the unnamed slot at 0x24 are deliberately
+/// absent: nothing has ever been observed calling either, on any version, so there is no call site
+/// to count and "required" would be a lie for them.
+///
+/// This is what a version's `StackArgs` is measured *against* — the thing that turns "we have not
+/// finished 1.09d yet" from a vague feeling into a concrete, checkable, per-slot list.
+pub const required_slots = [_]Slot{
+    .fpCloseGame,
+    .fpLeaveGame,
+    .fpGetDatabaseCharacter,
+    .fpSaveDatabaseCharacter,
+    .fpEnterGame,
+    .fpFindPlayerToken,
+    .fpUnlockDatabaseCharacter,
+    .fpUpdateCharacterLadder,
+    .fpUpdateGameInformation,
+    .fpHandlePacket,
+    .fpSetGameData,
+    .fpRelockDatabaseCharacter,
+};
+
+/// Whether every required slot has been counted for this version. The whole point of a version
+/// being "just a suggestion" to a host is that the host can ask this *before* trying to build a
+/// callback table, rather than a build failing on whichever slot happens to be missing.
+pub fn isComplete(comptime version: StackArgs) bool {
+    inline for (required_slots) |slot| {
+        if (@field(version, @tagName(slot)) == null) return false;
+    }
+    return true;
+}
+
+/// The required slots this version has NOT counted yet, formatted for a human. Empty string when
+/// `isComplete` is true. Comptime because it walks `required_slots` at compile time; a runtime
+/// caller gets the resulting string back as ordinary data.
+pub fn missingSlots(comptime version: StackArgs) []const u8 {
+    var out: []const u8 = "";
+    var first = true;
+    for (required_slots) |slot| {
+        if (@field(version, @tagName(slot)) != null) continue;
+        if (!first) out = out ++ ", ";
+        out = out ++ @tagName(slot);
+        first = false;
+    }
+    return out;
+}
+
 /// 1.14d, counted at the call sites in the monolith (ret 0x8 / 0x10 / 0x48 / 0x1c) and load-bearing
 /// in a running server. NOT interchangeable with v110f: fpFindPlayerToken takes 7 here and 5 there.
 pub const v114d: StackArgs = .{
@@ -145,14 +192,22 @@ pub const v110f: StackArgs = .{
     .fpRelockDatabaseCharacter = 1,
 };
 
-/// 1.09d. Only `fpFindPlayerToken` is counted so far, from `D2Game.dll`'s own `SrvVerifyJoinGame`
-/// (@0x6fc36c10 in the rebuilt 1.09d-lod binary): the call at 0x6fc36e85 pushes `esi, ebp, eax`
-/// before `calll *0x18(%eax)` — three stack args, not 1.10f's five. The pushes are what's counted,
-/// not the decompiler's rendering of the indirect call, which drops arguments it cannot type.
-/// Every other slot is still uncounted for this version and stays a compile error until measured —
-/// the arg counts below are NOT a superset of v110f's despite the shared Fog/D2Game ordinal family.
+/// 1.09d. Two of twelve required slots counted so far, both from the rebuilt 1.09d-lod
+/// `D2Game.dll`, both by raw push count at the call site rather than the decompiler's rendering
+/// (which drops arguments it cannot type):
+///
+///   - `fpFindPlayerToken`: `SrvVerifyJoinGame` @0x6fc36c10, call at 0x6fc36e85 pushes
+///     `esi, ebp, eax` before `calll *0x18(%eax)` — three stack args, not 1.10f's five.
+///   - `fpGetDatabaseCharacter`: the join path's callback call at 0x6fc37232 pushes `edi`, then
+///     `eax` (loaded from `0x4c(%esp)`) before `calll *0x8(%eax)` — two stack args, matching
+///     1.10f's count exactly. (Its *offsets*, not its arity, differ — see `hostapi.clientFields`.)
+///
+/// Every other required slot is still uncounted and stays a compile error until measured — the
+/// counted values here are NOT a superset of v110f's despite the shared Fog/D2Game ordinal family;
+/// `callbacks.isComplete(v109d)` is false, and `missingSlots(v109d)` names the rest.
 pub const v109d: StackArgs = .{
     .fpFindPlayerToken = 3,
+    .fpGetDatabaseCharacter = 2,
 };
 
 /// 1.14d grew the table past 0x40. fpGetDatabaseFileTime is the only appended slot known to be
@@ -209,4 +264,19 @@ test "stack-arg counts are per version, not shared" {
     try std.testing.expectEqual(5, stackArgs(v110f, .fpFindPlayerToken));
     try std.testing.expectEqual(18, stackArgs(v114d, .fpLeaveGame));
     try std.testing.expectEqual(12, stackArgs(v110f, .fpLeaveGame));
+}
+
+test "completeness is checkable before a build fails on it" {
+    // v110f has every required slot counted; v109d has one of twelve.
+    try std.testing.expect(isComplete(v110f));
+    try std.testing.expect(!isComplete(v109d));
+    try std.testing.expect(!isComplete(v114d)); // partial: only 4 of the 12 required slots
+}
+
+test "missingSlots names exactly what a version still needs" {
+    try std.testing.expectEqualStrings("", comptime missingSlots(v110f));
+    // v109d has only fpFindPlayerToken counted, so every other required slot is missing.
+    const m109 = comptime missingSlots(v109d);
+    try std.testing.expect(std.mem.indexOf(u8, m109, "fpCloseGame") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m109, "fpFindPlayerToken") == null);
 }
