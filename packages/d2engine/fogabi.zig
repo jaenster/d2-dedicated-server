@@ -36,7 +36,10 @@ pub const version_enum = version.Version;
 pub fn ordinalArgs(v: version.Version) ?OrdinalArgs {
     return switch (v) {
         .v110f, .v113c, .v114d => .{ .alloc_linker = 2 },
-        .v109d => .{ .alloc_linker = 0 },
+        // 1.07 and 1.09d agree, and both differ from 1.10f: the debug pair was added later. Swept
+        // the same way over every Fog ordinal D2Common imports — AllocLinker is the *only* one of
+        // the eighteen that moved, on either version.
+        .v107, .v109d => .{ .alloc_linker = 0 },
         else => null,
     };
 }
@@ -49,6 +52,7 @@ pub const default: OrdinalArgs = .{ .alloc_linker = 2 };
 test "the LoD family shares ordinals but not arities" {
     try std.testing.expectEqual(@as(u8, 2), ordinalArgs(.v110f).?.alloc_linker);
     try std.testing.expectEqual(@as(u8, 0), ordinalArgs(.v109d).?.alloc_linker);
+    try std.testing.expectEqual(@as(u8, 0), ordinalArgs(.v107).?.alloc_linker);
     // 1.06b is a different Fog numbering entirely and has not been measured.
     try std.testing.expect(ordinalArgs(.v106b) == null);
 }

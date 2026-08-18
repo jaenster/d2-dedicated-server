@@ -264,6 +264,31 @@ pub const v110f: StackArgs = .{
     .fpRelockDatabaseCharacter = .{ .args = 1 }, // the realm save path @0x6fc8a48f
 };
 
+/// 1.07, the first LoD build, swept from table global 0x6fd4d73c. Complete, and the closest thing
+/// we have to a version whose *data* we also hold — the 1.07 `d2exp.mpq` ships 70 compiled `.bin`
+/// tables, and a `.bin` is a raw struct dump, so only its own era's engine can read it.
+///
+/// It sits with 1.06b rather than with the later LoD builds on the two arities that matter:
+/// `fpGetDatabaseCharacter` takes **1** stack arg (1.09d and 1.10f take 2) and `fpLeaveGame` takes
+/// 12 (they take 13). Like 1.06b it also dispatches `fpSaveDatabaseGuild` and the unnamed 0x24,
+/// which the later builds never reach.
+pub const v107: StackArgs = .{
+    .fpCloseGame = .{ .args = 0 }, // @0x6fc6916d
+    .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fc62b25 and @0x6fc62bd0
+    .fpGetDatabaseCharacter = .{ .args = 1 }, // two sites @0x6fc664d9 and @0x6fc66fe7, both push one
+    .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fcac1af
+    .fpEnterGame = .{ .args = 2 }, // @0x6fc68631
+    .fpFindPlayerToken = .{ .args = 3 }, // @0x6fc66bd3, same shape as 1.10f's with two fewer pushes
+    .fpSaveDatabaseGuild = .{ .args = 1 }, // @0x6fd00851
+    .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fc66e64
+    .fpReserved0x24 = .{ .args = 0 }, // two sites @0x6fca9dda and @0x6fca9ea5
+    .fpUpdateCharacterLadder = .{ .args = 0 }, // three sites, all 0
+    .fpUpdateGameInformation = .{ .args = 0 }, // @0x6fc9ede3
+    .fpHandlePacket = .no_site_found,
+    .fpSetGameData = .{ .args = 0 }, // @0x6fc6257b (the function opens with the ESI prologue push)
+    .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcac0a8
+};
+
 /// 1.09d, counted the same way against the rebuilt 1.09d-lod `D2Game.dll` (table global
 /// 0x6fd24174, 203 references, 122 dispatches — the count is high only because this build kept its
 /// assert/log calls, and all but 14 of the dispatches are slot 0x10).

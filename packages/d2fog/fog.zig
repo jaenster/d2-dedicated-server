@@ -1069,7 +1069,21 @@ export fn FOG_GetStringFromLinkIndex(linker: ?*Linker, index: i32, out_str: ?[*]
 }
 
 /// Grows by 0x40, keeps the table sorted by code, and returns the assigned index.
-/// A duplicate code retries at `code + 1`, so codes stay unique.
+///
+/// A duplicate code retries at `code + 1` until it finds a free one — which is the real Fog's own
+/// behaviour (@10215 @0x6ff5b990), not a convenience: the binary loops `uVar6 = uVar6 + 1` around
+/// its binary search until the insert succeeds. Two details of that loop are load-bearing and were
+/// both wrong here:
+///
+///   - It **wraps**. The increment is a plain 32-bit add, so a table holding 0xFFFFFFFF (an empty
+///     cell reads as one) rolls over to 0 and keeps going. Zig traps that, so this has to say `+%`
+///     out loud. A 1.09d run reached it after 26 tables and panicked in our own Fog.
+///   - It **loops rather than recurses**, which matters for the same input: rolling over from
+///     0xFFFFFFFF can retry a great many times before it lands, and recursion would take the stack
+///     with it.
+///
+/// The duplicate warning is likewise conditional in the original — only on the first attempt, and
+/// only above 0x202020A0, so blank and low codes stay quiet instead of flooding the log.
 export fn FOG_AddCodeToLinkingTable(linker: ?*Linker, code: u32) callconv(.winapi) i32 {
     trace("FOG_AddCodeToLinkingTable @10215");
     const l = linker orelse return -1;
@@ -1084,17 +1098,22 @@ export fn FOG_AddCodeToLinkingTable(linker: ?*Linker, code: u32) callconv(.winap
         l.capacity = @intCast(want);
     }
     const tbl = l.tbl.?;
-    var at: i32 = 0;
-    while (at < l.size and tbl[@intCast(at)].code < code) at += 1;
-    if (at < l.size and tbl[@intCast(at)].code == code) {
-        sayFmt("  link: duplicate code 0x{x}, retrying at +1", .{code});
-        return FOG_AddCodeToLinkingTable(l, code + 1);
+    var want_code = code;
+    while (true) {
+        var at: i32 = 0;
+        while (at < l.size and tbl[@intCast(at)].code < want_code) at += 1;
+        if (at < l.size and tbl[@intCast(at)].code == want_code) {
+            if (want_code == code and want_code > 0x202020a0)
+                sayFmt("  link: duplicate code 0x{x}, retrying at +1", .{want_code});
+            want_code +%= 1;
+            continue;
+        }
+        var i: i32 = l.size;
+        while (i > at) : (i -= 1) tbl[@intCast(i)] = tbl[@intCast(i - 1)];
+        tbl[@intCast(at)] = .{ .code = want_code, .index = l.size };
+        l.size += 1;
+        return l.size - 1;
     }
-    var i: i32 = l.size;
-    while (i > at) : (i -= 1) tbl[@intCast(i)] = tbl[@intCast(i - 1)];
-    tbl[@intCast(at)] = .{ .code = code, .index = l.size };
-    l.size += 1;
-    return l.size - 1;
 }
 
 /// Returns nothing: the binary leaves EAX undefined here, whatever D2MOO's prototype says.

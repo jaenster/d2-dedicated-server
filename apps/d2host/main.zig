@@ -159,8 +159,12 @@ var pending: [8]Pending = @splat(.{});
 /// same way `apps/d2gs/engine/realm.zig` has its own 1.14d-specific implementations.
 fn Binding(comptime version: d2version.Version) type {
     const spec = d2version.spec(version);
-    const client_fields = hostapi.clientFields(version) orelse
-        @compileError(@tagName(version) ++ ": no client field offsets measured — see hostapi.clientFields");
+    // A version can have every arity counted and still have an unknown client layout, because the
+    // two are found different ways: arities come off the call sites, the layout only shows up in
+    // memory. Rather than block on that, such a version builds a probe — it boots, and the first
+    // fetch prints what is actually around ECX so the offsets can be measured rather than guessed.
+    const probing = hostapi.clientFields(version) == null;
+    const client_fields = hostapi.clientFields(version) orelse hostapi.ClientFieldOffsets{ .name = 0, .account = 0 };
 
     // A handler may declare FEWER stack parameters than the engine pushes — the shim pushes all
     // `n_stack` of them and cleans up `n_stack`, so trailing arguments a handler never names are
@@ -169,7 +173,9 @@ fn Binding(comptime version: d2version.Version) type {
     // body serve 1.10f's five-argument fpFindPlayerToken and 1.09d's three.
     comptime {
         assertReads(version, .fpFindPlayerToken, 2, "findPlayerToken reads game_id and account");
-        assertReads(version, .fpGetDatabaseCharacter, 2, "getDatabaseCharacter reads client_id and account");
+        // The probe names no stack parameters at all, so the floor only binds the real handler.
+        if (!probing)
+            assertReads(version, .fpGetDatabaseCharacter, 2, "getDatabaseCharacter reads client_id and account");
     }
 
     return struct {
@@ -179,6 +185,31 @@ fn Binding(comptime version: d2version.Version) type {
         /// constant: pRealm's own position in the client struct moves (1.10f +0x68, 1.09d +0x54),
         /// which shifts the ECX-relative distance even though both versions keep the fields
         /// themselves at the same +0x0D/+0x1D within the struct.
+        /// Dump what surrounds ECX so the character name and account can be located by eye. The
+        /// engine hands this callback `&pClient->pRealm`, and the fields sit at negative offsets
+        /// from it whose distance is per-version — 1.10f's pRealm is at client+0x68, 1.09d's at
+        /// +0x54, 1.07's at +0x20 — so the layout cannot be carried over from another build.
+        pub fn probeClientFields(ecx: usize, edx: usize) callconv(.c) usize {
+            _ = edx;
+            sayFmt("d2host: PROBE fpGetDatabaseCharacter, ecx=0x{x} — dumping the client struct", .{ecx});
+            const from = ecx -% 0x90;
+            var row: usize = 0;
+            while (row < 0xb0) : (row += 16) {
+                const at = from + row;
+                const p: [*]const u8 = @ptrFromInt(at);
+                var hex: [16 * 3]u8 = undefined;
+                var txt: [16]u8 = undefined;
+                for (0..16) |i| {
+                    _ = std.fmt.bufPrint(hex[i * 3 ..][0..3], "{x:0>2} ", .{p[i]}) catch {};
+                    txt[i] = if (p[i] >= 0x20 and p[i] < 0x7f) p[i] else '.';
+                }
+                const delta = @as(isize, @intCast(at)) - @as(isize, @intCast(ecx));
+                sayFmt("  ecx{d: >5}  {s} {s}", .{ delta, hex, txt });
+            }
+            say("d2host: probe only — refusing the join until the offsets are recorded");
+            return 0;
+        }
+
         pub fn getDatabaseCharacter(ecx: usize, edx: usize, client_id: usize, account: usize) callconv(.c) usize {
             _ = .{ edx, account };
             const sz_char: [*:0]const u8 = @ptrFromInt(ecx -% client_fields.name);
@@ -263,7 +294,10 @@ fn Binding(comptime version: d2version.Version) type {
                 .close_game = stubFor(.fpCloseGame, "pfCloseGame"),
                 .leave_game = stubFor(.fpLeaveGame, "pfLeaveGame"),
                 // The one slot that is a real implementation rather than a report: it drives every join.
-                .get_database_character = @ptrCast(&fastcall.Callback2(
+                .get_database_character = if (probing) @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
+                    probeClientFields,
+                ).shim) else @ptrCast(&fastcall.Callback2(
                     cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
                     getDatabaseCharacter,
                 ).shim),
@@ -838,13 +872,27 @@ fn moduleHandle(modules: []const Module, name: []const u8) ?HMODULE {
 /// and the two are meant to be handled differently: selecting an unknown version is a usage
 /// mistake (reject early), selecting a known-but-incomplete one is expected, ongoing work (reject
 /// clearly, naming exactly what is missing, not a build failure three files away).
+/// Whether `v` can serve games: every arity counted AND a measured client layout.
 fn ready(comptime v: d2version.Version) bool {
     return cb.isComplete(d2version.spec(v).stack_args) and hostapi.clientFields(v) != null;
+}
+
+/// Whether `v` can be booted just far enough to measure what it is still missing. Arities have to
+/// be counted either way — those are what keep the engine's stack balanced — but the client layout
+/// is exactly what such a run is for, so it is not required.
+fn probeable(comptime v: d2version.Version) bool {
+    return cb.isComplete(d2version.spec(v).stack_args);
 }
 
 /// `D2GS_ENGINE_VERSION` picks which build this process drives, the same way `D2GS_REDIS_ADDR`
 /// picks the store — a run-time knob, not a source edit. Defaults to 1.10f, the only version
 /// `ready()` currently accepts; naming an unready or unknown one is reported by `main`, not here.
+fn envFlag(comptime name: [:0]const u8) bool {
+    var buf: [16]u8 = undefined;
+    const v = env(name, &buf) orelse return false;
+    return !std.mem.eql(u8, v, "0");
+}
+
 fn resolveVersion() d2version.Version {
     var buf: [32]u8 = undefined;
     const requested = env("D2GS_ENGINE_VERSION", &buf) orelse return .v110f;
@@ -929,6 +977,20 @@ pub fn main() !void {
     switch (requested) {
         inline else => |v| {
             if (comptime !ready(v)) {
+                // A version with every arity counted but no client layout is not broken, it is
+                // half-measured — and the run that measures the rest is a run of this binary. That
+                // is what D2GS_ENGINE_PROBE asks for, and it is opt-in so nobody gets a server that
+                // silently refuses every join.
+                if (comptime probeable(v)) {
+                    if (envFlag("D2GS_ENGINE_PROBE")) {
+                        sayFmt("d2host: {s} PROBE — arities counted, client layout not; " ++
+                            "booting to dump it on the first character fetch", .{@tagName(v)});
+                        return run(v, install_dir);
+                    }
+                    sayFmt("d2host: {s} has every arity counted but no client layout — " ++
+                        "set D2GS_ENGINE_PROBE=1 to boot and measure it", .{@tagName(v)});
+                    return error.VersionNotReady;
+                }
                 sayFmt("d2host: {s} is not ready yet — missing: {s}", .{
                     @tagName(v),
                     comptime cb.missingSlots(d2version.spec(v).stack_args),
