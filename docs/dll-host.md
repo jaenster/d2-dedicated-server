@@ -312,41 +312,49 @@ disassembly is readable.
 
 ## What is left
 
-In dependency order. Each line is blocked by the ones above it, except where noted.
+**Goal 1 (a working 1.10f server) is done.** Every item that used to block it — our own D2Net,
+game creation, the 16 callbacks, a real client joining and playing — is finished and verified: see
+"A character joins a game on the 1.10f engine" and "A 1.14d client plays on the 1.10f server" below.
 
-1. **Our own `D2Net.dll` — 14 functions.** The 11 D2Game+D2Common import plus the 3 the host
-   calls (`10003` SERVER_Initialize, `10026` SetMaxClientsPerGame, `10023` SetHackListEnabled).
-   This is the current hard stop: `D2Net @10003` calls `Fog @10149` and the process aborts.
-   Replacing it is less work than implementing the 31 Fog networking ordinals it needs, and it is
-   where our own transport belongs.
-2. ~~**Get through game creation.**~~ **Done.** `GAME_CreateNewEmptyGame` returns game id 1,
-   `GAME_GetGamesCount` reports 1, the engine calls `pfSetGameData` on our table, and the host
-   ticks frames with no assert, crash or hang.
-3. **Wire the 16 callbacks to the realm.** Less reuse than it looked: the store client is shared
-   (`packages/gs-store`) and `packages/d2engine` holds the layout and 1.10f's `stack_args`, but the
-   1.14d implementations read the engine's client struct at 1.14d offsets, so 1.10f's equivalents
-   have to be established before `fpGetDatabaseCharacter` can load anyone.
-4. **A real client joins and plays.** Everything under this is now in place — framing, the
-   character load and its delivery through `@10007`, and a listener on a configurable port. What
-   has not happened is a join: no client has connected.
+What remains is goal 2 (multiple versions, cleanly) plus the small honest gaps 1.10f itself still
+has:
 
-   The test path does not need a realm. We hold a complete 1.10f client (`Game.exe` plus every
-   client DLL, in `~/code/d2-1.10f-binaries`), and 1.10f's TCP/IP join dials port 4000 directly, so
-   `D2GS_GS_ADDR=127.0.0.1:4000 wine d2host.exe <dir>` and a client pointed at 127.0.0.1 is the
-   whole setup. A 1.14d client cannot substitute — it desynchronises on its opening `0x68`.
+- **`d2host`'s ABI is now version-parameterized, not just version-tested.** A single
+  `target_version` constant in `apps/d2host/main.zig` selects the module set, the callback
+  stack-arg counts, and the client-struct field offsets; every one of those was previously either
+  a `.v110f` literal or (worse) a bare number that happened to equal 1.10f's. Building for a
+  version whose slots are not counted is now a **compile error naming the exact missing slot**,
+  not a silent reuse of another version's numbers under a different engine.
+- **1.09d: two ABI facts measured, most slots still uncounted.** `fpFindPlayerToken` takes **3**
+  stack args on 1.09d, not 1.10f's 5 (`packages/d2engine/callbacks.zig`, `v109d`) — read off the
+  actual push count at `SrvVerifyJoinGame`'s callback call site (0x6fc36e85 in the rebuilt
+  1.09d-lod `D2Game.dll`), not the decompiler's rendering, which drops args it cannot type. And
+  the char/account offsets from ECX in `fpGetDatabaseCharacter` are version-specific in a way that
+  is easy to get backwards: pRealm sits at client+0x54 in 1.09d versus +0x68 in 1.10f, which moves
+  the *relative* offset even though the fields themselves stay at +0x0D/+0x1D in both
+  (`hostapi.clientFields`). The game-data-table vtable interface — mask at +0x24, slots at +0x1c,
+  counter at +0x10, list head at +8 — was checked too and is **identical** to 1.10f's, so that
+  whole apparatus needs no change to drive 1.09d.
 
-Independent of the above:
-
+  Still uncounted for 1.09d: every other callback slot's stack-arg count, and whether the worker
+  loop / task re-arm / `ARENAFLAG_ClientUpdate` requirement behave the same (probably yes — same
+  engine family — but "probably" is exactly what this file exists to replace with "measured").
+- **1.06b and 1.00: not yet started.** Same investigation, classic Fog family. The Fog rosetta gap
+  documented below (31 unmapped classic-era ordinals) blocks these before the callback ABI would
+  even matter.
+- **1.08: not yet started**, no binaries confirmed on hand.
+- **Fill the classic Fog rosetta column — 31 ordinals** — and build the import rewriter, so one
+  Fog serves 1.00-1.06b as well as 1.07+. Nothing before 1.07 runs until this exists.
 - **Own D2CMP (8 functions), Storm (10) and D2Lang (4, plus the string-table init).** Drops the
   last modules we do not control and takes their Fog imports with them, leaving D2Game and
   D2Common as the only Blizzard code loaded.
-- **Fill the classic Fog rosetta column — 31 ordinals** — and build the import rewriter, so one
-  Fog serves 1.00-1.06b as well as 1.07+. Nothing before 1.07 runs until this exists.
-- **Count `stack_args` for 1.09d, 1.08 and 1.06b** at their D2Game call sites.
 - **Implement `FOG @10207`** (txt → record decode, needs the `D2BinFieldStrc` column
   descriptors) or reverse the 1.10f record layouts, then generate `runessrv.bin` and
   `cubeserver.bin`. Until then runewords and cube recipes are empty — non-fatal, and the only
   known data gap.
+- **`fpSaveDatabaseGuild`'s arity is still a guess** (`unmeasured_guess` in `d2host`), unlike every
+  other slot d2host wires — nothing has been observed calling it on any version, so there is no
+  call site to count yet.
 
 
 ## The game-data table is an object, not a buffer

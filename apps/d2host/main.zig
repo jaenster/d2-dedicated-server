@@ -17,6 +17,21 @@ const proto = @import("realm_proto").protocol;
 const cb = @import("d2engine").callbacks;
 const hostapi = @import("d2engine").hostapi;
 const gameflags = @import("d2engine").gameflags;
+const d2version = @import("d2engine").version;
+
+/// The one line that names which build this host drives. Every ABI-dependent constant below —
+/// callback stack-arg counts, the client-struct field offsets, which D2Game ordinal answers a
+/// character load — is keyed off this, specifically so that driving a different version is
+/// "change this line" rather than "hunt down every place 1.10f's numbers were typed in by hand".
+/// A version whose slots are not yet counted (`packages/d2engine/callbacks.zig`) fails to compile
+/// rather than silently reusing 1.10f's — see `target_spec.stack_args` below.
+const target_version: d2version.Version = .v110f;
+const target_spec = d2version.spec(target_version);
+
+/// `fpSaveDatabaseGuild` has never been observed called on any version, so its arity is a guess
+/// carried over from the cut Guild Halls feature rather than a measurement — named so a reader does
+/// not mistake it for data the way the other slots' counts are.
+const unmeasured_guess: usize = 1;
 
 const HMODULE = *anyopaque;
 extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?HMODULE;
@@ -142,14 +157,17 @@ var pending: [8]Pending = @splat(.{});
 
 /// Slot 0x08. `__fastcall`, ECX = &pClient->pRealm.
 ///
-/// The client-struct offsets are 1.14d's, and that is not an assumption: 1.10f's D2Game does
-/// `leal 0x68(%esi), %ecx` immediately before `calll *0x8(%eax)` at 0x6fc37413, and writes the two
-/// name fields as a consecutive pair into +0x0D and +0x1D at 0x6fc32685. Same layout, so the
-/// arithmetic is the same as the injected server's.
+/// The offsets from ECX to the name/account fields are per-version — `hostapi.clientFields` — not a
+/// fixed 1.14d constant: pRealm's own position in the client struct moves (1.10f +0x68, 1.09d
+/// +0x54), which shifts the ECX-relative distance even though both versions keep the fields
+/// themselves at the same +0x0D/+0x1D within the struct. Measured per version, not assumed shared.
+const client_fields = hostapi.clientFields(target_version) orelse
+    @compileError("no client field offsets measured for this version — see hostapi.clientFields");
+
 fn getDatabaseCharacter(ecx: usize, edx: usize, client_id: usize, account: usize) callconv(.c) usize {
     _ = .{ edx, account };
-    const sz_char: [*:0]const u8 = @ptrFromInt(ecx -% 0x5B); // pClient+0x0D
-    const sz_acct: [*:0]const u8 = @ptrFromInt(ecx -% 0x4B); // pClient+0x1D
+    const sz_char: [*:0]const u8 = @ptrFromInt(ecx -% client_fields.name);
+    const sz_acct: [*:0]const u8 = @ptrFromInt(ecx -% client_fields.account);
     const char_name = std.mem.sliceTo(sz_char, 0);
     // The realm's JOINGAME is the only place the account is known; the engine leaves its own field
     // empty on this path, so fall back to it only if we were never told.
@@ -764,27 +782,52 @@ pub fn main() !void {
     sayHex("d2host: GAME_InitGameDataTable=", @intFromPtr(init_table));
     sayHex("d2host: GAME_SetServerCallbackFunctions=", @intFromPtr(set_callbacks));
 
+    // Every arity below routes through `cb.stackArgs(target_spec.stack_args, .slot)` rather than a
+    // literal, so a Stub for a slot `target_version` has never had counted is a COMPILE ERROR, not
+    // a silent reuse of 1.10f's number under a different version's engine. The two slots with no
+    // measurement even for 1.10f (fpSaveDatabaseGuild, the unnamed 0x24) stay literal and say so —
+    // nothing has been observed calling either, so a wrong stack-cleanup there has not yet cost us
+    // a corrupted call, but it is a guess, not data.
     callbacks = .{
-        .close_game = Stub("pfCloseGame", 2).ptr,
-        .leave_game = Stub("pfLeaveGame", 12).ptr,
+        .close_game = Stub("pfCloseGame", cb.stackArgs(target_spec.stack_args, .fpCloseGame)).ptr,
+        .leave_game = Stub("pfLeaveGame", cb.stackArgs(target_spec.stack_args, .fpLeaveGame)).ptr,
         // The one slot that is a real implementation rather than a report: it drives every join.
-        .get_database_character = @ptrCast(&fastcall.Callback2(2, getDatabaseCharacter).shim),
-        .save_database_character = Stub("pfSaveDatabaseCharacter", 4).ptr,
+        .get_database_character = @ptrCast(&fastcall.Callback2(
+            cb.stackArgs(target_spec.stack_args, .fpGetDatabaseCharacter),
+            getDatabaseCharacter,
+        ).shim),
+        .save_database_character = Stub(
+            "pfSaveDatabaseCharacter",
+            cb.stackArgs(target_spec.stack_args, .fpSaveDatabaseCharacter),
+        ).ptr,
         .server_log_message = @ptrCast(&serverLogMessage),
-        .enter_game = Stub("pfEnterGame", 3).ptr,
-        // Five stack args on 1.10f, not 1.14d's seven — the count comes from d2engine.
+        .enter_game = Stub("pfEnterGame", cb.stackArgs(target_spec.stack_args, .fpEnterGame)).ptr,
         .find_player_token = @ptrCast(&fastcall.Callback2(
-            cb.stackArgs(cb.v110f, .fpFindPlayerToken),
+            cb.stackArgs(target_spec.stack_args, .fpFindPlayerToken),
             findPlayerToken,
         ).shim),
-        .save_database_guild = Stub("pfSaveDatabaseGuild", 1).ptr,
-        .unlock_database_character = Stub("pfUnlockDatabaseCharacter", 1).ptr,
-        .unk_0x24 = Stub("unk0x24", 0).ptr,
-        .update_character_ladder = Stub("pfUpdateCharacterLadder", 5).ptr,
-        .update_game_information = Stub("pfUpdateGameInformation", 2).ptr,
-        .handle_packet = Stub("pfHandlePacket", 0).ptr,
-        .set_game_data = Stub("pfSetGameData", 0).ptr,
-        .relock_database_character = Stub("pfRelockDatabaseCharacter", 1).ptr,
+        // Unmeasured for every version so far — literal, and marked as such rather than routed
+        // through stackArgs, which would otherwise make an honest gap look like counted data.
+        .save_database_guild = Stub("pfSaveDatabaseGuild", unmeasured_guess).ptr,
+        .unlock_database_character = Stub(
+            "pfUnlockDatabaseCharacter",
+            cb.stackArgs(target_spec.stack_args, .fpUnlockDatabaseCharacter),
+        ).ptr,
+        .unk_0x24 = Stub("unk0x24", 0).ptr, // truly unused — nothing calls this slot on any version
+        .update_character_ladder = Stub(
+            "pfUpdateCharacterLadder",
+            cb.stackArgs(target_spec.stack_args, .fpUpdateCharacterLadder),
+        ).ptr,
+        .update_game_information = Stub(
+            "pfUpdateGameInformation",
+            cb.stackArgs(target_spec.stack_args, .fpUpdateGameInformation),
+        ).ptr,
+        .handle_packet = Stub("pfHandlePacket", cb.stackArgs(target_spec.stack_args, .fpHandlePacket)).ptr,
+        .set_game_data = Stub("pfSetGameData", cb.stackArgs(target_spec.stack_args, .fpSetGameData)).ptr,
+        .relock_database_character = Stub(
+            "pfRelockDatabaseCharacter",
+            cb.stackArgs(target_spec.stack_args, .fpRelockDatabaseCharacter),
+        ).ptr,
         .load_complete = @ptrCast(&loadComplete),
     };
     say("d2host: callback table built");
@@ -913,7 +956,7 @@ fn createGame(d2game: HMODULE) !void {
 
     // @10007 — the async half of fpGetDatabaseCharacter. Without it a fetched save has nowhere to
     // go and every join stalls, so say so at startup rather than at the first join.
-    if (byOrdinal(d2game, hostapi.sendDatabaseCharacter(.v110f).?.ordinal)) |p| {
+    if (byOrdinal(d2game, hostapi.sendDatabaseCharacter(target_version).?.ordinal)) |p| {
         load_filetimes = .{ @truncate(@intFromPtr(&load_filetime)), 0 };
         send_character = @ptrCast(@alignCast(p));
         say("d2host: D2GSSendDatabaseCharacter @10007 resolved");

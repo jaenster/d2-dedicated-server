@@ -145,6 +145,16 @@ pub const v110f: StackArgs = .{
     .fpRelockDatabaseCharacter = 1,
 };
 
+/// 1.09d. Only `fpFindPlayerToken` is counted so far, from `D2Game.dll`'s own `SrvVerifyJoinGame`
+/// (@0x6fc36c10 in the rebuilt 1.09d-lod binary): the call at 0x6fc36e85 pushes `esi, ebp, eax`
+/// before `calll *0x18(%eax)` — three stack args, not 1.10f's five. The pushes are what's counted,
+/// not the decompiler's rendering of the indirect call, which drops arguments it cannot type.
+/// Every other slot is still uncounted for this version and stays a compile error until measured —
+/// the arg counts below are NOT a superset of v110f's despite the shared Fog/D2Game ordinal family.
+pub const v109d: StackArgs = .{
+    .fpFindPlayerToken = 3,
+};
+
 /// 1.14d grew the table past 0x40. fpGetDatabaseFileTime is the only appended slot known to be
 /// called — CalculateGetFlags @0x569d80 calls it with no IsBadCodePtr guard, so null is a
 /// call-to-zero during the character load. Pre-1.14 has no equivalent.

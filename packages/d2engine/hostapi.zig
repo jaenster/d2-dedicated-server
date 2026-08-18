@@ -86,6 +86,29 @@ pub const ChatKind = enum(u32) {
 /// The longest message the engine will take.
 pub const chat_message_max_len = 0x100;
 
+/// `fpGetDatabaseCharacter` hands the callback `ECX = &pClient->pRealm`, and the char name and
+/// account sit at fixed offsets *from pRealm* — not from the start of the client struct, whose own
+/// size differs per version. 1.10f's client puts pRealm at +0x68 (name ECX-0x5B, account ECX-0x4B);
+/// 1.09d's puts it at +0x54 instead — measured from `SrvJoinGame`'s `leal 0x54(%esi), %ecx` versus
+/// 1.10f's `leal 0x68(%esi), %ecx` immediately before the same callback call — which moves the
+/// *relative* offsets to ECX-0x47 and ECX-0x37, even though the name/account fields themselves are
+/// still at the same +0x0D/+0x1D within the client struct on both versions. Getting this backwards
+/// reads a different client's memory as this one's character name.
+pub const ClientFieldOffsets = struct {
+    /// Bytes to subtract from ECX to reach `szCharName`.
+    name: usize,
+    /// Bytes to subtract from ECX to reach `szAccName`.
+    account: usize,
+};
+
+pub fn clientFields(v: version.Version) ?ClientFieldOffsets {
+    return switch (v) {
+        .v110f, .v114d => .{ .name = 0x5B, .account = 0x4B },
+        .v109d => .{ .name = 0x47, .account = 0x37 },
+        else => null,
+    };
+}
+
 /// Where each function is for `v`. Null means nobody has located it for that build yet — asking is
 /// better than a plausible-looking address that is really another version's.
 pub fn createGame(v: version.Version) ?Location {
@@ -133,4 +156,18 @@ test "1.14d locates the same function by address, not ordinal" {
 test "chat kinds are the engine's own numbers" {
     try std.testing.expectEqual(@as(u32, 0x07), @intFromEnum(ChatKind.scroll));
     try std.testing.expectEqual(@as(u32, 0x04), @intFromEnum(ChatKind.system));
+}
+
+test "client field offsets are relative to pRealm, and pRealm moves between versions" {
+    // The fields themselves sit at the same absolute offset in the client struct on both versions
+    // (+0x0D name, +0x1D account); it is pRealm's own offset that moves, so the ECX-relative
+    // numbers a callback handler needs are NOT interchangeable even though the underlying layout
+    // agrees. 0x68 - 0x0D == 0x5B confirms the 1.10f pair; 0x54 - 0x0D == 0x47 confirms 1.09d's.
+    const f110 = clientFields(.v110f).?;
+    const f109 = clientFields(.v109d).?;
+    try std.testing.expectEqual(@as(usize, 0x68 - 0x0D), f110.name);
+    try std.testing.expectEqual(@as(usize, 0x54 - 0x0D), f109.name);
+    try std.testing.expectEqual(@as(usize, 0x68 - 0x1D), f110.account);
+    try std.testing.expectEqual(@as(usize, 0x54 - 0x1D), f109.account);
+    try std.testing.expect(clientFields(.v100) == null);
 }
