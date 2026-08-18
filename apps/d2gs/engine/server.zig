@@ -133,13 +133,9 @@ pub const ARENAFLAG_Expansion: u32 = 0x10_0000; // 1048576
 // nReason 0x19 (verified live: on -> all joins refused, off -> joins succeed). Leave CLEAR
 // until that char-load path is understood — a working join beats Cain's cosmetic position.
 pub const ARENAFLAG_Multiplayer: u32 = 0x20_0000; // 2097152 (bit 21) — intentionally NOT set
-pub fn gameFlags(difficulty: u3, expansion: bool, hardcore: bool) u32 {
-    var f: u32 = @as(u32, difficulty) << 12; // difficulty in bits 12-14
-    f |= ARENAFLAG_ClientUpdate;
-    if (expansion) f |= ARENAFLAG_Expansion;
-    if (hardcore) f |= ARENAFLAG_Hardcore;
-    return f;
-}
+/// Shared with the pre-1.14 host: both servers create games and the engine is equally unforgiving
+/// about ARENAFLAG_ClientUpdate on either.
+pub const gameFlags = @import("d2engine").gameflags.gameFlags;
 
 // realm communication (D2CS / D2DBS bridge)
 // The GS calls back into this table to talk to the realm/database — same model

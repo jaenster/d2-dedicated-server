@@ -394,8 +394,16 @@ comptime {
     exportFastcall("FOG_EnterCriticalSection", 0, fcEnterCriticalSection);
 }
 
+/// The engine's clock, and **not** milliseconds. D2 runs at 25 frames a second and the task
+/// scheduler re-arms a game with `*task += 0x28` — 40 ms, one frame — so sync time counts frames.
+/// The game idle timeout compares against `0x708` (1800): 1800 frames is 72 seconds, which is a
+/// sensible reap window, while 1800 *milliseconds* is 1.8 s and reaps every game before anyone can
+/// join it. Returning GetTickCount() here made the engine delete each game seconds after creating
+/// it, reported as "Deleting game from sSrvTaskProcessGame(), I/O timeout".
+const frame_ms = 40;
+
 fn fcGetSyncTime(_: u32, _: u32) callconv(.c) u32 {
-    return GetTickCount();
+    return GetTickCount() / frame_ms;
 }
 comptime {
     exportFastcall("FOG_GetSyncTime", 0, fcGetSyncTime);

@@ -16,6 +16,7 @@ const store = @import("gs_store");
 const proto = @import("realm_proto").protocol;
 const cb = @import("d2engine").callbacks;
 const hostapi = @import("d2engine").hostapi;
+const gameflags = @import("d2engine").gameflags;
 
 const HMODULE = *anyopaque;
 extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?HMODULE;
@@ -263,6 +264,15 @@ fn handleCreateGame(seq: u32, body: []const u8) void {
         return;
     }
 
+    // Flags are load-bearing, not cosmetic: without ARENAFLAG_ClientUpdate the engine halts the
+    // whole process the first time this game's task is processed. Same builder the 1.14d server
+    // uses, so the two cannot drift.
+    const ladder = body[0];
+    const is_expansion = body[1] != 0;
+    const difficulty: u3 = @truncate(body[2]);
+    const is_hardcore = body[3] != 0;
+    const flags = gameflags.gameFlags(difficulty, is_expansion, is_hardcore);
+
     var off: usize = 4;
     const want_name = proto.readCStr(body, &off);
     const want_pass = proto.readCStr(body, &off);
@@ -274,7 +284,7 @@ fn handleCreateGame(seq: u32, body: []const u8) void {
     @memcpy(pass[0..@min(want_pass.len, 31)], want_pass[0..@min(want_pass.len, 31)]);
 
     var game_id: u16 = 0;
-    const ok = make(&name, &pass, "", 0, 0, 0, 8, &game_id);
+    const ok = make(&name, &pass, "", flags, ladder, 0, 8, &game_id);
     if (ok == 0) {
         say("d2host: CREATEGAME refused by the engine");
         reply.result = proto.CREATE_SERVER_FULL;
@@ -567,7 +577,7 @@ const GameDataVTable = extern struct {
 /// The vtable is not told the size — it arrives as `(slot, 0, 0)`, because in Blizzard's host this
 /// is a template that knows its element type — so this is deliberately generous rather than
 /// measured. Pinning the true size is worth doing; guessing it small is not.
-const GameRecord = extern struct { bytes: [0x2000]u8 align(16) = @splat(0) };
+const GameRecord = extern struct { bytes: [0x8000]u8 align(16) = @splat(0) };
 
 /// Well past the seven games a single engine has memory pools for.
 var game_records: [64]GameRecord = @splat(.{});
@@ -894,7 +904,7 @@ fn createGame(d2game: HMODULE) !void {
         @memcpy(name[0..5], "spike");
         var game_id: u16 = 0;
         say("d2host: no realm configured — creating one game directly");
-        ok = create_game.?(&name, "", "d2host spike", 0, 0, 0, 8, &game_id);
+        ok = create_game.?(&name, "", "d2host spike", gameflags.gameFlags(0, true, false), 0, 0, 8, &game_id);
         sayHex("d2host: GAME_CreateNewEmptyGame returned=", @intCast(ok));
         sayHex("d2host:   gameId=", game_id);
         if (ok != 0) live_games += 1;
@@ -974,18 +984,16 @@ fn createGame(d2game: HMODULE) !void {
                 // false there as "this should never happen". The condition is the engine's own —
                 // `(*(u8*)(inner[0x1d28] + 8) >> 2) & 1`, where `inner` is `*(game+8)` — so we
                 // test it rather than discover it as a crash.
-                // @10045 ends in D2GAME_UpdateAllClients, which halts the process rather than
-                // returning when a game is not ready for one — `ARENA_NeedsClientUpdate` false is
-                // "this should never happen" to it. Its own precondition lives behind two engine
-                // pointers that are not yet valid at this stage of bring-up, so gate on something
-                // we own instead: with nobody connected there is nothing to flush anyway.
+                // @10045 is not optional and must not be conditional: besides flushing, it is
+                // what RE-ARMS the task — `*task += 0x28; TASK_LinkList_Insert(...)`, due again in
+                // 40 ms. @10043 has already unlinked it, so skipping the flush even once drops
+                // that game out of the scheduler for good, which is what made the engine go quiet
+                // after the first frame.
                 if (flush_game) |flush| {
-                    if (connectedClients() > 0) {
-                        flushes += 1;
-                        if (flushes % 200 == 1) sayFmt("d2host: flushed {d} game frame(s)", .{flushes});
-                        _ = fastcall.fastcallAt(fn (usize, usize) callconv(.c) usize)
-                            .call(@intFromPtr(flush), .{ worker_ctx, game });
-                    }
+                    flushes += 1;
+                    if (flushes % 500 == 1) sayFmt("d2host: processed {d} game frame(s)", .{flushes});
+                    _ = fastcall.fastcallAt(fn (usize, usize) callconv(.c) usize)
+                        .call(@intFromPtr(flush), .{ worker_ctx, game });
                 }
             }
         }

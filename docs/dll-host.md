@@ -583,40 +583,42 @@ store and checksummed it. Five things had to be right, and each was wrong first:
    needs to lock that client's game. Answering 0 fails the delivery with
    `*** Failed SrvLockGame for client N ***` — it is the engine's state, but ours to hold.
 
-### Outbound: found the path, not yet the trigger
-
-Nothing the engine sends reaches the socket. It is not a missing send call — the path is now mapped
-end to end:
-
-`D2GAME_PACKETS_SendPacket` @0x6fc3c710 does not touch a socket at all; it **queues** into a
-per-client list (`CLIENTS_PacketDataList_Append`) in 0x200-byte chunks. The drain is
-`@10045` → `FUN_6fc386d0` → `D2GAME_UpdateAllClients` @0x6fc389c0, which is where the
-`SERVER_Send` call sites live. So a tick without @10045 leaves a client joined and permanently mute.
-
-Blizzard's worker loop, from `D2Server.dll` @0x10009DE0, argument for argument:
+### The server talks back
 
 ```
-esi = D2Game@10041()                        acquire a worker slot index (0, 1, ... & 0x1f)
-loop: if (shutdown_flag) break
-      D2Game@10043(ecx=esi, edx=&game)      process one game
-      D2Net @10022(timeout)                 wait for network
-      if (that returned) D2Game@10003()     pump the network only when there is traffic
-      if (game) D2Game@10045(ecx=esi, edx=game)   flush that game's clients
+SERVER SENT 10 BYTES:  01 00 04 00 10 00 01 00 00 02
+d2net: -> client 0, 9 bytes    game init (0x01)
+d2net: -> client 0, 1 bytes    ACTINITDONE (0x02)
 ```
 
-`apps/d2host` implements this. Two hazards found the hard way, both recorded in the code:
+Outbound is not a send call the host makes. `D2GAME_PACKETS_SendPacket` @0x6fc3c710 never touches a
+socket — it **queues** into a per-client list in 0x200-byte chunks. The drain is
+`@10045` → `FUN_6fc386d0` → `GAME_UpdateAllClients` @0x6fc389c0, where every `SERVER_Send` call
+site lives. Three things had to be right, and each was silent in a different way:
 
-- **@10045 halts rather than returning** when a game is not ready — `ARENA_NeedsClientUpdate` false
-  is "This should never happen! [sUpdateClients]" to it. Its own precondition is
-  `(*(u8*)(inner[0x1d28] + 8) >> 2) & 1` where `inner` is `*(game+8)`, but those pointers are not
-  reliably valid at this stage, so the host gates on its own connected-client count instead.
-- **The record the vtable allocates is the game object**, not a handle to one: its CRITICAL_SECTION
-  is at +0x18, its client list at +0x88 and flags at +0xA8. A 0x40-byte record put all of that in
-  the next record. The size is not passed to the allocator — the call arrives as `(slot, 0, 0)` —
-  so the record is deliberately over-sized rather than measured, and pinning the true size is
-  outstanding.
+1. **`@10045` re-arms the task, so it is not optional.** `@10043` *unlinks* the due task and hands
+   it over; `@10045` does `*task += 0x28` (40 ms, one frame) and re-inserts it. Skipping it even
+   once — we gated it on having a connected client — drops that game out of the scheduler for good.
+   The engine simply goes quiet, with nothing logged.
+2. **A game must be created with `ARENAFLAG_ClientUpdate` (0x04).** `GAME_UpdateAllClients` starts
+   with `ARENA_NeedsClientUpdate`, which reads that flag back as
+   `(*(u8*)(pGame[0x1d28] + 8) >> 2) & 1`, and **halts the process** when it is clear:
+   `This should never happen! [sUpdateClients]`. Creating with `flags = 0` therefore kills the
+   server the first time the game is processed, and the halt names nothing useful. The flag builder
+   now lives in `packages/d2engine/gameflags.zig` so both servers share it.
+3. **`FOG_GetSyncTime` is in frames, not milliseconds.** The reap check is
+   `0x708 < GetSyncTime() - pGame[0x771]`. At 25 fps, 1800 frames is a 72-second idle timeout;
+   returning `GetTickCount()` makes it 1.8 seconds and every game is deleted before anyone can
+   join, reported as `Deleting game from sSrvTaskProcessGame(), I/O timeout`.
 
-What is left is the **trigger**: `@10043` hands the worker a game once, right after creation, and
-then stops, so the flush almost never runs. `@10039` (TASK_InitializeClock) is called at startup and
-`@10040` turned out to be shutdown (stop flag, wait, free queue slots), so something else re-arms a
-game in the task system and has not been found yet.
+The worker loop, from `D2Server.dll` @0x10009DE0 and now implemented in `apps/d2host`:
+
+```
+esi = @10041()                              a worker slot index (0..0x1f)
+loop: @10043(ecx=esi, edx=&task)            take the due task; returns ms until the next
+      @10003()                              pump the network
+      if (task) @10045(ecx=esi, edx=task)   update + flush + re-arm
+```
+
+`TASK_GetNextDueTask` (@10043) and `TASK_ProcessGameTask` (@10045) are named and described in the
+shared Ghidra database, along with `GAME_UpdateAllClients` and its halt condition.
