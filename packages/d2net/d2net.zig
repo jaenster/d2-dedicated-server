@@ -149,18 +149,56 @@ export fn D2NET_SetTranslate114dJoin(on: u32) callconv(.winapi) void {
     translate_join = on != 0;
 }
 
+/// Which engine this transport is framing for. The size table and the join opcode are both
+/// per-version — 1.10f inserted two opcodes ahead of the join, so 1.07 frames the same packets at
+/// different numbers — and getting either wrong desynchronises the stream on the first packet.
+/// Defaults to 1.10f, which is what this file was written against.
+var sizes: []const i32 = &cs.packet_size_110f;
+var join_op: u8 = cs.join_110f;
+
+/// cdecl and by plain name, like Fog's: the engine never calls this, only our host does, and a
+/// stdcall export would pick up mingw's `@4` decoration.
+export fn D2NET_SetEngineVersion(v: u32) callconv(.c) i32 {
+    inline for (@typeInfo(@import("d2engine").version.Version).@"enum".fields) |f| {
+        if (f.value == v) {
+            const tbl = cs.packetSizes(@enumFromInt(f.value)) orelse {
+                sayFmt("d2net: no packet table read for {s} — framing as 1.10f", .{f.name});
+                return 0;
+            };
+            sizes = tbl;
+            join_op = (cs.joinPacket(@enumFromInt(f.value)) orelse return 0).op;
+            const sys = cs.systemRange(@enumFromInt(f.value)) orelse return 0;
+            system_lo = sys.lo;
+            system_hi = sys.hi;
+            sayFmt("d2net: framing for {s} ({d} opcodes, join 0x{x}, system 0x{x}-0x{x})", .{
+                f.name, sizes.len, join_op, system_lo, system_hi,
+            });
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// Frame with the selected version's table rather than the compile-time default.
+fn packetLenFor(buf: []const u8) ?usize {
+    if (buf.len == 0) return null;
+    const op = buf[0];
+    if (op >= sizes.len) return 0;
+    return cs.packetLenWith(sizes, buf);
+}
+
 /// Rewrite in place at the head of a client's buffer, before framing sees it.
 fn translateHead(c: *Client) void {
     if (!translate_join or c.len < cs.join_114d_len) return;
     if (c.buf[0] != cs.join_114d) return;
     var rewritten: [cs.join_110f_len]u8 = undefined;
-    const n = cs.translateJoin114dTo110f(c.buf[0..cs.join_114d_len], &rewritten) orelse return;
+    const n = cs.translateJoin114dTo(c.buf[0..cs.join_114d_len], &rewritten, join_op) orelse return;
     @memcpy(c.buf[0..n], rewritten[0..n]);
     // Close the gap the shorter packet leaves, so whatever followed stays framed.
     const rest = c.len - cs.join_114d_len;
     if (rest > 0) std.mem.copyForwards(u8, c.buf[n .. n + rest], c.buf[cs.join_114d_len..c.len]);
     c.len = n + rest;
-    sayFmt("d2net: translated a 1.14d join (0x68/{d}) into 1.10f (0x67/{d})", .{ cs.join_114d_len, n });
+    sayFmt("d2net: translated a 1.14d join (0x68/{d}) into 0x{x}/{d}", .{ cs.join_114d_len, join_op, n });
 }
 
 fn poll() void {
@@ -208,8 +246,11 @@ fn poll() void {
 /// Note this is where 1.14d's join went: 1.10f joins with **0x67, 29 bytes**, while 1.14d uses
 /// **0x68, 37 bytes**. The opcode shifted by one and the payload grew, which is why a 1.14d client
 /// desynchronises here rather than merely being refused.
+var system_lo: u8 = 0x66;
+var system_hi: u8 = 0x6f;
+
 fn listFor(opcode: u8) u32 {
-    return if (opcode >= 0x66 and opcode <= 0x6F) 0 else 1;
+    return if (opcode >= system_lo and opcode <= system_hi) 0 else 1;
 }
 
 /// Hand the engine one pending message as `[clientId:u32][payload]`, and return its total length.
@@ -221,7 +262,7 @@ fn takeMessageFor(list: u32, buf: ?[*]u8, cap: u32) u32 {
     for (&clients, 0..) |*c, i| {
         if (!c.active() or c.len == 0) continue;
         translateHead(c);
-        const n = packetLen(c.buf[0..c.len]) orelse continue; // incomplete, wait for more
+        const n = packetLenFor(c.buf[0..c.len]) orelse continue; // incomplete, wait for more
         if (n != 0 and listFor(c.buf[0]) != list) continue; // another drain loop's packet
         if (n == 0) {
             // Unframeable opcode: the stream is desynchronised and every later byte is garbage,

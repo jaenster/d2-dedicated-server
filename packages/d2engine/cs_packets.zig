@@ -7,6 +7,7 @@
 //! table, which is why it lives in a package rather than inside the DLL.
 
 const std = @import("std");
+const version = @import("version.zig");
 
 /// Total wire size per C->S opcode, including the opcode byte. Read out of 1.10f's own D2Net at
 /// 0x6FC08418, not transcribed from another version: 0 means the opcode is unused and framing
@@ -18,7 +19,7 @@ const std = @import("std");
 /// handshake range, and one of them is decisive: 0x68, the client's very first packet, is 1 byte
 /// here and 37 in 1.14d. So a stock 1.14d client cannot speak to this server — it desyncs on the
 /// first packet — while a 1.10f-era client shares the entire gameplay vocabulary.
-pub const packet_size = [0x70]i32{
+pub const packet_size_110f = [0x70]i32{
       0,   5,   9,   5,   9,   5,   9,   9, // 0x00-0x07
       5,   9,   9,   1,   5,   9,   9,   5, // 0x08-0x0F
       9,   9,   1,   9,  -1,  -1,  13,   5, // 0x10-0x17
@@ -40,13 +41,90 @@ pub const max_packet = 0x204;
 
 /// How many bytes at the front of `buf` form one packet: null when more is needed, 0 when the
 /// opcode cannot be framed at all (a desync — the caller drops the client rather than guessing).
+/// 1.07's table, read out of its own `D2Net.dll`. It is NOT 1.10f's with a different join
+/// opcode: 1.10f **inserted two opcodes** at 0x64 and 0x65 (sizes 9 and 17), which shifts every
+/// later opcode by two. The 46/29 pair that is 0x66/0x67 on 1.10f is 0x64/0x65 here, so 1.07's
+/// join is **0x65**, and its table ends at 0x6E rather than 0x70.
+///
+/// Below 0x64 the two agree except for five opcodes 1.10f retired to 0 — 0x2B, 0x55, 0x56, 0x5A
+/// and 0x5B — which 1.07 still accepts.
+pub const packet_size_107 = [0x6e]i32{
+      0,   5,   9,   5,   9,   5,   9,   9, // 0x00-0x07
+      5,   9,   9,   1,   5,   9,   9,   5, // 0x08-0x0F
+      9,   9,   1,   9,  -1,  -1,  13,   5, // 0x10-0x17
+     17,   5,   9,   9,   3,   9,   9,  17, // 0x18-0x1F
+     13,   9,   5,   9,   5,   9,  13,   9, // 0x20-0x27
+      9,   9,   9,   5,   0,   1,   3,   9, // 0x28-0x2F
+      9,   9,  17,  17,   5,  17,   9,   5, // 0x30-0x37
+     13,   5,   3,   3,   9,   5,   5,   3, // 0x38-0x3F
+      1,   1,   1,   1,  17,   9,  13,  13, // 0x40-0x47
+      1,   9,   0,   9,   5,   3,   0,   7, // 0x48-0x4F
+      9,   9,   5,   1,   1,   8,  12,   0, // 0x50-0x57
+      3,  17, 260,   4,   0,   7,   6,   5, // 0x58-0x5F
+      1,   3,   5,   5,  46,  29,   1,   1, // 0x60-0x67
+      1,  -1,   9,   1,   0,   1,           // 0x68-0x6D
+};
+
+/// The table `v` frames with. Null means nobody has read that version's out of its D2Net.
+pub fn packetSizes(v: version.Version) ?[]const i32 {
+    return switch (v) {
+        .v107 => &packet_size_107,
+        .v109d, .v110f => &packet_size_110f,
+        else => null,
+    };
+}
+
+/// The C->S opcodes the engine's system-message processor owns — the block the join lives in,
+/// which the transport must route to message list 0. It shifts with the join for the same reason:
+/// 1.10f inserted two opcodes ahead of it, so 1.07's block is 0x64-0x6D where 1.10f's is 0x66-0x6F.
+/// Route a join to the wrong list and the engine never sees it: no reply, no callback, no error.
+pub fn systemRange(v: version.Version) ?struct { lo: u8, hi: u8 } {
+    return switch (v) {
+        .v107 => .{ .lo = 0x64, .hi = 0x6d },
+        .v109d, .v110f => .{ .lo = 0x66, .hi = 0x6f },
+        else => null,
+    };
+}
+
+test "the system-message block shifts with the join" {
+    const a = systemRange(.v107).?;
+    const b = systemRange(.v110f).?;
+    try std.testing.expect(joinPacket(.v107).?.op >= a.lo and joinPacket(.v107).?.op <= a.hi);
+    try std.testing.expect(joinPacket(.v110f).?.op >= b.lo and joinPacket(.v110f).?.op <= b.hi);
+    try std.testing.expectEqual(b.lo - a.lo, b.hi - a.hi); // the same two-opcode shift
+}
+
+/// The opcode and length a join arrives as on `v`.
+pub fn joinPacket(v: version.Version) ?struct { op: u8, len: usize } {
+    return switch (v) {
+        .v107 => .{ .op = 0x65, .len = 29 },
+        .v109d, .v110f => .{ .op = join_110f, .len = join_110f_len },
+        .v114d => .{ .op = join_114d, .len = join_114d_len },
+        else => null,
+    };
+}
+
+/// Frame `buf` against an explicit table, so a caller can pick the version's own.
+pub fn packetLenWith(sizes: []const i32, buf: []const u8) ?usize {
+    if (buf.len == 0) return null;
+    const op = buf[0];
+    if (op >= sizes.len) return 0;
+    const entry = sizes[op];
+    if (entry > 0) return if (buf.len >= @as(usize, @intCast(entry))) @intCast(entry) else null;
+    if (entry == 0) return 0;
+    // -1 means the length is a byte in the packet itself, at offset 1.
+    if (buf.len < 2) return null;
+    const n: usize = buf[1];
+    return if (buf.len >= n) n else null;
+}
+
 pub fn packetLen(buf: []const u8) ?usize {
     if (buf.len == 0) return null;
     const op = buf[0];
     // 0xFF is the fixed-size control packet the table does not cover.
     if (op == 0xFF) return if (buf.len < 16) null else 16;
-    if (op >= packet_size.len) return 0;
-    const entry = packet_size[op];
+    if (op >= packet_size_110f.len) return 0;
+    const entry = packet_size_110f[op];
     if (entry == 0) return 0;
     if (entry > 0) {
         const n: usize = @intCast(entry);
@@ -61,11 +139,38 @@ pub fn packetLen(buf: []const u8) ?usize {
 }
 
 
+test "1.10f inserted two opcodes ahead of the join, so 1.07's sits two lower" {
+    // The 46/29 pair is the fingerprint: same two packets, two slots apart.
+    try std.testing.expectEqual(@as(i32, 46), packet_size_110f[0x66]);
+    try std.testing.expectEqual(@as(i32, 29), packet_size_110f[0x67]);
+    try std.testing.expectEqual(@as(i32, 46), packet_size_107[0x64]);
+    try std.testing.expectEqual(@as(i32, 29), packet_size_107[0x65]);
+    try std.testing.expectEqual(@as(u8, 0x65), joinPacket(.v107).?.op);
+    try std.testing.expectEqual(@as(u8, 0x67), joinPacket(.v110f).?.op);
+    // and 1.07 accepts five opcodes 1.10f retired
+    try std.testing.expectEqual(@as(i32, 5), packet_size_107[0x2b]);
+    try std.testing.expectEqual(@as(i32, 0), packet_size_110f[0x2b]);
+}
+
+test "the same field surgery serves both join opcodes" {
+    var src: [join_114d_len]u8 = @splat(0);
+    src[0] = join_114d;
+    src[20] = 5;
+    @memcpy(src[21..25], "Tenf");
+    var a: [64]u8 = @splat(0);
+    var b: [64]u8 = @splat(0);
+    _ = translateJoin114dTo(&src, &a, 0x65).?;
+    _ = translateJoin114dTo(&src, &b, 0x67).?;
+    try std.testing.expectEqual(@as(u8, 0x65), a[0]);
+    try std.testing.expectEqual(@as(u8, 0x67), b[0]);
+    try std.testing.expectEqualSlices(u8, a[1..29], b[1..29]);
+}
+
 test "the join is 0x67 and 29 bytes on 1.10f" {
     // 1.14d joins with 0x68 at 37; here 0x68 is a one-byte end-game. Getting this backwards is
     // what makes a 1.14d client desynchronise on its opening packet.
-    try std.testing.expectEqual(@as(i32, 29), packet_size[0x67]);
-    try std.testing.expectEqual(@as(i32, 1), packet_size[0x68]);
+    try std.testing.expectEqual(@as(i32, 29), packet_size_110f[0x67]);
+    try std.testing.expectEqual(@as(i32, 1), packet_size_110f[0x68]);
 }
 
 test "framing splits a coalesced read and waits for a partial one" {
@@ -106,13 +211,20 @@ pub const join_110f_len: usize = 29;
 
 /// Rewrite a 1.14d join in `src` into the 1.10f form in `dst`, returning its length. Null when
 /// `src` is not a 1.14d join, so a caller can pass every packet through and only pay for the one.
-pub fn translateJoin114dTo110f(src: []const u8, dst: []u8) ?usize {
+/// Rewrite a 1.14d join into `target_op`'s 29-byte pre-1.14 shape. The payload is identical on
+/// every pre-1.14 build measured — only the opcode moved, because 1.10f inserted two opcodes ahead
+/// of it — so the same field surgery serves 1.07's 0x65 and 1.10f's 0x67.
+pub fn translateJoin114dTo(src: []const u8, dst: []u8, target_op: u8) ?usize {
     if (src.len != join_114d_len or src[0] != join_114d) return null;
     if (dst.len < join_110f_len) return null;
-    dst[0] = join_110f;
+    dst[0] = target_op;
     @memcpy(dst[1..12], src[1..12]); // hash, token/gameId, and the two fields after it
     @memcpy(dst[12..join_110f_len], src[20..join_114d_len]); // class + name, past the 8 dropped bytes
     return join_110f_len;
+}
+
+pub fn translateJoin114dTo110f(src: []const u8, dst: []u8) ?usize {
+    return translateJoin114dTo(src, dst, join_110f);
 }
 
 test "a 1.14d join becomes a 1.10f join, field for field" {

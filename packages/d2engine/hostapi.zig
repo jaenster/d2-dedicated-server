@@ -101,6 +101,38 @@ pub const ClientFieldOffsets = struct {
     account: usize,
 };
 
+/// Where `fpGetDatabaseCharacter` actually gets the character name on a given build. This is not
+/// one layout with moving offsets — the callback's shape changes:
+///
+///   - 1.09d/1.10f hand it `ECX = &pClient->pRealm`, with the name and account at fixed negative
+///     offsets from it, and two stack args.
+///   - 1.07 hands it `EDX = szCharName` directly, with ECX pointing at the *game* (its game name
+///     sits at ECX+0x0A) and only one stack arg. Measured by probing a live join: the name was
+///     nowhere within +/-0x600 of ECX and exactly at EDX.
+///
+/// Modelling that as an offset would be a lie, so it is a choice of shape instead.
+pub const CharNameSource = union(enum) {
+    /// ECX is `&pClient->pRealm`; subtract these to reach the fields.
+    realm_relative: ClientFieldOffsets,
+    /// EDX is the NUL-terminated character name.
+    edx_pointer,
+};
+
+pub fn charNameSource(v: version.Version) ?CharNameSource {
+    return switch (v) {
+        .v110f, .v114d => .{ .realm_relative = .{ .name = 0x5B, .account = 0x4B } },
+        .v109d => .{ .realm_relative = .{ .name = 0x47, .account = 0x37 } },
+        .v107 => .edx_pointer,
+        else => null,
+    };
+}
+
+test "1.07 does not merely move the offsets, it changes the shape" {
+    try std.testing.expect(charNameSource(.v107).? == .edx_pointer);
+    try std.testing.expectEqual(@as(usize, 0x5B), charNameSource(.v110f).?.realm_relative.name);
+    try std.testing.expect(charNameSource(.v106b) == null);
+}
+
 pub fn clientFields(v: version.Version) ?ClientFieldOffsets {
     return switch (v) {
         .v110f, .v114d => .{ .name = 0x5B, .account = 0x4B },

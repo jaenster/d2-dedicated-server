@@ -163,8 +163,13 @@ fn Binding(comptime version: d2version.Version) type {
     // two are found different ways: arities come off the call sites, the layout only shows up in
     // memory. Rather than block on that, such a version builds a probe — it boots, and the first
     // fetch prints what is actually around ECX so the offsets can be measured rather than guessed.
-    const probing = hostapi.clientFields(version) == null;
-    const client_fields = hostapi.clientFields(version) orelse hostapi.ClientFieldOffsets{ .name = 0, .account = 0 };
+    const name_source = hostapi.charNameSource(version);
+    const probing = name_source == null;
+    const client_fields = switch (name_source orelse hostapi.CharNameSource{ .edx_pointer = {} }) {
+        .realm_relative => |f| f,
+        .edx_pointer => hostapi.ClientFieldOffsets{ .name = 0, .account = 0 },
+    };
+    const name_in_edx = (name_source orelse hostapi.CharNameSource{ .edx_pointer = {} }) == .edx_pointer;
 
     // A handler may declare FEWER stack parameters than the engine pushes — the shim pushes all
     // `n_stack` of them and cleans up `n_stack`, so trailing arguments a handler never names are
@@ -173,9 +178,13 @@ fn Binding(comptime version: d2version.Version) type {
     // body serve 1.10f's five-argument fpFindPlayerToken and 1.09d's three.
     comptime {
         assertReads(version, .fpFindPlayerToken, 2, "findPlayerToken reads game_id and account");
-        // The probe names no stack parameters at all, so the floor only binds the real handler.
+        // The probe names no stack parameters at all, so the floor only binds a real handler —
+        // and the two shapes read a different number of them.
         if (!probing)
-            assertReads(version, .fpGetDatabaseCharacter, 2, "getDatabaseCharacter reads client_id and account");
+            assertReads(version, .fpGetDatabaseCharacter, if (name_in_edx) 1 else 2, if (name_in_edx)
+                "getDatabaseCharacterEdx reads client_id"
+            else
+                "getDatabaseCharacter reads client_id and account");
     }
 
     return struct {
@@ -190,23 +199,74 @@ fn Binding(comptime version: d2version.Version) type {
         /// from it whose distance is per-version — 1.10f's pRealm is at client+0x68, 1.09d's at
         /// +0x54, 1.07's at +0x20 — so the layout cannot be carried over from another build.
         pub fn probeClientFields(ecx: usize, edx: usize) callconv(.c) usize {
-            _ = edx;
-            sayFmt("d2host: PROBE fpGetDatabaseCharacter, ecx=0x{x} — dumping the client struct", .{ecx});
-            const from = ecx -% 0x90;
-            var row: usize = 0;
-            while (row < 0xb0) : (row += 16) {
-                const at = from + row;
-                const p: [*]const u8 = @ptrFromInt(at);
-                var hex: [16 * 3]u8 = undefined;
-                var txt: [16]u8 = undefined;
-                for (0..16) |i| {
-                    _ = std.fmt.bufPrint(hex[i * 3 ..][0..3], "{x:0>2} ", .{p[i]}) catch {};
-                    txt[i] = if (p[i] >= 0x20 and p[i] < 0x7f) p[i] else '.';
-                }
-                const delta = @as(isize, @intCast(at)) - @as(isize, @intCast(ecx));
-                sayFmt("  ecx{d: >5}  {s} {s}", .{ delta, hex, txt });
+            sayFmt("d2host: PROBE fpGetDatabaseCharacter, ecx=0x{x}", .{ecx});
+            // The realm already told us which character is joining, so the probe does not have to
+            // be read by eye: search memory around ECX for that exact name and report the distance.
+            // That is the measurement `hostapi.clientFields` wants, taken from the only place the
+            // layout is actually visible.
+            // EDX is the other candidate on builds where ECX turns out to be the game rather than
+            // the client: 1.07 passes one stack arg where 1.10f passes two, so the arguments are
+            // not merely shifted, they are different things.
+            sayFmt("d2host: PROBE edx=0x{x}", .{edx});
+            if (edx > 0x10000) {
+                const p: [*]const u8 = @ptrFromInt(edx);
+                var txt: [32]u8 = undefined;
+                for (0..32) |i| txt[i] = if (p[i] >= 0x20 and p[i] < 0x7f) p[i] else '.';
+                sayFmt("  [edx] = {s}", .{txt});
             }
+            var found_any = false;
+            for (&join_contexts) |*j| {
+                if (!j.used) continue;
+                const names = [_][]const u8{ j.charName(), std.mem.sliceTo(&j.account, 0) };
+                const labels = [_][]const u8{ "szCharName", "szAccName" };
+                for (names, labels) |needle, label| {
+                    if (needle.len == 0) continue;
+                    const span: usize = 0x600;
+                    const anchors = [_]struct { name: []const u8, at: usize }{
+                        .{ .name = "ecx", .at = ecx },
+                        .{ .name = "edx", .at = edx },
+                    };
+                    for (anchors) |anchor| {
+                        if (anchor.at <= span) continue;
+                        const from = anchor.at -% span;
+                        var at: usize = 0;
+                        while (at < span * 2) : (at += 1) {
+                            const p: [*]const u8 = @ptrFromInt(from + at);
+                            if (!std.mem.eql(u8, p[0..needle.len], needle)) continue;
+                            // A field, not a stray copy: it should be NUL-terminated in place.
+                            if (p[needle.len] != 0) continue;
+                            const delta = @as(isize, @intCast(from + at)) - @as(isize, @intCast(anchor.at));
+                            sayFmt("  found {s} \"{s}\" at {s}{d} (0x{x} away)", .{
+                                label, needle, anchor.name, delta, @abs(delta),
+                            });
+                            found_any = true;
+                        }
+                    }
+                }
+            }
+            if (!found_any) say("  neither name found within +/-0x600 of ecx — widen the search");
             say("d2host: probe only — refusing the join until the offsets are recorded");
+            return 0;
+        }
+
+        /// 1.07's shape: EDX is the character name and there is one stack arg, not two. The
+        /// account is not passed at all, so it comes from the realm's JOINGAME the same way the
+        /// other shape's fallback does.
+        pub fn getDatabaseCharacterEdx(ecx: usize, edx: usize, client_id: usize) callconv(.c) usize {
+            _ = ecx;
+            const char_name = std.mem.sliceTo(@as([*:0]const u8, @ptrFromInt(edx)), 0);
+            const acct_name = accountFor(char_name) orelse "";
+            if (acct_name.len == 0)
+                sayFmt("d2host: no account known for '{s}' — the realm sent no JOINGAME for it", .{char_name});
+            const slot = for (&pending) |*p| {
+                if (!p.used) break p;
+            } else {
+                say("d2host: no free character slot — refusing this join");
+                return 0;
+            };
+            slot.* = .{ .used = true, .client_id = @intCast(client_id), .container = 0 };
+            slot.len = @intCast(store.getChar(acct_name, char_name, &slot.save));
+            sayFmt("d2host: fpGetDatabaseCharacter ({s}) — save bytes 0x{x}", .{ char_name, slot.len });
             return 0;
         }
 
@@ -297,6 +357,9 @@ fn Binding(comptime version: d2version.Version) type {
                 .get_database_character = if (probing) @ptrCast(&fastcall.Callback2(
                     cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
                     probeClientFields,
+                ).shim) else if (name_in_edx) @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
+                    getDatabaseCharacterEdx,
                 ).shim) else @ptrCast(&fastcall.Callback2(
                     cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
                     getDatabaseCharacter,
@@ -874,7 +937,7 @@ fn moduleHandle(modules: []const Module, name: []const u8) ?HMODULE {
 /// clearly, naming exactly what is missing, not a build failure three files away).
 /// Whether `v` can serve games: every arity counted AND a measured client layout.
 fn ready(comptime v: d2version.Version) bool {
-    return cb.isComplete(d2version.spec(v).stack_args) and hostapi.clientFields(v) != null;
+    return cb.isComplete(d2version.spec(v).stack_args) and hostapi.charNameSource(v) != null;
 }
 
 /// Whether `v` can be booted just far enough to measure what it is still missing. Arities have to
@@ -1026,6 +1089,16 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     // to be told which engine it is standing in for before anything calls it. Nothing does during
     // LoadLibrary, so here is early enough — and it must be before the D2Lang/D2Common init below,
     // whose table loading is exactly what the drift destroys.
+    // The transport has the same problem for the same reason: the C->S size table and the join
+    // opcode are per-version, and framing with the wrong table desynchronises on the first packet.
+    if (moduleHandle(&modules, "D2Net.dll")) |net| {
+        if (GetProcAddress(net, "D2NET_SetEngineVersion")) |p| {
+            const set: *const fn (u32) callconv(.c) i32 = @ptrCast(@alignCast(p));
+            if (set(@intFromEnum(version)) == 0)
+                sayFmt("d2host: D2Net kept its default framing for {s}", .{@tagName(version)});
+        }
+    }
+
     if (moduleHandle(&modules, "Fog.dll")) |fog| {
         if (GetProcAddress(fog, "FOG_SetEngineVersion")) |p| {
             const set: *const fn (u32) callconv(.c) i32 = @ptrCast(@alignCast(p));
