@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const mpq = @import("libd2").formats.mpq;
+const fogabi = @import("d2engine").fogabi;
 
 extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn WriteFile(h: *anyopaque, buf: [*]const u8, n: u32, wrote: *u32, ov: ?*anyopaque) callconv(.winapi) i32;
@@ -100,8 +101,18 @@ fn say(msg: []const u8) void {
 fn trace(comptime name: []const u8) void {
     call_seq += 1;
     var buf: [96]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "fog[{d}]: {s}", .{ call_seq, name }) catch return;
+    const s = std.fmt.bufPrint(&buf, "fog[{d}]: esp~0x{x} {s}", .{ call_seq, esp(), name }) catch return;
     say(s);
+}
+
+/// Roughly where the caller's stack is. Only the *trend* matters: every ordinal here is stdcall, so
+/// two calls made from the same place in the engine's own call tree must see the same value. A
+/// baseline that walks between them is an ordinal whose `ret N` pops the wrong amount, which is
+/// invisible until some unrelated function returns to whatever the drift left behind.
+inline fn esp() usize {
+    return asm volatile (""
+        : [ret] "={esp}" (-> usize),
+    );
 }
 
 fn sayFmt(comptime fmt: []const u8, args: anytype) void {
@@ -165,6 +176,60 @@ fn shimAsm(comptime n_stack: usize) []const u8 {
         s = s ++ (if (n_stack == 0) "ret\n" else std.fmt.comptimePrint("ret ${d}\n", .{n_stack * 4}));
         return s;
     }
+}
+
+// ── entry points whose arity is not the same on every engine build ───────────
+//
+// Fog is stdcall: the callee pops. Where two builds disagree about how many arguments an ordinal
+// takes, a fixed `ret N` is wrong for one of them, and wrong quietly — ESP shifts and the fault
+// lands somewhere unrelated much later. So the cleanup for those entry points is a variable the
+// host sets once, before the engine modules are loaded, via `FOG_SetEngineVersion`.
+//
+// Exported (not `var` in a comptime block) because the shims below name it from inline asm.
+
+export var d2fog_alloc_linker_pop: u32 = fogabi.default.alloc_linker * 4;
+
+/// Tell Fog which engine build it is standing in for. Takes the integer value of
+/// `d2engine.version.Version`. A host that never calls this gets `fogabi.default`, which is 1.10f.
+///
+/// cdecl, unlike every other entry point here, and deliberately: the engine never calls this one,
+/// only our own host does, and mingw decorates a stdcall export as `name@4` — which neither the
+/// .def nor a GetProcAddress by plain name will match.
+export fn FOG_SetEngineVersion(v: u32) callconv(.c) i32 {
+    const tags = @typeInfo(fogabi.version_enum).@"enum".fields;
+    inline for (tags) |f| {
+        if (f.value == v) {
+            const abi = fogabi.ordinalArgs(@enumFromInt(f.value)) orelse {
+                sayFmt("fog: no measured Fog ABI for {s} — keeping 1.10f's", .{f.name});
+                return 0;
+            };
+            d2fog_alloc_linker_pop = @as(u32, abi.alloc_linker) * 4;
+            sayFmt("fog: ABI set for {s} (AllocLinker pops {d})", .{ f.name, d2fog_alloc_linker_pop });
+            return 1;
+        }
+    }
+    sayFmt("fog: unknown engine version {d} — keeping 1.10f's ABI", .{v});
+    return 0;
+}
+
+
+/// Export `impl` at `name` as a stdcall entry point whose stack cleanup is read from `pop_symbol`
+/// at call time instead of being baked into a `ret N`. `impl` takes no arguments — an entry point
+/// in here only needs a runtime-variable pop when the arguments differ between builds, and none of
+/// those arguments are ones we use.
+fn exportStdcallVarPop(comptime name: []const u8, comptime pop_symbol: []const u8, comptime impl: anytype) void {
+    const shim = struct {
+        fn f() callconv(.naked) void {
+            asm volatile ("call %[impl:P]\n" ++
+                    "pop %%ecx\n" ++ // our own return address, out of the way of the cleanup
+                    "addl " ++ pop_symbol ++ ", %%esp\n" ++
+                    "jmp *%%ecx\n"
+                :
+                : [impl] "X" (&impl),
+            );
+        }
+    }.f;
+    @export(&shim, .{ .name = name });
 }
 
 /// Export `impl` at `name` as a __fastcall entry point with `n_stack` stack args past ECX/EDX.
@@ -936,11 +1001,16 @@ fn foldKey(dst: *[0x20]u8, src: ?[*:0]const u8) void {
     for (s[0..n], 0..) |c, i| dst[i] = std.ascii.toLower(c);
 }
 
-export fn FOG_AllocLinker(file: ?[*:0]const u8, line: i32) callconv(.winapi) ?*Linker {
-    _ = file;
-    _ = line;
+/// @10211. Takes `(__FILE__, __LINE__)` on 1.10f and nothing on 1.09d, so neither the arguments
+/// nor the cleanup can be fixed here — see `d2fog_alloc_linker_pop`. We ignore the debug pair
+/// either way, which is what makes one implementation able to serve both.
+fn allocLinkerImpl() callconv(.c) ?*Linker {
     trace("FOG_AllocLinker @10211");
     return @ptrCast(@alignCast(heapZeroed(@sizeOf(Linker))));
+}
+comptime {
+    // The asm names the symbol as the linker sees it: x86 COFF prefixes an underscore.
+    exportStdcallVarPop("FOG_AllocLinker", "_d2fog_alloc_linker_pop", allocLinkerImpl);
 }
 
 fn freeTree(node: ?*StrNode) void {

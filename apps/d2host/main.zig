@@ -30,6 +30,7 @@ extern "kernel32" fn SetCurrentDirectoryA(path: [*:0]const u8) callconv(.winapi)
 extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn WriteFile(h: *anyopaque, buf: [*]const u8, n: u32, wrote: *u32, ov: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn AllocConsole() callconv(.winapi) i32;
+extern "kernel32" fn AddVectoredExceptionHandler(first: u32, handler: *const fn (*ExceptionPointers) callconv(.winapi) i32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetCommandLineA() callconv(.winapi) [*:0]const u8;
 
 var out_handle: ?*anyopaque = null;
@@ -853,9 +854,68 @@ fn resolveVersion() d2version.Version {
     };
 }
 
+// x86 CONTEXT, far enough in to reach the integer registers. The engine faults inside Blizzard
+// code with no symbols, so the useful fact is never the fault address — it is the return address
+// the CALL pushed, which names the instruction that dispatched through a null.
+const ExceptionRecord = extern struct {
+    code: u32,
+    flags: u32,
+    next: ?*ExceptionRecord,
+    address: usize,
+    n_params: u32,
+    params: [15]usize,
+};
+
+const Context = extern struct {
+    flags: u32,
+    dr: [6]u32,
+    float: [112]u8,
+    seg_gs: u32,
+    seg_fs: u32,
+    seg_es: u32,
+    seg_ds: u32,
+    edi: u32,
+    esi: u32,
+    ebx: u32,
+    edx: u32,
+    ecx: u32,
+    eax: u32,
+    ebp: u32,
+    eip: u32,
+    seg_cs: u32,
+    eflags: u32,
+    esp: u32,
+    seg_ss: u32,
+};
+
+const ExceptionPointers = extern struct {
+    record: *ExceptionRecord,
+    context: *Context,
+};
+
+/// Report a fault with the one thing a post-mortem register dump cannot give: who called.
+/// A `CALL` through a null pointer leaves EIP at 0 and the caller's return address at [ESP], so
+/// reading the top of the stack turns "it crashed somewhere in D2Common" into an address that maps
+/// straight onto the disassembly.
+fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
+    const rec = info.record;
+    if (rec.code != 0xC0000005) return 0; // EXCEPTION_CONTINUE_SEARCH
+    const c = info.context;
+    sayFmt("d2host: ACCESS VIOLATION eip=0x{x} esp=0x{x}", .{ c.eip, c.esp });
+    sayFmt("d2host:   eax=0x{x} ebx=0x{x} ecx=0x{x} edx=0x{x} esi=0x{x} edi=0x{x} ebp=0x{x}", .{
+        c.eax, c.ebx, c.ecx, c.edx, c.esi, c.edi, c.ebp,
+    });
+    // Only meaningful when EIP is null: then nothing has run in the callee, so [ESP] is exactly
+    // the return address the CALL pushed.
+    const stack: [*]const u32 = @ptrFromInt(c.esp);
+    for (0..6) |i| sayFmt("d2host:   [esp+0x{x}] = 0x{x}", .{ i * 4, stack[i] });
+    return 0;
+}
+
 pub fn main() !void {
     _ = AllocConsole();
     out_handle = GetStdHandle(@bitCast(@as(i32, -11))); // STD_OUTPUT_HANDLE
+    _ = AddVectoredExceptionHandler(1, &onException);
     say("d2host: start");
 
     const install_dir = firstArg();
@@ -899,6 +959,18 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
 
     var modules = try loadModules(spec.modules);
     say("d2host: all modules loaded");
+
+    // Fog is stdcall and two builds disagree about what some of its entry points take, so it has
+    // to be told which engine it is standing in for before anything calls it. Nothing does during
+    // LoadLibrary, so here is early enough — and it must be before the D2Lang/D2Common init below,
+    // whose table loading is exactly what the drift destroys.
+    if (moduleHandle(&modules, "Fog.dll")) |fog| {
+        if (GetProcAddress(fog, "FOG_SetEngineVersion")) |p| {
+            const set: *const fn (u32) callconv(.c) i32 = @ptrCast(@alignCast(p));
+            if (set(@intFromEnum(version)) == 0)
+                sayFmt("d2host: Fog kept its default ABI for {s}", .{@tagName(version)});
+        } else say("d2host: Fog has no FOG_SetEngineVersion — using its built-in ABI");
+    }
 
     const d2game = modules[modules.len - 1].handle.?;
     const d2common = moduleHandle(&modules, "D2Common.dll").?;

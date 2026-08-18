@@ -180,6 +180,7 @@ pub fn build(b: *std.Build) void {
     d2fog.root_module.addObjectFile(b.path("packages/d2fog/fog.def"));
     // The archive reader: Fog serves the engine's files straight out of the MPQs.
     d2fog.root_module.addImport("libd2", libd2_win);
+    d2fog.root_module.addImport("d2engine", d2engine);
     b.installArtifact(d2fog);
     b.step("d2fog", "Build our replacement Fog.dll (x86-windows)")
         .dependOn(&b.addInstallArtifact(d2fog, .{}).step);
