@@ -319,22 +319,43 @@ game creation, the 16 callbacks, a real client joining and playing — is finish
 What remains is goal 2 (multiple versions, cleanly) plus the small honest gaps 1.10f itself still
 has:
 
-- **`d2host`'s ABI is now version-parameterized, not just version-tested.** A single
-  `target_version` constant in `apps/d2host/main.zig` selects the module set, the callback
-  stack-arg counts, and the client-struct field offsets; every one of those was previously either
-  a `.v110f` literal or (worse) a bare number that happened to equal 1.10f's. Building for a
-  version whose slots are not counted is now a **compile error naming the exact missing slot**,
-  not a silent reuse of another version's numbers under a different engine.
+- **`d2host` selects its version at runtime, not at compile time.** `D2GS_ENGINE_VERSION` (default
+  1.10f) picks the build the same way `D2GS_REDIS_ADDR` picks a store — one binary carries every
+  measured version's code, and `switch (requested) { inline else => |v| ... }` monomorphizes the
+  whole bring-up-and-tick path once per `Version` enum value, dispatched at runtime. Two layers
+  catch a version that is not actually usable, at two different points:
+
+  1. `callbacks.isComplete` — every *required* slot (`callbacks.required_slots`, the twelve a host
+     actually wires) has a counted stack-arg number. Selecting an incomplete version at runtime
+     fails cleanly, naming exactly what is still missing (`callbacks.missingSlots`) — verified live:
+     `D2GS_ENGINE_VERSION=1.09d` prints `v109d is not ready yet — missing: fpCloseGame, ...` and
+     exits, rather than building or misbehaving.
+  2. `Binding(comptime version)`'s own comptime asserts — completeness of *data* is not correctness
+     of *code*. `findPlayerToken`'s body is written assuming 5 stack args (1.10f's count);
+     `isComplete` only checks that *some* number is recorded for a slot, so a future version whose
+     measured arity differs would silently reuse a mismatched shim without this. Proved it fires:
+     temporarily gave 1.09d a full StackArgs using its real (3-arg) measurement and rebuilt —
+     `fpFindPlayerToken takes 3 stack args, but Binding's findPlayerToken is written for 5 — add a
+     version-specific override instead of reusing this one`, a compile error, not a corrupted call.
+
+  Adding a version that reaches both gates is exactly: measure its remaining required slots and
+  `hostapi.clientFields`, and — only if an arity genuinely differs from what `Binding`'s current
+  bodies assume — add that one version's override function. Nothing else in `d2host` changes.
 - **1.09d: two ABI facts measured, most slots still uncounted.** `fpFindPlayerToken` takes **3**
-  stack args on 1.09d, not 1.10f's 5 (`packages/d2engine/callbacks.zig`, `v109d`) — read off the
-  actual push count at `SrvVerifyJoinGame`'s callback call site (0x6fc36e85 in the rebuilt
-  1.09d-lod `D2Game.dll`), not the decompiler's rendering, which drops args it cannot type. And
-  the char/account offsets from ECX in `fpGetDatabaseCharacter` are version-specific in a way that
-  is easy to get backwards: pRealm sits at client+0x54 in 1.09d versus +0x68 in 1.10f, which moves
-  the *relative* offset even though the fields themselves stay at +0x0D/+0x1D in both
-  (`hostapi.clientFields`). The game-data-table vtable interface — mask at +0x24, slots at +0x1c,
-  counter at +0x10, list head at +8 — was checked too and is **identical** to 1.10f's, so that
-  whole apparatus needs no change to drive 1.09d.
+  stack args on 1.09d, not 1.10f's 5, and `fpGetDatabaseCharacter` takes 2 — matching 1.10f's count
+  exactly, only its *offsets* differ (`packages/d2engine/callbacks.zig`, `v109d`) — both read off
+  the actual push count at the respective call sites in the rebuilt 1.09d-lod `D2Game.dll`, not the
+  decompiler's rendering, which drops args it cannot type. And the char/account offsets from ECX in
+  `fpGetDatabaseCharacter` are version-specific in a way that is easy to get backwards: pRealm sits
+  at client+0x54 in 1.09d versus +0x68 in 1.10f, which moves the *relative* offset even though the
+  fields themselves stay at +0x0D/+0x1D in both (`hostapi.clientFields`). The game-data-table
+  vtable interface — mask at +0x24, slots at +0x1c, counter at +0x10, list head at +8 — was checked
+  too and is **identical** to 1.10f's, so that whole apparatus needs no change to drive 1.09d.
+
+  (`version.zig`'s `spec(.v109d)` originally left `.stack_args` as an empty literal rather than
+  wiring in the measured `callbacks.v109d` — a real bug the runtime dispatch caught immediately:
+  selecting 1.09d reported both facts as still missing. Fixed; the two measurements are now
+  actually reachable through `spec()`.)
 
   Still uncounted for 1.09d: every other callback slot's stack-arg count, and whether the worker
   loop / task re-arm / `ARENAFLAG_ClientUpdate` requirement behave the same (probably yes — same
