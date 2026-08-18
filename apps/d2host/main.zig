@@ -187,12 +187,18 @@ fn pumpCharacterLoads() void {
 
 /// Slot 0x18, the closed-realm join gate. `__fastcall` with five stack args on 1.10f.
 ///
-/// The engine names every argument itself, in the message it logs when this returns zero:
-/// `[HACKLIST] <D2CLTSYS_JOINGAME> ACCT:%s CLIENT:%s GAMEID:%d TOKEN:%x ERROR: Invalid Token`,
-/// built from EBP/EDI/ESI/EBX — which are, in order, the account, the character, the game id and
-/// the token. ECX is the character and EDX the token at the call (@0x6fc37066).
+/// Called from `GAME_VerifyJoinGame` @0x6fc36df0. Five stack args is from the call site's five
+/// pushes, which is the reliable count — the decompiler renders the indirect call with fewer
+/// because it cannot know an unnamed pointer's signature.
 ///
-/// **Nonzero accepts.** Zero makes the engine log that line and refuse the join.
+/// **Nonzero accepts.** Zero makes the engine log
+/// `[HACKLIST] <D2CLTSYS_JOINGAME> ACCT:%s CLIENT:%s GAMEID:%d TOKEN:%x ERROR: Invalid Token`
+/// and refuse the join. That message is also where the argument names come from — it is built from
+/// EBP/EDI/ESI/EBX, the account, character, game id and token — so the identities below are read
+/// off the engine's own logging rather than guessed, but they are inference, unlike the count.
+///
+/// The slot cannot be left null: the engine runs `IsBadCodePtr` on it first and a bad pointer is
+/// an assert and `exit(-1)`, not a skipped call.
 ///
 /// Accepting unconditionally is what the injected 1.14d server does in production today: realmd
 /// has already authorised this join before the client is told where to connect, so the token is a
