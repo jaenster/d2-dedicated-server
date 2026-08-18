@@ -322,9 +322,10 @@ In dependency order. Each line is blocked by the ones above it, except where not
 2. ~~**Get through game creation.**~~ **Done.** `GAME_CreateNewEmptyGame` returns game id 1,
    `GAME_GetGamesCount` reports 1, the engine calls `pfSetGameData` on our table, and the host
    ticks frames with no assert, crash or hang.
-3. **Wire the 16 callbacks to the realm.** Mostly reuse: `apps/d2gs/engine/realm.zig` already
-   implements them for 1.14d and `packages/d2engine` holds the shared layout. Needs `stack_args`
-   counted for the target version — `callbacks.stackArgs` refuses to guess.
+3. **Wire the 16 callbacks to the realm.** Less reuse than it looked: the store client is shared
+   (`packages/gs-store`) and `packages/d2engine` holds the layout and 1.10f's `stack_args`, but the
+   1.14d implementations read the engine's client struct at 1.14d offsets, so 1.10f's equivalents
+   have to be established before `fpGetDatabaseCharacter` can load anyone.
 4. **A real client joins and plays.** The transport is up and a socket client round-trips through
    the engine; what is missing is meaning — packet framing (the stream is delivered in `recv`-sized
    chunks, not split into packets) and the realm-backed callbacks from 3.
@@ -469,5 +470,22 @@ treats the remaining 36 as the start of the next packet, so the stream desynchro
 anything else happens. The gameplay vocabulary is shared; the handshake is not. Testing needs a
 1.10f-era client, or our own clientless one taught this table.
 
+16. **It is a member of the fleet.** With `D2GS_REDIS_ADDR` and `D2GS_GSID` set it publishes
+    itself into the shared store and takes work from the realm queue, exactly as `apps/d2gs` does
+    and over the same protocol — because it is now literally the same code. The GS side of that
+    store had already been re-implemented once (`apps/d2gs-native/store.zig`), so it moved out to
+    `packages/gs-store` rather than being written a third time.
+
+    Verified against the dev redis. The heartbeat record decodes as it should —
+    `7f 00 00 01 | 0e 10 | 07 00 00 00 | 00 00 00 00 | 00` is 127.0.0.1, port 4110, 7 games max,
+    0 live, not full — and a CREATEGAME pushed onto `realmd:gsq:<gsid>` comes back on
+    `realmd:gsreply:<seq>` as `10 00 | 20 00 | 63 00 00 00 | 00 00 00 00 | 01 00 00 00`: seq 99,
+    CREATE_OK, game id 1. The realm asked for a game and the 1.10f engine made one.
+
+    Without a store address it stays the standalone spike that creates one game and ticks, which is
+    still the quickest way to prove a build.
+
 What this does *not* do yet: load a character. The callbacks are still reporting stubs rather than
-realm calls.
+realm calls, and the 1.14d implementations in `apps/d2gs/engine/realm.zig` cannot be reused as they
+stand — they read the client struct at 1.14d offsets (`ECX-0x5B` for the name, `ECX-8` for the
+container), so the equivalent 1.10f offsets have to be established first.

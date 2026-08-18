@@ -12,6 +12,8 @@
 
 const std = @import("std");
 const fastcall = @import("fastcall");
+const store = @import("gs_store");
+const proto = @import("realm_proto").protocol;
 
 const HMODULE = *anyopaque;
 extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?HMODULE;
@@ -52,6 +54,118 @@ fn listenPort() u16 {
     const spec = buf[0..n];
     const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return 4100;
     return std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch 4100;
+}
+
+/// Read an environment variable into `buf`, or null when unset.
+fn env(name: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const n = GetEnvironmentVariableA(name, buf.ptr, @intCast(buf.len));
+    return if (n == 0 or n >= buf.len) null else buf[0..n];
+}
+
+/// This server's identity in the shared store. Same knobs as `apps/d2gs`, because a fleet that
+/// mixes both has to be configured one way.
+var gsid: u32 = 0;
+var public_ip: [4]u8 = .{ 127, 0, 0, 1 };
+var public_port: u16 = 4100;
+var max_games: u32 = 7;
+var live_games: u32 = 0;
+
+/// The realm link is optional. Without a store address this stays a standalone spike that creates
+/// one game and ticks — which is exactly what it was, and still the quickest way to prove a build.
+fn realmConfigured() bool {
+    return gsid != 0 and store.enabled();
+}
+
+/// Read the store address and this server's identity, the same env the DLL server takes so a
+/// fleet mixing both is configured one way.
+fn configureRealm() void {
+    var buf: [128]u8 = undefined;
+    if (env("D2GS_REDIS_ADDR", &buf)) |addr| store.configure(addr);
+    var idbuf: [32]u8 = undefined;
+    if (env("D2GS_GSID", &idbuf)) |v| gsid = std.fmt.parseInt(u32, v, 10) catch 0;
+    var abuf: [64]u8 = undefined;
+    if (env("D2GS_GS_ADDR", &abuf)) |spec| {
+        if (std.mem.lastIndexOfScalar(u8, spec, ':')) |c| {
+            public_port = std.fmt.parseInt(u16, spec[c + 1 ..], 10) catch public_port;
+            var it = std.mem.splitScalar(u8, spec[0..c], '.');
+            var i: usize = 0;
+            while (it.next()) |octet| : (i += 1) {
+                if (i >= 4) break;
+                public_ip[i] = std.fmt.parseInt(u8, octet, 10) catch return;
+            }
+        }
+    }
+}
+
+/// The engine call that makes a game, resolved once at startup so the realm handler can use it.
+const CreateGameFn = *const fn (
+    [*:0]u8, // game name (written to, not const)
+    [*:0]const u8, // password
+    [*:0]const u8, // description
+    u32, // flags
+    u8, // arena template
+    u8, // max level difference
+    u8, // max players
+    *u16, // out: game id
+) callconv(.winapi) i32;
+
+var create_game: ?CreateGameFn = null;
+
+/// Answer one CREATEGAME from the realm by actually creating it. The realm keeps the authoritative
+/// game list; this only reports what the engine did, so a refusal has to be reported as a refusal
+/// rather than a silence — a client left waiting on a game that was never made just times out.
+fn handleCreateGame(seq: u32, body: []const u8) void {
+    var reply = std.mem.zeroes(proto.CreateGameReply);
+    reply.h = proto.header(.creategame, @sizeOf(proto.CreateGameReply), seq);
+
+    const make = create_game orelse {
+        reply.result = 1;
+        _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
+        return;
+    };
+    if (body.len < 5) {
+        reply.result = 1;
+        _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
+        return;
+    }
+
+    var off: usize = 4;
+    const want_name = proto.readCStr(body, &off);
+    const want_pass = proto.readCStr(body, &off);
+
+    // The engine writes into the name buffer, so it cannot be the realm's bytes.
+    var name: [32:0]u8 = @splat(0);
+    var pass: [32:0]u8 = @splat(0);
+    @memcpy(name[0..@min(want_name.len, 31)], want_name[0..@min(want_name.len, 31)]);
+    @memcpy(pass[0..@min(want_pass.len, 31)], want_pass[0..@min(want_pass.len, 31)]);
+
+    var game_id: u16 = 0;
+    const ok = make(&name, &pass, "", 0, 0, 0, 8, &game_id);
+    if (ok == 0) {
+        say("d2host: CREATEGAME refused by the engine");
+        reply.result = proto.CREATE_SERVER_FULL;
+    } else {
+        live_games += 1;
+        reply.gameid = game_id;
+        sayHex("d2host: CREATEGAME made game ", game_id);
+    }
+    _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
+}
+
+/// Take at most one request per tick, which is what the DLL server does — the queue is drained by
+/// the tick rate rather than in a burst, so one slow creation cannot stall the game loop.
+fn pumpRealm() void {
+    var buf: [1024]u8 = undefined;
+    const n = store.popRequest(gsid, &buf);
+    if (n < proto.HEADER_LEN) return;
+    const size = std.mem.readInt(u16, buf[0..2], .little);
+    const typ = std.mem.readInt(u16, buf[2..4], .little);
+    const seq = std.mem.readInt(u32, buf[4..8], .little);
+    if (size > n or size < proto.HEADER_LEN) return; // truncated; nothing sensible to answer
+    switch (@as(proto.Type, @enumFromInt(typ))) {
+        .creategame => handleCreateGame(seq, buf[proto.HEADER_LEN..size]),
+        else => {},
+    }
 }
 
 /// Frames to run before exiting. 50 ms apart, so this is about a minute — enough to attach a
@@ -405,10 +519,12 @@ pub fn main() !void {
         say("d2host: DATATBLS_LoadAllTxts returned");
     } else say("d2host: D2Common @10576 missing");
 
+    configureRealm();
+
     // Ours, by name: tell the transport where to listen before it binds. Not an ordinal, because
     // it is not part of the D2Net ABI the engine imports.
     if (GetProcAddress(d2net, "D2NET_SetListenPort")) |p| {
-        const port = listenPort();
+        const port = public_port;
         @as(*const fn (u16) callconv(.winapi) void, @ptrCast(@alignCast(p)))(port);
         sayHex("d2host: listen port set to ", port);
     }
@@ -487,24 +603,23 @@ fn createGame(d2game: HMODULE) !void {
         say("d2host: ordinal 10047 (GAME_CreateNewEmptyGame) missing");
         return error.MissingOrdinal;
     };
-    const CreateFn = *const fn (
-        [*:0]u8, // game name (written to, not const)
-        [*:0]const u8, // password
-        [*:0]const u8, // description
-        u32, // flags
-        u8, // arena template
-        u8, // max level difference
-        u8, // max players
-        *u16, // out: game id
-    ) callconv(.winapi) i32;
+    create_game = @ptrCast(@alignCast(create));
 
-    var name: [32:0]u8 = @splat(0);
-    @memcpy(name[0..5], "spike");
-    var game_id: u16 = 0;
-    say("d2host: calling GAME_CreateNewEmptyGame");
-    const ok = @as(CreateFn, @ptrCast(@alignCast(create)))(&name, "", "d2host spike", 0, 0, 0, 8, &game_id);
-    sayHex("d2host: GAME_CreateNewEmptyGame returned=", @intCast(ok));
-    sayHex("d2host:   gameId=", game_id);
+    // With a realm, games are made on request and creating one here would be a phantom the realm
+    // does not know about. Without one, this is still the quickest proof the engine works.
+    var ok: i32 = 1;
+    if (!realmConfigured()) {
+        var name: [32:0]u8 = @splat(0);
+        @memcpy(name[0..5], "spike");
+        var game_id: u16 = 0;
+        say("d2host: no realm configured — creating one game directly");
+        ok = create_game.?(&name, "", "d2host spike", 0, 0, 0, 8, &game_id);
+        sayHex("d2host: GAME_CreateNewEmptyGame returned=", @intCast(ok));
+        sayHex("d2host:   gameId=", game_id);
+        if (ok != 0) live_games += 1;
+    } else {
+        sayHex("d2host: joined the realm as gsid ", gsid);
+    }
 
     if (byOrdinal(d2game, 10012)) |p| {
         const Count = *const fn () callconv(.c) i32; // fastcall, no args — same as cdecl here
@@ -527,7 +642,17 @@ fn createGame(d2game: HMODULE) !void {
     // also a network poll — there is no separate accept loop to run.
     say("d2host: ticking");
     var i: usize = 0;
-    while (i < tick_frames) : (i += 1) {
+    var last_beat: usize = 0;
+    while (realmConfigured() or i < tick_frames) : (i += 1) {
+        if (realmConfigured()) {
+            pumpRealm();
+            // ~5s at 50ms a frame. The record carries a 90s TTL, so missing a few beats under
+            // load takes this server out of rotation rather than handing the realm a stale route.
+            if (i - last_beat >= 100) {
+                last_beat = i;
+                _ = store.putHeartbeat(gsid, public_ip, public_port, max_games, live_games, live_games >= max_games, 90);
+            }
+        }
         if (progress) |p| {
             _ = @as(*const fn (i32) callconv(.winapi) i32, @ptrCast(@alignCast(p)))(0);
         }

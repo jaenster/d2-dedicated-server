@@ -15,7 +15,7 @@ const p = @import("realm_proto").protocol;
 const server = @import("../engine/server.zig");
 const command = @import("../engine/command.zig");
 const joinctx = @import("joinctx.zig");
-const redis = @import("redis.zig");
+const redis = @import("gs_store");
 const poolstat = @import("../runtime/poolstat.zig");
 const log = @import("../log.zig");
 

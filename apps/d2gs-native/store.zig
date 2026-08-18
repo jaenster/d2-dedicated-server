@@ -1,6 +1,6 @@
 //! The native server's link to the realm: redis, over libc sockets and `packages/resp`.
 //!
-//! Same arrangement as the wine DLL (apps/d2gs/realmclient/redis.zig) and the same IO-free codec,
+//! Same arrangement as the wine DLL (packages/gs-store/gs_store.zig) and the same IO-free codec,
 //! so the two cannot drift; only the socket layer differs. One connection, one lock over the whole
 //! request/reply cycle — two threads sharing it desyncs, and the symptom is reads coming back
 //! empty while writes still look fine.

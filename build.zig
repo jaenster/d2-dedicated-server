@@ -65,6 +65,16 @@ pub fn build(b: *std.Build) void {
     });
     d2engine.addImport("fastcall", fastcall_mod);
 
+    // The game server's side of the shared store: the ops a GS needs of the realm — fetch and
+    // save a character, advertise itself, take create/join requests, report events. Domain ops on
+    // the outside, redis on the inside. It lives here rather than inside apps/d2gs because a
+    // second game server already re-implemented it once (apps/d2gs-native/store.zig) and a third
+    // is now driving the pre-1.14 DLLs; the protocol is the same for all of them.
+    const gs_store = b.addModule("gs_store", .{
+        .root_source_file = b.path("packages/gs-store/gs_store.zig"),
+    });
+    gs_store.addImport("resp", resp);
+
     // Host-side infrastructure (net/log/config/lock/store types) for the NATIVE binaries.
     // Deliberately NOT given to the DLL, so libc-socket / POSIX code never enters that build.
     const realm_infra = b.addModule("realm_infra", .{
@@ -129,6 +139,7 @@ pub fn build(b: *std.Build) void {
     });
     d2gs.root_module.addImport("realm_proto", realm_proto);
     d2gs.root_module.addImport("resp", resp);
+    d2gs.root_module.addImport("gs_store", gs_store);
     d2gs.root_module.addImport("obs", obs);
     d2gs.root_module.addImport("d2engine", d2engine);
     // As a module, not a relative import: the same file is the root of the `fastcall` module that
@@ -147,6 +158,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     d2host.root_module.addImport("fastcall", fastcall_mod);
+    d2host.root_module.addImport("gs_store", gs_store);
+    d2host.root_module.addImport("realm_proto", realm_proto);
     b.installArtifact(d2host);
     b.step("d2host", "Build the pre-1.14 DLL host (x86-windows exe)")
         .dependOn(&b.addInstallArtifact(d2host, .{}).step);
