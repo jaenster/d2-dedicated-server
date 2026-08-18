@@ -646,3 +646,35 @@ The consequence for testing is that the client has to be ours. That is not a dow
 client is a better test than a headed one — but it does mean the packet vocabulary cannot live
 inside a Windows DLL where nothing else can reach it, which is why it moved to
 `packages/d2engine/cs_packets.zig`.
+
+
+## A 1.14d client plays on the 1.10f server
+
+The stock 1.10f client cannot be driven here (SafeDisc, above) and pre-1.12 clients want the disc, so
+the practical test client is the 1.14d one — which runs under wine without either. Exactly **one**
+packet stands in the way, and we own the transport it arrives on:
+
+```
+1.14d  0x68, 37 bytes:  op | u32 hash | u16 token | u8 | u32 | u64 extra | u8 class | name[16]
+1.10f  0x67, 29 bytes:  op | u32 hash | u16 gameId| u8 | u32 |             u8 class | name[16]
+```
+
+Same fields with an 8-byte insertion, so the translation is dropping bytes 12..20 and renumbering
+the opcode. The leading fields line up exactly, which matters because d2ingress rewrites the token
+at byte 5 into the engine's game id and that lands on 1.10f's `gameId` unchanged.
+`packages/d2engine/cs_packets.zig` does it, `packages/d2net` applies it before framing, and
+`D2HOST_ACCEPT_114D_CLIENT=0` turns it off for a genuine same-version client.
+
+Result:
+
+```
+d2net:  translated a 1.14d join (0x68/37) into 1.10f (0x67/29)
+engine: ClientAddToGame:  Added client 0 'Tenf' to game 1 'tr1'
+engine: SrvRecvDatabaseCharacter: Sent ACTINITDONE for client 0 'Tenf'
+[GS] joined: 3 packets, 1 world bytes after 0x6b  => IN GAME
+[GS] parsed: 3/3 packets (100%)
+```
+
+That the client parses **everything** the 1.10f engine sends is the point: the 102 of 112 C->S
+entries that match are not a coincidence of the table, they are the same protocol. Only the session
+block 0x64-0x6F was renumbered between the versions.

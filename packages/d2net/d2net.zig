@@ -139,6 +139,30 @@ fn htons(v: u16) u16 {
 /// Accept whatever is pending and read whatever has arrived. Called from the read path rather than
 /// a thread: the host already ticks, and polling inside the drain keeps every socket touch on one
 /// thread, so none of this needs locking.
+/// Accept a 1.14d client's join and hand the engine the 1.10f one. Off by default: it exists so a
+/// 1.14d client — which runs under wine without a disc, unlike 1.10f's SafeDisc-wrapped Game.exe —
+/// can be used to exercise this server. Everything after the join is byte-identical between the two
+/// versions, so this one rewrite is the whole of the compatibility layer.
+var translate_join = false;
+
+export fn D2NET_SetTranslate114dJoin(on: u32) callconv(.winapi) void {
+    translate_join = on != 0;
+}
+
+/// Rewrite in place at the head of a client's buffer, before framing sees it.
+fn translateHead(c: *Client) void {
+    if (!translate_join or c.len < cs.join_114d_len) return;
+    if (c.buf[0] != cs.join_114d) return;
+    var rewritten: [cs.join_110f_len]u8 = undefined;
+    const n = cs.translateJoin114dTo110f(c.buf[0..cs.join_114d_len], &rewritten) orelse return;
+    @memcpy(c.buf[0..n], rewritten[0..n]);
+    // Close the gap the shorter packet leaves, so whatever followed stays framed.
+    const rest = c.len - cs.join_114d_len;
+    if (rest > 0) std.mem.copyForwards(u8, c.buf[n .. n + rest], c.buf[cs.join_114d_len..c.len]);
+    c.len = n + rest;
+    sayFmt("d2net: translated a 1.14d join (0x68/{d}) into 1.10f (0x67/{d})", .{ cs.join_114d_len, n });
+}
+
 fn poll() void {
     if (listener != INVALID_SOCKET) {
         while (true) {
@@ -196,6 +220,7 @@ fn takeMessageFor(list: u32, buf: ?[*]u8, cap: u32) u32 {
     const dst = buf orelse return no_message;
     for (&clients, 0..) |*c, i| {
         if (!c.active() or c.len == 0) continue;
+        translateHead(c);
         const n = packetLen(c.buf[0..c.len]) orelse continue; // incomplete, wait for more
         if (n != 0 and listFor(c.buf[0]) != list) continue; // another drain loop's packet
         if (n == 0) {

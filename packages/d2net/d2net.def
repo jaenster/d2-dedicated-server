@@ -21,6 +21,7 @@ EXPORTS
     ; instead of an ordinal that would imply it is part of D2Net's ABI.
     D2NET_SetListenPort @10800
     D2NET_ConnectedClients @10801
+    D2NET_SetTranslate114dJoin @10802
     ; Not called. See D2NET_ordinal_ceiling in d2net.zig — this pins where mingw's
     ; auto-exported decorated aliases start, clear of the real module's ordinals.
     D2NET_ordinal_ceiling @10900 NONAME

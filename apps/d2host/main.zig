@@ -806,6 +806,16 @@ pub fn main() !void {
     // Ours, by name: tell the transport where to listen before it binds. Not an ordinal, because
     // it is not part of the D2Net ABI the engine imports.
     connected_clients_fn = @ptrCast(@alignCast(GetProcAddress(d2net, "D2NET_ConnectedClients")));
+
+    // A 1.14d client is the only pre-1.14-compatible client that runs here without the disc, so
+    // allow it to join by translating its one incompatible packet. D2HOST_ACCEPT_114D_CLIENT=0
+    // turns it off for a genuine same-version client.
+    if (GetProcAddress(d2net, "D2NET_SetTranslate114dJoin")) |p| {
+        var b: [8]u8 = undefined;
+        const on: u32 = if (env("D2HOST_ACCEPT_114D_CLIENT", &b)) |v| @intFromBool(!std.mem.eql(u8, v, "0")) else 1;
+        @as(*const fn (u32) callconv(.winapi) void, @ptrCast(@alignCast(p)))(on);
+        if (on != 0) say("d2host: accepting 1.14d clients (join packet translated)");
+    }
     if (GetProcAddress(d2net, "D2NET_SetListenPort")) |p| {
         const port = public_port;
         @as(*const fn (u16) callconv(.winapi) void, @ptrCast(@alignCast(p)))(port);

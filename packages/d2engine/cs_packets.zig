@@ -81,3 +81,64 @@ test "an unframeable opcode is reported, not guessed" {
     const bad = [_]u8{0x00};
     try std.testing.expectEqual(@as(?usize, 0), packetLen(&bad));
 }
+
+// ── speaking to an older server with a newer client ──────────────────────────
+//
+// The join is the only packet that stands between a 1.14d client and a 1.10f server. Everything
+// else it will send during a session — every opcode 0x00-0x63 — is byte-identical between the two,
+// measured against 1.14d's own table: 102 of 112 entries match, and all ten differences sit in
+// 0x64-0x6F, the session block Blizzard renumbered.
+//
+// The two joins are the same fields with one insertion:
+//
+//     1.14d  0x68, 37 bytes:  op | u32 hash | u16 token | u8 | u32 | u64 extra | u8 class | name[16]
+//     1.10f  0x67, 29 bytes:  op | u32 hash | u16 gameId| u8 | u32 |             u8 class | name[16]
+//
+// so translating is dropping bytes 12..20 and renumbering the opcode. The leading fields line up
+// exactly, which matters because d2ingress rewrites the token at byte 5 into the engine's game id
+// and that lands on 1.10f's gameId field unchanged.
+
+/// 1.14d's join opcode and length. `join_110f` is what the 1.10f engine expects.
+pub const join_114d: u8 = 0x68;
+pub const join_114d_len: usize = 37;
+pub const join_110f: u8 = 0x67;
+pub const join_110f_len: usize = 29;
+
+/// Rewrite a 1.14d join in `src` into the 1.10f form in `dst`, returning its length. Null when
+/// `src` is not a 1.14d join, so a caller can pass every packet through and only pay for the one.
+pub fn translateJoin114dTo110f(src: []const u8, dst: []u8) ?usize {
+    if (src.len != join_114d_len or src[0] != join_114d) return null;
+    if (dst.len < join_110f_len) return null;
+    dst[0] = join_110f;
+    @memcpy(dst[1..12], src[1..12]); // hash, token/gameId, and the two fields after it
+    @memcpy(dst[12..join_110f_len], src[20..join_114d_len]); // class + name, past the 8 dropped bytes
+    return join_110f_len;
+}
+
+test "a 1.14d join becomes a 1.10f join, field for field" {
+    var src: [join_114d_len]u8 = @splat(0);
+    src[0] = join_114d;
+    std.mem.writeInt(u16, src[5..7], 0x1234, .little); // the game id d2ingress writes here
+    src[7] = 3;
+    @memcpy(src[12..20], &[_]u8{ 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4 }); // the block that is dropped
+    src[20] = 5; // class
+    @memcpy(src[21..25], "Tenf");
+
+    var dst: [64]u8 = @splat(0);
+    const n = translateJoin114dTo110f(&src, &dst).?;
+    try std.testing.expectEqual(join_110f_len, n);
+    try std.testing.expectEqual(join_110f, dst[0]);
+    try std.testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, dst[5..7], .little));
+    try std.testing.expectEqual(@as(u8, 3), dst[7]);
+    try std.testing.expectEqual(@as(u8, 5), dst[12]); // class survived the shift
+    try std.testing.expectEqualStrings("Tenf", dst[13..17]);
+    // and the translated packet is exactly what the framer will accept
+    try std.testing.expectEqual(@as(?usize, join_110f_len), packetLen(dst[0..n]));
+}
+
+test "anything that is not a 1.14d join is left alone" {
+    var dst: [64]u8 = @splat(0);
+    try std.testing.expect(translateJoin114dTo110f(&[_]u8{0x67}, &dst) == null);
+    const wrong_len = [_]u8{join_114d} ** 20;
+    try std.testing.expect(translateJoin114dTo110f(&wrong_len, &dst) == null);
+}
