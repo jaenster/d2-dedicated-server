@@ -9,8 +9,13 @@
 # Realm display name shown in the client realm list.
 realmName: MyRealm
 
-# Public IPv4 / hostname that clients dial for d2cs (bnetd advertises it). Set this to
-# the realm's external LoadBalancer IP/host. REQUIRED — there is no sane default.
+# Public IPv4 or hostname that clients dial for d2cs (bnetd advertises it). Set this to the
+# realm's external LoadBalancer IP or a name pointing at it. REQUIRED — there is no sane default.
+#
+# A name is resolved ONCE, at realmd startup, because bnet hands the client four raw bytes and
+# there is nowhere in the protocol to put a name. So DNS is how you write the address down, not
+# how it fails over: moving the record needs a realmd restart to take effect. A floating IP that
+# moves between nodes keeps working without one, which is why it is still the better front door.
 realmAddr: ""
 
 # Stable public IPs (e.g. cloud floating IPs) used as Service externalIPs on the public
@@ -25,7 +30,8 @@ floatingIPs: []
 # realmd writes {token -> the real GS pod ip:port} to redis and hands the client this address
 # plus the token; d2ingress looks the token up and splices through to the right GS, which stays
 # internal. Clients never dial a game server: the token is realm-global and only the gateway
-# can translate it, so realmd refuses to start without this.
+# can translate it, so realmd refuses to start without this. A hostname works, resolved once at
+# startup on the same terms as realmAddr above.
 gameAddr: ""
 
 # Don't take client traffic until a game server has published itself into redis.

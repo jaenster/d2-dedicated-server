@@ -42,17 +42,6 @@ fn hashStr(s: []const u8) u32 {
     return h;
 }
 
-fn parseIp4(text: []const u8) ?[4]u8 {
-    var octets: [4]u8 = undefined;
-    var it = std.mem.splitScalar(u8, text, '.');
-    var i: usize = 0;
-    while (it.next()) |part| : (i += 1) {
-        if (i >= 4) return null;
-        octets[i] = std.fmt.parseInt(u8, part, 10) catch return null;
-    }
-    return if (i == 4) octets else null;
-}
-
 /// Ensure `name` exists as an admin account: create it (with `password` if given,
 /// lowercased+xsha1 to match the login path) when missing, then set the admin flag.
 /// Idempotent — used by both `create-admin` and REALMD_ADMIN_BOOTSTRAP. Assumes
@@ -211,16 +200,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // onto :6112, exactly as real bnet does. There is no second listener — the client was never
     // told about one, so the only thing the old d2cs port ever served was our own test harness.
     bncs.d2cs_port = cfg.bnet_port;
-    if (parseIp4(cfg.realm_addr)) |ip| {
+    if (net.resolve4(cfg.realm_addr)) |ip| {
         bncs.d2cs_ip = ip;
     } else {
-        log.line("realmd", "WARNING realm_addr '{s}' is not an IPv4; advertising 127.0.0.1 to clients", .{cfg.realm_addr});
+        log.line("realmd", "WARNING realm_addr '{s}' did not resolve; advertising 127.0.0.1 to clients", .{cfg.realm_addr});
     }
     if (cfg.gs_addr.len > 0) {
-        if (parseIp4(cfg.gs_addr)) |ip| {
+        if (net.resolve4(cfg.gs_addr)) |ip| {
             fleet.gs_ip_override = ip;
         } else {
-            log.line("realmd", "WARNING gs_addr '{s}' is not an IPv4; ignoring", .{cfg.gs_addr});
+            log.line("realmd", "WARNING gs_addr '{s}' did not resolve; ignoring", .{cfg.gs_addr});
         }
     }
     // The game-traffic ingress clients dial, and the routes it resolves. Not optional: the token
@@ -232,11 +221,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.line("realmd", "FATAL REALMD_GAME_ADDR is required: the address clients dial for game traffic (d2ingress, or realmd's own edge via REALMD_GAME_PORT)", .{});
         return error.GameAddrRequired;
     }
-    d2cs.game_ip = parseIp4(cfg.game_addr) orelse {
-        log.line("realmd", "FATAL REALMD_GAME_ADDR '{s}' is not an IPv4", .{cfg.game_addr});
+    d2cs.game_ip = net.resolve4(cfg.game_addr) orelse {
+        log.line("realmd", "FATAL REALMD_GAME_ADDR '{s}' did not resolve to an IPv4", .{cfg.game_addr});
         return error.GameAddrInvalid;
     };
-    log.line("realmd", "game ingress: advertising {s}:{d} to clients (route ttl {d}s)", .{ cfg.game_addr, cfg.ingress_port, cfg.route_ttl_s });
+    log.line("realmd", "game ingress: advertising {s} ({d}.{d}.{d}.{d}):{d} to clients (route ttl {d}s)", .{
+        cfg.game_addr,       d2cs.game_ip[0],   d2cs.game_ip[1], d2cs.game_ip[2],
+        d2cs.game_ip[3], cfg.ingress_port, cfg.route_ttl_s,
+    });
 
     const bnet_fd = try net.listenTcp(cfg.bind, cfg.bnet_port);
     const health_fd = try net.listenTcp(cfg.bind, cfg.health_port);
