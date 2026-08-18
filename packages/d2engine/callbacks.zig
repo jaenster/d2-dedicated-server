@@ -6,9 +6,14 @@
 //! monolith (SetupAsBnetServer @0x0052c0e0). Two independent derivations agreeing is why the layout
 //! lives here once instead of per host.
 //!
-//! What is NOT shared is per-version: the stack-arg count of each slot, and the slots 1.14d added
-//! past 0x40. Both are parameters here — `StackArgs` per version, `Extended` for the tail — because
-//! guessing either one corrupts the engine's stack or dispatches through a wrong offset.
+//! What is NOT shared is per-version: the stack-arg count of each slot, and the slots past 0x40.
+//! Both are parameters here — `StackArgs` per version, `Extended` for the tail — because guessing
+//! either one corrupts the engine's stack or dispatches through a wrong offset.
+//!
+//! A third-party 1.13c host's published `EVENTCALLBACKTABLE` agrees with all sixteen slots derived
+//! here, which is a third independent derivation. It also declares `void* fpReservedDebug[10]`
+//! after them — so the tail `Extended` models is not a 1.14d invention, it was already there in the
+//! DLL era, and 1.14d's `fpGetDatabaseFileTime` at 0x54 lands inside it.
 //!
 //! Slots are __fastcall (ECX/EDX + stack, callee-cleanup) except 0x10 fpServerLogMessage (cdecl
 //! varargs) and 0x3C fpLoadComplete (stdcall). Zig's x86 fastcall callconv is buggy
@@ -30,10 +35,10 @@ pub const Slot = enum(u8) {
     fpFindPlayerToken = 0x18,
     fpSaveDatabaseGuild = 0x1C,
     fpUnlockDatabaseCharacter = 0x20,
-    fpUnknown0x24 = 0x24,
+    fpReserved0x24 = 0x24, // "fpReserved1" to a third-party host; nothing has been seen calling it
     fpUpdateCharacterLadder = 0x28,
     fpUpdateGameInformation = 0x2C,
-    fpHandlePacket = 0x30,
+    fpHandlePacket = 0x30, // "fpReserved2" to a third-party host, but the engine does call it
     fpSetGameData = 0x34,
     fpRelockDatabaseCharacter = 0x38,
     fpLoadComplete = 0x3C,
@@ -51,7 +56,7 @@ pub const D2ServerCallbackFunctions = extern struct {
     fpFindPlayerToken: ?*const anyopaque = null, // validate the join token the realm issued
     fpSaveDatabaseGuild: ?*const anyopaque = null,
     fpUnlockDatabaseCharacter: ?*const anyopaque = null, // (gameData*, charName, accountName)
-    fpUnknown0x24: ?*const anyopaque = null,
+    fpReserved0x24: ?*const anyopaque = null,
     fpUpdateCharacterLadder: ?*const anyopaque = null,
     fpUpdateGameInformation: ?*const anyopaque = null, // (gameId, charName, classId, level)
     fpHandlePacket: ?*const anyopaque = null, // (packet*, size)

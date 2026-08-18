@@ -97,6 +97,101 @@ fn configureRealm() void {
     }
 }
 
+// ── the character load ───────────────────────────────────────────────────────
+//
+// `fpGetDatabaseCharacter` is asynchronous: the call site at 0x6fc37413 discards the return value,
+// so the answer goes back through a separate engine entry point. That is `D2Game @10007`, whose
+// `RET 0x20` matches a published third-party host's `D2GSSendDatabaseCharacter` — eight stdcall
+// args — and whose body calls `CLIENTS_AttachSaveFile`.
+//
+// Delivering from inside the callback would run the engine's join continuation halfway through its
+// own join call, so the fetch queues here and the tick loop delivers it afterwards. That is the
+// same shape `apps/d2gs/engine/realm.zig` needs on 1.14d, for the same reason.
+
+/// `BOOL __stdcall (dwClientId, lpSaveData, dwSize, dwTotalSize, bLock, r1, lpPlayerInfo, r2)`.
+const SendDatabaseCharacterFn = *const fn (
+    u32, // client id
+    [*]const u8, // the save
+    u32, // this-call chunk
+    u32, // total size
+    u32, // bLock — nonzero refuses the join
+    u32,
+    *const PlayerInfo,
+    u32,
+) callconv(.winapi) i32;
+
+/// The engine reads the joining character back out of this, so it is not optional padding.
+const PlayerInfo = extern struct {
+    player_mark: u32 = 0,
+    reserved: u32 = 0,
+    char_name: [16]u8 = @splat(0),
+    acct_name: [16]u8 = @splat(0),
+};
+
+comptime {
+    std.debug.assert(@sizeOf(PlayerInfo) == 40);
+}
+
+var send_character: ?SendDatabaseCharacterFn = null;
+
+/// One in-flight character load. A join asks for exactly one save, so a small table is enough; a
+/// full one refuses the join rather than dropping it silently, which would leave a client sitting
+/// on a loading screen until it timed out.
+const Pending = struct {
+    used: bool = false,
+    client_id: u32 = 0,
+    len: u32 = 0,
+    info: PlayerInfo = .{},
+    save: [8192]u8 = undefined,
+};
+
+var pending: [8]Pending = @splat(.{});
+
+/// Slot 0x08. `__fastcall`, ECX = &pClient->pRealm.
+///
+/// The client-struct offsets are 1.14d's, and that is not an assumption: 1.10f's D2Game does
+/// `leal 0x68(%esi), %ecx` immediately before `calll *0x8(%eax)` at 0x6fc37413, and writes the two
+/// name fields as a consecutive pair into +0x0D and +0x1D at 0x6fc32685. Same layout, so the
+/// arithmetic is the same as the injected server's.
+fn getDatabaseCharacter(ecx: usize, edx: usize, client_id: usize, account: usize) callconv(.c) usize {
+    _ = .{ edx, account };
+    const sz_char: [*:0]const u8 = @ptrFromInt(ecx -% 0x5B); // pClient+0x0D
+    const sz_acct: [*:0]const u8 = @ptrFromInt(ecx -% 0x4B); // pClient+0x1D
+    const char_name = std.mem.sliceTo(sz_char, 0);
+    const acct_name = std.mem.sliceTo(sz_acct, 0);
+
+    const slot = for (&pending) |*p| {
+        if (!p.used) break p;
+    } else {
+        say("d2host: no free character slot — refusing this join");
+        return 0;
+    };
+
+    slot.* = .{ .used = true, .client_id = @intCast(client_id) };
+    @memcpy(slot.info.char_name[0..@min(char_name.len, 15)], char_name[0..@min(char_name.len, 15)]);
+    @memcpy(slot.info.acct_name[0..@min(acct_name.len, 15)], acct_name[0..@min(acct_name.len, 15)]);
+    slot.len = @intCast(store.getChar(acct_name, char_name, &slot.save));
+    sayHex("d2host: fpGetDatabaseCharacter — save bytes ", slot.len);
+    return 0;
+}
+
+/// Hand every fetched save to the engine, outside the join call stack. A zero-length fetch is a
+/// refusal, not a silence: bLock nonzero tells the engine the load failed and it disconnects.
+fn pumpCharacterLoads() void {
+    const send = send_character orelse return;
+    for (&pending) |*p| {
+        if (!p.used) continue;
+        p.used = false;
+        if (p.len == 0) {
+            say("d2host: character fetch failed — refusing the join");
+            _ = send(p.client_id, &p.save, 0, 0, 1, 0, &p.info, 0);
+            continue;
+        }
+        _ = send(p.client_id, &p.save, p.len, p.len, 0, 0, &p.info, 0);
+        sayHex("d2host: character delivered, bytes ", p.len);
+    }
+}
+
 /// The engine call that makes a game, resolved once at startup so the realm handler can use it.
 const CreateGameFn = *const fn (
     [*:0]u8, // game name (written to, not const)
@@ -477,7 +572,8 @@ pub fn main() !void {
     callbacks = .{
         .close_game = Stub("pfCloseGame", 2).ptr,
         .leave_game = Stub("pfLeaveGame", 12).ptr,
-        .get_database_character = Stub("pfGetDatabaseCharacter", 2).ptr,
+        // The one slot that is a real implementation rather than a report: it drives every join.
+        .get_database_character = @ptrCast(&fastcall.Callback2(2, getDatabaseCharacter).shim),
         .save_database_character = Stub("pfSaveDatabaseCharacter", 4).ptr,
         .server_log_message = @ptrCast(&serverLogMessage),
         .enter_game = Stub("pfEnterGame", 3).ptr,
@@ -605,6 +701,13 @@ fn createGame(d2game: HMODULE) !void {
     };
     create_game = @ptrCast(@alignCast(create));
 
+    // @10007 — the async half of fpGetDatabaseCharacter. Without it a fetched save has nowhere to
+    // go and every join stalls, so say so at startup rather than at the first join.
+    if (byOrdinal(d2game, 10007)) |p| {
+        send_character = @ptrCast(@alignCast(p));
+        say("d2host: D2GSSendDatabaseCharacter @10007 resolved");
+    } else say("d2host: ordinal 10007 missing — characters cannot be delivered");
+
     // With a realm, games are made on request and creating one here would be a phantom the realm
     // does not know about. Without one, this is still the quickest proof the engine works.
     var ok: i32 = 1;
@@ -644,6 +747,7 @@ fn createGame(d2game: HMODULE) !void {
     var i: usize = 0;
     var last_beat: usize = 0;
     while (realmConfigured() or i < tick_frames) : (i += 1) {
+        pumpCharacterLoads();
         if (realmConfigured()) {
             pumpRealm();
             // ~5s at 50ms a frame. The record carries a 90s TTL, so missing a few beats under

@@ -489,3 +489,49 @@ What this does *not* do yet: load a character. The callbacks are still reporting
 realm calls, and the 1.14d implementations in `apps/d2gs/engine/realm.zig` cannot be reused as they
 stand — they read the client struct at 1.14d offsets (`ECX-0x5B` for the name, `ECX-8` for the
 container), so the equivalent 1.10f offsets have to be established first.
+
+
+## The host-facing D2Game API, mapped
+
+Blizzard's own `D2Server.dll` imports exactly **26 D2Game ordinals**, which bounds what a host may
+call. A third-party 1.13c server publishes a `D2GSINTERFACE` of named function pointers for the same
+job, and its signatures give the arity of each — so the two together identify most of the set
+without reading a single function body.
+
+|D2GSINTERFACE|args|1.10f ordinal|how it was pinned|
+|-|-|-|-|
+|`D2GSNewEmptyGame`|8|**@10047**|`GAME_CreateNewEmptyGame`, and `RET 0x20`|
+|`D2GSSendDatabaseCharacter`|8|**@10007**|`RET 0x20` and it calls `CLIENTS_AttachSaveFile`|
+|`D2GSEndAllGames`|0|**@10006**|`GAME_CloseAllGames`|
+|`D2GSSendClientChatMessage`|5|**@10018**|the only 5-argument host ordinal|
+|`D2GSSetTickCount` / `D2GSSetACData` / `D2GSLoadConfig`|1|@10016 / @10020 / @10023|not yet separated; all 1-arg|
+|`D2GSStart`|1|—|takes their own `D2GSINFO`, so it is wrapper code, not an ordinal|
+
+Their `EVENTCALLBACKTABLE` is a third independent derivation of the engine→host table and agrees
+with ours on all sixteen slots. Two disagreements of naming rather than layout are worth recording:
+they call slot 0x24 `fpReserved1` and slot 0x30 `fpReserved2`, but we have *observed* the engine
+call 0x30 — it is `pfHandlePacket`. And they declare `void* fpReservedDebug[10]` after the sixteen,
+which means the tail `Extended` models was already there in the DLL era rather than being a 1.14d
+invention; 1.14d's `fpGetDatabaseFileTime` at 0x54 lands inside it.
+
+## The character load
+
+`fpGetDatabaseCharacter` is asynchronous — the call site at 0x6fc37413 discards the return value —
+so the answer goes back through `@10007`:
+
+```
+BOOL __stdcall D2GSSendDatabaseCharacter(
+    DWORD dwClientId, LPVOID lpSaveData, DWORD dwSize, DWORD dwTotalSize,
+    BOOL bLock, DWORD dwReserved1, LPPLAYERINFO lpPlayerInfo, DWORD dwReserved2);
+```
+
+The client-struct offsets are 1.14d's, and that is measured rather than assumed: 1.10f does
+`leal 0x68(%esi), %ecx` immediately before `calll *0x8(%eax)`, and writes the two name fields as a
+consecutive pair into `+0x0D` and `+0x1D` at 0x6fc32685. Same layout, so the pointer arithmetic in
+`apps/d2gs/engine/realm.zig` ports over unchanged.
+
+`apps/d2host` implements it: fetch the save from `packages/gs-store` — the same
+`realmd:char:<account>:<char>` key the 1.14d server already uses — queue it, and deliver from the
+tick loop rather than inside the join call, because delivering synchronously runs the engine's join
+continuation halfway through its own join. A zero-length fetch is delivered as a refusal
+(`bLock` nonzero) rather than dropped, so a client is told rather than left on a loading screen.
