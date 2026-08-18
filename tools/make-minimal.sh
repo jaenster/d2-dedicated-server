@@ -20,6 +20,16 @@ if [ -f "$ROOT/.env" ]; then set -a; . "$ROOT/.env"; set +a; fi
 MAC=0
 if [ "${1:-}" = "--mac" ]; then MAC=1; shift; fi
 
+# An MPQ's (listfile) is optional and often incomplete, and a member it does not name is invisible
+# to the enumerator and so gets dropped from the rebuild. Point D2_LISTFILE at a community listfile
+# to recover those by name hash. A no-op for 1.14d's d2data/d2exp, which name everything they hold;
+# the safety net is for other versions, whose archives have not been checked.
+LISTFILE_ARG=""
+if [ -n "${D2_LISTFILE:-}" ]; then
+    [ -f "$D2_LISTFILE" ] || { echo "D2_LISTFILE=$D2_LISTFILE not found"; exit 1; }
+    LISTFILE_ARG="--listfile $D2_LISTFILE"
+fi
+
 D2_INSTALL="${D2_INSTALL:-${1:-}}"
 STUB="$ROOT/tools/stub.mpq"
 MPQMIN="$ROOT/tools/mpqmin/mpqmin"
@@ -53,7 +63,8 @@ shrink() { # shrink <name> [mpqmin flags...] — rebuild an archive with only wh
     local src; src="$(find_ci "$name")"
     if [ -z "$src" ]; then echo "MISSING: $name (not found in $D2_INSTALL)"; missing=1; return; fi
     rm -f "$OUT/$name"
-    "$MPQMIN" "$@" "$src" "$OUT/$name"
+    # shellcheck disable=SC2086  # LISTFILE_ARG is deliberately two words or empty
+    "$MPQMIN" $LISTFILE_ARG "$@" "$src" "$OUT/$name"
 }
 
 if [ "$MAC" = 1 ]; then
@@ -79,8 +90,9 @@ else
     for f in Game.exe D2.LNG binkw32.dll SmackW32.dll ijl11.dll; do take "$f"; done
     shrink d2data.mpq
     shrink d2exp.mpq
-    # Patch_D2.mpq is copied, not rebuilt: it ships without a (listfile), so its members have no
-    # names to filter on — and at 2 MB there is nothing worth filtering.
+    # Patch_D2.mpq is copied, not rebuilt: its own (listfile) names only a fraction of what it
+    # holds (153 keep-rule members of 1.14d's are unlisted), so rebuilding it from an enumeration
+    # would silently drop them — and at 2 MB there is nothing worth filtering.
     take Patch_D2.mpq
     # Media MPQs the headless server doesn't need — replaced by empty stubs.
     for f in d2char.mpq d2music.mpq d2sfx.mpq d2speech.mpq d2Xmusic.mpq d2Xtalk.mpq d2Xvideo.mpq; do
