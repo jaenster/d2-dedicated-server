@@ -154,6 +154,12 @@ fn getDatabaseCharacter(ecx: usize, edx: usize, client_id: usize, account: usize
     // The realm's JOINGAME is the only place the account is known; the engine leaves its own field
     // empty on this path, so fall back to it only if we were never told.
     const acct_name = accountFor(char_name) orelse std.mem.sliceTo(sz_acct, 0);
+    if (acct_name.len == 0) {
+        // Nothing told us the account: the engine leaves its field empty on this path and no
+        // JOINGAME for this character reached us. Say so, because the alternative is a fetch
+        // against `realmd:char::<char>` that misses for a reason nothing explains.
+        sayFmt("d2host: no account known for '{s}' — the realm sent no JOINGAME for it", .{char_name});
+    }
 
     const slot = for (&pending) |*p| {
         if (!p.used) break p;
@@ -314,7 +320,10 @@ const JoinContext = struct {
 var join_contexts: [16]JoinContext = @splat(.{});
 
 fn rememberJoin(char: []const u8, account: []const u8) void {
-    if (char.len == 0 or account.len == 0) return;
+    if (char.len == 0 or account.len == 0) {
+        sayFmt("d2host: JOINGAME with no char/account to cache ('{s}'/'{s}')", .{ char, account });
+        return;
+    }
     // Newest wins: a re-join of the same character replaces its entry rather than filling the
     // table with stale copies.
     const slot = for (&join_contexts) |*j| {
@@ -339,6 +348,7 @@ fn accountFor(char: []const u8) ?[]const u8 {
 /// `JOINGAMEREQ: gameid, token, charname\0, account\0`. The realm has already authorised this
 /// join; the engine validates it again through `fpFindPlayerToken` when the client connects.
 fn handleJoinGame(seq: u32, body: []const u8) void {
+    sayFmt("d2host: JOINGAME seq {d}, {d} body bytes", .{ seq, body.len });
     var reply = std.mem.zeroes(proto.JoinGameReply);
     reply.h = proto.header(.joingame, @sizeOf(proto.JoinGameReply), seq);
     if (body.len < 8) {
@@ -365,10 +375,13 @@ fn pumpRealm() void {
     const typ = std.mem.readInt(u16, buf[2..4], .little);
     const seq = std.mem.readInt(u32, buf[4..8], .little);
     if (size > n or size < proto.HEADER_LEN) return; // truncated; nothing sensible to answer
+    // Every request is announced, including ones we do not handle. A realm message that arrives
+    // and is quietly ignored is indistinguishable from one that never arrived, and that ambiguity
+    // is expensive to debug from the other end.
     switch (@as(proto.Type, @enumFromInt(typ))) {
-        .creategame => handleCreateGame(seq, buf[proto.HEADER_LEN..size]),
-        .joingame => handleJoinGame(seq, buf[proto.HEADER_LEN..size]),
-        else => {},
+        .creategame => handleCreateGame(seq, buf[proto.HEADER_LEN .. size]),
+        .joingame => handleJoinGame(seq, buf[proto.HEADER_LEN .. size]),
+        else => sayFmt("d2host: realm request type 0x{x} seq {d} — not handled", .{ typ, seq }),
     }
 }
 
