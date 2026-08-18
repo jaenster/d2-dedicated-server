@@ -583,8 +583,40 @@ store and checksummed it. Five things had to be right, and each was wrong first:
    needs to lock that client's game. Answering 0 fails the delivery with
    `*** Failed SrvLockGame for client N ***` — it is the engine's state, but ours to hold.
 
-**What still does not work:** nothing the engine sends reaches the socket. It logs "Sent game init"
-and "Sent ACTINITDONE", but `SERVER_Send` @10006 is called zero times, so the outbound path uses
-something we have not identified — @10015 turned out to be a kick-with-reason
-(`clientId, szFile, nLine`), not a send. Until that is found the client is joined from the engine's
-point of view and silent from its own.
+### Outbound: found the path, not yet the trigger
+
+Nothing the engine sends reaches the socket. It is not a missing send call — the path is now mapped
+end to end:
+
+`D2GAME_PACKETS_SendPacket` @0x6fc3c710 does not touch a socket at all; it **queues** into a
+per-client list (`CLIENTS_PacketDataList_Append`) in 0x200-byte chunks. The drain is
+`@10045` → `FUN_6fc386d0` → `D2GAME_UpdateAllClients` @0x6fc389c0, which is where the
+`SERVER_Send` call sites live. So a tick without @10045 leaves a client joined and permanently mute.
+
+Blizzard's worker loop, from `D2Server.dll` @0x10009DE0, argument for argument:
+
+```
+esi = D2Game@10041()                        acquire a worker slot index (0, 1, ... & 0x1f)
+loop: if (shutdown_flag) break
+      D2Game@10043(ecx=esi, edx=&game)      process one game
+      D2Net @10022(timeout)                 wait for network
+      if (that returned) D2Game@10003()     pump the network only when there is traffic
+      if (game) D2Game@10045(ecx=esi, edx=game)   flush that game's clients
+```
+
+`apps/d2host` implements this. Two hazards found the hard way, both recorded in the code:
+
+- **@10045 halts rather than returning** when a game is not ready — `ARENA_NeedsClientUpdate` false
+  is "This should never happen! [sUpdateClients]" to it. Its own precondition is
+  `(*(u8*)(inner[0x1d28] + 8) >> 2) & 1` where `inner` is `*(game+8)`, but those pointers are not
+  reliably valid at this stage, so the host gates on its own connected-client count instead.
+- **The record the vtable allocates is the game object**, not a handle to one: its CRITICAL_SECTION
+  is at +0x18, its client list at +0x88 and flags at +0xA8. A 0x40-byte record put all of that in
+  the next record. The size is not passed to the allocator — the call arrives as `(slot, 0, 0)` —
+  so the record is deliberately over-sized rather than measured, and pinning the true size is
+  outstanding.
+
+What is left is the **trigger**: `@10043` hands the worker a game once, right after creation, and
+then stops, so the flush almost never runs. `@10039` (TASK_InitializeClock) is called at startup and
+`@10040` turned out to be shutdown (stop flag, wait, free queue slots), so something else re-arms a
+game in the task system and has not been found yet.

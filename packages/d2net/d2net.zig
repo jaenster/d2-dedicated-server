@@ -410,6 +410,17 @@ export fn SERVER_WSAGetLastError(a: u32, b: u32, c: u32) callconv(.winapi) u32 {
     return @bitCast(WSAGetLastError());
 }
 
+/// How many clients are connected. Ours to answer, and the host uses it to decide whether the
+/// engine's per-game update is safe to drive: that path halts the process on a game with nothing
+/// in it, and a count we already keep is a safer test than walking the engine's own structures.
+export fn D2NET_ConnectedClients() callconv(.winapi) u32 {
+    var n: u32 = 0;
+    for (&clients) |*c| {
+        if (c.active()) n += 1;
+    }
+    return n;
+}
+
 /// mingw auto-exports every `export fn` a second time under its decorated name, numbered from just
 /// above the highest ordinal the .def uses. Left alone they would land on 10027-10047 — inside real
 /// D2Net's own ordinal range (it ends at 10040) — so an engine build importing one of those numbers

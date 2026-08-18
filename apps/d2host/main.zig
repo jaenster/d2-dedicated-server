@@ -219,6 +219,18 @@ fn findPlayerToken(ecx: usize, edx: usize, game_id: usize, account: usize, s3: u
     return 1;
 }
 
+/// Resolved from our own D2Net, by name.
+var connected_clients_fn: ?*const fn () callconv(.winapi) u32 = null;
+
+fn connectedClients() u32 {
+    const f = connected_clients_fn orelse return 0;
+    return f();
+}
+
+var flush_logged = false;
+var flushes: usize = 0;
+var alloc_logged = false;
+
 /// The engine call that makes a game, resolved once at startup so the realm handler can use it.
 const CreateGameFn = *const fn (
     [*:0]u8, // game name (written to, not const)
@@ -546,12 +558,19 @@ const GameDataVTable = extern struct {
     terminator: ?*const anyopaque = null,
 };
 
-/// One per-game record. The engine writes `[rec]` and `[rec+0x14]` and threads `[rec+4]` through
-/// its list, so it is at least 0x18 bytes; the rest is headroom rather than a known layout.
-const GameRecord = extern struct { bytes: [0x40]u8 align(4) = @splat(0) };
+/// One per-game record — and it is the engine's **game object**, not a handle to one. That is easy
+/// to under-size: the engine writes `[rec]`, `[rec+4]` and `[rec+0x14]` early, then treats the same
+/// allocation as a full game, with its CRITICAL_SECTION at +0x18, its client list at +0x88 and
+/// flags at +0xA8 (`D2GAME_UpdateAllClients` @0x6fc389c0). A 0x40-byte record let all of that land
+/// in the next record and halted the engine with "This should never happen! [sUpdateClients]".
+///
+/// The vtable is not told the size — it arrives as `(slot, 0, 0)`, because in Blizzard's host this
+/// is a template that knows its element type — so this is deliberately generous rather than
+/// measured. Pinning the true size is worth doing; guessing it small is not.
+const GameRecord = extern struct { bytes: [0x2000]u8 align(16) = @splat(0) };
 
-/// 0x400 is the size of D2Game's own game array, so it cannot need more records than that.
-var game_records: [0x400]GameRecord = @splat(.{});
+/// Well past the seven games a single engine has memory pools for.
+var game_records: [64]GameRecord = @splat(.{});
 var records_used: usize = 0;
 
 /// `[this+8]` is dereferenced as a node on every insert (`edx = [esi+8]; edi = [edx+4]`), including
@@ -579,7 +598,13 @@ const record_link_offset = 0x20;
 /// so `slot+8` is the bucket head and `slot+0` is the byte offset of the chain link inside a
 /// record. Leaving the bucket empty makes every lookup miss, which surfaces much later and much
 /// less helpfully as `SrvJoinGame: *** Failed to lock game N ***`.
-fn allocRecord(_: usize, _: usize, slot: usize, _: usize, _: usize) callconv(.c) usize {
+fn allocRecord(_: usize, _: usize, slot: usize, a: usize, b: usize) callconv(.c) usize {
+    // The size is not passed — `(slot, 0, 0)` — because in Blizzard's host this is a template
+    // that knows its element type. Recorded once so the next person does not go looking for it.
+    if (!alloc_logged) {
+        alloc_logged = true;
+        sayFmt("d2host: alloc_record(slot=0x{x}, a=0x{x}, b=0x{x})", .{ slot, a, b });
+    }
     if (records_used >= game_records.len) {
         say("d2host: game-data records exhausted");
         return 0;
@@ -770,6 +795,7 @@ pub fn main() !void {
 
     // Ours, by name: tell the transport where to listen before it binds. Not an ordinal, because
     // it is not part of the D2Net ABI the engine imports.
+    connected_clients_fn = @ptrCast(@alignCast(GetProcAddress(d2net, "D2NET_ConnectedClients")));
     if (GetProcAddress(d2net, "D2NET_SetListenPort")) |p| {
         const port = public_port;
         @as(*const fn (u16) callconv(.winapi) void, @ptrCast(@alignCast(p)))(port);
@@ -887,13 +913,29 @@ fn createGame(d2game: HMODULE) !void {
         return;
     }
 
-    // The tick is the two calls Blizzard's own host makes, and no others. D2Server.dll imports 26
-    // D2Game ordinals and @10004/@10005 are not among them: driving those halts the engine with
-    // "This should never happen! [sUpdateClients]" (Game.cpp:2944) as soon as a game has a client
-    // in it. Its worker threads run @10043 (TASK_ProcessGame); the main thread pumps the network
-    // with @10003.
+    // The tick is Blizzard's worker loop, argument for argument. Its shape is not guessable and
+    // getting it wrong is what kept the engine's replies off the wire: it queues outbound packets
+    // per client (`CLIENTS_PacketDataList_Append`) and only @10045 drains them to D2Net, so a tick
+    // without it leaves a client joined and permanently silent.
+    //
+    // D2Server.dll @0x10009DE0:
+    //     esi = @10041()                            acquire a worker context
+    //     loop: @10043(ecx=esi, edx=&game)          process one game
+    //           if (game) @10045(ecx=esi, edx=game) flush that game's clients
+    //
+    // Calling @10005 directly instead — it is the flush's inner half — halts the engine with
+    // "This should never happen! [sUpdateClients]"; it is reached *through* @10045, and D2Server
+    // does not import it at all.
     const netmsgs = byOrdinal(d2game, 10003);
-    const process_games = byOrdinal(d2game, 10043);
+    const worker_ctx_fn = byOrdinal(d2game, 10041);
+    const process_game = byOrdinal(d2game, 10043);
+    const flush_game = byOrdinal(d2game, 10045);
+
+    var worker_ctx: usize = 0;
+    if (worker_ctx_fn) |p| {
+        worker_ctx = @as(*const fn () callconv(.c) usize, @ptrCast(@alignCast(p)))();
+        sayHex("d2host: worker context ", worker_ctx);
+    } else say("d2host: ordinal 10041 missing — games cannot be processed");
     // Announced per call, not per frame: a tick that never returns is the failure mode here, and
     // only naming the call in flight distinguishes "hung in @10004" from "hung in @10005".
     // Long enough to connect to by hand. The transport polls inside the read path, so a frame is
@@ -913,8 +955,44 @@ fn createGame(d2game: HMODULE) !void {
             }
         }
         if (netmsgs) |p| @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();
-        if (process_games) |p| @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();
-        Sleep(50);
+
+        // Drain every game the worker has ready, not just one per frame: at 50 ms a frame a
+        // single game per tick is a hard cap on how fast anything reaches a client.
+        if (process_game) |proc| {
+            var spins: usize = 0;
+            while (spins < 64) : (spins += 1) {
+                var game: usize = 0;
+                _ = fastcall.fastcallAt(fn (usize, *usize) callconv(.c) usize)
+                    .call(@intFromPtr(proc), .{ worker_ctx, &game });
+                if (game == 0) break;
+                if (!flush_logged) {
+                    flush_logged = true;
+                    sayHex("d2host: worker handed us a game at ", game);
+                }
+                // @10045 ends in D2GAME_UpdateAllClients, which *halts the process* unless the
+                // game wants a client update: it calls ARENA_NeedsClientUpdate first and treats a
+                // false there as "this should never happen". The condition is the engine's own —
+                // `(*(u8*)(inner[0x1d28] + 8) >> 2) & 1`, where `inner` is `*(game+8)` — so we
+                // test it rather than discover it as a crash.
+                // @10045 ends in D2GAME_UpdateAllClients, which halts the process rather than
+                // returning when a game is not ready for one — `ARENA_NeedsClientUpdate` false is
+                // "this should never happen" to it. Its own precondition lives behind two engine
+                // pointers that are not yet valid at this stage of bring-up, so gate on something
+                // we own instead: with nobody connected there is nothing to flush anyway.
+                if (flush_game) |flush| {
+                    if (connectedClients() > 0) {
+                        flushes += 1;
+                        if (flushes % 200 == 1) sayFmt("d2host: flushed {d} game frame(s)", .{flushes});
+                        _ = fastcall.fastcallAt(fn (usize, usize) callconv(.c) usize)
+                            .call(@intFromPtr(flush), .{ worker_ctx, game });
+                    }
+                }
+            }
+        }
+        // 10 ms is the idle cadence a third-party host publishes as DEFAULT_IDLE_SLEEP, and
+        // Blizzard's own worker loop is tighter still — it spins on a network wait rather than
+        // sleeping. At 50 ms the engine's scheduler rarely had a game ready when we asked.
+        Sleep(10);
     }
     say("d2host: tick loop finished");
 }
