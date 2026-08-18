@@ -435,7 +435,39 @@ The send signature came from the engine's own call site rather than a guess: `pu
 push clientId; push 2` at 0x6fc381a2 makes it `SERVER_Send(kind, clientId, pData, nLen)`, and the
 `@10016` called immediately after a rejection send is the disconnect.
 
-What this does *not* do yet: mean anything at the protocol level. The bytes we send are arbitrary,
-the stream is handed over in whatever chunks `recv` returns rather than split into packets, and the
-callbacks are still reporting stubs rather than realm calls. But the transport seam is ours, end to
-end, which was the point of replacing D2Net.
+15. **The stream is framed into packets.** A TCP read is not a packet and D2Game will not tolerate
+    being handed one. The real D2Net framed before the engine ever saw the bytes:
+    `SERVER_ValidateClientPacket` @0x6FC01FE0 calls `SERVER_GetClientPacketSize` @0x6FC01E60, which
+    indexes a table at **0x6FC08418** by the leading opcode and rejects anything at or above 0x70
+    (except 0xFF) or longer than 0x204. That table is now in `packages/d2net`, read out of 1.10f's
+    own binary. Verified both ways: three packets sent in a single write arrive as three, and a
+    packet split across two writes is reassembled.
+
+### A 1.14d client cannot join a 1.10f server
+
+Worth stating plainly, because the opposite is a reasonable guess. Against 1.14d's equivalent table
+(libd2 `net.cs.OUTGOING_SIZE`, dumped from `NET_D2GS_CLIENT_OUTGOING_SIZE @0x00730dc0`), **102 of
+112 entries are identical** — every gameplay opcode 0x00-0x63 matches byte for byte.
+
+All ten differences fall in 0x64-0x6F, the join and handshake range:
+
+|opcode|1.10f|1.14d|
+|-|-|-|
+|0x64|9|0|
+|0x65|17|0|
+|0x66|46|-1|
+|0x67|29|46|
+|**0x68**|**1**|**37**|
+|0x6b|-1|1|
+|0x6c|9|-1|
+|0x6d|1|13|
+|0x6e|0|1|
+|0x6f|1|0|
+
+`0x68` is the client's first packet. A 1.14d client sends 37 bytes; a 1.10f server frames 1 and
+treats the remaining 36 as the start of the next packet, so the stream desynchronises before
+anything else happens. The gameplay vocabulary is shared; the handshake is not. Testing needs a
+1.10f-era client, or our own clientless one taught this table.
+
+What this does *not* do yet: load a character. The callbacks are still reporting stubs rather than
+realm calls.
