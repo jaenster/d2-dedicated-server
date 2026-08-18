@@ -622,3 +622,27 @@ loop: @10043(ecx=esi, edx=&task)            take the due task; returns ms until 
 
 `TASK_GetNextDueTask` (@10043) and `TASK_ProcessGameTask` (@10045) are named and described in the
 shared Ghidra database, along with `GAME_UpdateAllClients` and its halt condition.
+
+
+## The stock 1.10f client will not run here (SafeDisc)
+
+Worth writing down, because it looks like a configuration problem for a long time and is not one.
+
+`Game.exe` extracts `CmdLineExt03.dll` into `%TEMP%` at startup and loads it; under wine that faults
+writing to its own image base. Disabling it (`WINEDLLOVERRIDES="CmdLineExt03=d"`) clears that crash
+and the next one is a divide-by-zero at 0x00416277 — inside an XOR decryption loop in a section
+named `.uako`. The section table settles it:
+
+|binary|sections|
+|-|-|
+|1.10f `Game.exe`|`.text .rdata .data` **`.uako .mnkam`** `.idata .rsrc`|
+|1.14d `Game.exe`|`.text .rdata .data .rsrc .reloc`|
+
+1.10f is SafeDisc-wrapped and 1.14d is not, which is why the 1.14d client runs here without
+ceremony. Replicating the 1.10f patch does not help: the patch is where that `Game.exe` comes from.
+Driving a stock 1.10f client needs the disc or an unwrapped binary.
+
+The consequence for testing is that the client has to be ours. That is not a downside — a scripted
+client is a better test than a headed one — but it does mean the packet vocabulary cannot live
+inside a Windows DLL where nothing else can reach it, which is why it moved to
+`packages/d2engine/cs_packets.zig`.

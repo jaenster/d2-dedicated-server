@@ -7,6 +7,7 @@ pub const callbacks = @import("callbacks.zig");
 pub const version = @import("version.zig");
 pub const hostapi = @import("hostapi.zig");
 pub const gameflags = @import("gameflags.zig");
+pub const cs_packets = @import("cs_packets.zig");
 
 // A test artifact rooted here only runs the tests of files it actually analyses.
 test {
@@ -14,4 +15,5 @@ test {
     _ = version;
     _ = hostapi;
     _ = gameflags;
+    _ = cs_packets;
 }

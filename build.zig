@@ -159,6 +159,7 @@ pub fn build(b: *std.Build) void {
     });
     d2host.root_module.addImport("fastcall", fastcall_mod);
     d2host.root_module.addImport("gs_store", gs_store);
+    d2host.root_module.addImport("d2engine", d2engine);
     d2host.root_module.addImport("realm_proto", realm_proto);
     b.installArtifact(d2host);
     b.step("d2host", "Build the pre-1.14 DLL host (x86-windows exe)")
@@ -196,6 +197,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     d2net.root_module.addObjectFile(b.path("packages/d2net/d2net.def"));
+    d2net.root_module.addImport("d2engine", d2engine);
     b.installArtifact(d2net);
     b.step("d2net", "Build our replacement D2Net.dll (x86-windows)")
         .dependOn(&b.addInstallArtifact(d2net, .{}).step);
