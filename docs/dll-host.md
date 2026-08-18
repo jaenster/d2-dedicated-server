@@ -540,3 +540,51 @@ consecutive pair into `+0x0D` and `+0x1D` at 0x6fc32685. Same layout, so the poi
 tick loop rather than inside the join call, because delivering synchronously runs the engine's join
 continuation halfway through its own join. A zero-length fetch is delivered as a refusal
 (`bLock` nonzero) rather than dropped, so a client is told rather than left on a loading screen.
+
+
+## A character joins a game on the 1.10f engine
+
+The whole closed-realm path, with `apps/d2host` as the only game server on the realm:
+
+```
+d2host: JOINGAME cached t110f/Tenf for the character fetch
+d2net: client 0 packet 0x67 (29 bytes)
+d2host: fpFindPlayerToken - /Tenf gameid=1 token=0x1
+d2net: client 0 joined game 0x1
+engine[6]: [CLIENT]  ClientAddToGame:  Added client 0 'Tenf' to game 1 'live4'
+engine[6]: [SERVER]  sSrvSendGameInit: Sent game init to client 0 'Tenf' for game 1 'live4'
+engine[6]: [SERVER]  SrvJoinGame:      client 0 'Tenf' joined game 1 'live4'
+d2host: fpGetDatabaseCharacter - save bytes 0x14f
+engine[7]: [LOAD]    CKSUM:5ADBB0FD len:335  Tenf
+engine[6]: [SERVER]  SrvRecvDatabaseCharacter: Sent ACTINITDONE for client 0 'Tenf'
+```
+
+realmd created the game, the client joined it, the engine loaded the character out of the shared
+store and checksummed it. Five things had to be right, and each was wrong first:
+
+1. **The join is opcode 0x67, 29 bytes, on message list 0.** `CCMD_ProcessClientSystemMessage`
+   owns 0x66-0x6F and `GAME_VerifyJoinGame` hangs off its 0x67 case. 1.14d joins with 0x68 at 37
+   bytes — the opcode shifted by one and the payload grew, which is why a 1.14d client
+   desynchronises here rather than being cleanly refused. Layout:
+   `u8 0x67 | u32 token | u16 gameId | u8 (<=6) | u32 | u8 class (<=0xC) | char name[16]`.
+2. **The host owns the game-lookup index.** `D2GameDataTable_Ptr` @0x6fc3b6a0 reads a bucket head
+   at `slots + (gameId & mask)*12 + 8` and the chain-link offset at `+0`, and `alloc_record` is
+   handed that bucket — so populating it is the host's job. Leaving it empty surfaces much later
+   as `SrvJoinGame: *** Failed to lock game N ***`.
+3. **Tick with the ordinals Blizzard's host uses.** `D2Server.dll` imports 26 D2Game ordinals and
+   @10004/@10005 are not among them. Driving those halts the engine with
+   `This should never happen! [sUpdateClients]` the moment a game has a client in it. The tick is
+   @10003 (network) and @10043 (games).
+4. **The account comes from the realm, not the engine.** The engine leaves `pClient+0x1D` empty on
+   the join path, so the save key would be `realmd:char::<char>`. The realm's JOINGAME carries the
+   account; caching it there is what makes the fetch resolve.
+5. **The transport remembers which game a client is in.** The engine calls
+   `SERVER_SetClientGameGUID` on join and reads it back with `SERVER_GetClientGameGUID` whenever it
+   needs to lock that client's game. Answering 0 fails the delivery with
+   `*** Failed SrvLockGame for client N ***` — it is the engine's state, but ours to hold.
+
+**What still does not work:** nothing the engine sends reaches the socket. It logs "Sent game init"
+and "Sent ACTINITDONE", but `SERVER_Send` @10006 is called zero times, so the outbound path uses
+something we have not identified — @10015 turned out to be a kick-with-reason
+(`clientId, szFile, nLine`), not a send. Until that is found the client is joined from the engine's
+point of view and silent from its own.

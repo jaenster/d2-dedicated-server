@@ -150,7 +150,9 @@ fn getDatabaseCharacter(ecx: usize, edx: usize, client_id: usize, account: usize
     const sz_char: [*:0]const u8 = @ptrFromInt(ecx -% 0x5B); // pClient+0x0D
     const sz_acct: [*:0]const u8 = @ptrFromInt(ecx -% 0x4B); // pClient+0x1D
     const char_name = std.mem.sliceTo(sz_char, 0);
-    const acct_name = std.mem.sliceTo(sz_acct, 0);
+    // The realm's JOINGAME is the only place the account is known; the engine leaves its own field
+    // empty on this path, so fall back to it only if we were never told.
+    const acct_name = accountFor(char_name) orelse std.mem.sliceTo(sz_acct, 0);
 
     const slot = for (&pending) |*p| {
         if (!p.used) break p;
@@ -272,6 +274,65 @@ fn handleCreateGame(seq: u32, body: []const u8) void {
     _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
 }
 
+/// Who is joining, remembered from the realm's JOINGAME so the character fetch can find them.
+///
+/// The engine's join path carries the character name and the token but **never the account** — it
+/// leaves `pClient+0x1D` empty — and the save is keyed by account. Without this the fetch looks up
+/// `realmd:char::<char>` and misses, which surfaces as a refused join with nothing to explain it.
+const JoinContext = struct {
+    used: bool = false,
+    char: [24]u8 = @splat(0),
+    account: [24]u8 = @splat(0),
+
+    fn charName(self: *const JoinContext) []const u8 {
+        return std.mem.sliceTo(&self.char, 0);
+    }
+};
+
+var join_contexts: [16]JoinContext = @splat(.{});
+
+fn rememberJoin(char: []const u8, account: []const u8) void {
+    if (char.len == 0 or account.len == 0) return;
+    // Newest wins: a re-join of the same character replaces its entry rather than filling the
+    // table with stale copies.
+    const slot = for (&join_contexts) |*j| {
+        if (j.used and std.mem.eql(u8, j.charName(), char)) break j;
+    } else for (&join_contexts) |*j| {
+        if (!j.used) break j;
+    } else &join_contexts[0];
+
+    slot.* = .{ .used = true };
+    @memcpy(slot.char[0..@min(char.len, 23)], char[0..@min(char.len, 23)]);
+    @memcpy(slot.account[0..@min(account.len, 23)], account[0..@min(account.len, 23)]);
+    sayFmt("d2host: JOINGAME cached {s}/{s} for the character fetch", .{ account, char });
+}
+
+fn accountFor(char: []const u8) ?[]const u8 {
+    for (&join_contexts) |*j| {
+        if (j.used and std.mem.eql(u8, j.charName(), char)) return std.mem.sliceTo(&j.account, 0);
+    }
+    return null;
+}
+
+/// `JOINGAMEREQ: gameid, token, charname\0, account\0`. The realm has already authorised this
+/// join; the engine validates it again through `fpFindPlayerToken` when the client connects.
+fn handleJoinGame(seq: u32, body: []const u8) void {
+    var reply = std.mem.zeroes(proto.JoinGameReply);
+    reply.h = proto.header(.joingame, @sizeOf(proto.JoinGameReply), seq);
+    if (body.len < 8) {
+        reply.result = 1;
+        _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
+        return;
+    }
+    const gameid = std.mem.readInt(u32, body[0..4], .little);
+    var off: usize = 8;
+    const charname = proto.readCStr(body, &off);
+    const account = proto.readCStr(body, &off);
+    rememberJoin(charname, account);
+    reply.gameid = gameid;
+    _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
+}
+
 /// Take at most one request per tick, which is what the DLL server does — the queue is drained by
 /// the tick rate rather than in a burst, so one slow creation cannot stall the game loop.
 fn pumpRealm() void {
@@ -284,6 +345,7 @@ fn pumpRealm() void {
     if (size > n or size < proto.HEADER_LEN) return; // truncated; nothing sensible to answer
     switch (@as(proto.Type, @enumFromInt(typ))) {
         .creategame => handleCreateGame(seq, buf[proto.HEADER_LEN..size]),
+        .joingame => handleJoinGame(seq, buf[proto.HEADER_LEN..size]),
         else => {},
     }
 }
@@ -383,11 +445,52 @@ fn QStub(comptime name: []const u8, comptime n_stack: usize) type {
     };
 }
 
-/// cdecl varargs, not fastcall — the engine's own logger.
+/// cdecl varargs, not fastcall — the engine's own logger, and the only channel through which it
+/// explains itself. Formatting it rather than counting the calls is the difference between "the
+/// join failed" and knowing which check refused it.
 fn serverLogMessage(level: i32, fmt: [*:0]const u8, ...) callconv(.c) void {
-    _ = level;
-    say("d2host: engine called pfServerLogMessage");
-    sayHex("d2host:   fmt=", @intFromPtr(fmt));
+    var ap = @cVaStart();
+    defer @cVaEnd(&ap);
+    var buf: [512]u8 = undefined;
+    sayFmt("engine[{d}]: {s}", .{ level, cformat(&buf, fmt, &ap) });
+}
+
+/// Enough of C's `%` vocabulary to read the engine's own messages. An unknown directive is emitted
+/// verbatim, so a message we cannot fully format is still legible rather than lost.
+fn cformat(buf: []u8, fmt: [*:0]const u8, ap: anytype) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (fmt[i] != 0 and n < buf.len) {
+        if (fmt[i] != '%') {
+            buf[n] = fmt[i];
+            n += 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while (fmt[i] != 0 and (fmt[i] == '-' or fmt[i] == '+' or fmt[i] == ' ' or fmt[i] == '#' or
+            fmt[i] == '.' or fmt[i] == 'l' or fmt[i] == 'h' or (fmt[i] >= '0' and fmt[i] <= '9'))) i += 1;
+        const rest = buf[n..];
+        switch (fmt[i]) {
+            0 => break,
+            's' => {
+                const p = @cVaArg(ap, ?[*:0]const u8);
+                const v = if (p) |q| std.mem.sliceTo(q, 0) else "(null)";
+                n += (std.fmt.bufPrint(rest, "{s}", .{v}) catch break).len;
+            },
+            'd', 'i' => n += (std.fmt.bufPrint(rest, "{d}", .{@cVaArg(ap, i32)}) catch break).len,
+            'u' => n += (std.fmt.bufPrint(rest, "{d}", .{@cVaArg(ap, u32)}) catch break).len,
+            'x' => n += (std.fmt.bufPrint(rest, "{x}", .{@cVaArg(ap, u32)}) catch break).len,
+            'X' => n += (std.fmt.bufPrint(rest, "{X}", .{@cVaArg(ap, u32)}) catch break).len,
+            'c' => n += (std.fmt.bufPrint(rest, "{c}", .{@as(u8, @truncate(@cVaArg(ap, u32)))}) catch break).len,
+            else => |c| {
+                buf[n] = c;
+                n += 1;
+            },
+        }
+        i += 1;
+    }
+    return buf[0..n];
 }
 
 /// stdcall, one arg.
@@ -457,17 +560,26 @@ var list_sentinel: [4]usize align(4) = @splat(0);
 
 var vtable: GameDataVTable = undefined;
 
-/// vtable +0x04. `__thiscall (this /*ECX*/, D2GameToken* slot, int a, int b) -> void*`.
+/// Byte offset within a record of the chain link this host maintains. The engine writes
+/// `record[0]` (the game id) and `record[1]` and `record[0x14]` itself, so the link has to live
+/// clear of those — and it can, because the *engine reads the offset out of the slot* rather than
+/// assuming one.
+const record_link_offset = 0x20;
+
+/// vtable +0x04. `__thiscall (this /*ECX*/, slot* /*the hash bucket*/, int, int) -> void*`.
 ///
-/// The engine takes the result as the new game's record: it links it into `[this+8]` and then
-/// writes through it, so returning null trips D2Game's own assert at DataTbls line 0x2d2. Handing
-/// back zeroed storage also steers it to the insert path rather than the free-list pop, which is
-/// the correct behaviour for a game that has never existed before.
-fn allocRecord(this: usize, _: usize, slot: usize, a: usize, b: usize) callconv(.c) usize {
-    _ = this;
-    _ = slot;
-    _ = a;
-    _ = b;
+/// Two jobs, and the second one is easy to miss. The engine takes the result as the new game's
+/// record and links it into `[this+8]`, so returning null trips its assert. But it also expects
+/// **the bucket to be populated by us**: `D2GameDataTable_Ptr` @0x6fc3b6a0 looks a game up as
+///
+///     slot = this[0x1c] + (gameId & this[0x24]) * 12
+///     rec  = *(slot + 8);  while (rec > 0) { if (*rec == gameId) return rec;
+///                                            rec = *(rec + *(slot + 0) + 4) }
+///
+/// so `slot+8` is the bucket head and `slot+0` is the byte offset of the chain link inside a
+/// record. Leaving the bucket empty makes every lookup miss, which surfaces much later and much
+/// less helpfully as `SrvJoinGame: *** Failed to lock game N ***`.
+fn allocRecord(_: usize, _: usize, slot: usize, _: usize, _: usize) callconv(.c) usize {
     if (records_used >= game_records.len) {
         say("d2host: game-data records exhausted");
         return 0;
@@ -475,6 +587,16 @@ fn allocRecord(this: usize, _: usize, slot: usize, a: usize, b: usize) callconv(
     const rec = &game_records[records_used];
     records_used += 1;
     rec.* = .{};
+
+    // Chain onto whatever this bucket already held, so two games that hash together both stay
+    // findable. The link offset is ours to choose because the engine reads it back from the slot.
+    if (slot != 0) {
+        const bucket: [*]usize = @ptrFromInt(slot);
+        const link: *usize = @ptrFromInt(@intFromPtr(rec) + record_link_offset + 4);
+        link.* = bucket[2];
+        bucket[0] = record_link_offset;
+        bucket[2] = @intFromPtr(rec);
+    }
     return @intFromPtr(rec);
 }
 
@@ -765,10 +887,13 @@ fn createGame(d2game: HMODULE) !void {
         return;
     }
 
-    // Tick it a few times: progress the games, pump the network, update clients.
-    const progress = byOrdinal(d2game, 10004);
+    // The tick is the two calls Blizzard's own host makes, and no others. D2Server.dll imports 26
+    // D2Game ordinals and @10004/@10005 are not among them: driving those halts the engine with
+    // "This should never happen! [sUpdateClients]" (Game.cpp:2944) as soon as a game has a client
+    // in it. Its worker threads run @10043 (TASK_ProcessGame); the main thread pumps the network
+    // with @10003.
     const netmsgs = byOrdinal(d2game, 10003);
-    const clients = byOrdinal(d2game, 10005);
+    const process_games = byOrdinal(d2game, 10043);
     // Announced per call, not per frame: a tick that never returns is the failure mode here, and
     // only naming the call in flight distinguishes "hung in @10004" from "hung in @10005".
     // Long enough to connect to by hand. The transport polls inside the read path, so a frame is
@@ -787,15 +912,8 @@ fn createGame(d2game: HMODULE) !void {
                 _ = store.putHeartbeat(gsid, public_ip, public_port, max_games, live_games, live_games >= max_games, 90);
             }
         }
-        if (progress) |p| {
-            _ = @as(*const fn (i32) callconv(.winapi) i32, @ptrCast(@alignCast(p)))(0);
-        }
-        if (netmsgs) |p| {
-            @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();
-        }
-        if (clients) |p| {
-            @as(*const fn (i32, i32) callconv(.winapi) void, @ptrCast(@alignCast(p)))(0, 0);
-        }
+        if (netmsgs) |p| @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();
+        if (process_games) |p| @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();
         Sleep(50);
     }
     say("d2host: tick loop finished");

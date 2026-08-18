@@ -161,6 +161,8 @@ const Client = struct {
     /// one, so this accumulates until `packetLen` says a whole packet is present.
     buf: [4 * max_packet]u8 = undefined,
     len: usize = 0,
+    /// The game the engine put this client in; see SERVER_SetClientGameGUID.
+    game_guid: u32 = 0,
 
     fn active(self: Client) bool {
         return self.sock != INVALID_SOCKET;
@@ -217,13 +219,33 @@ fn poll() void {
     }
 }
 
+/// Which drain loop a packet belongs to. The engine does not sort them for us — each list has its
+/// own processor and its own vocabulary, so handing a packet to the wrong one is silently ignored
+/// at best.
+///
+///   - **list 0** `CCMD_ProcessClientSystemMessage` @0x6fc31910 switches on `buf[4]` after
+///     subtracting 0x66, so it owns opcodes **0x66-0x6F** — the session traffic, including the
+///     join. `GAME_VerifyJoinGame` hangs off its case for **0x67**.
+///   - **list 1** `CCMD_ProcessClientMessage` @0x6fc31c00 takes everything else: the in-game
+///     commands.
+///
+/// Note this is where 1.14d's join went: 1.10f joins with **0x67, 29 bytes**, while 1.14d uses
+/// **0x68, 37 bytes**. The opcode shifted by one and the payload grew, which is why a 1.14d client
+/// desynchronises here rather than merely being refused.
+fn listFor(opcode: u8) u32 {
+    return if (opcode >= 0x66 and opcode <= 0x6F) 0 else 1;
+}
+
 /// Hand the engine one pending message as `[clientId:u32][payload]`, and return its total length.
-fn takeMessage(buf: ?[*]u8, cap: u32) u32 {
+/// `list` is the drain loop asking; a packet belonging to another list is left for that one, which
+/// costs nothing because the engine drains all three in the same frame.
+fn takeMessageFor(list: u32, buf: ?[*]u8, cap: u32) u32 {
     poll();
     const dst = buf orelse return no_message;
     for (&clients, 0..) |*c, i| {
         if (!c.active() or c.len == 0) continue;
         const n = packetLen(c.buf[0..c.len]) orelse continue; // incomplete, wait for more
+        if (n != 0 and listFor(c.buf[0]) != list) continue; // another drain loop's packet
         if (n == 0) {
             // Unframeable opcode: the stream is desynchronised and every later byte is garbage,
             // so there is nothing to resynchronise to. Drop the client rather than feed the
@@ -315,20 +337,19 @@ export fn SERVER_Send(kind: u32, client: u32, data: ?[*]const u8, len: u32) call
 /// -1, not 0: the drain loops break on -1 and 0 is a legitimate length.
 const no_message: u32 = 0xFFFF_FFFF;
 
-/// List 2 is the one whose processor consults the callback table, so client packets go there.
-/// Lists 0 and 1 carry traffic our transport does not originate, and answer "empty".
-export fn SERVER_ReadFromMessageList0(buf: u32, len: u32) callconv(.winapi) u32 {
+export fn SERVER_ReadFromMessageList0(buf: ?[*]u8, len: u32) callconv(.winapi) u32 {
+    return takeMessageFor(0, buf, len);
+}
+export fn SERVER_ReadFromMessageList1(buf: ?[*]u8, len: u32) callconv(.winapi) u32 {
+    return takeMessageFor(1, buf, len);
+}
+
+/// List 2's processor reads its opcode at `buf[5]`, not `buf[4]` like the other two, so it takes a
+/// different envelope entirely. Nothing we originate belongs there yet.
+export fn SERVER_ReadFromMessageList2(buf: u32, len: u32) callconv(.winapi) u32 {
     _ = buf;
     _ = len;
     return no_message;
-}
-export fn SERVER_ReadFromMessageList1(buf: u32, len: u32) callconv(.winapi) u32 {
-    _ = buf;
-    _ = len;
-    return no_message;
-}
-export fn SERVER_ReadFromMessageList2(buf: ?[*]u8, len: u32) callconv(.winapi) u32 {
-    return takeMessage(buf, len);
 }
 
 // ── per-client queries ───────────────────────────────────────────────────────
@@ -366,14 +387,20 @@ export fn D2NET_10019(a: u32) callconv(.winapi) u32 {
     return 0;
 }
 
+/// Which game each client is in. The engine sets this when a client joins and reads it back
+/// whenever it needs to lock that client's game — `CLIENTS_OnDatabaseCharacterReceived` does
+/// `SrvLockGame(GetClientGameGUID(clientId))`, so a transport that forgets it answers 0 and the
+/// character delivery fails with `*** Failed SrvLockGame for client N ***`. It is the engine's
+/// state, but we are the ones holding it.
 export fn SERVER_SetClientGameGUID(client: u32, guid: u32) callconv(.winapi) u32 {
+    if (client >= clients.len) return 0;
+    clients[client].game_guid = guid;
     sayFmt("d2net: client {d} joined game 0x{x}", .{ client, guid });
     return 0;
 }
 
 export fn SERVER_GetClientGameGUID(client: u32) callconv(.winapi) u32 {
-    _ = client;
-    return 0;
+    return if (client < clients.len) clients[client].game_guid else 0;
 }
 
 export fn SERVER_WSAGetLastError(a: u32, b: u32, c: u32) callconv(.winapi) u32 {
