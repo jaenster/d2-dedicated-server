@@ -303,10 +303,14 @@ disassembly is readable.
 
 ## Open questions
 
-- The true table size in 1.10f is taken from D2MOO's 0x40. A scan of the 41 xref sites to
-  `DAT_6fd45830` only recovered slots 0x08, 0x0C and 0x20 — the lookahead heuristic was too narrow to
-  size the struct, not evidence that the rest are unused.
-- Whether `pfHandlePacket` (0x30) is the D2GS↔realm control channel or something else.
+- ~~A scan of the 41 xref sites to `DAT_6fd45830` only recovered slots 0x08, 0x0C and 0x20.~~
+  Resolved: a wider sweep recovers **twelve** of the sixteen. See "Every callback arity, counted"
+  below — the heuristic needed to follow `LEA reg,[table+n]` / `ADD reg,n`, which is how the engine
+  reaches the higher slots, and to fall back to the decompiler where a register is clobbered across
+  a switch.
+- `pfHandlePacket` (0x30) is dispatched by `GAME_ProcessRealmMessage` (1.10f @0x6fc38140, 1.09d
+  @0x6fc37f50) with zero arguments, from the case that also answers 0xFA/0xFB/0xFC connect and
+  disconnect bookkeeping. So it is on the client-message path, not a separate realm control channel.
 - The **third** method D2Game uses to reach the host, past the 16-slot callback table: what its four
   virtual methods do. See below.
 
@@ -325,32 +329,35 @@ has:
   whole bring-up-and-tick path once per `Version` enum value, dispatched at runtime. Two layers
   catch a version that is not actually usable, at two different points:
 
-  1. `callbacks.isComplete` — every *required* slot (`callbacks.required_slots`, the twelve a host
-     actually wires) has a counted stack-arg number. Selecting an incomplete version at runtime
-     fails cleanly, naming exactly what is still missing (`callbacks.missingSlots`) — verified live:
-     `D2GS_ENGINE_VERSION=1.09d` prints `v109d is not ready yet — missing: fpCloseGame, ...` and
-     exits, rather than building or misbehaving.
+  1. `callbacks.isComplete` — every slot in `callbacks.accounted_slots` (all sixteen bar the two
+     convention exceptions, 0x10 cdecl-varargs and 0x3C stdcall) has an answer: either a counted
+     stack-arg number or `no_site_found`. Selecting a version that still has a `null` fails cleanly
+     at runtime, naming exactly what is missing (`callbacks.missingSlots`).
   2. `Binding(comptime version)`'s own comptime asserts — completeness of *data* is not correctness
-     of *code*. `findPlayerToken`'s body is written assuming 5 stack args (1.10f's count);
-     `isComplete` only checks that *some* number is recorded for a slot, so a future version whose
-     measured arity differs would silently reuse a mismatched shim without this. Proved it fires:
-     temporarily gave 1.09d a full StackArgs using its real (3-arg) measurement and rebuilt —
-     `fpFindPlayerToken takes 3 stack args, but Binding's findPlayerToken is written for 5 — add a
-     version-specific override instead of reusing this one`, a compile error, not a corrupted call.
+     of *code*. A handler may name FEWER stack parameters than the engine pushes, because the shim
+     pushes and cleans all of them and trailing arguments simply go unread; naming MORE reads the
+     engine's stack as if it were arguments. So `assertReads` enforces a floor per slot, which is
+     also what lets one `findPlayerToken` body serve 1.10f's five-argument call and 1.09d's three
+     instead of needing a per-version override.
 
   Adding a version that reaches both gates is exactly: measure its remaining required slots and
   `hostapi.clientFields`, and — only if an arity genuinely differs from what `Binding`'s current
   bodies assume — add that one version's override function. Nothing else in `d2host` changes.
-- **1.09d: two ABI facts measured, most slots still uncounted.** `fpFindPlayerToken` takes **3**
-  stack args on 1.09d, not 1.10f's 5, and `fpGetDatabaseCharacter` takes 2 — matching 1.10f's count
-  exactly, only its *offsets* differ (`packages/d2engine/callbacks.zig`, `v109d`) — both read off
-  the actual push count at the respective call sites in the rebuilt 1.09d-lod `D2Game.dll`, not the
-  decompiler's rendering, which drops args it cannot type. And the char/account offsets from ECX in
-  `fpGetDatabaseCharacter` are version-specific in a way that is easy to get backwards: pRealm sits
-  at client+0x54 in 1.09d versus +0x68 in 1.10f, which moves the *relative* offset even though the
-  fields themselves stay at +0x0D/+0x1D in both (`hostapi.clientFields`). The game-data-table
-  vtable interface — mask at +0x24, slots at +0x1c, counter at +0x10, list head at +8 — was checked
-  too and is **identical** to 1.10f's, so that whole apparatus needs no change to drive 1.09d.
+- **1.09d: every slot measured, and it boots as far as the data lets it.** Both versions were
+  swept the same way and the results are in `callbacks.v109d` / `callbacks.v110f`. The two are NOT
+  interchangeable: `fpFindPlayerToken` takes 3 stack args on 1.09d and 5 on 1.10f, `fpCloseGame`
+  takes 0 and 2, and `fpUnlockDatabaseCharacter` has a 1.10f dispatch (`GAME_JoinGame` @0x6fc372fc)
+  with no 1.09d counterpart. Everything else agrees, including `fpLeaveGame`'s 13.
+
+  `D2GS_ENGINE_VERSION=1.09d` now gets through module load, both ordinal lookups (at 1.09d's own
+  0x6fc35680 / 0x6fc356e0), the callback table, `STRTABLE_Init`, and eleven data tables — then
+  faults with `EIP=0` inside D2Common's `DataTbls.cpp` while compiling `states`, before that
+  table's `AllocLinker`. What it is NOT: the callback ABI (no callback had fired yet), a Fog gap
+  (our Fog exports all 39 ordinals 1.09d's D2Common imports), a broken import table in the rebuilt
+  DLL (its USER32/`wsprintfA` thunk is structurally identical to 1.10f's), or a wrong entry arity
+  (`DATATBLS_LoadAllTxts` is `RET 0xC` on both, matching the `(0, 1, 0)` d2host passes). The most
+  likely remaining cause is the archives: these are 1.14d-era compiled tables, and 1.09d is reading
+  them with its own record layout.
 
   (`version.zig`'s `spec(.v109d)` originally left `.stack_args` as an empty literal rather than
   wiring in the measured `callbacks.v109d` — a real bug the runtime dispatch caught immediately:
@@ -373,9 +380,62 @@ has:
   descriptors) or reverse the 1.10f record layouts, then generate `runessrv.bin` and
   `cubeserver.bin`. Until then runewords and cube recipes are empty — non-fatal, and the only
   known data gap.
-- **`fpSaveDatabaseGuild`'s arity is still a guess** (`unmeasured_guess` in `d2host`), unlike every
-  other slot d2host wires — nothing has been observed calling it on any version, so there is no
-  call site to count yet.
+- **`fpSaveDatabaseGuild` (0x1C) and the unnamed 0x24 have no dispatch site** on either version
+  swept. They are recorded as `no_site_found` and the host leaves them **null**, which replaced the
+  guessed arity `d2host` used to carry for 0x1C. Null is the safe answer to an unfound site and a
+  guessed `ret n` is not: every dispatch the sweep did find tests the slot before calling it, so a
+  slot we wrongly believe is unused costs a skipped feature, while a wrong stack cleanup costs a
+  corrupted engine stack that nothing checks.
+
+
+## Every callback arity, counted
+
+The stack-arg count for a slot is what the host's shim pops on return, so a wrong one unbalances the
+engine's stack. These used to come from the decompiler's rendered prototypes. Four of the twelve
+were wrong, in the direction that corrupts:
+
+|slot|name|1.09d|1.10f|was recorded|
+|-|-|-|-|-|
+|0x00|fpCloseGame|0|2|2|
+|0x04|fpLeaveGame|13|13|**12**|
+|0x08|fpGetDatabaseCharacter|2|2|2|
+|0x0C|fpSaveDatabaseCharacter|4|4|4|
+|0x14|fpEnterGame|2|2|**3**|
+|0x18|fpFindPlayerToken|3|5|5|
+|0x1C|fpSaveDatabaseGuild|no site|no site|guessed 1|
+|0x20|fpUnlockDatabaseCharacter|no site|1|1|
+|0x24|(unnamed)|no site|no site|guessed 0|
+|0x28|fpUpdateCharacterLadder|0|0|**5**|
+|0x2C|fpUpdateGameInformation|0|0|**2**|
+|0x30|fpHandlePacket|0|0|0|
+|0x34|fpSetGameData|0|0|0|
+|0x38|fpRelockDatabaseCharacter|1|1|1|
+
+0x10 (cdecl varargs) and 0x3C (stdcall, one arg) are not counted — their conventions are fixed and
+the host writes them out directly.
+
+The method, which matters because the first two attempts at it both under-reported:
+
+1. Walk every reference to the version's callback-table global (`DAT_6fd45830` on 1.10f,
+   `DAT_6fd24174` on 1.09d), follow the register that receives it, and count raw `PUSH`es back to
+   the dispatch's own basic block. Most references are not dispatches at all — 28 of 1.10f's 41 are
+   `if (server)` guards.
+2. Follow `LEA reg,[table+n]` and `ADD reg,n`. Without this the higher slots are invisible:
+   `GAME_TriggerClientSave` reaches 0x28 as `CALL [EBP]` after `ADD EBP,0x28`, and a naive read
+   scores it as slot 0x00 with a contradictory count.
+3. Cross-check with the decompiler on every function holding a reference. This is what recovers
+   0x30, whose dispatch sits in a switch case far enough from the load that a linear walk has lost
+   the register.
+
+Three traps worth naming, because each produced a plausible wrong number:
+
+- **Prologue pushes are not arguments.** `CLIENTS_SetGameData` opens with `PUSH ESI` and closes with
+  `POP ESI`; counting it makes 0x34 look like a one-argument call.
+- **Preceding calls consume their own pushes.** `GAME_UpdateAllClients` pushes four arguments for an
+  intermediate call before pushing 0x14's two; the boundary is the previous `CALL`.
+- **Finding no site is not proof of no site.** The first sweep concluded 1.10f never dispatches
+  `fpHandlePacket` — and a live `d2host` run logs the stub firing. That is why the recorded state is
+  `no_site_found` and the host answers it with a null pointer rather than a guessed `ret n`.
 
 
 ## The game-data table is an object, not a buffer

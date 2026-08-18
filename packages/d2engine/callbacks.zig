@@ -105,34 +105,82 @@ pub fn Extended(comptime Ext: type) type {
     };
 }
 
-/// Stack args past ECX/EDX for each slot — i.e. what the shim must pop on return. `null` means
-/// nobody has counted it at a call site for that version yet; asking for it is a compile error
-/// rather than a guess, because a wrong count corrupts the engine's stack.
-// `@as(?u8, null)` and not a bare `null`: the default-value parameter is itself optional, so a bare
-// null reads as "no default" and every version would have to spell out all sixteen slots.
-pub const StackArgs = std.enums.EnumFieldStruct(Slot, ?u8, @as(?u8, null));
+/// What a host knows about one slot on one version. Three states, not two: a slot the engine
+/// dispatches with a counted number of stack args, a slot that version's engine never dispatches
+/// at all, and (as `null`) a slot nobody has looked at yet. Collapsing the middle case into the
+/// first is what produces a guessed `ret n` for a call that never comes; collapsing it into the
+/// last makes a finished version look unfinished forever.
+pub const Arity = union(enum) {
+    /// Stack args past ECX/EDX — i.e. what the shim must pop on return. Counted by raw pushes at
+    /// a dispatch site, never from a decompiler's rendered prototype: the decompiler drops
+    /// arguments it cannot type, which is how this file carried a 12 for a slot the engine pushes
+    /// 13 arguments to.
+    args: u8,
+    /// Two independent sweeps of that version's `D2Game.dll` — every reference to the callback
+    /// table global, and the decompiler's own rendering of each function that holds one — found
+    /// nothing that calls this slot.
+    ///
+    /// It is deliberately *not* called "never dispatched", because that claim has already been
+    /// wrong once: the first sweep missed `fpHandlePacket` (the register holding the table was
+    /// clobbered across a switch, so a linear walk lost it) on a version where the engine
+    /// demonstrably calls it. What the host does with this state is what makes the weaker claim
+    /// safe — it leaves the pointer null, and every dispatch site found on any version tests the
+    /// slot before calling it, so a missed site costs a skipped feature. A guessed `ret n` in the
+    /// same position costs a corrupted engine stack, and nothing checks it.
+    no_site_found,
+};
 
+// `@as(?Arity, null)` and not a bare `null`: the default-value parameter is itself optional, so a
+// bare null reads as "no default" and every version would have to spell out all sixteen slots.
+pub const StackArgs = std.enums.EnumFieldStruct(Slot, ?Arity, @as(?Arity, null));
+
+/// The stack-arg count for a slot this version dispatches. Both other states are compile errors,
+/// and deliberately different ones — "nobody measured it" is a to-do, "the engine never calls it"
+/// is an answer, and a host that confuses them builds the wrong thing.
 pub fn stackArgs(comptime version: StackArgs, comptime slot: Slot) usize {
-    return @field(version, @tagName(slot)) orelse @compileError(
+    const arity = @field(version, @tagName(slot)) orelse @compileError(
         "no stack-arg count for " ++ @tagName(slot) ++ " on this version — count it at the call site first",
     );
+    return switch (arity) {
+        .args => |n| n,
+        .no_site_found => @compileError(
+            @tagName(slot) ++ " has no known dispatch site on this version — leave the slot null rather " ++
+                "than building a stub whose stack cleanup nothing can check",
+        ),
+    };
 }
 
-/// Every slot a host actually has to build a shim for — i.e. one a live D2Game call site is known
-/// to invoke. `fpSaveDatabaseGuild` (cut Guild Halls) and the unnamed slot at 0x24 are deliberately
-/// absent: nothing has ever been observed calling either, on any version, so there is no call site
-/// to count and "required" would be a lie for them.
+/// Whether this version's engine has a dispatch site for `slot` — i.e. whether the host should
+/// build anything for it at all.
+pub fn dispatches(comptime version: StackArgs, comptime slot: Slot) bool {
+    const arity = @field(version, @tagName(slot)) orelse @compileError(
+        @tagName(slot) ++ " is unaccounted for on this version — scan its dispatch sites first",
+    );
+    return switch (arity) {
+        .args => true,
+        .no_site_found => false,
+    };
+}
+
+/// Every slot a host has to have an answer for before it can build a table — either a counted
+/// arity or `no_site_found`. It is all sixteen minus the two convention exceptions: 0x10 is
+/// cdecl varargs and 0x3C is stdcall, both with fixed signatures a host writes out directly
+/// instead of counting pushes for.
 ///
-/// This is what a version's `StackArgs` is measured *against* — the thing that turns "we have not
-/// finished 1.09d yet" from a vague feeling into a concrete, checkable, per-slot list.
-pub const required_slots = [_]Slot{
+/// Note that this is deliberately *not* "the slots the engine calls". Which slots a version
+/// dispatches is a per-version fact that belongs in that version's `StackArgs` — 1.10f dispatches
+/// `fpUnlockDatabaseCharacter` and no 1.09d site for it was found, and that difference is recorded
+/// rather than assumed.
+pub const accounted_slots = [_]Slot{
     .fpCloseGame,
     .fpLeaveGame,
     .fpGetDatabaseCharacter,
     .fpSaveDatabaseCharacter,
     .fpEnterGame,
     .fpFindPlayerToken,
+    .fpSaveDatabaseGuild,
     .fpUnlockDatabaseCharacter,
+    .fpReserved0x24,
     .fpUpdateCharacterLadder,
     .fpUpdateGameInformation,
     .fpHandlePacket,
@@ -140,23 +188,23 @@ pub const required_slots = [_]Slot{
     .fpRelockDatabaseCharacter,
 };
 
-/// Whether every required slot has been counted for this version. The whole point of a version
+/// Whether every accounted slot has an answer for this version. The whole point of a version
 /// being "just a suggestion" to a host is that the host can ask this *before* trying to build a
 /// callback table, rather than a build failing on whichever slot happens to be missing.
 pub fn isComplete(comptime version: StackArgs) bool {
-    inline for (required_slots) |slot| {
+    inline for (accounted_slots) |slot| {
         if (@field(version, @tagName(slot)) == null) return false;
     }
     return true;
 }
 
-/// The required slots this version has NOT counted yet, formatted for a human. Empty string when
-/// `isComplete` is true. Comptime because it walks `required_slots` at compile time; a runtime
+/// The slots this version has no answer for yet, formatted for a human. Empty string when
+/// `isComplete` is true. Comptime because it walks `accounted_slots` at compile time; a runtime
 /// caller gets the resulting string back as ordinary data.
 pub fn missingSlots(comptime version: StackArgs) []const u8 {
     var out: []const u8 = "";
     var first = true;
-    for (required_slots) |slot| {
+    for (accounted_slots) |slot| {
         if (@field(version, @tagName(slot)) != null) continue;
         if (!first) out = out ++ ", ";
         out = out ++ @tagName(slot);
@@ -167,47 +215,85 @@ pub fn missingSlots(comptime version: StackArgs) []const u8 {
 
 /// 1.14d, counted at the call sites in the monolith (ret 0x8 / 0x10 / 0x48 / 0x1c) and load-bearing
 /// in a running server. NOT interchangeable with v110f: fpFindPlayerToken takes 7 here and 5 there.
+///
+/// Only the four the injected 1.14d server actually installs are here; the monolith's remaining
+/// slots have never been scanned, so they stay `null` (a to-do) rather than being declared
+/// `no_site_found` on the strength of not having looked — that state means a sweep ran and came
+/// back empty, not that nobody swept.
 pub const v114d: StackArgs = .{
-    .fpLeaveGame = 18, // CleanUpClient, ret 0x48
-    .fpGetDatabaseCharacter = 2, // ret 0x8
-    .fpSaveDatabaseCharacter = 4, // ret 0x10
-    .fpFindPlayerToken = 7, // ret 0x1c
+    .fpLeaveGame = .{ .args = 18 }, // CleanUpClient, ret 0x48
+    .fpGetDatabaseCharacter = .{ .args = 2 }, // ret 0x8
+    .fpSaveDatabaseCharacter = .{ .args = 4 }, // ret 0x10
+    .fpFindPlayerToken = .{ .args = 7 }, // ret 0x1c
 };
 
-/// 1.10f, derived from the prototypes in D2Game.dll (total params minus the two register args).
-/// The three convention exceptions have no fastcall count: 0x10 is cdecl varargs, 0x3C is stdcall,
-/// and 0x1C/0x24 are unused with no prototype to count.
+/// 1.10f, counted at every dispatch site in `D2Game.dll`. The method is mechanical and worth
+/// stating because the numbers it replaced were not: walk all 41 references to the callback-table
+/// global (0x6fd45830), follow the register that receives it — through `LEA reg,[table+n]` and
+/// `ADD reg,n`, which is how the engine reaches the higher slots — and count the raw `PUSH`es in
+/// the dispatch's own basic block. 28 of those references are `if (server)` guards, 2 are the
+/// writes in `GAME_SetServerCallbackFunctions`, and 11 are dispatches.
+///
+/// Four of these disagree with the prototype-derived numbers this file used to carry, and the
+/// prototypes were the ones that were wrong:
+///
+///   - `fpLeaveGame` 12 -> 13. `CLIENTS_RemoveClientFromGame` pushes thirteen at both of its call
+///     sites (0x6fc32e3a and 0x6fc32eec), in one straight-line block each.
+///   - `fpEnterGame` 3 -> 2. `GAME_UpdateAllClients` @0x6fc38d74 pushes EAX then EDI, and the four
+///     pushes before those belong to the `0x6fd1b692` call between them.
+///   - `fpUpdateCharacterLadder` 5 -> 0. `GAME_TriggerClientSave` reaches it as `CALL [EBP]` after
+///     `ADD EBP,0x28`, with only ECX/EDX set since the preceding call.
+///   - `fpUpdateGameInformation` 2 -> 0. Same shape in `PLAYERSTATS_LevelUp` @0x6fc7edc7.
+///
+/// Every one of those is a stub whose `ret n*4` would have unbalanced the engine's stack the first
+/// time that path ran.
 pub const v110f: StackArgs = .{
-    .fpCloseGame = 2,
-    .fpLeaveGame = 12,
-    .fpGetDatabaseCharacter = 2,
-    .fpSaveDatabaseCharacter = 4,
-    .fpEnterGame = 3,
-    .fpFindPlayerToken = 5,
-    .fpUnlockDatabaseCharacter = 1,
-    .fpUpdateCharacterLadder = 5,
-    .fpUpdateGameInformation = 2,
-    .fpHandlePacket = 0,
-    .fpSetGameData = 0,
-    .fpRelockDatabaseCharacter = 1,
+    .fpCloseGame = .{ .args = 2 }, // GAME_CloseGame @0x6fc396ec
+    .fpLeaveGame = .{ .args = 13 }, // CLIENTS_RemoveClientFromGame, two sites, both 13
+    .fpGetDatabaseCharacter = .{ .args = 2 }, // GAME_JoinGame @0x6fc3741b
+    .fpSaveDatabaseCharacter = .{ .args = 4 }, // the realm save path @0x6fc8a4d7
+    .fpEnterGame = .{ .args = 2 }, // GAME_UpdateAllClients @0x6fc38d74
+    .fpFindPlayerToken = .{ .args = 5 }, // GAME_VerifyJoinGame @0x6fc37073
+    .fpSaveDatabaseGuild = .no_site_found, // cut Guild Halls
+    .fpUnlockDatabaseCharacter = .{ .args = 1 }, // GAME_JoinGame @0x6fc372fc
+    .fpReserved0x24 = .no_site_found,
+    .fpUpdateCharacterLadder = .{ .args = 0 }, // GAME_TriggerClientSave @0x6fc37670, via ADD EBP,0x28
+    .fpUpdateGameInformation = .{ .args = 0 }, // PLAYERSTATS_LevelUp @0x6fc7edc7, via LEA EBX,[EAX+0x2c]
+    .fpHandlePacket = .{ .args = 0 }, // FUN_6fc38140 @0x6fc38232, the client-message processor
+    .fpSetGameData = .{ .args = 0 }, // CLIENTS_SetGameData @0x6fc32801 (its one PUSH is the ESI prologue)
+    .fpRelockDatabaseCharacter = .{ .args = 1 }, // the realm save path @0x6fc8a48f
 };
 
-/// 1.09d. Two of twelve required slots counted so far, both from the rebuilt 1.09d-lod
-/// `D2Game.dll`, both by raw push count at the call site rather than the decompiler's rendering
-/// (which drops arguments it cannot type):
+/// 1.09d, counted the same way against the rebuilt 1.09d-lod `D2Game.dll` (table global
+/// 0x6fd24174, 203 references, 122 dispatches — the count is high only because this build kept its
+/// assert/log calls, and all but 14 of the dispatches are slot 0x10).
 ///
-///   - `fpFindPlayerToken`: `SrvVerifyJoinGame` @0x6fc36c10, call at 0x6fc36e85 pushes
-///     `esi, ebp, eax` before `calll *0x18(%eax)` — three stack args, not 1.10f's five.
-///   - `fpGetDatabaseCharacter`: the join path's callback call at 0x6fc37232 pushes `edi`, then
-///     `eax` (loaded from `0x4c(%esp)`) before `calll *0x8(%eax)` — two stack args, matching
-///     1.10f's count exactly. (Its *offsets*, not its arity, differ — see `hostapi.clientFields`.)
+/// Not a subset of 1.10f's, which is the whole reason it is measured rather than inherited:
 ///
-/// Every other required slot is still uncounted and stays a compile error until measured — the
-/// counted values here are NOT a superset of v110f's despite the shared Fog/D2Game ordinal family;
-/// `callbacks.isComplete(v109d)` is false, and `missingSlots(v109d)` names the rest.
+///   - `fpFindPlayerToken` takes 3 where 1.10f takes 5 (`GAME_VerifyJoinGame` @0x6fc36e85 pushes
+///     esi, ebp, eax; 1.10f's pushes two more).
+///   - `fpCloseGame` takes 0 where 1.10f takes 2 — @0x6fc3942f sets only ECX/EDX, so the two extra
+///     arguments 1.10f passes did not exist yet.
+///   - `fpUnlockDatabaseCharacter` has no dispatch site at all. 1.10f calls it from
+///     `GAME_JoinGame`; 1.09d's join path only *asserts* the table's slot 0x08 is a valid code
+///     pointer (@0x6fc371fa) and never reaches 0x20.
+///
+/// Everything else agrees with 1.10f, including the 13 of `fpLeaveGame`.
 pub const v109d: StackArgs = .{
-    .fpFindPlayerToken = 3,
-    .fpGetDatabaseCharacter = 2,
+    .fpCloseGame = .{ .args = 0 }, // @0x6fc3942f
+    .fpLeaveGame = .{ .args = 13 }, // two sites @0x6fc32c2f and @0x6fc32cef, both 13
+    .fpGetDatabaseCharacter = .{ .args = 2 }, // the join path @0x6fc37232
+    .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fc7e1af
+    .fpEnterGame = .{ .args = 2 }, // @0x6fc388e6
+    .fpFindPlayerToken = .{ .args = 3 }, // GAME_VerifyJoinGame @0x6fc36e85
+    .fpSaveDatabaseGuild = .no_site_found,
+    .fpUnlockDatabaseCharacter = .no_site_found, // 1.10f dispatches this; no 1.09d site found
+    .fpReserved0x24 = .no_site_found,
+    .fpUpdateCharacterLadder = .{ .args = 0 }, // three sites, all 0
+    .fpUpdateGameInformation = .{ .args = 0 }, // @0x6fc726b3
+    .fpHandlePacket = .{ .args = 0 }, // FUN_6fc37f50, the client-message processor
+    .fpSetGameData = .{ .args = 0 }, // @0x6fc32681 (its one PUSH is the ESI prologue)
+    .fpRelockDatabaseCharacter = .{ .args = 1 }, // @0x6fc7e091
 };
 
 /// 1.14d grew the table past 0x40. fpGetDatabaseFileTime is the only appended slot known to be
@@ -262,21 +348,43 @@ test "layout is the one the engine indexes" {
 test "stack-arg counts are per version, not shared" {
     try std.testing.expectEqual(7, stackArgs(v114d, .fpFindPlayerToken));
     try std.testing.expectEqual(5, stackArgs(v110f, .fpFindPlayerToken));
+    try std.testing.expectEqual(3, stackArgs(v109d, .fpFindPlayerToken));
     try std.testing.expectEqual(18, stackArgs(v114d, .fpLeaveGame));
-    try std.testing.expectEqual(12, stackArgs(v110f, .fpLeaveGame));
+    try std.testing.expectEqual(13, stackArgs(v110f, .fpLeaveGame));
+    // fpCloseGame grew two arguments between these two builds, so a shared count would corrupt
+    // one of them.
+    try std.testing.expectEqual(2, stackArgs(v110f, .fpCloseGame));
+    try std.testing.expectEqual(0, stackArgs(v109d, .fpCloseGame));
+}
+
+test "a slot with no dispatch site is an answer, not a gap" {
+    // Both are fully accounted for even though neither counts all fourteen slots: the difference
+    // is recorded as no_site_found, which is what lets the host leave the pointer null.
+    try std.testing.expect(isComplete(v110f));
+    try std.testing.expect(isComplete(v109d));
+    try std.testing.expect(!dispatches(v110f, .fpSaveDatabaseGuild));
+    try std.testing.expect(!dispatches(v110f, .fpReserved0x24));
+    // The one slot the two versions disagree about: 1.10f calls it from GAME_JoinGame, and no
+    // 1.09d site turned up under either sweep.
+    try std.testing.expect(dispatches(v110f, .fpUnlockDatabaseCharacter));
+    try std.testing.expect(!dispatches(v109d, .fpUnlockDatabaseCharacter));
+    // fpHandlePacket is the reason this state is "no site found" and not "never dispatched": the
+    // engine does call it, on both versions, and the first sweep said otherwise.
+    try std.testing.expectEqual(0, stackArgs(v110f, .fpHandlePacket));
+    try std.testing.expectEqual(0, stackArgs(v109d, .fpHandlePacket));
 }
 
 test "completeness is checkable before a build fails on it" {
-    // v110f has every required slot counted; v109d has one of twelve.
     try std.testing.expect(isComplete(v110f));
-    try std.testing.expect(!isComplete(v109d));
-    try std.testing.expect(!isComplete(v114d)); // partial: only 4 of the 12 required slots
+    try std.testing.expect(isComplete(v109d));
+    // The monolith's table was only ever scanned for the four slots the injected server installs.
+    try std.testing.expect(!isComplete(v114d));
 }
 
 test "missingSlots names exactly what a version still needs" {
     try std.testing.expectEqualStrings("", comptime missingSlots(v110f));
-    // v109d has only fpFindPlayerToken counted, so every other required slot is missing.
-    const m109 = comptime missingSlots(v109d);
-    try std.testing.expect(std.mem.indexOf(u8, m109, "fpCloseGame") != null);
-    try std.testing.expect(std.mem.indexOf(u8, m109, "fpFindPlayerToken") == null);
+    try std.testing.expectEqualStrings("", comptime missingSlots(v109d));
+    const m114 = comptime missingSlots(v114d);
+    try std.testing.expect(std.mem.indexOf(u8, m114, "fpCloseGame") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m114, "fpLeaveGame") == null);
 }

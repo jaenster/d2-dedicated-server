@@ -19,11 +19,6 @@ const hostapi = @import("d2engine").hostapi;
 const gameflags = @import("d2engine").gameflags;
 const d2version = @import("d2engine").version;
 
-/// `fpSaveDatabaseGuild` has never been observed called on any version, so its arity is a guess
-/// carried over from the cut Guild Halls feature rather than a measurement — named so a reader does
-/// not mistake it for data the way the other slots' counts are.
-const unmeasured_guess: usize = 1;
-
 const HMODULE = *anyopaque;
 extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?HMODULE;
 extern "kernel32" fn InitializeCriticalSection(cs: *anyopaque) callconv(.winapi) void;
@@ -166,19 +161,14 @@ fn Binding(comptime version: d2version.Version) type {
     const client_fields = hostapi.clientFields(version) orelse
         @compileError(@tagName(version) ++ ": no client field offsets measured — see hostapi.clientFields");
 
+    // A handler may declare FEWER stack parameters than the engine pushes — the shim pushes all
+    // `n_stack` of them and cleans up `n_stack`, so trailing arguments a handler never names are
+    // simply never read. Declaring MORE is the bug: those read whatever the engine left on the
+    // stack. So the invariant is a floor, not an equality, which is also what lets one handler
+    // body serve 1.10f's five-argument fpFindPlayerToken and 1.09d's three.
     comptime {
-        const token_args = cb.stackArgs(spec.stack_args, .fpFindPlayerToken);
-        if (token_args != 5) @compileError(std.fmt.comptimePrint(
-            "{s}: fpFindPlayerToken takes {d} stack args, but Binding's findPlayerToken is written " ++
-                "for 5 (1.10f's count) — add a version-specific override instead of reusing this one",
-            .{ @tagName(version), token_args },
-        ));
-        const char_args = cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter);
-        if (char_args != 2) @compileError(std.fmt.comptimePrint(
-            "{s}: fpGetDatabaseCharacter takes {d} stack args, but Binding's getDatabaseCharacter " ++
-                "is written for 2 — add a version-specific override instead of reusing this one",
-            .{ @tagName(version), char_args },
-        ));
+        assertReads(version, .fpFindPlayerToken, 2, "findPlayerToken reads game_id and account");
+        assertReads(version, .fpGetDatabaseCharacter, 2, "getDatabaseCharacter reads client_id and account");
     }
 
     return struct {
@@ -240,16 +230,10 @@ fn Binding(comptime version: d2version.Version) type {
         /// the token is a second check rather than the only one. Enforcing it here needs the same
         /// join-context bookkeeping `apps/d2gs` keeps, which is realm-side state this host does
         /// not hold yet.
-        pub fn findPlayerToken(
-            ecx: usize,
-            edx: usize,
-            game_id: usize,
-            account: usize,
-            s3: usize,
-            s4: usize,
-            s5: usize,
-        ) callconv(.c) usize {
-            _ = .{ s3, s4, s5 };
+        /// Only the first two stack arguments are named: 1.10f pushes five and 1.09d three, but
+        /// both push the game id first and the account second, and the shim cleans up whatever
+        /// that version's count is.
+        pub fn findPlayerToken(ecx: usize, edx: usize, game_id: usize, account: usize) callconv(.c) usize {
             const char_name: [*:0]const u8 = @ptrFromInt(ecx);
             const acct_name: [*:0]const u8 = @ptrFromInt(account);
             sayFmt("d2host: fpFindPlayerToken — {s}/{s} gameid={d} token=0x{x}", .{
@@ -261,54 +245,42 @@ fn Binding(comptime version: d2version.Version) type {
             return 1;
         }
 
-        // Every arity below routes through `cb.stackArgs(spec.stack_args, .slot)` rather than a
-        // literal, so a Stub for a slot `version` has never had counted is a COMPILE ERROR, not a
-        // silent reuse of another version's number under a different engine. The two slots with no
-        // measurement even for 1.10f (fpSaveDatabaseGuild, the unnamed 0x24) stay literal and say
-        // so — nothing has been observed calling either, so a wrong stack-cleanup there has not
-        // yet cost us a corrupted call, but it is a guess, not data.
+        /// A reporting stub for a slot this version dispatches, or null for one it never does.
+        /// Null is the honest answer to "never dispatched": every dispatch site the scan found
+        /// reads the slot and branches on it, so a null cannot be called by accident — whereas a
+        /// stub for a call that never comes needs a stack-cleanup count nothing can check.
+        inline fn stubFor(comptime which: cb.Slot, comptime name: []const u8) ?*const anyopaque {
+            if (comptime !cb.dispatches(spec.stack_args, which)) return null;
+            return Stub(name, cb.stackArgs(spec.stack_args, which)).ptr;
+        }
+
+        // Every arity routes through `cb.stackArgs(spec.stack_args, .slot)` rather than a literal,
+        // so a stub for a slot `version` has never had counted is a COMPILE ERROR, not a silent
+        // reuse of another version's number under a different engine.
         pub fn buildCallbackTable() CallbackTable {
             return .{
-                .close_game = Stub("pfCloseGame", cb.stackArgs(spec.stack_args, .fpCloseGame)).ptr,
-                .leave_game = Stub("pfLeaveGame", cb.stackArgs(spec.stack_args, .fpLeaveGame)).ptr,
+                .close_game = stubFor(.fpCloseGame, "pfCloseGame"),
+                .leave_game = stubFor(.fpLeaveGame, "pfLeaveGame"),
                 // The one slot that is a real implementation rather than a report: it drives every join.
                 .get_database_character = @ptrCast(&fastcall.Callback2(
                     cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
                     getDatabaseCharacter,
                 ).shim),
-                .save_database_character = Stub(
-                    "pfSaveDatabaseCharacter",
-                    cb.stackArgs(spec.stack_args, .fpSaveDatabaseCharacter),
-                ).ptr,
+                .save_database_character = stubFor(.fpSaveDatabaseCharacter, "pfSaveDatabaseCharacter"),
                 .server_log_message = @ptrCast(&serverLogMessage),
-                .enter_game = Stub("pfEnterGame", cb.stackArgs(spec.stack_args, .fpEnterGame)).ptr,
+                .enter_game = stubFor(.fpEnterGame, "pfEnterGame"),
                 .find_player_token = @ptrCast(&fastcall.Callback2(
                     cb.stackArgs(spec.stack_args, .fpFindPlayerToken),
                     findPlayerToken,
                 ).shim),
-                // Unmeasured for every version so far — literal, and marked as such rather than
-                // routed through stackArgs, which would otherwise make an honest gap look like
-                // counted data.
-                .save_database_guild = Stub("pfSaveDatabaseGuild", unmeasured_guess).ptr,
-                .unlock_database_character = Stub(
-                    "pfUnlockDatabaseCharacter",
-                    cb.stackArgs(spec.stack_args, .fpUnlockDatabaseCharacter),
-                ).ptr,
-                .unk_0x24 = Stub("unk0x24", 0).ptr, // truly unused — nothing calls this slot on any version
-                .update_character_ladder = Stub(
-                    "pfUpdateCharacterLadder",
-                    cb.stackArgs(spec.stack_args, .fpUpdateCharacterLadder),
-                ).ptr,
-                .update_game_information = Stub(
-                    "pfUpdateGameInformation",
-                    cb.stackArgs(spec.stack_args, .fpUpdateGameInformation),
-                ).ptr,
-                .handle_packet = Stub("pfHandlePacket", cb.stackArgs(spec.stack_args, .fpHandlePacket)).ptr,
-                .set_game_data = Stub("pfSetGameData", cb.stackArgs(spec.stack_args, .fpSetGameData)).ptr,
-                .relock_database_character = Stub(
-                    "pfRelockDatabaseCharacter",
-                    cb.stackArgs(spec.stack_args, .fpRelockDatabaseCharacter),
-                ).ptr,
+                .save_database_guild = stubFor(.fpSaveDatabaseGuild, "pfSaveDatabaseGuild"),
+                .unlock_database_character = stubFor(.fpUnlockDatabaseCharacter, "pfUnlockDatabaseCharacter"),
+                .unk_0x24 = stubFor(.fpReserved0x24, "unk0x24"),
+                .update_character_ladder = stubFor(.fpUpdateCharacterLadder, "pfUpdateCharacterLadder"),
+                .update_game_information = stubFor(.fpUpdateGameInformation, "pfUpdateGameInformation"),
+                .handle_packet = stubFor(.fpHandlePacket, "pfHandlePacket"),
+                .set_game_data = stubFor(.fpSetGameData, "pfSetGameData"),
+                .relock_database_character = stubFor(.fpRelockDatabaseCharacter, "pfRelockDatabaseCharacter"),
                 .load_complete = @ptrCast(&loadComplete),
             };
         }
@@ -530,22 +502,22 @@ fn byOrdinal(m: HMODULE, ordinal: u16) ?*anyopaque {
 // spike is to learn which ones D2Game actually calls during init, and in what order.
 
 const CallbackTable = extern struct {
-    close_game: *const anyopaque,
-    leave_game: *const anyopaque,
-    get_database_character: *const anyopaque,
-    save_database_character: *const anyopaque,
-    server_log_message: *const anyopaque,
-    enter_game: *const anyopaque,
-    find_player_token: *const anyopaque,
-    save_database_guild: *const anyopaque,
-    unlock_database_character: *const anyopaque,
-    unk_0x24: *const anyopaque,
-    update_character_ladder: *const anyopaque,
-    update_game_information: *const anyopaque,
-    handle_packet: *const anyopaque,
-    set_game_data: *const anyopaque,
-    relock_database_character: *const anyopaque,
-    load_complete: *const anyopaque,
+    close_game: ?*const anyopaque,
+    leave_game: ?*const anyopaque,
+    get_database_character: ?*const anyopaque,
+    save_database_character: ?*const anyopaque,
+    server_log_message: ?*const anyopaque,
+    enter_game: ?*const anyopaque,
+    find_player_token: ?*const anyopaque,
+    save_database_guild: ?*const anyopaque,
+    unlock_database_character: ?*const anyopaque,
+    unk_0x24: ?*const anyopaque,
+    update_character_ladder: ?*const anyopaque,
+    update_game_information: ?*const anyopaque,
+    handle_packet: ?*const anyopaque,
+    set_game_data: ?*const anyopaque,
+    relock_database_character: ?*const anyopaque,
+    load_complete: ?*const anyopaque
 };
 
 comptime {
@@ -556,6 +528,24 @@ comptime {
     std.debug.assert(@offsetOf(CallbackTable, "enter_game") == 0x14);
     std.debug.assert(@offsetOf(CallbackTable, "find_player_token") == 0x18);
     std.debug.assert(@offsetOf(CallbackTable, "load_complete") == 0x3C);
+}
+
+/// Refuse to build a handler that names more stack parameters than the engine actually pushes.
+/// The failure this prevents is quiet: the extra parameters would read whatever happened to be on
+/// the engine's stack above the real arguments, which looks like plausible data right up until it
+/// is a pointer.
+fn assertReads(
+    comptime version: d2version.Version,
+    comptime which: cb.Slot,
+    comptime reads: usize,
+    comptime what: []const u8,
+) void {
+    const pushed = cb.stackArgs(d2version.spec(version).stack_args, which);
+    if (pushed < reads) @compileError(std.fmt.comptimePrint(
+        "{s}: the engine pushes {d} stack arg(s) for {s}, but {s} — a handler cannot read " ++
+            "arguments the engine never pushed",
+        .{ @tagName(version), pushed, @tagName(which), what },
+    ));
 }
 
 /// Build a reporting stub for one slot. `n_stack` is the arg count past ECX/EDX, which is also what
