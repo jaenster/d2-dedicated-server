@@ -38,16 +38,18 @@ pub const CreateGameFn = fn (
 /// discards its return value (1.10f @0x6fc37413), so the save is handed back here instead, from
 /// outside the join call stack.
 ///
-/// Eight arguments on every version, but the last two are not the same thing on every version, so
-/// they are named for their role rather than their contents:
+/// The last two arguments are the same on every version, which is worth stating because a
+/// published third-party header names them `LPPLAYERINFO` and `dwReserved2` and that is wrong.
+/// 1.10f's body (`CLIENTS_OnDatabaseCharacterReceived`) settles it:
 ///
-/// | arg | 1.10f/1.13c | 1.14d |
-/// |-----|-------------|-------|
-/// | 7   | `LPPLAYERINFO` — the joining character/account | pointer to `{FILETIME*, unk}` |
-/// | 8   | reserved | the client container, checked against `pClient->pClientContainer` |
+///   - `file_times` is a pointer to **two dwords**, copied straight into `pClient+0x190` and
+///     `pClient+0x194` — the `{FILETIME*, unk0x194}` pair 1.14d also passes.
+///   - `container` is compared against `pClient[0x18]`, i.e. `pClient+0x60`, and a mismatch
+///     **removes the client from the game**. It must be the container read off the client, so a
+///     zero here is a failed join, not a harmless default.
 ///
-/// `refuse` nonzero reports a failed load and disconnects the client, which is how a character
-/// that could not be fetched is answered rather than ignored.
+/// `refuse` nonzero, or a zero `total`, likewise removes the client — which is how a character
+/// that could not be fetched is answered rather than ignored ("Character size was zero").
 pub const SendDatabaseCharacterFn = fn (
     client_id: u32,
     save: [*]const u8,
@@ -55,8 +57,8 @@ pub const SendDatabaseCharacterFn = fn (
     total: u32,
     refuse: u32,
     reserved: u32,
-    per_version_7: *const anyopaque,
-    per_version_8: usize,
+    file_times: *const [2]u32,
+    container: usize,
 ) callconv(.winapi) i32;
 
 /// `D2GSSendClientChatMessage`.
