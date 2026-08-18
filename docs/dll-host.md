@@ -326,9 +326,14 @@ In dependency order. Each line is blocked by the ones above it, except where not
    (`packages/gs-store`) and `packages/d2engine` holds the layout and 1.10f's `stack_args`, but the
    1.14d implementations read the engine's client struct at 1.14d offsets, so 1.10f's equivalents
    have to be established before `fpGetDatabaseCharacter` can load anyone.
-4. **A real client joins and plays.** The transport is up and a socket client round-trips through
-   the engine; what is missing is meaning — packet framing (the stream is delivered in `recv`-sized
-   chunks, not split into packets) and the realm-backed callbacks from 3.
+4. **A real client joins and plays.** Everything under this is now in place — framing, the
+   character load and its delivery through `@10007`, and a listener on a configurable port. What
+   has not happened is a join: no client has connected.
+
+   The test path does not need a realm. We hold a complete 1.10f client (`Game.exe` plus every
+   client DLL, in `~/code/d2-1.10f-binaries`), and 1.10f's TCP/IP join dials port 4000 directly, so
+   `D2GS_GS_ADDR=127.0.0.1:4000 wine d2host.exe <dir>` and a client pointed at 127.0.0.1 is the
+   whole setup. A 1.14d client cannot substitute — it desynchronises on its opening `0x68`.
 
 Independent of the above:
 

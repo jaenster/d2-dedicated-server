@@ -13,6 +13,7 @@
 const std = @import("std");
 const server = @import("server.zig");
 const cb = @import("d2engine").callbacks;
+const hostapi = @import("d2engine").hostapi;
 const gsredis = @import("gs_store");
 const joinctx = @import("../realmclient/joinctx.zig");
 const obs = @import("obs");
@@ -26,16 +27,12 @@ pub var table: server.BnetServerService = .{};
 // chunk==total==L stores it in one call (CLIENT_AccumulateSaveData marks it complete) and advances the
 // joining client to state 2 via SendStateCommand(2); CsResult!=0 logs the load error and disconnects.
 // It validates pContainer against pClient->pClientContainer, so we pass the value read off the client.
-const OnDatabaseCharacterReceived: *const fn (
-    n_client_id: u32,
-    p_save: [*]const u8,
-    n_chunk: u32, // this-call chunk size (low 16 bits used)
-    n_total: u32, // total save size (low 16 bits used)
-    cs_result: i32, // 0 = success, nonzero = load error (disconnect)
-    dw_param: u32,
-    pn_filetimes: *const [2]u32, // [0] = FILETIME*, [1] = unk0x194
-    p_container: ?*anyopaque, // must equal pClient->pClientContainer
-) callconv(.winapi) u32 = @ptrFromInt(0x005306e0);
+// The same function the pre-1.14 host reaches as D2Game @10007 ("D2GSSendDatabaseCharacter"),
+// so its shape lives in d2engine and only its location is per-version. Here arg 7 is
+// {FILETIME*, unk0x194} and arg 8 is the client container, which the engine checks against
+// pClient->pClientContainer.
+const OnDatabaseCharacterReceived: *const hostapi.SendDatabaseCharacterFn =
+    @ptrFromInt(hostapi.sendDatabaseCharacter(.v114d).?.address);
 
 var load_filetime: [2]u32 = .{ 0, 0 }; // a zeroed FILETIME (load-time placeholder)
 var load_filetimes: [2]u32 = undefined; // { &load_filetime, unk0x194 }
@@ -141,10 +138,10 @@ pub fn pumpDelivery() void {
         defer slot.busy.store(false, .release);
         if (slot.len == 0) {
             log.print("realm:   char fetch FAILED — refusing join");
-            _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, 0, 0, 1, 0, &load_filetimes, slot.container);
+            _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, 0, 0, 1, 0, &load_filetimes, @intFromPtr(slot.container));
             continue;
         }
-        _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, slot.len, slot.len, 0, 0, &load_filetimes, slot.container);
+        _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, slot.len, slot.len, 0, 0, &load_filetimes, @intFromPtr(slot.container));
         log.print("realm:   char delivered (SendStateCommand 2)");
     }
 }
