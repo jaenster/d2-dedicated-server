@@ -20,9 +20,12 @@
 //! A third constraint settles the rows the first two could not: **the arities must agree**. What
 //! 1.06b pushes at a call site must equal what the LoD function pops in its `ret N`. That is an
 //! independent fact about the same row, and it earned its place — solving on fingerprint and order
-//! alone produced five rows (the 10140-10175 tail) whose ret sizes contradicted the answer, and
-//! re-solving with the gate moved them: 10140 lands on 10152, not 10170. Every row below now
-//! satisfies all three.
+//! alone produced five rows (the 10140-10175 tail) whose ret sizes contradicted the answer.
+//!
+//! Those three constraints still got four rows wrong, and the way they were caught is the lesson:
+//! comparing the two function bodies instruction for instruction. Order and arity only ever narrow
+//! a row to a candidate set; an identical body identifies it. Where the two disagree the body wins,
+//! and the rows below carry the body's answer.
 
 const std = @import("std");
 
@@ -80,16 +83,16 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10096, .lod = 10127, .how = .corroborated },
     .{ .classic = 10097, .lod = 10128, .how = .inferred },
     .{ .classic = 10098, .lod = 10129, .how = .inferred },
-    .{ .classic = 10099, .lod = 10132, .how = .inferred },
+    .{ .classic = 10099, .lod = 10130, .how = .measured },
     .{ .classic = 10102, .lod = 10134, .how = .measured }, // NOT file I/O — String, margin 2.78
     .{ .classic = 10103, .lod = 10135, .how = .measured },
     .{ .classic = 10104, .lod = 10136, .how = .measured },
     .{ .classic = 10105, .lod = 10137, .how = .corroborated },
     .{ .classic = 10109, .lod = 10143, .how = .inferred },
     .{ .classic = 10110, .lod = 10144, .how = .inferred },
-    .{ .classic = 10140, .lod = 10152, .how = .inferred },
-    .{ .classic = 10141, .lod = 10153, .how = .inferred },
-    .{ .classic = 10142, .lod = 10156, .how = .inferred },
+    .{ .classic = 10140, .lod = 10045, .how = .measured },
+    .{ .classic = 10141, .lod = 10046, .how = .measured },
+    .{ .classic = 10142, .lod = 10047, .how = .measured },
     .{ .classic = 10152, .lod = 10200, .how = .inferred },
     .{ .classic = 10175, .lod = 10202, .how = .inferred },
     .{ .classic = 10200, .lod = 10207, .how = .measured }, // Excel.cpp, margin 5.12
@@ -121,20 +124,29 @@ pub fn countBy(how: Confidence) usize {
 test "every row satisfies the arity gate that refuted five of them" {
     // Recorded from the cross-check: classic push counts vs the LoD function's `ret N`. These are
     // the rows the gate moved, and their old targets are the ones it rejected.
-    try std.testing.expectEqual(@as(u16, 10152), lodFor(10140, true).?); // was 10170, ret 12 vs 8
-    try std.testing.expectEqual(@as(u16, 10153), lodFor(10141, true).?); // was 10171, ret 12 vs 8
-    try std.testing.expectEqual(@as(u16, 10156), lodFor(10142, true).?); // was 10172, ret 16 vs 12
+    // Bodies compared instruction for instruction, so these no longer need `accept_inferred`.
+    try std.testing.expectEqual(@as(u16, 10045), lodFor(10140, false).?);
+    try std.testing.expectEqual(@as(u16, 10046), lodFor(10141, false).?);
+    try std.testing.expectEqual(@as(u16, 10047), lodFor(10142, false).?);
+    try std.testing.expectEqual(@as(u16, 10130), lodFor(10099, false).?);
     try std.testing.expectEqual(@as(u16, 10200), lodFor(10152, true).?); // was 10175, ret 0 vs 16
     try std.testing.expectEqual(@as(u16, 10202), lodFor(10175, true).?); // was 10180, ret 0 vs 4
 }
 
-test "the map is strictly increasing, which is what pinned half of it" {
+test "the map increases everywhere except the one block that was relocated" {
+    // Order pinned half this map, and it is still worth asserting — but it is an observation, not a
+    // law, and comparing bodies found where it breaks. Classic 10140-10142 land on LoD 10045-10047:
+    // a contiguous block moved contiguously, downward, past everything around it. Anything solved
+    // from order alone in that neighbourhood was solved from a false premise.
+    const relocated = [_]u16{ 10140, 10141, 10142 };
     var prev_c: u16 = 0;
     var prev_l: u16 = 0;
     for (classic_to_lod) |row| {
-        try std.testing.expect(row.classic > prev_c);
-        try std.testing.expect(row.lod > prev_l);
+        try std.testing.expect(row.classic > prev_c); // the classic side really is ordered
         prev_c = row.classic;
+
+        if (std.mem.indexOfScalar(u16, &relocated, row.classic) != null) continue;
+        try std.testing.expect(row.lod > prev_l);
         prev_l = row.lod;
     }
 }
@@ -154,7 +166,7 @@ test "an unconfirmed row is refused rather than guessed" {
 
 test "how much of the set is actually established" {
     try std.testing.expectEqual(@as(usize, 47), classic_to_lod.len);
-    try std.testing.expectEqual(@as(usize, 16), countBy(.measured));
+    try std.testing.expectEqual(@as(usize, 20), countBy(.measured));
     try std.testing.expectEqual(@as(usize, 17), countBy(.corroborated));
-    try std.testing.expectEqual(@as(usize, 14), countBy(.inferred));
+    try std.testing.expectEqual(@as(usize, 10), countBy(.inferred));
 }
