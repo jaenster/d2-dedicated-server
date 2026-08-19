@@ -86,9 +86,31 @@ pub const packet_size_108 = [0x6e]i32{
       1,  -1,   9,   1,   0,   1, // 0x68-0x6D
 };
 
+/// 1.06b, classic. Read straight off the instruction stream rather than matched by pattern:
+/// SERVER_GetClientPacketSize bounds the opcode against 0x6a and indexes this array, so both the
+/// base and the length are the engine's own. Classic's join is a byte shorter than LoD's — a
+/// 15-byte name field, not 16 — so the tell-tale pair is 45/28 where later versions read 46/29.
+pub const packet_size_106b = [0x6a]i32{
+    0,   5,   9,   5,   9,   5,   9,   9, // 0x00-0x07
+    5,   9,   9,   1,   5,   9,   9,   5, // 0x08-0x0F
+    9,   9,   1,   9,  -1,  -1,  13,   5, // 0x10-0x17
+    17,  5,   9,   9,   3,   9,   9,  17, // 0x18-0x1F
+    13,  9,   5,   9,   5,   9,  13,   9, // 0x20-0x27
+    9,   9,   9,   5,   0,   1,   3,   9, // 0x28-0x2F
+    9,   9,  17,  17,   5,  17,   9,   5, // 0x30-0x37
+    13,  5,   3,   3,   5,   5,   5,   3, // 0x38-0x3F
+    1,   1,   1,   1,  17,   9,  13,  13, // 0x40-0x47
+    1,   9,   0,   9,   5,   3,   0,   7, // 0x48-0x4F
+    9,   7,   5,   1,   1,   8,  12,   0, // 0x50-0x57
+    3,   17, 260, 4,   0,   7,   6,   5, // 0x58-0x5F
+    45,  28,  1,   1,   1,  -1,   9,   1, // 0x60-0x67
+    0,   1, // 0x68-0x69
+};
+
 /// The table `v` frames with. Null means nobody has read that version's out of its D2Net.
 pub fn packetSizes(v: version.Version) ?[]const i32 {
     return switch (v) {
+        .v106b => &packet_size_106b,
         .v107 => &packet_size_107,
         .v108 => &packet_size_108,
         .v109d, .v110f => &packet_size_110f,
@@ -102,6 +124,7 @@ pub fn packetSizes(v: version.Version) ?[]const i32 {
 /// Route a join to the wrong list and the engine never sees it: no reply, no callback, no error.
 pub fn systemRange(v: version.Version) ?struct { lo: u8, hi: u8 } {
     return switch (v) {
+        .v106b => .{ .lo = 0x60, .hi = 0x69 },
         .v107, .v108 => .{ .lo = 0x64, .hi = 0x6d },
         .v109d, .v110f => .{ .lo = 0x66, .hi = 0x6f },
         else => null,
@@ -114,11 +137,19 @@ test "the system-message block shifts with the join" {
     try std.testing.expect(joinPacket(.v107).?.op >= a.lo and joinPacket(.v107).?.op <= a.hi);
     try std.testing.expect(joinPacket(.v110f).?.op >= b.lo and joinPacket(.v110f).?.op <= b.hi);
     try std.testing.expectEqual(b.lo - a.lo, b.hi - a.hi); // the same two-opcode shift
+
+    // Classic sits six below 1.10f, and its join is the shorter 28-byte one.
+    const c = systemRange(.v106b).?;
+    try std.testing.expect(joinPacket(.v106b).?.op >= c.lo and joinPacket(.v106b).?.op <= c.hi);
+    try std.testing.expectEqual(@as(u8, 6), b.lo - c.lo);
+    try std.testing.expectEqual(@as(usize, 28), joinPacket(.v106b).?.len);
+    try std.testing.expectEqual(@as(i32, 28), packetSizes(.v106b).?[joinPacket(.v106b).?.op]);
 }
 
 /// The opcode and length a join arrives as on `v`.
 pub fn joinPacket(v: version.Version) ?struct { op: u8, len: usize } {
     return switch (v) {
+        .v106b => .{ .op = 0x61, .len = 28 },
         .v107, .v108 => .{ .op = 0x65, .len = 29 },
         .v109d, .v110f => .{ .op = join_110f, .len = join_110f_len },
         .v114d => .{ .op = join_114d, .len = join_114d_len },
