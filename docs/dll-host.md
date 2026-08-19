@@ -333,6 +333,51 @@ disassembly is readable.
 
 ## What is left
 
+### The work queue, in dependency order
+
+- [ ] **`FOG @10207` — the txt→record decoder.** The keystone: it unblocks 1.08, 1.09d and 1.06b
+      at once, and closes 1.10f's runewords/cube gap. Not so the engines read `.txt` — they do not,
+      see below — but because `CompileTxt`'s other branch, gated on `DAT_6fde1cec` and an exported
+      setter, reads `.txt` and **writes `.bin` back out** using that version's own field
+      descriptors. That is how Blizzard built server distributions, and it is the only way to get
+      era-correct tables for versions whose data we do not have. Real function: 1.10f Fog
+      @0x6ff5aa60. Field descriptor is 0x14 bytes — name, type (0 terminates), size/bit, record
+      offset, linker-or-callback — and roughly 20 column types. Every piece it leans on (linkers,
+      string tree, `GetRowFromTxt`, `CreateBinFile`) is already implemented in `packages/d2fog`.
+- [ ] **Drive the compiler and keep the output.** Once 10207 exists: set the per-version compile
+      flag, run each engine once against the retail text tables, and keep the `.bin` files it
+      emits as that version's data.
+- [ ] **1.06b: wire `tools/fogrewrite` into a staged install** and boot it. The rosetta and the
+      rewriter are both done; nothing has been run through them yet.
+- [ ] **1.06b: three slots are unmeasured** — `fpEnterGame`, `fpUpdateCharacterLadder`,
+      `fpUpdateGameInformation`. Their call sites have an indirect call in the window, so the stack
+      simulation cannot resolve what it consumes. They are `null` and therefore refused.
+- [ ] **1.06b: find its `.bin`/`.txt` selector.** 1.07, 1.08 and 1.09d all hardcode it to 1 (always
+      `.bin`); 1.06b's was not located. If it turns out to be 0, 1.06b needs no era data at all —
+      only 10207.
+- [ ] **1.06b: measure its callback shape** with `D2GS_ENGINE_PROBE=1`, the same way 1.07's was.
+- [ ] **13 rosetta rows rest on the structural constraints only** (order + matching `ret N`), not
+      on a decisive fingerprint. `lodFor` refuses them unless a caller opts in.
+- [ ] **1.13c renumbered D2Game's host ordinals** — `@10023` is a bare `ret 4`, `@10046` is
+      `mov eax,1; ret 0x18`. `version.GameOrdinals` does not extend to it and needs its own row.
+- [ ] **1.07/1.08's S->C direction is unverified.** Our test client speaks 1.14d, so it stops
+      understanding after GameFlags. Irrelevant with a period client; it only blocks *our* ability
+      to watch world state locally.
+
+### Notes that changed the plan
+
+**Every pre-1.10 build reads `.bin`, not `.txt`.** This document used to say only 1.10f had a
+compiled-table path. All of 1.06b, 1.07, 1.08 and 1.09d carry both, and 1.07/1.08/1.09d hardcode
+the selector to `.bin`. A `.bin` is a raw struct dump, so only its own era's engine can read one:
+1.08 loads 1.07's `lvltypes.bin` at the wrong stride and asks for `DATA\GLOBAL\TILES\wn\Floor.dt1`
+— a fragment, not a filename — where 1.07 reads the same file and gets
+`DATA\GLOBAL\TILES\Act1\Town\Floor.dt1` with zero misses.
+
+**The patch installers carry no data.** `LODPatch_109d.exe` carves to 1.7 MB of twenty PE deltas
+and no data member, so era tables cannot be recovered from the patches — they have to be compiled.
+
+
+
 **Goal 1 (a working 1.10f server) is done.** Every item that used to block it — our own D2Net,
 game creation, the 16 callbacks, a real client joining and playing — is finished and verified: see
 "A character joins a game on the 1.10f engine" and "A 1.14d client plays on the 1.10f server" below.
