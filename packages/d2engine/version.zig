@@ -56,7 +56,15 @@ pub const GameOrdinals = struct {
     /// Stores (does not copy) the callback table pointer, so the table must outlive the process.
     set_server_callbacks: u16 = 10023,
     init_clock: u16 = 10039,
+    /// Per-frame "process net messages". No arguments.
+    net_messages: u16 = 10003,
+    /// Acquires the worker context the loop below is driven with. No arguments; returns a pointer.
+    /// A zero here is the tell that the number does not mean on this build what it means on 1.10f.
+    worker_context: u16 = 10041,
     process_game: u16 = 10043,
+    /// Drains one game's queued packets to D2Net, and re-arms the game's scheduler task. Skipping
+    /// it once drops that game out of the scheduler permanently, so it is not optional.
+    flush_game: u16 = 10045,
     create_empty_game: u16 = 10047,
     set_init_seed: u16 = 10010,
     shutdown: u16 = 10050,

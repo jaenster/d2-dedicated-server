@@ -1364,10 +1364,11 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     // Calling @10005 directly instead — it is the flush's inner half — halts the engine with
     // "This should never happen! [sUpdateClients]"; it is reached *through* @10045, and D2Server
     // does not import it at all.
-    const netmsgs = byOrdinal(d2game, 10003);
-    const worker_ctx_fn = byOrdinal(d2game, 10041);
-    const process_game = byOrdinal(d2game, 10043);
-    const flush_game = byOrdinal(d2game, 10045);
+    const game_ord = comptime d2version.spec(version).game;
+    const netmsgs = byOrdinal(d2game, game_ord.net_messages);
+    const worker_ctx_fn = byOrdinal(d2game, game_ord.worker_context);
+    const process_game = byOrdinal(d2game, game_ord.process_game);
+    const flush_game = byOrdinal(d2game, game_ord.flush_game);
 
     var worker_ctx: usize = 0;
     if (worker_ctx_fn) |p| {
