@@ -289,6 +289,31 @@ pub const v107: StackArgs = .{
     .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcac0a8
 };
 
+/// 1.08, swept from table global 0x6fd4e66c and finished with the stack simulation. Structurally
+/// the same build as 1.07 — pRealm at client+0x20, a one-argument `fpGetDatabaseCharacter`, a
+/// twelve-argument `fpLeaveGame`, a four-argument `fpUpdateCharacterLadder` — which is what makes
+/// it the cheapest of the pre-1.10 targets: it needs no new handler shape, only its own numbers.
+///
+/// Four slots have no dispatch site under the sweep (0x1C, 0x24, 0x30, 0x3C). 1.07 does dispatch
+/// 0x1C and 0x24, so these may be sites the sweep missed rather than calls the build does not
+/// make; either way the host leaves them null, which the engine's own guards make safe.
+pub const v108: StackArgs = .{
+    .fpCloseGame = .{ .args = 0 }, // @0x6fc690fd
+    .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fc62b15 and @0x6fc62bc0
+    .fpGetDatabaseCharacter = .{ .args = 1 }, // two sites, both push one; ECX = game, EDX = name
+    .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fcad377
+    .fpEnterGame = .{ .args = 3 }, // @0x6fc685c1, simulated with the intermediate pops resolved
+    .fpFindPlayerToken = .{ .args = 3 }, // @0x6fc66b63
+    .fpSaveDatabaseGuild = .no_site_found,
+    .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fc66df4
+    .fpReserved0x24 = .no_site_found,
+    .fpUpdateCharacterLadder = .{ .args = 4 }, // @0x6fc671c4, same as 1.07; 1.09 grew a 7th param
+    .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fca1033
+    .fpHandlePacket = .no_site_found,
+    .fpSetGameData = .{ .args = 0 }, // @0x6fc6256b (its one PUSH is the ESI prologue)
+    .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcad270
+};
+
 /// 1.09d, counted the same way against the rebuilt 1.09d-lod `D2Game.dll` (table global
 /// 0x6fd24174, 203 references, 122 dispatches — the count is high only because this build kept its
 /// assert/log calls, and all but 14 of the dispatches are slot 0x10).

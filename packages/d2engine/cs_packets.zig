@@ -65,10 +65,32 @@ pub const packet_size_107 = [0x6e]i32{
       1,  -1,   9,   1,   0,   1,           // 0x68-0x6D
 };
 
+/// 1.08's, read out of its own `D2Net.dll`. Below 0x64 it is 1.10f's table exactly — 1.08 had
+/// already retired the five opcodes 1.07 still accepts — while the join block above it is 1.07's,
+/// so the join is 0x65 and the table ends at 0x6E. Two different versions' worth of drift in one
+/// table, which is why it is read per version rather than derived from a neighbour.
+pub const packet_size_108 = [0x6e]i32{
+      0,   5,   9,   5,   9,   5,   9,   9, // 0x00-0x07
+      5,   9,   9,   1,   5,   9,   9,   5, // 0x08-0x0F
+      9,   9,   1,   9,  -1,  -1,  13,   5, // 0x10-0x17
+     17,   5,   9,   9,   3,   9,   9,  17, // 0x18-0x1F
+     13,   9,   5,   9,   5,   9,  13,   9, // 0x20-0x27
+      9,   9,   9,   0,   0,   1,   3,   9, // 0x28-0x2F
+      9,   9,  17,  17,   5,  17,   9,   5, // 0x30-0x37
+     13,   5,   3,   3,   9,   5,   5,   3, // 0x38-0x3F
+      1,   1,   1,   1,  17,   9,  13,  13, // 0x40-0x47
+      1,   9,   0,   9,   5,   3,   0,   7, // 0x48-0x4F
+      9,   9,   5,   1,   1,   0,   0,   0, // 0x50-0x57
+      3,  17,   0,   0,   0,   7,   6,   5, // 0x58-0x5F
+      1,   3,   5,   5,  46,  29,   1,   1, // 0x60-0x67
+      1,  -1,   9,   1,   0,   1, // 0x68-0x6D
+};
+
 /// The table `v` frames with. Null means nobody has read that version's out of its D2Net.
 pub fn packetSizes(v: version.Version) ?[]const i32 {
     return switch (v) {
         .v107 => &packet_size_107,
+        .v108 => &packet_size_108,
         .v109d, .v110f => &packet_size_110f,
         else => null,
     };
@@ -80,7 +102,7 @@ pub fn packetSizes(v: version.Version) ?[]const i32 {
 /// Route a join to the wrong list and the engine never sees it: no reply, no callback, no error.
 pub fn systemRange(v: version.Version) ?struct { lo: u8, hi: u8 } {
     return switch (v) {
-        .v107 => .{ .lo = 0x64, .hi = 0x6d },
+        .v107, .v108 => .{ .lo = 0x64, .hi = 0x6d },
         .v109d, .v110f => .{ .lo = 0x66, .hi = 0x6f },
         else => null,
     };
@@ -97,7 +119,7 @@ test "the system-message block shifts with the join" {
 /// The opcode and length a join arrives as on `v`.
 pub fn joinPacket(v: version.Version) ?struct { op: u8, len: usize } {
     return switch (v) {
-        .v107 => .{ .op = 0x65, .len = 29 },
+        .v107, .v108 => .{ .op = 0x65, .len = 29 },
         .v109d, .v110f => .{ .op = join_110f, .len = join_110f_len },
         .v114d => .{ .op = join_114d, .len = join_114d_len },
         else => null,
@@ -150,6 +172,10 @@ test "1.10f inserted two opcodes ahead of the join, so 1.07's sits two lower" {
     // and 1.07 accepts five opcodes 1.10f retired
     try std.testing.expectEqual(@as(i32, 5), packet_size_107[0x2b]);
     try std.testing.expectEqual(@as(i32, 0), packet_size_110f[0x2b]);
+    // 1.08 sits between them: 1.10f's opcodes below the join block, 1.07's join position above it.
+    try std.testing.expectEqual(@as(i32, 0), packet_size_108[0x2b]);
+    try std.testing.expectEqual(@as(u8, 0x65), joinPacket(.v108).?.op);
+    try std.testing.expectEqual(@as(u8, 0x64), systemRange(.v108).?.lo);
 }
 
 test "the same field surgery serves both join opcodes" {

@@ -121,6 +121,10 @@ fn configureRealm() void {
 /// Shape from d2engine; only the location is per version.
 var send_character: ?*const hostapi.SendDatabaseCharacterFn = null;
 
+/// Pre-1.10 takes one argument fewer, and we are the caller here, so the wrong shape drifts OUR
+/// stack rather than the engine's. Selected at load time from the version's measured arity.
+var send_character7: ?*const hostapi.SendDatabaseCharacterFn7 = null;
+
 /// One in-flight character load. A join asks for exactly one save, so a small table is enough; a
 /// full one refuses the join rather than dropping it silently, which would leave a client sitting
 /// on a loading screen until it timed out.
@@ -388,17 +392,20 @@ fn Binding(comptime version: d2version.Version) type {
 /// Hand every fetched save to the engine, outside the join call stack. A zero-length fetch is a
 /// refusal, not a silence: bLock nonzero tells the engine the load failed and it disconnects.
 fn pumpCharacterLoads() void {
-    const send = send_character orelse return;
     for (&pending) |*p| {
         if (!p.used) continue;
         p.used = false;
-        if (p.len == 0) {
-            say("d2host: character fetch failed — refusing the join");
-            _ = send(p.client_id, &p.save, 0, 0, 1, 0, &load_filetimes, p.container);
-            continue;
-        }
-        _ = send(p.client_id, &p.save, p.len, p.len, 0, 0, &load_filetimes, p.container);
-        sayHex("d2host: character delivered, bytes ", p.len);
+        const refused = p.len == 0;
+        if (refused) say("d2host: character fetch failed — refusing the join");
+        const size: u32 = if (refused) 0 else p.len;
+        const lock: u32 = if (refused) 1 else 0;
+        if (send_character7) |send| {
+            // No container argument before 1.10: the engine had not started cross-checking it.
+            _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetimes);
+        } else if (send_character) |send| {
+            _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetimes, p.container);
+        } else return;
+        if (!refused) sayHex("d2host: character delivered, bytes ", p.len);
     }
 }
 
@@ -1255,8 +1262,13 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     // go and every join stalls, so say so at startup rather than at the first join.
     if (byOrdinal(d2game, hostapi.sendDatabaseCharacter(version).?.ordinal)) |p| {
         load_filetimes = .{ @truncate(@intFromPtr(&load_filetime)), 0 };
-        send_character = @ptrCast(@alignCast(p));
-        say("d2host: D2GSSendDatabaseCharacter @10007 resolved");
+        if (comptime hostapi.sendDatabaseCharacterArgs(version) orelse 8 == 7) {
+            send_character7 = @ptrCast(@alignCast(p));
+            say("d2host: D2GSSendDatabaseCharacter @10007 resolved (7-argument form)");
+        } else {
+            send_character = @ptrCast(@alignCast(p));
+            say("d2host: D2GSSendDatabaseCharacter @10007 resolved");
+        }
     } else say("d2host: ordinal 10007 missing — characters cannot be delivered");
 
     // With a realm, games are made on request and creating one here would be a phantom the realm

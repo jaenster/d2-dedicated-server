@@ -39,7 +39,7 @@ pub fn ordinalArgs(v: version.Version) ?OrdinalArgs {
         // 1.07 and 1.09d agree, and both differ from 1.10f: the debug pair was added later. Swept
         // the same way over every Fog ordinal D2Common imports — AllocLinker is the *only* one of
         // the eighteen that moved, on either version.
-        .v107, .v109d => .{ .alloc_linker = 0 },
+        .v107, .v108, .v109d => .{ .alloc_linker = 0 },
         else => null,
     };
 }

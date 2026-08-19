@@ -62,6 +62,33 @@ pub const SendDatabaseCharacterFn = fn (
 ) callconv(.winapi) i32;
 
 /// `D2GSSendClientChatMessage`.
+/// The same call before 1.10 added the eighth argument. Verified two ways: the published header
+/// of a working 1.09 server declares seven — `(dwClientId, lpSaveData, dwSize, dwTotalSize, bLock,
+/// dwReserved1, lpPlayerInfo)` — and @10007 ends in `ret 0x1C` on 1.06b, 1.07 and 1.09d against
+/// `ret 0x20` on 1.10f.
+///
+/// This one matters in the other direction from the callbacks: the host *calls* it, so a host that
+/// pushes eight where the engine pops seven leaves its OWN stack four bytes off on every character
+/// delivery.
+pub const SendDatabaseCharacterFn7 = fn (
+    client_id: u32,
+    save: [*]const u8,
+    chunk: u32,
+    total: u32,
+    refuse: u32,
+    reserved: u32,
+    file_times: *const [2]u32,
+) callconv(.winapi) i32;
+
+/// How many arguments @10007 takes on `v`. Null means unmeasured.
+pub fn sendDatabaseCharacterArgs(v: version.Version) ?u8 {
+    return switch (v) {
+        .v106b, .v107, .v108, .v109d => 7,
+        .v110f, .v113c, .v114d => 8,
+        else => null,
+    };
+}
+
 pub const SendClientChatMessageFn = fn (
     client_id: u32,
     kind: ChatKind,
@@ -121,14 +148,21 @@ pub const CharNameSource = union(enum) {
 pub fn charNameSource(v: version.Version) ?CharNameSource {
     return switch (v) {
         .v110f, .v114d => .{ .realm_relative = .{ .name = 0x5B, .account = 0x4B } },
-        .v109d => .{ .realm_relative = .{ .name = 0x47, .account = 0x37 } },
-        .v107 => .edx_pointer,
+        // 1.09d's own shape, from the published source of a 1.09 server:
+        // `GetDatabaseCharacter(LPGAMEDATA, LPCSTR lpCharName, ...)` is __fastcall, so ECX is the
+        // game and EDX is the name — the same shape 1.07 was measured to have, not the
+        // realm-relative one this file first assumed.
+        .v109d, .v108, .v107 => .edx_pointer,
         else => null,
     };
 }
 
 test "1.07 does not merely move the offsets, it changes the shape" {
     try std.testing.expect(charNameSource(.v107).? == .edx_pointer);
+    try std.testing.expect(charNameSource(.v108).? == .edx_pointer);
+    try std.testing.expect(charNameSource(.v109d).? == .edx_pointer);
+    try std.testing.expectEqual(@as(u8, 7), sendDatabaseCharacterArgs(.v108).?);
+    try std.testing.expectEqual(@as(u8, 8), sendDatabaseCharacterArgs(.v110f).?);
     try std.testing.expectEqual(@as(usize, 0x5B), charNameSource(.v110f).?.realm_relative.name);
     try std.testing.expect(charNameSource(.v106b) == null);
 }
