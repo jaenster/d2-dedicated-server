@@ -333,6 +333,43 @@ disassembly is readable.
 
 ## What is left
 
+### One image per engine, and the version is compiled in
+
+A release artifact is built FOR an engine rather than carrying all of them and choosing later:
+
+```
+deploy/build-d2host.sh 0.0.1            # every engine that is ready
+deploy/build-d2host.sh 0.0.1 1.09d      # just one
+```
+
+Tags are `<our release>-d2-<engine>` — `d2gs:0.0.1-d2-109d` — the same shape as a base image
+naming what it is built on. Both halves are build args (`APP_VERSION`, `D2_VERSION`).
+
+The point of pinning at build time is that it moves the readiness gate from runtime to the
+compiler. `-Dengine-version=1.06b` does not produce an image that exits on start; it fails to
+build:
+
+```
+error: -Dengine-version=1.06b is not ready to serve: missing fpEnterGame,
+       fpUpdateCharacterLadder (and/or no measured client layout)
+```
+
+So the set of engines that *can* be tagged is exactly the set that is finished, and nobody has to
+maintain a list of which those are — `build-d2host.sh` iterates every known version and lets the
+compiler decide. A refusal there is a correct outcome, not a broken pipeline.
+
+Two things follow from the version being a constant rather than a flag:
+
+- `D2GS_ENGINE_VERSION` is **refused**, not ignored, if it disagrees with the build. An image
+  tagged for one engine quietly serving another is the failure a per-version tag exists to prevent.
+- The binary shrinks to one engine's code. The default build (no `-Dengine-version`) still carries
+  every measured version and keeps the runtime switch, which is what local bring-up wants — a probe
+  run is a run of the same binary.
+
+Game data is not baked in, and for these versions the *era* matters as much as the licence: a
+`.bin` is a raw struct dump, so an install from another patch level decodes as garbage rather than
+failing cleanly. Mount the matching era at `/game`.
+
 ### The work queue, in dependency order
 
 - [ ] **`FOG @10207` — the txt→record decoder.** The keystone: it unblocks 1.08, 1.09d and 1.06b

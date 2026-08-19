@@ -18,6 +18,7 @@ const cb = @import("d2engine").callbacks;
 const hostapi = @import("d2engine").hostapi;
 const gameflags = @import("d2engine").gameflags;
 const d2version = @import("d2engine").version;
+const build_options = @import("build_options");
 
 const HMODULE = *anyopaque;
 extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?HMODULE;
@@ -1037,6 +1038,30 @@ pub fn main() !void {
     say("d2host: start");
 
     const install_dir = firstArg();
+
+    // Built for one engine: the version is a constant, so `ready()` is checked by the compiler and
+    // an unfinished version cannot produce a binary at all. `D2GS_ENGINE_VERSION` is refused
+    // rather than ignored — an image tagged for one engine quietly serving another is exactly the
+    // failure a per-version tag exists to prevent.
+    if (comptime build_options.engine_version) |pinned| {
+        const v = comptime d2version.Version.parse(pinned) orelse
+            @compileError("-Dengine-version=" ++ pinned ++ " is not a known version");
+        comptime {
+            if (!ready(v)) @compileError("-Dengine-version=" ++ pinned ++ " is not ready to serve: " ++
+                "missing " ++ cb.missingSlots(d2version.spec(v).stack_args) ++
+                " (and/or no measured client layout) — see docs/dll-host.md");
+        }
+        var buf: [32]u8 = undefined;
+        if (env("D2GS_ENGINE_VERSION", &buf)) |asked| {
+            if (d2version.Version.parse(asked) != v) {
+                sayFmt("d2host: built for {s}; refusing D2GS_ENGINE_VERSION='{s}'", .{ @tagName(v), asked });
+                return error.WrongEngineForThisBuild;
+            }
+        }
+        sayFmt("d2host: targeting {s} (pinned at build time)", .{@tagName(v)});
+        return run(v, install_dir);
+    }
+
     const requested = resolveVersion();
 
     // `inline else` monomorphizes this switch's body once per `d2version.Version` enum value, with

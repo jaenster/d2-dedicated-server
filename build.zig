@@ -157,6 +157,16 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Pin the engine version at build time, so a release artifact is built FOR one engine rather
+    // than carrying every one and choosing later. This is what makes a per-version container tag
+    // mean something: `-Dengine-version=1.06b` turns the readiness gate into a BUILD error, so an
+    // image for a version that is not finished cannot be produced at all. Left unset, the binary
+    // keeps the runtime switch and `D2GS_ENGINE_VERSION` picks among the ready versions.
+    const engine_version = b.option([]const u8, "engine-version",
+        "Build d2host for ONE engine (e.g. 1.06b, 1.09d, 1.10f); omit to carry all of them");
+    const d2host_options = b.addOptions();
+    d2host_options.addOption(?[]const u8, "engine_version", engine_version);
+    d2host.root_module.addOptions("build_options", d2host_options);
     d2host.root_module.addImport("fastcall", fastcall_mod);
     d2host.root_module.addImport("gs_store", gs_store);
     d2host.root_module.addImport("d2engine", d2engine);

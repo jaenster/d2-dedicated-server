@@ -15,6 +15,21 @@
 #                (windows) from files.typeguru.nl rather than rebuilding it in CI.
 #   gs-native  — the wine-free GS: game data IS baked in (the mac minimal set), since
 #                nothing wires an initContainer for it yet — see that target below.
+#   d2host     — headless PRE-1.14 server: our host driving the engine's D2Game.dll as a
+#                library, rather than injecting into Game.exe. Built for ONE engine version
+#                and tagged for it, the way a base image is tagged for its distro:
+#
+#                  deploy/build-d2host.sh 0.0.1          # every engine that is ready
+#                  deploy/build-d2host.sh 0.0.1 1.09d     # just one
+#
+#                Tags are <our release>-d2-<engine>: d2gs:0.0.1-d2-109d — the same shape as a
+#                base image naming what it is built on.
+#
+#                The version is a build argument on purpose. d2host carries every measured
+#                version and can pick at runtime, but a release artifact should be built FOR
+#                one engine: -Dengine-version makes the readiness gate a COMPILE error, so an
+#                image for an unfinished version cannot be built. Game data is not baked in,
+#                and the era has to match the tag — see that target.
 #
 # --target gs builds only the windows DLLs (pg is a lazy dep, never pulled there);
 # --target realmd builds only the realmd binary. Neither builds the other's artifacts.
@@ -100,6 +115,48 @@ ENV D2MAC_BIN=/game/DiabloII_macho
 VOLUME ["/game", "/tmp"]
 EXPOSE 4000
 ENTRYPOINT ["/d2gs-native"]
+
+# build: d2host (x86-windows) for ONE engine version
+# The version is a BUILD argument, not a runtime one, and that is the point of tagging an image
+# per engine: -Dengine-version turns d2host's readiness gate into a compile error, so an image for
+# a version whose ABI is not finished cannot be produced at all. Building for 1.06b today fails
+# with "missing fpEnterGame, fpUpdateCharacterLadder", which is exactly what should happen.
+#
+# Fog.dll and D2Net.dll are version-agnostic — they are told which engine they are standing in for
+# at startup — so they build once regardless of D2_VERSION.
+FROM zig AS build-d2host
+ARG D2_VERSION=1.10f
+RUN zig build d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
+    zig build d2fog d2net -Doptimize=ReleaseSafe
+
+# d2host: headless pre-1.14 wine runtime
+# Distinct from `gs` above: that one injects into 1.14d's Game.exe, this one IS the host and loads
+# D2Game.dll/D2Common.dll as libraries. Tag it per engine — e.g.
+#
+#   deploy/build-d2host.sh 0.0.1 1.09d      ->  d2gs:0.0.1-d2-109d
+#
+# Both halves of the tag are build args: APP_VERSION is our release, D2_VERSION the engine.
+#
+# Game data is NOT baked in, same as `gs`, and here the era matters as much as the licence: a .bin
+# table is a raw struct dump, so an install from another patch level decodes as garbage rather than
+# failing cleanly. Mount the matching era at /game.
+FROM debian:bookworm-slim AS d2host
+ARG D2_VERSION=1.10f
+RUN dpkg --add-architecture i386 && apt-get update && \
+    apt-get install -y --no-install-recommends wine wine32 curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=build-d2host /src/zig-out/bin/d2host.exe /opt/d2host/
+COPY --from=build-d2host /src/zig-out/bin/Fog.dll /src/zig-out/bin/D2Net.dll /opt/d2host/
+COPY deploy/d2host-entrypoint.sh /opt/d2host/entrypoint.sh
+RUN chmod +x /opt/d2host/entrypoint.sh
+ENV WINEPREFIX=/wine WINEDEBUG=-all
+# Announced, not obeyed: the binary was built for this engine and refuses to be told otherwise, so
+# this is a label for humans and `docker inspect` rather than a switch.
+ENV D2HOST_ENGINE=${D2_VERSION}
+LABEL org.d2gs.engine-version=${D2_VERSION}
+VOLUME ["/game", "/wine", "/work"]
+EXPOSE 4000
+ENTRYPOINT ["/opt/d2host/entrypoint.sh"]
 
 # gs: headless wine runtime (no X, no desktop)
 FROM debian:bookworm-slim AS gs
