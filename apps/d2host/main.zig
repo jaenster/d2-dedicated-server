@@ -1187,19 +1187,22 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     // Opt-in, because it is a build step wearing a server's clothes: it wants `data/global/excel/`
     // to exist in the working directory and it rewrites tables there.
     if (envFlag("D2GS_COMPILE_TABLES")) {
-        if (byOrdinal(d2common, 11242)) |p| {
+        if (comptime spec.common.set_compile_tables) |ord| if (byOrdinal(d2common, ord)) |p| {
             const set_compile: *const fn (u32) callconv(.winapi) void = @ptrCast(@alignCast(p));
             set_compile(0);
-            say("d2host: table COMPILE mode on (D2Common @11242) — .txt in, .bin out");
-        } else say("d2host: D2Common @11242 missing — cannot enable table compilation");
+            say("d2host: table COMPILE mode on — .txt in, .bin out");
+        } else say("d2host: the compile-tables setter is missing — cannot enable it")
+        else say("d2host: this engine has no compile-tables setter (it reads .txt directly)");
     }
 
-    // D2Common @10576 DATATBLS_LoadAllTxts(a, lang, flags) — D2Server passes (0, 1, 0).
-    if (byOrdinal(d2common, 10576)) |p| {
-        say("d2host: calling D2Common @10576 (DATATBLS_LoadAllTxts)");
+    // DATATBLS_LoadAllTxts(a, lang, flags) — D2Server passes (0, 1, 0). The ordinal is per version:
+    // classic renumbered D2Common, and 1.06b's @10576 is an unrelated bounds check that returns
+    // without loading anything.
+    if (byOrdinal(d2common, spec.common.load_all_txts)) |p| {
+        sayFmt("d2host: calling D2Common @{d} (DATATBLS_LoadAllTxts)", .{spec.common.load_all_txts});
         @as(*const fn (u32, u32, u32) callconv(.winapi) void, @ptrCast(@alignCast(p)))(0, 1, 0);
         say("d2host: DATATBLS_LoadAllTxts returned");
-    } else say("d2host: D2Common @10576 missing");
+    } else say("d2host: the table loader ordinal is missing");
 
     configureRealm();
 

@@ -62,6 +62,17 @@ pub const GameOrdinals = struct {
     shutdown: u16 = 10050,
 };
 
+/// D2Common's host-facing entry points. Unlike D2Game's, these did NOT stay put: classic's export
+/// table stops at 11152 where the LoD builds run past 11242, and the numbers moved with it.
+pub const CommonOrdinals = struct {
+    /// `DATATBLS_LoadAllTxts(a, lang, flags)`. Recognisable by shape rather than by number — a run
+    /// of ~50 direct calls ending in `ret 0xC`, one call per table group.
+    load_all_txts: u16 = 10576,
+    /// Sets the flag `CompileTxt` reads to decide whether to consume `.bin` or generate it. The
+    /// argument is inverted: zero turns compilation ON. Null where the export does not exist.
+    set_compile_tables: ?u16 = 11242,
+};
+
 pub const Spec = struct {
     /// As the install directories spell it.
     name: []const u8,
@@ -71,6 +82,7 @@ pub const Spec = struct {
     /// D2Common by 92 KB in 1.10f), so this order is the one that costs a single relocation.
     modules: []const [:0]const u8,
     game: GameOrdinals = .{},
+    common: CommonOrdinals = .{},
     /// Stack args per callback slot. Counted at the call sites in that version's D2Game; asking
     /// for an uncounted slot is a compile error rather than a guess.
     stack_args: callbacks.StackArgs,
@@ -82,7 +94,17 @@ const lod_modules = classic_modules;
 pub fn spec(comptime v: Version) Spec {
     return switch (v) {
         .v100 => .{ .name = "1.00", .fog = .classic, .expansion = false, .modules = &classic_modules, .stack_args = .{} },
-        .v106b => .{ .name = "1.06b", .fog = .classic, .expansion = false, .modules = &classic_modules, .stack_args = callbacks.v106b },
+        // 1.06b's table loader is @10554, not @10576 — @10576 there is an unrelated bounds check,
+        // and calling it returns without reading a single table. It has no compile-tables setter at
+        // all, which costs nothing: 1.06b reads .txt directly and never wants compiled tables.
+        .v106b => .{
+            .name = "1.06b",
+            .fog = .classic,
+            .expansion = false,
+            .modules = &classic_modules,
+            .common = .{ .load_all_txts = 10554, .set_compile_tables = null },
+            .stack_args = callbacks.v106b,
+        },
         .v107 => .{ .name = "1.07", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v107 },
         .v108 => .{ .name = "1.08", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v108 },
         .v109d => .{ .name = "1.09d", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v109d },
@@ -103,6 +125,13 @@ test "version spelling round-trips both ways" {
 test "the LoD boundary is where Fog renumbered" {
     try std.testing.expectEqual(FogFamily.classic, spec(.v106b).fog);
     try std.testing.expectEqual(FogFamily.lod, spec(.v107).fog);
+}
+
+test "D2Common's ordinals did not stay put the way D2Game's did" {
+    try std.testing.expectEqual(@as(u16, 10576), spec(.v109d).common.load_all_txts);
+    try std.testing.expectEqual(@as(u16, 10554), spec(.v106b).common.load_all_txts);
+    try std.testing.expect(spec(.v106b).common.set_compile_tables == null);
+    try std.testing.expectEqual(@as(u16, 11242), spec(.v110f).common.set_compile_tables.?);
 }
 
 test "host-facing D2Game ordinals are shared across the DLL era" {
