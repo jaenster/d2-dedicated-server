@@ -1152,15 +1152,23 @@ export fn FOG_10207(
 
     // Bind each of the file's columns to a descriptor, by header name. A column the descriptors do
     // not mention is skipped rather than guessed at — tables carry columns the server ignores.
+    // A descriptor binds to at most ONE column, the first that names it. The engine does this by
+    // clearing the hash entry when it matches, so a second column of the same name finds nothing
+    // and is skipped — and files really do repeat names: armor.txt carries `mindam` and `maxdam`
+    // twice, at columns 60 and 156. Binding both lets the later (empty) one overwrite the real
+    // value with zero.
     var bound: [EXCEL_MAX_CELLS]?*BinField = @splat(null);
+    var taken: [EXCEL_MAX_CELLS]bool = @splat(false);
     var head = Cells{ .p = header };
     for (0..@min(columns, EXCEL_MAX_CELLS)) |c| {
         const name = head.next();
         var i: usize = 0;
         while (f[i].kind != 0) : (i += 1) {
+            if (i < taken.len and taken[i]) continue;
             const dn = cstr(f[i].name);
             if (dn.len == name.len and std.ascii.eqlIgnoreCase(dn, name)) {
                 bound[c] = &f[i];
+                if (i < taken.len) taken[i] = true;
                 break;
             }
         }
