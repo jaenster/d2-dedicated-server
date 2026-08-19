@@ -165,9 +165,19 @@ pub fn packetLenWith(sizes: []const i32, buf: []const u8) ?usize {
     const entry = sizes[op];
     if (entry > 0) return if (buf.len >= @as(usize, @intCast(entry))) @intCast(entry) else null;
     if (entry == 0) return 0;
-    // -1 means the length is a byte in the packet itself, at offset 1.
-    if (buf.len < 2) return null;
-    const n: usize = buf[1];
+    // -1 means the length is carried in the packet. The rule is the same one `packetLen` uses
+    // against live 1.10f and 1.14d clients: a u16 after the opcode, covering the three bytes it
+    // sits behind. This previously read a bare byte at offset 1, which disagreed with the proven
+    // path — and every pre-1.10 version frames through here, so the two must not diverge.
+    //
+    // Known gap, stated rather than hidden: -1 is not one rule for every opcode. Reading 1.06b's
+    // own size function shows its 0x14/0x15 walk embedded strings while 0x65 is byte[1] plus seven.
+    // This applies the u16 rule uniformly, so those three are wrong on 1.06b and must be measured
+    // per opcode before a classic client is trusted on the wire — framing one wrong desynchronises
+    // the stream for good rather than dropping a single packet.
+    if (buf.len < 3) return null;
+    const n = 3 + @as(usize, std.mem.readInt(u16, buf[1..3], .little));
+    if (n > max_packet) return 0;
     return if (buf.len >= n) n else null;
 }
 
