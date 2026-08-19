@@ -4,8 +4,10 @@
 #   deploy/build-d2host.sh 0.0.1            # every engine that is ready
 #   deploy/build-d2host.sh 0.0.1 1.09d ...  # only the ones named
 #
-# Tags are <our release>-d2-<engine>: d2gs:0.0.1-d2-109d. The engine keeps its own spelling
-# minus the dot, so 1.09d -> 109d, matching how the versions are named everywhere else.
+# Tags are <engine>-<our release>: d2gs:1.09d-0.0.1, plus a floating d2gs:1.09d for the newest
+# build of that engine. Engine first because that is what a consumer is choosing — the same shape
+# as postgres:16 / postgres:16-alpine, where the headline number is the thing you want and the
+# suffix is which build of it. Release-first has no natural "latest 1.09d".
 #
 # There is no list here of which engines are finished, on purpose. The version is compiled in
 # (-Dengine-version), so d2host's readiness gate is a COMPILE error and an unfinished engine
@@ -24,18 +26,21 @@ ENGINES="${*:-$ALL}"
 
 built="" refused=""
 for engine in $ENGINES; do
-  tag="${REPO}:${APP_VERSION}-d2-$(printf '%s' "$engine" | tr -d '.')"
+  tag="${REPO}:${engine}-${APP_VERSION}"
+  floating="${REPO}:${engine}"
   printf '==> %s ... ' "$tag"
   if docker build -q -f "$ROOT/deploy/Dockerfile" --target d2host \
        --build-arg "D2_VERSION=$engine" --build-arg "APP_VERSION=$APP_VERSION" \
-       -t "$tag" "$ROOT" >/dev/null 2>"$ROOT/.build-$engine.err"; then
+       -t "$tag" -t "$floating" "$ROOT" >/dev/null 2>"$ROOT/.build-$engine.err"; then
     echo "ok"
     built="$built $tag"
     rm -f "$ROOT/.build-$engine.err"
   else
-    # Show why, from the compiler rather than a guess: usually the slots still unmeasured.
-    why=$(grep -o 'is not ready to serve: [^"]*' "$ROOT/.build-$engine.err" | head -1)
-    echo "refused${why:+ — ${why#is not ready to serve: }}"
+    # Say why, in the compiler's own words. docker prefixes build output with "#NN T.TT ", so
+    # strip that; a refusal that does not explain itself is the one thing worse than a refusal.
+    why=$(sed -n 's/^#[0-9]* *[0-9.]* *//; s/.*error: //p' "$ROOT/.build-$engine.err" \
+          | grep -m1 -E 'is not ready to serve|is not a known version' || true)
+    echo "refused${why:+ — $why}"
     refused="$refused $engine"
     rm -f "$ROOT/.build-$engine.err"
   fi

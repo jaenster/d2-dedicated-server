@@ -22,8 +22,8 @@
 #                  deploy/build-d2host.sh 0.0.1          # every engine that is ready
 #                  deploy/build-d2host.sh 0.0.1 1.09d     # just one
 #
-#                Tags are <our release>-d2-<engine>: d2gs:0.0.1-d2-109d — the same shape as a
-#                base image naming what it is built on.
+#                Tags are <engine>-<our release>: d2gs:1.09d-0.0.1, plus a floating d2gs:1.09d
+#                for the newest build of that engine — the postgres:16 / postgres:16.2 shape.
 #
 #                The version is a build argument on purpose. d2host carries every measured
 #                version and can pick at runtime, but a release artifact should be built FOR
@@ -133,7 +133,7 @@ RUN zig build d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
 # Distinct from `gs` above: that one injects into 1.14d's Game.exe, this one IS the host and loads
 # D2Game.dll/D2Common.dll as libraries. Tag it per engine — e.g.
 #
-#   deploy/build-d2host.sh 0.0.1 1.09d      ->  d2gs:0.0.1-d2-109d
+#   deploy/build-d2host.sh 0.0.1 1.09d      ->  d2gs:1.09d-0.0.1  (+ d2gs:1.09d)
 #
 # Both halves of the tag are build args: APP_VERSION is our release, D2_VERSION the engine.
 #
@@ -142,6 +142,8 @@ RUN zig build d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
 # failing cleanly. Mount the matching era at /game.
 FROM debian:bookworm-slim AS d2host
 ARG D2_VERSION=1.10f
+# The other half of the tag: <engine>-<APP_VERSION>, e.g. 1.09d-0.0.1.
+ARG APP_VERSION=0.0.0
 RUN dpkg --add-architecture i386 && apt-get update && \
     apt-get install -y --no-install-recommends wine wine32 curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -153,7 +155,10 @@ ENV WINEPREFIX=/wine WINEDEBUG=-all
 # Announced, not obeyed: the binary was built for this engine and refuses to be told otherwise, so
 # this is a label for humans and `docker inspect` rather than a switch.
 ENV D2HOST_ENGINE=${D2_VERSION}
-LABEL org.d2gs.engine-version=${D2_VERSION}
+LABEL org.d2gs.engine-version="${D2_VERSION}" \
+      org.opencontainers.image.version="${D2_VERSION}-${APP_VERSION}" \
+      org.opencontainers.image.title="d2gs (pre-1.14 host)" \
+      org.opencontainers.image.description="Headless Diablo II ${D2_VERSION} dedicated server"
 VOLUME ["/game", "/wine", "/work"]
 EXPOSE 4000
 ENTRYPOINT ["/opt/d2host/entrypoint.sh"]

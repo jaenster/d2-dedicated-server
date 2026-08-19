@@ -342,8 +342,10 @@ deploy/build-d2host.sh 0.0.1            # every engine that is ready
 deploy/build-d2host.sh 0.0.1 1.09d      # just one
 ```
 
-Tags are `<our release>-d2-<engine>` — `d2gs:0.0.1-d2-109d` — the same shape as a base image
-naming what it is built on. Both halves are build args (`APP_VERSION`, `D2_VERSION`).
+Tags are `<engine>-<our release>` — `d2gs:1.09d-0.0.1` — plus a floating `d2gs:1.09d` for the
+newest build of that engine. Engine first because that is what a consumer is choosing, the same
+shape as `postgres:16` / `postgres:16.2`; release-first has no natural "latest 1.09d". Both halves
+are build args (`APP_VERSION`, `D2_VERSION`).
 
 The point of pinning at build time is that it moves the readiness gate from runtime to the
 compiler. `-Dengine-version=1.06b` does not produce an image that exits on start; it fails to
