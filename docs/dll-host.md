@@ -391,9 +391,14 @@ failing cleanly. Mount the matching era at `/game`.
 - [ ] **1.06b: three slots are unmeasured** — `fpEnterGame`, `fpUpdateCharacterLadder`,
       `fpUpdateGameInformation`. Their call sites have an indirect call in the window, so the stack
       simulation cannot resolve what it consumes. They are `null` and therefore refused.
-- [ ] **1.06b: find its `.bin`/`.txt` selector.** 1.07, 1.08 and 1.09d all hardcode it to 1 (always
-      `.bin`); 1.06b's was not located. If it turns out to be 0, 1.06b needs no era data at all —
-      only 10207.
+- [x] **1.06b's selector is 0 — it reads `.txt`.** The global (0x6fe060b4 in its D2Common) lives
+      beyond the section's raw data, so it is zero-initialised `.bss`, and nothing writes it: seven
+      reads, no writes. 1.07/1.08/1.09d all hardcode theirs to 1 and read `.bin`.
+
+      So 1.06b needs **no era-matched compiled tables at all** — it reads the text tables straight
+      out of `d2data.mpq`, and the v1.00 classic archive has them. Its data problem is solved by
+      FOG @10207 alone, with no compile-then-run cycle. That makes it the closest of the pre-1.14
+      versions to running, not the furthest.
 - [ ] **1.06b: measure its callback shape** with `D2GS_ENGINE_PROBE=1`, the same way 1.07's was.
 - [ ] **13 rosetta rows rest on the structural constraints only** (order + matching `ret N`), not
       on a decisive fingerprint. `lodFor` refuses them unless a caller opts in.
@@ -405,7 +410,7 @@ failing cleanly. Mount the matching era at `/game`.
 
 ### Notes that changed the plan
 
-**Every pre-1.10 build reads `.bin`, not `.txt`.** This document used to say only 1.10f had a
+**Every pre-1.10 build EXCEPT 1.06b reads `.bin`, not `.txt`.** This document used to say only 1.10f had a
 compiled-table path. All of 1.06b, 1.07, 1.08 and 1.09d carry both, and 1.07/1.08/1.09d hardcode
 the selector to `.bin`. A `.bin` is a raw struct dump, so only its own era's engine can read one:
 1.08 loads 1.07's `lvltypes.bin` at the wrong stride and asks for `DATA\GLOBAL\TILES\wn\Floor.dt1`
