@@ -153,6 +153,15 @@ pub fn charNameSource(v: version.Version) ?CharNameSource {
         // game and EDX is the name — the same shape 1.07 was measured to have, not the
         // realm-relative one this file first assumed.
         .v109d, .v108, .v107 => .edx_pointer,
+        // 1.06b too, measured in its own binary rather than assumed from the LoD builds: both 0x08
+        // sites load ECX with `lea ecx,[esi+0x20]` where esi is the GAME (game id at +0x08, name at
+        // +0x0A) and pass the name in EDX. The same EDX value is what CLIENTS_Alloc strncpy's into
+        // pClient+0x0D, which is what makes it the character name rather than something adjacent.
+        //
+        // The account name is NOT passed on this build. SrvJoinGame carries it as a separate stack
+        // argument that only reaches pClient+0x1D, and the create-game path leaves it an empty BSS
+        // global — so an account must be found from the client id, never read off EDX.
+        .v106b => .edx_pointer,
         else => null,
     };
 }
@@ -164,7 +173,8 @@ test "1.07 does not merely move the offsets, it changes the shape" {
     try std.testing.expectEqual(@as(u8, 7), sendDatabaseCharacterArgs(.v108).?);
     try std.testing.expectEqual(@as(u8, 8), sendDatabaseCharacterArgs(.v110f).?);
     try std.testing.expectEqual(@as(usize, 0x5B), charNameSource(.v110f).?.realm_relative.name);
-    try std.testing.expect(charNameSource(.v106b) == null);
+    try std.testing.expect(charNameSource(.v106b).? == .edx_pointer);
+    try std.testing.expect(charNameSource(.v100) == null); // still genuinely unmeasured
 }
 
 pub fn clientFields(v: version.Version) ?ClientFieldOffsets {
