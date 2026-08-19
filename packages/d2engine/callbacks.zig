@@ -388,10 +388,18 @@ pub const v106b: StackArgs = .{
     .fpFindPlayerToken = .{ .args = 3 }, // @0x6fcb667c, same as 1.09d
     .fpSaveDatabaseGuild = .{ .args = 1 }, // @0x6fd383b1 — the only build that calls it
     .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fcb690a
-    .fpReserved0x24 = .{ .args = 0 }, // @0x6fcf9b52 — likewise the only build that calls it
+    // @0x6fcf9b52 — likewise the only build that calls it. Two args, not zero: D2Common #10418 and
+    // #11038 are each `ret 4`, so the `push ecx` at 0x6fcf9b40 and the `push eax` at 0x6fcf9b47
+    // survive both intervening calls, and the depth is 0 at the guard join 0x6fcf9b29. Reading it
+    // as 0 under-popped 8 bytes on every character save, which is what returned into the stack.
+    .fpReserved0x24 = .{ .args = 2 },
     .fpUpdateCharacterLadder = .{ .args = 5 }, // @0x6fcb6cee, every intermediate pop resolved
     .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fceb3a1, simulated with the intermediate pops resolved
-    .fpHandlePacket = .no_site_found,
+    // 1.06b does dispatch this: @0x6fcb785c, ecx only, no stack args. The site hides behind a
+    // computed jmp at 0x6fcb77b4 (case 0 of a five-way switch), which is precisely why a call-site
+    // sweep found nothing — and why the absent state is named for the sweep rather than for the
+    // engine. The block is byte-shape identical to 1.10f's at 0x6fc38218.
+    .fpHandlePacket = .{ .args = 0 },
     .fpSetGameData = .{ .args = 0 }, // @0x6fcb21db (its one PUSH is the ESI prologue)
     .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcf73e8
 };
@@ -461,11 +469,16 @@ test "the cut Guild Halls slot was real once" {
     // 0x1C and 0x24 have no dispatch site on either LoD build, and both are genuinely called on
     // 1.06b — so "no site found" is a fact about a version, not about the slot.
     try std.testing.expectEqual(1, stackArgs(v106b, .fpSaveDatabaseGuild));
-    try std.testing.expectEqual(0, stackArgs(v106b, .fpReserved0x24));
+    try std.testing.expectEqual(2, stackArgs(v106b, .fpReserved0x24));
     try std.testing.expect(!dispatches(v110f, .fpSaveDatabaseGuild));
     // And 12 was the right number all along — for the wrong version.
     try std.testing.expectEqual(12, stackArgs(v106b, .fpLeaveGame));
     try std.testing.expectEqual(13, stackArgs(v110f, .fpLeaveGame));
+
+    // And a slot with no site found on one build can still be dispatched on another: 1.06b reaches
+    // fpHandlePacket through a computed jmp, which a call-site sweep cannot see.
+    try std.testing.expect(dispatches(v106b, .fpHandlePacket));
+    try std.testing.expectEqual(0, stackArgs(v106b, .fpHandlePacket));
 }
 
 test "an intermediate call does not consume every push before it" {
