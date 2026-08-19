@@ -20,16 +20,29 @@ shift
 REPO="${D2GS_IMAGE_REPO:-d2gs}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Every version the engine model knows about, in release order.
-ALL="1.00 1.06b 1.07 1.08 1.09d 1.10f 1.13c"
+# Every engine, in release order. 1.14d is one of them: it is a different mechanism — the server
+# is injected into Game.exe rather than hosting D2Game.dll as a library, and 1.14d-native drops
+# wine entirely — but that is an implementation detail the tag has no business exposing. A consumer
+# picks an engine; which Dockerfile target builds it is our problem.
+ALL="1.00 1.06b 1.07 1.08 1.09d 1.10f 1.13c 1.14d 1.14d-native"
 ENGINES="${*:-$ALL}"
+
+# Which target builds a given engine. Only the pre-1.14 ones take -Dengine-version.
+target_for() {
+  case "$1" in
+    1.14d)        echo "gs" ;;
+    1.14d-native) echo "gs-native" ;;
+    *)            echo "d2host" ;;
+  esac
+}
 
 built="" refused=""
 for engine in $ENGINES; do
   tag="${REPO}:${engine}-${APP_VERSION}"
   floating="${REPO}:${engine}"
-  printf '==> %s ... ' "$tag"
-  if docker build -q -f "$ROOT/deploy/Dockerfile" --target d2host \
+  target=$(target_for "$engine")
+  printf '==> %s (%s) ... ' "$tag" "$target"
+  if docker build -q -f "$ROOT/deploy/Dockerfile" --target "$target" \
        --build-arg "D2_VERSION=$engine" --build-arg "APP_VERSION=$APP_VERSION" \
        -t "$tag" -t "$floating" "$ROOT" >/dev/null 2>"$ROOT/.build-$engine.err"; then
     echo "ok"

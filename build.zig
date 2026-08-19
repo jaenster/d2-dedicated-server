@@ -195,6 +195,20 @@ pub fn build(b: *std.Build) void {
     b.step("d2fog", "Build our replacement Fog.dll (x86-windows)")
         .dependOn(&b.addInstallArtifact(d2fog, .{}).step);
 
+    // tools/mpqcat — pull one member out of an archive, to diff generated tables against shipped.
+    const mpqcat = b.addExecutable(.{
+        .name = "mpqcat",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/mpqcat/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    mpqcat.root_module.addImport("libd2", libd2);
+    b.installArtifact(mpqcat);
+    b.step("mpqcat", "Extract one member from an MPQ by name")
+        .dependOn(&b.addInstallArtifact(mpqcat, .{}).step);
+
     // tools/fogrewrite — stage a classic-era install against our LoD-numbered Fog.
     const fogrewrite = b.addExecutable(.{
         .name = "fogrewrite",

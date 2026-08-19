@@ -916,11 +916,15 @@ export fn FOG_CreateBinFile(data: ?[*]u8, size: i32) callconv(.winapi) ?*BinFile
     if (size <= 0) return null;
     var buf = p[0..@intCast(size)];
 
+    // Counts separators, and a line with one tab has two cells. The decoder loops `columns` times
+    // per row, so an off-by-one here silently drops the last column of every table — which is how
+    // a generated storepage.bin came out all zeros while still being the right size.
     var columns: i32 = 0;
     const first = tokenizeLine(buf, 0, &columns) orelse {
         heapFree(p);
         return null;
     };
+    columns += 1;
     if (columns >= EXCEL_MAX_CELLS) columns = EXCEL_MAX_CELLS - 1;
 
     var rows: i32 = 0;
@@ -1008,13 +1012,12 @@ const Cells = struct {
         return start[0..n];
     }
 
-    /// True once the row separator is reached; consumes it.
-    fn endOfRow(self: *Cells) bool {
-        if (self.p[0] == '\n') {
-            self.p += 1;
-            return true;
-        }
-        return false;
+    /// Step over the row separator. @10208 NULs the tabs AND the CRLF in place, so a row ends in
+    /// two NULs — the last cell's, then the line's — and there is no '\n' left to look for. Miss
+    /// this and every row after the first is read one cell late, which shows up as a table of the
+    /// right size holding its neighbours' columns.
+    fn endOfRow(self: *Cells) void {
+        if (self.p[0] == 0) self.p += 1;
     }
 };
 
@@ -1115,13 +1118,26 @@ export fn FOG_10207(
     }
     if (needs_registration) {
         var cur = Cells{ .p = body };
-        for (0..rows) |_| {
+        for (0..rows) |row| {
             for (0..columns) |c| {
                 const cell = cur.next();
                 const d = (if (c < EXCEL_MAX_CELLS) bound[c] else null) orelse continue;
                 const link = if (d.link) |pp| pp.* else null;
                 switch (d.kind) {
-                    0xA, 0xC, 0xE => _ = FOG_AddCodeToLinkingTable(link, code4(cell)),
+                    // Registering is only half of it: the real @10207 also writes, and what it
+                    // writes depends on the kind — 0xA stores the 4CC itself, 0xC and 0xE store
+                    // the index the linking table just handed back. Registering without storing
+                    // leaves a correctly sized table full of zeros.
+                    0xA, 0xC, 0xE => {
+                        const code = code4(cell);
+                        const idx = FOG_AddCodeToLinkingTable(link, code);
+                        const dst = rec + row * stride + d.offset;
+                        switch (d.kind) {
+                            0xA => std.mem.writeInt(u32, dst[0..4], code, .little),
+                            0xC => dst[0] = @truncate(@as(u32, @bitCast(idx))),
+                            else => std.mem.writeInt(i16, dst[0..2], @truncate(idx), .little),
+                        }
+                    },
                     0x10, 0x11, 0x12 => {
                         var key: [0x21]u8 = @splat(0);
                         const n = @min(cell.len, key.len - 1);
@@ -1131,7 +1147,7 @@ export fn FOG_10207(
                     else => {},
                 }
             }
-            _ = cur.endOfRow();
+            cur.endOfRow();
         }
     }
 
@@ -1179,7 +1195,7 @@ export fn FOG_10207(
                 .cb_word, .cb_void => {},
             }
         }
-        _ = cur.endOfRow();
+        cur.endOfRow();
     }
     sayFmt("  10207: {d} rows x {d} bytes decoded", .{ rows, stride });
 }

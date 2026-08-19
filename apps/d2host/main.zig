@@ -1179,6 +1179,21 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
         sayHex("d2host: D2Lang init returned=", r);
     } else say("d2host: D2Lang @10000 missing");
 
+    // Compile the tables instead of consuming them. D2Common @11242 sets the flag CompileTxt reads
+    // at its top: with it on, the loader reads the `.txt`, decodes it through FOG @10207, and
+    // WRITES the `.bin` back out — which is how a version whose compiled tables nobody shipped
+    // gets them. The argument is inverted (`flag = (arg == 0)`), so zero turns compilation on.
+    //
+    // Opt-in, because it is a build step wearing a server's clothes: it wants `data/global/excel/`
+    // to exist in the working directory and it rewrites tables there.
+    if (envFlag("D2GS_COMPILE_TABLES")) {
+        if (byOrdinal(d2common, 11242)) |p| {
+            const set_compile: *const fn (u32) callconv(.winapi) void = @ptrCast(@alignCast(p));
+            set_compile(0);
+            say("d2host: table COMPILE mode on (D2Common @11242) — .txt in, .bin out");
+        } else say("d2host: D2Common @11242 missing — cannot enable table compilation");
+    }
+
     // D2Common @10576 DATATBLS_LoadAllTxts(a, lang, flags) — D2Server passes (0, 1, 0).
     if (byOrdinal(d2common, 10576)) |p| {
         say("d2host: calling D2Common @10576 (DATATBLS_LoadAllTxts)");
