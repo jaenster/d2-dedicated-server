@@ -1066,6 +1066,29 @@ fn callWithEcx(fn_addr: usize, ecx: usize) void {
         : .{ .eax = true, .edx = true, .memory = true });
 }
 
+fn capFor(d: *const BinField, stride: u32) u32 {
+    return if (d.size != 0) d.size else stride - d.offset;
+}
+
+/// Copy a cell into a fixed-width field the way the engine does — which is not the way a careful
+/// implementation would.
+///
+/// The copy bound is the END of the field, not one before it, and the terminator is written
+/// afterwards regardless. So a string that exactly fills its field is stored WITHOUT a terminator
+/// and the NUL lands on the first byte of the next record, which that record then overwrites.
+/// `states.txt` shows it plainly: "STATE_RESISTFIRE" is sixteen characters in a sixteen-byte field,
+/// and Blizzard's own table holds all sixteen with no NUL. Terminating at cap-1 instead truncates
+/// every such string by one character.
+///
+/// The one place this departs from the engine: it will not run the NUL past the end of the whole
+/// records buffer. The engine does, into whatever follows its allocation; we would rather diverge
+/// in one byte of the final record than scribble on the heap.
+fn copyString(rec: [*]u8, total: usize, at: usize, cap: u32, cell: []const u8) void {
+    const n = @min(cell.len, cap);
+    @memcpy((rec + at)[0..n], cell[0..n]);
+    if (at + n < total) rec[at + n] = 0;
+}
+
 fn writeSized(rec: [*]u8, off: u32, bytes: u32, v: i32) void {
     switch (bytes) {
         1 => rec[off] = @truncate(@as(u32, @bitCast(v))),
@@ -1113,6 +1136,7 @@ export fn FOG_10207(
     const body = b.first_row orelse return;
     const columns: usize = @intCast(@max(b.columns, 0));
     const rows: usize = @min(@as(usize, @intCast(@max(b.rows, 0))), n_records);
+    const total: usize = @as(usize, n_records) * stride;
 
     // Optional one-line-per-column dump, for diffing a generated table against a shipped one:
     // the record layout the engine asked for is the only thing that explains a wrong byte.
@@ -1179,9 +1203,14 @@ export fn FOG_10207(
                     // Treating all three as registration leaves those columns zero where the
                     // engine writes 0xFFFFFFFF.
                     0x10 => {
+                        // Stores as well as registers. states.txt is the clearest case: one column,
+                        // `state`, and the shipped 16-byte record holds "STATE_NONE" — so the
+                        // string goes into the record too. Its descriptor carries size 0, so the
+                        // bound is the record itself.
+                        copyString(rec, total, row * stride + d.offset, capFor(d, stride), cell);
                         var key: [0x21]u8 = @splat(0);
-                        const n = @min(cell.len, key.len - 1);
-                        @memcpy(key[0..n], cell[0..n]);
+                        const k = @min(cell.len, key.len - 1);
+                        @memcpy(key[0..k], cell[0..k]);
                         FOG_AddRecordToLinkingTable(link, @ptrCast(&key));
                     },
                     0x11, 0x12 => {
@@ -1217,12 +1246,7 @@ export fn FOG_10207(
             const link = if (d.link) |pp| pp.* else null;
             switch (handler) {
                 .skip => {},
-                .string => {
-                    const cap = if (d.size == 0) 1 else d.size;
-                    const n = @min(cell.len, cap - 1);
-                    @memcpy((dst + d.offset)[0..n], cell[0..n]);
-                    dst[d.offset + n] = 0;
-                },
+                .string => copyString(rec, total, row * stride + d.offset, capFor(d, stride), cell),
                 .code4 => std.mem.writeInt(u32, (dst + d.offset)[0..4], code4(cell), .little),
                 .integer => {
                     if (d.kind == 0x1A) {
