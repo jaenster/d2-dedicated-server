@@ -284,7 +284,7 @@ pub const v107: StackArgs = .{
     .fpReserved0x24 = .{ .args = 0 }, // two sites @0x6fca9dda and @0x6fca9ea5
     .fpUpdateCharacterLadder = .{ .args = 5 }, // @0x6fc67226, stable across every sane window
     .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fc9ede3
-    .fpHandlePacket = .no_site_found,
+    .fpHandlePacket = .{ .args = 0 }, // @0x6fc67dec — the same lea+call shape a slot scan misses
     .fpSetGameData = .{ .args = 0 }, // @0x6fc6257b (the function opens with the ESI prologue push)
     .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcac0a8
 };
@@ -309,14 +309,22 @@ pub const v108: StackArgs = .{
     .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fc62b15 and @0x6fc62bc0
     .fpGetDatabaseCharacter = .{ .args = 1 }, // two sites, both push one; ECX = game, EDX = name
     .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fcad377
-    .fpEnterGame = null, // @0x6fc685c1: windows split 2 vs 3 — needs a hand-read, not a vote
+    // @0x6fc685c1. The 2-vs-3 split was a windowing artefact: `call 0x6fd205a8` (D2Common #10519,
+    // ret 8) sits mid-sequence, so three are pushed, two eaten, two more pushed.
+    .fpEnterGame = .{ .args = 3 },
     .fpFindPlayerToken = .{ .args = 3 }, // @0x6fc66b63
     .fpSaveDatabaseGuild = .no_site_found,
     .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fc66df4
     .fpReserved0x24 = .no_site_found,
-    .fpUpdateCharacterLadder = null, // @0x6fc671c4: windows split 1 vs 5
+    // Three sites, @0x6fc671c4, @0x6fc67265 and @0x6fc68871, all 5. Two D2Common #10521 calls
+    // (ret 8 each) plus two ret-0 fastcalls sit inside the push sequence, which is what the
+    // earlier 1-vs-5 split was reading.
+    .fpUpdateCharacterLadder = .{ .args = 5 },
     .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fca1033, 13 of 18 windows agree
-    .fpHandlePacket = .no_site_found,
+    // @0x6fc67d7c, no stack args. Dispatch here is `lea reg,[cb+slot]` then `call [reg]`, so a
+    // scan for `call [reg+0x30]` finds nothing — which is how three versions of this row came to
+    // say "no site found" at once.
+    .fpHandlePacket = .{ .args = 0 },
     .fpSetGameData = .{ .args = 0 }, // @0x6fc6256b (its one PUSH is the ESI prologue)
     .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcad270
 };
@@ -348,7 +356,16 @@ pub const v109d: StackArgs = .{
     .fpReserved0x24 = .{ .args = 0 }, // ReservedCallback1(dwReserved1, dwReserved2)
     .fpUpdateCharacterLadder = .{ .args = 5 }, // 7 params
     .fpUpdateGameInformation = .{ .args = 2 }, // (wGameId, lpCharName, wCharClass, dwCharLevel)
-    .fpHandlePacket = .{ .args = 1 }, // ReservedCallback2(dwReserved1, dwReserved2, dwReserved3)
+    // Zero, from the binary: the site is @0x6fc38042 and has the same shape as 1.07, 1.08 and
+    // 1.10f, which are all zero. This row previously said 1, read off a published 1.09 server
+    // header declaring ReservedCallback2(dwReserved1, dwReserved2, dwReserved3) — three params,
+    // two of them register ones under fastcall, so one on the stack.
+    //
+    // The conflict is worth recording rather than smoothing over, because that header was right
+    // and this file wrong on three other rows earlier. It loses here: a header states an intended
+    // signature, the call site states what is actually pushed, and four versions of the call site
+    // agree with each other against it.
+    .fpHandlePacket = .{ .args = 0 },
     .fpSetGameData = .{ .args = 0 }, // SetGameData(void)
     .fpRelockDatabaseCharacter = .{ .args = 1 }, // (lpGameData, lpCharName, lpAccountName)
 };
@@ -508,8 +525,13 @@ test "a slot with no dispatch site is an answer, not a gap" {
     try std.testing.expect(dispatches(v110f, .fpUnlockDatabaseCharacter));
     // fpHandlePacket is the reason this state is "no site found" and not "never dispatched": the
     // engine does call it, on both versions, and the first sweep said otherwise.
+    // Every version that has been read at the call site says zero. The dispatch is `lea reg,
+    // [cb+0x30]` then `call [reg]`, which is why scans kept reporting no site at all.
     try std.testing.expectEqual(0, stackArgs(v110f, .fpHandlePacket));
-    try std.testing.expectEqual(1, stackArgs(v109d, .fpHandlePacket));
+    try std.testing.expectEqual(0, stackArgs(v109d, .fpHandlePacket));
+    try std.testing.expectEqual(0, stackArgs(v108, .fpHandlePacket));
+    try std.testing.expectEqual(0, stackArgs(v107, .fpHandlePacket));
+    try std.testing.expectEqual(0, stackArgs(v106b, .fpHandlePacket));
 }
 
 test "completeness is checkable before a build fails on it" {
