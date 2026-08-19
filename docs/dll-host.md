@@ -374,39 +374,44 @@ failing cleanly. Mount the matching era at `/game`.
 
 ### The work queue, in dependency order
 
-- [ ] **`FOG @10207` — the txt→record decoder.** The keystone: it unblocks 1.08, 1.09d and 1.06b
-      at once, and closes 1.10f's runewords/cube gap. Not so the engines read `.txt` — they do not,
-      see below — but because `CompileTxt`'s other branch, gated on `DAT_6fde1cec` and an exported
-      setter, reads `.txt` and **writes `.bin` back out** using that version's own field
-      descriptors. That is how Blizzard built server distributions, and it is the only way to get
-      era-correct tables for versions whose data we do not have. Real function: 1.10f Fog
-      @0x6ff5aa60. Field descriptor is 0x14 bytes — name, type (0 terminates), size/bit, record
-      offset, linker-or-callback — and roughly 20 column types. Every piece it leans on (linkers,
-      string tree, `GetRowFromTxt`, `CreateBinFile`) is already implemented in `packages/d2fog`.
-- [ ] **Drive the compiler and keep the output.** Once 10207 exists: set the per-version compile
-      flag, run each engine once against the retail text tables, and keep the `.bin` files it
-      emits as that version's data.
-- [ ] **1.06b: wire `tools/fogrewrite` into a staged install** and boot it. The rosetta and the
-      rewriter are both done; nothing has been run through them yet.
-- [ ] **1.06b: three slots are unmeasured** — `fpEnterGame`, `fpUpdateCharacterLadder`,
-      `fpUpdateGameInformation`. Their call sites have an indirect call in the window, so the stack
-      simulation cannot resolve what it consumes. They are `null` and therefore refused.
-- [x] **1.06b's selector is 0 — it reads `.txt`.** The global (0x6fe060b4 in its D2Common) lives
-      beyond the section's raw data, so it is zero-initialised `.bss`, and nothing writes it: seven
-      reads, no writes. 1.07/1.08/1.09d all hardcode theirs to 1 and read `.bin`.
+Done since this list was written:
 
-      So 1.06b needs **no era-matched compiled tables at all** — it reads the text tables straight
-      out of `d2data.mpq`, and the v1.00 classic archive has them. Its data problem is solved by
-      FOG @10207 alone, with no compile-then-run cycle. That makes it the closest of the pre-1.14
-      versions to running, not the furthest.
-- [ ] **1.06b: measure its callback shape** with `D2GS_ENGINE_PROBE=1`, the same way 1.07's was.
-- [ ] **13 rosetta rows rest on the structural constraints only** (order + matching `ret N`), not
-      on a decisive fingerprint. `lodFor` refuses them unless a caller opts in.
+- [x] **`FOG @10207` — the txt→record decoder.** Implemented and verified the only way that counts:
+      1.07 ships both its text tables and its own compiled output, so compiling the former and
+      diffing against the latter is byte-exact checkable. **51 of 70 tables match byte for byte.**
+- [x] **Drive the compiler.** `D2GS_COMPILE_TABLES=1` calls the per-version setter (`@11242` on the
+      LoD builds, argument inverted so zero enables it) and the engine writes `.bin` back out.
+- [x] **1.06b's three unmeasured slots.** Not unmeasurable — the window started early enough to
+      swallow a `call` belonging to the statement before the argument setup. They are 3, 5 and 2.
+- [x] **1.06b through `fogrewrite`.** All five modules rewritten, all seven load, both D2Game
+      ordinals resolve, `STRTABLE_Init` returns 1.
+- [x] **1.06b's selector is 0 — it reads `.txt`**, so it needs no era-matched tables at all.
+
+Open, roughly in order of what unblocks the most:
+
+- [ ] **1.06b blocks before `@10207` on its first table.** It gets through `CreateBinFile` and
+      `GetRecordCountFromBinFile` and then sits at 0% CPU — blocked, not spinning, so it is waiting
+      on something rather than looping. The suspects are our own Fog entry points between those two
+      calls, which makes it the cheapest thing on this list to find.
+- [ ] **19 tables still differ.** The ones with reference columns, bit flags, and the two genuine
+      callback kinds (0x17-0x19, `__fastcall` with the cell in ECX and no stack args — safe to call,
+      just not called yet). `qualityitems.bin` is down to 8 differing bytes, all a width: a 16-bit
+      -1 where the engine writes 32.
+- [ ] **1.08/1.09d: compile their tables and boot on them.** Mechanical once the decoder is right;
+      1.09d already compiles 62 tables before asserting on one of the columns above.
+- [ ] **1.06b: measure its callback shape** with `D2GS_ENGINE_PROBE=1`, the way 1.07's was.
+- [ ] **1.06b has no measured Fog ABI or packet table** — it falls back to 1.10f's for both, which
+      the host says out loud. Both need measuring before a client can join.
+- [ ] **14 rosetta rows rest on the structural constraints only** (order + matching `ret N`) rather
+      than a decisive fingerprint. `lodFor` refuses them unless a caller opts in; the 1.06b rewrite
+      needed `--accept-inferred`.
 - [ ] **1.13c renumbered D2Game's host ordinals** — `@10023` is a bare `ret 4`, `@10046` is
-      `mov eax,1; ret 0x18`. `version.GameOrdinals` does not extend to it and needs its own row.
-- [ ] **1.07/1.08's S->C direction is unverified.** Our test client speaks 1.14d, so it stops
-      understanding after GameFlags. Irrelevant with a period client; it only blocks *our* ability
-      to watch world state locally.
+      `mov eax,1; ret 0x18`. It needs its own `GameOrdinals` row, and D2Common's moved too.
+- [ ] **`callbacks.v114d` has 4 of 14 slots measured.** It never needed more, since the injected
+      server installs only those four — but the sweep tooling would close it cheaply now.
+- [ ] **Make the clientless speak more than 1.14d.** The C→S half is already data we hold
+      (`cs_packets`); the S→C half is extractable from each version's `D2Client.dll` the same way.
+      Only blocks watching world state locally, not the servers themselves.
 
 ### Notes that changed the plan
 
