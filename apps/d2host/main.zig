@@ -1028,6 +1028,22 @@ fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
     // the return address the CALL pushed.
     const stack: [*]const u32 = @ptrFromInt(c.esp);
     for (0..6) |i| sayFmt("d2host:   [esp+0x{x}] = 0x{x}", .{ i * 4, stack[i] });
+    // What is actually executing. When EIP lands inside the stack the bytes are not code at all,
+    // and seeing them says which data got jumped into — the register dump alone cannot.
+    {
+        const code: [*]const u8 = @ptrFromInt(c.eip -% 8);
+        var buf: [96]u8 = undefined;
+        var n: usize = 0;
+        for (0..24) |i| {
+            const b = code[i];
+            const hex = "0123456789abcdef";
+            buf[n] = hex[b >> 4];
+            buf[n + 1] = hex[b & 15];
+            buf[n + 2] = if (i == 7) '|' else ' ';
+            n += 3;
+        }
+        sayFmt("d2host:   bytes at eip-8: {s}", .{buf[0..n]});
+    }
     return 0;
 }
 
@@ -1093,7 +1109,9 @@ pub fn main() !void {
                 return error.VersionNotReady;
             }
             sayFmt("d2host: targeting {s}", .{@tagName(v)});
-            return run(v, install_dir);
+            try run(v, install_dir);
+            say("d2host: run returned cleanly, process exiting");
+            return;
         },
     }
 }
@@ -1279,6 +1297,7 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     say("d2host: calling GAME_InitGameDataTable");
     init(@ptrCast(&game_data_table), @ptrCast(&game_list));
     say("d2host: GAME_InitGameDataTable returned");
+    sayHex("d2host: esp after InitGameDataTable = ", espNow());
 
     say("d2host: init sequence survived");
 
@@ -1287,6 +1306,16 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
 
 /// Try to stand a game up and tick it. Every call is announced before it happens, so a hard failure
 /// names the step instead of just killing the process.
+/// Roughly where our stack is. Only the TREND matters: two points at the same depth in our own
+/// call tree must see the same value, so a baseline that walks between them is an engine call
+/// whose callee popped a different amount than we pushed. That damage is invisible until some
+/// unrelated function returns into the drift.
+inline fn espNow() usize {
+    return asm volatile (""
+        : [ret] "={esp}" (-> usize),
+    );
+}
+
 fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     // TASK_InitializeClock @10039 — the game clock the tick functions read.
     if (byOrdinal(d2game, 10039)) |p| {
@@ -1334,6 +1363,7 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
         say("d2host: no realm configured — creating one game directly");
         ok = create_game.?(&name, "", "d2host spike", gameflags.gameFlags(0, true, false), 0, 0, 8, &game_id);
         sayHex("d2host: GAME_CreateNewEmptyGame returned=", @intCast(ok));
+        sayHex("d2host: esp after CreateNewEmptyGame = ", espNow());
         sayHex("d2host:   gameId=", game_id);
         if (ok != 0) live_games += 1;
     } else {
@@ -1432,4 +1462,5 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
         Sleep(10);
     }
     say("d2host: tick loop finished");
+    sayHex("d2host: esp after tick loop = ", espNow());
 }
