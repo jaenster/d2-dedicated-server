@@ -1131,6 +1131,16 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
         }
     }
 
+    if (envFlag("D2FOG_DUMP_FIELDS")) {
+        if (moduleHandle(&modules, "Fog.dll")) |fog| {
+            if (GetProcAddress(fog, "FOG_DumpFields")) |p| {
+                const f: *const fn (u32) callconv(.c) void = @ptrCast(@alignCast(p));
+                f(1);
+                say("d2host: Fog will describe each table's column layout");
+            }
+        }
+    }
+
     if (moduleHandle(&modules, "Fog.dll")) |fog| {
         if (GetProcAddress(fog, "FOG_SetEngineVersion")) |p| {
             const set: *const fn (u32) callconv(.c) i32 = @ptrCast(@alignCast(p));

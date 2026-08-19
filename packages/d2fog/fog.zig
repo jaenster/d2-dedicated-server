@@ -881,6 +881,14 @@ const BinFile = extern struct {
 
 const EXCEL_MAX_CELLS = 0x118;
 
+/// Have @10207 describe each table's column layout as it decodes it. Set by the host through
+/// FOG_SetEngineVersion's sibling below; a diagnostic, off unless asked for.
+var dump_fields: bool = false;
+
+export fn FOG_DumpFields(on: u32) callconv(.c) void {
+    dump_fields = on != 0;
+}
+
 /// Turn one line's separators into NULs and report where the next line starts.
 /// Returns null at end of buffer.
 fn tokenizeLine(buf: []u8, from: usize, tabs: *i32) ?usize {
@@ -1023,16 +1031,20 @@ const Cells = struct {
     }
 };
 
+/// The engine's own integer parser, faithfully — which means NO validation. It consumes every
+/// character to the end of the cell as `acc*10 + (c - '0')`, digits or not.
+///
+/// That is not pedantry about a corner case: Blizzard's shipped tables contain cells like `#REF!`,
+/// an Excel error that leaked into lvlmaze.txt, and the engine turns it into -93695 (`#`→-13,
+/// `R`→-96, `E`→-939, `F`→-9368, `!`→-93695). A parser that stops at the first non-digit writes 0
+/// there and disagrees with every table that has a typo in it.
 fn parseInt(cell: []const u8) i32 {
     var i: usize = 0;
-    var neg = false;
-    if (i < cell.len and (cell[i] == '-' or cell[i] == '+')) {
-        neg = cell[i] == '-';
-        i += 1;
-    }
+    const neg = cell.len > 0 and cell[0] == '-';
+    if (neg) i = 1;
     var v: i32 = 0;
-    while (i < cell.len and cell[i] >= '0' and cell[i] <= '9') : (i += 1) {
-        v = v *% 10 +% @as(i32, cell[i] - '0');
+    while (i < cell.len) : (i += 1) {
+        v = v *% 10 +% (@as(i32, cell[i]) - '0');
     }
     return if (neg) -v else v;
 }
@@ -1065,7 +1077,7 @@ fn writeSized(rec: [*]u8, off: u32, bytes: u32, v: i32) void {
 /// Width of the destination for the kinds that encode it in the kind itself.
 fn kindWidth(kind: u32) u32 {
     return switch (kind) {
-        3, 0xF, 0x14, 0x16, 0x11 => 2,
+        3, 0xF, 0x14, 0x16, 0x12 => 2,
         4, 5, 6, 0xD, 0x15 => 1,
         else => 4,
     };
@@ -1101,6 +1113,18 @@ export fn FOG_10207(
     const body = b.first_row orelse return;
     const columns: usize = @intCast(@max(b.columns, 0));
     const rows: usize = @min(@as(usize, @intCast(@max(b.rows, 0))), n_records);
+
+    // Optional one-line-per-column dump, for diffing a generated table against a shipped one:
+    // the record layout the engine asked for is the only thing that explains a wrong byte.
+    if (dump_fields) {
+        sayFmt("  10207 table: {d} records x {d} bytes", .{ rows, stride });
+        var i: usize = 0;
+        while (f[i].kind != 0) : (i += 1) {
+            sayFmt("    col {s} kind=0x{x} size={d} off={d}", .{
+                cstr(f[i].name), f[i].kind, f[i].size, f[i].offset,
+            });
+        }
+    }
 
     // Bind each of the file's columns to a descriptor, by header name. A column the descriptors do
     // not mention is skipped rather than guessed at — tables carry columns the server ignores.
@@ -1166,7 +1190,11 @@ export fn FOG_10207(
                         @memcpy(key[0..n], cell[0..n]);
                         const idx = FOG_GetRowFromTxt(link, @ptrCast(&key), 1);
                         const dst = rec + row * stride + d.offset;
-                        if (d.kind == 0x11)
+                        // 0x11 is the DWORD one. The decompiler renders this pair the other way
+                        // round, and the tables settle it: qualityitems' mod2code is 0x11 at
+                        // offset 28, and the shipped record has ffffffff there — a full dword of
+                        // "not found", not a word plus padding.
+                        if (d.kind == 0x12)
                             std.mem.writeInt(i16, dst[0..2], @truncate(idx), .little)
                         else
                             std.mem.writeInt(i32, dst[0..4], idx, .little);
