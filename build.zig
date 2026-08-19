@@ -185,6 +185,20 @@ pub fn build(b: *std.Build) void {
     b.step("d2fog", "Build our replacement Fog.dll (x86-windows)")
         .dependOn(&b.addInstallArtifact(d2fog, .{}).step);
 
+    // tools/fogrewrite — stage a classic-era install against our LoD-numbered Fog.
+    const fogrewrite = b.addExecutable(.{
+        .name = "fogrewrite",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fogrewrite/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    fogrewrite.root_module.addImport("d2engine", d2engine);
+    b.installArtifact(fogrewrite);
+    b.step("fogrewrite", "Rewrite a classic install's Fog imports onto the LoD numbering")
+        .dependOn(&b.addInstallArtifact(fogrewrite, .{}).step);
+
     // packages/d2net — our own D2Net.dll. The real one forwards every export into Fog's QServer, so
     // keeping it would mean writing 31 Fog networking ordinals to serve a module we are replacing
     // anyway. This is 14 stdcall entries, and it is where our own transport goes.

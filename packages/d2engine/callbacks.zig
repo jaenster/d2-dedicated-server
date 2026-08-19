@@ -227,38 +227,38 @@ pub const v114d: StackArgs = .{
     .fpFindPlayerToken = .{ .args = 7 }, // ret 0x1c
 };
 
-/// 1.10f, counted at every dispatch site in `D2Game.dll`. The method is mechanical and worth
-/// stating because the numbers it replaced were not: walk all 41 references to the callback-table
-/// global (0x6fd45830), follow the register that receives it — through `LEA reg,[table+n]` and
-/// `ADD reg,n`, which is how the engine reaches the higher slots — and count the raw `PUSH`es in
-/// the dispatch's own basic block. 28 of those references are `if (server)` guards, 2 are the
-/// writes in `GAME_SetServerCallbackFunctions`, and 11 are dispatches.
+/// 1.10f. Counted at the dispatch sites, but by simulating the stack rather than counting raw
+/// pushes — and that distinction cost three rows before it was understood.
 ///
-/// Four of these disagree with the prototype-derived numbers this file used to carry, and the
-/// prototypes were the ones that were wrong:
+/// Counting pushes back to the previous `CALL` assumes that call consumed everything pushed before
+/// it. It does not: an intermediate stdcall pops only its own arguments, and the remainder still
+/// belong to the pending call. `GAME_UpdateAllClients` pushes four, calls `D2Common @10519` which
+/// pops three, then pushes two more — so `fpEnterGame` gets 1 + 2 = **3**, not the 2 a naive count
+/// reports. `fpUpdateCharacterLadder` and `fpUpdateGameInformation` were wrong the same way.
 ///
-///   - `fpLeaveGame` 12 -> 13. `CLIENTS_RemoveClientFromGame` pushes thirteen at both of its call
-///     sites (0x6fc32e3a and 0x6fc32eec), in one straight-line block each.
-///   - `fpEnterGame` 3 -> 2. `GAME_UpdateAllClients` @0x6fc38d74 pushes EAX then EDI, and the four
-///     pushes before those belong to the `0x6fd1b692` call between them.
-///   - `fpUpdateCharacterLadder` 5 -> 0. `GAME_TriggerClientSave` reaches it as `CALL [EBP]` after
-///     `ADD EBP,0x28`, with only ECX/EDX set since the preceding call.
-///   - `fpUpdateGameInformation` 2 -> 0. Same shape in `PLAYERSTATS_LevelUp` @0x6fc7edc7.
+/// Those three were briefly "corrected" here to 2/0/0 on the strength of that naive count, which
+/// was a regression: the prototype-derived numbers they replaced were right. They are restored,
+/// now on two independent footings — a stack simulation that resolves each intermediate call's
+/// `ret N`, and the published source of a working 1.09 game server, whose `EnterGame` takes five
+/// __fastcall parameters (3 on the stack), `UpdateCharacterLadder` seven (5) and
+/// `UpdateGameInformation` four (2).
 ///
-/// Every one of those is a stub whose `ret n*4` would have unbalanced the engine's stack the first
-/// time that path ran.
+/// What survived the recheck: `fpLeaveGame` really is 13 and not the 12 this file used to carry —
+/// its two call sites push thirteen in one straight-line block with no intermediate call, and the
+/// 1.09 source's fifteen __fastcall parameters agree. `fpCloseGame` really is 2 here against
+/// 1.09's 0, because 1.09's `CloseGame` takes only `wGameId`.
 pub const v110f: StackArgs = .{
     .fpCloseGame = .{ .args = 2 }, // GAME_CloseGame @0x6fc396ec
     .fpLeaveGame = .{ .args = 13 }, // CLIENTS_RemoveClientFromGame, two sites, both 13
     .fpGetDatabaseCharacter = .{ .args = 2 }, // GAME_JoinGame @0x6fc3741b
     .fpSaveDatabaseCharacter = .{ .args = 4 }, // the realm save path @0x6fc8a4d7
-    .fpEnterGame = .{ .args = 2 }, // GAME_UpdateAllClients @0x6fc38d74
+    .fpEnterGame = .{ .args = 3 }, // GAME_UpdateAllClients @0x6fc38d74
     .fpFindPlayerToken = .{ .args = 5 }, // GAME_VerifyJoinGame @0x6fc37073
     .fpSaveDatabaseGuild = .no_site_found, // cut Guild Halls
     .fpUnlockDatabaseCharacter = .{ .args = 1 }, // GAME_JoinGame @0x6fc372fc
     .fpReserved0x24 = .no_site_found,
-    .fpUpdateCharacterLadder = .{ .args = 0 }, // GAME_TriggerClientSave @0x6fc37670, via ADD EBP,0x28
-    .fpUpdateGameInformation = .{ .args = 0 }, // PLAYERSTATS_LevelUp @0x6fc7edc7, via LEA EBX,[EAX+0x2c]
+    .fpUpdateCharacterLadder = .{ .args = 5 }, // GAME_TriggerClientSave @0x6fc37670, via ADD EBP,0x28
+    .fpUpdateGameInformation = .{ .args = 2 }, // PLAYERSTATS_LevelUp @0x6fc7edc7, via LEA EBX,[EAX+0x2c]
     .fpHandlePacket = .{ .args = 0 }, // FUN_6fc38140 @0x6fc38232, the client-message processor
     .fpSetGameData = .{ .args = 0 }, // CLIENTS_SetGameData @0x6fc32801 (its one PUSH is the ESI prologue)
     .fpRelockDatabaseCharacter = .{ .args = 1 }, // the realm save path @0x6fc8a48f
@@ -277,13 +277,13 @@ pub const v107: StackArgs = .{
     .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fc62b25 and @0x6fc62bd0
     .fpGetDatabaseCharacter = .{ .args = 1 }, // two sites @0x6fc664d9 and @0x6fc66fe7, both push one
     .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fcac1af
-    .fpEnterGame = .{ .args = 2 }, // @0x6fc68631
+    .fpEnterGame = .{ .args = 3 }, // @0x6fc68631: 3 pushes, D2Common @10519 pops 2, then 2 more
     .fpFindPlayerToken = .{ .args = 3 }, // @0x6fc66bd3, same shape as 1.10f's with two fewer pushes
     .fpSaveDatabaseGuild = .{ .args = 1 }, // @0x6fd00851
     .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fc66e64
     .fpReserved0x24 = .{ .args = 0 }, // two sites @0x6fca9dda and @0x6fca9ea5
-    .fpUpdateCharacterLadder = .{ .args = 0 }, // three sites, all 0
-    .fpUpdateGameInformation = .{ .args = 0 }, // @0x6fc9ede3
+    .fpUpdateCharacterLadder = .{ .args = 4 }, // @0x6fc67226 simulated; 1.09 grew a 7th param to 5
+    .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fc9ede3
     .fpHandlePacket = .no_site_found,
     .fpSetGameData = .{ .args = 0 }, // @0x6fc6257b (the function opens with the ESI prologue push)
     .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcac0a8
@@ -305,22 +305,21 @@ pub const v107: StackArgs = .{
 ///
 /// Everything else agrees with 1.10f, including the 13 of `fpLeaveGame`.
 pub const v109d: StackArgs = .{
-    .fpCloseGame = .{ .args = 0 }, // @0x6fc3942f
-    .fpLeaveGame = .{ .args = 13 }, // two sites @0x6fc32c2f and @0x6fc32cef, both 13
-    .fpGetDatabaseCharacter = .{ .args = 2 }, // the join path @0x6fc37232
-    .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fc7e1af
-    .fpEnterGame = .{ .args = 2 }, // @0x6fc388e6
-    .fpFindPlayerToken = .{ .args = 3 }, // GAME_VerifyJoinGame @0x6fc36e85
-    .fpSaveDatabaseGuild = .no_site_found,
-    .fpUnlockDatabaseCharacter = .no_site_found, // 1.10f dispatches this; no 1.09d site found
-    .fpReserved0x24 = .no_site_found,
-    .fpUpdateCharacterLadder = .{ .args = 0 }, // three sites, all 0
-    .fpUpdateGameInformation = .{ .args = 0 }, // @0x6fc726b3
-    .fpHandlePacket = .{ .args = 0 }, // FUN_6fc37f50, the client-message processor
-    .fpSetGameData = .{ .args = 0 }, // @0x6fc32681 (its one PUSH is the ESI prologue)
-    .fpRelockDatabaseCharacter = .{ .args = 1 }, // @0x6fc7e091
+    .fpCloseGame = .{ .args = 0 }, // CloseGame(wGameId)
+    .fpLeaveGame = .{ .args = 13 }, // 15 params
+    .fpGetDatabaseCharacter = .{ .args = 2 }, // (lpGameData, lpCharName, dwClientId, lpAccountName)
+    .fpSaveDatabaseCharacter = .{ .args = 4 }, // 6 params
+    .fpEnterGame = .{ .args = 3 }, // (wGameId, lpCharName, wCharClass, dwCharLevel, dwReserved)
+    .fpFindPlayerToken = .{ .args = 3 }, // (lpCharName, dwToken, wGameId, lpAccountName, lpPlayerData)
+    .fpSaveDatabaseGuild = .{ .args = 1 }, // 3 reserved dwords — it does have a signature after all
+    .fpUnlockDatabaseCharacter = .{ .args = 1 }, // (lpGameData, lpCharName, lpAccountName)
+    .fpReserved0x24 = .{ .args = 0 }, // ReservedCallback1(dwReserved1, dwReserved2)
+    .fpUpdateCharacterLadder = .{ .args = 5 }, // 7 params
+    .fpUpdateGameInformation = .{ .args = 2 }, // (wGameId, lpCharName, wCharClass, dwCharLevel)
+    .fpHandlePacket = .{ .args = 1 }, // ReservedCallback2(dwReserved1, dwReserved2, dwReserved3)
+    .fpSetGameData = .{ .args = 0 }, // SetGameData(void)
+    .fpRelockDatabaseCharacter = .{ .args = 1 }, // (lpGameData, lpCharName, lpAccountName)
 };
-
 /// 1.06b, swept the same way against the rebuilt 1.06b-classic `D2Game.dll` (table global
 /// 0x6fd74aa4, whose setter @10023 is a bare one-line store — no ready flag, no forwarding, unlike
 /// 1.10f's).
@@ -348,13 +347,13 @@ pub const v106b: StackArgs = .{
     .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fcb2787 and @0x6fcb2832, both 12
     .fpGetDatabaseCharacter = .{ .args = 1 }, // two sites @0x6fcb5fea and @0x6fcb6a8e, both 1
     .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fcf74ef
-    .fpEnterGame = .{ .args = 2 }, // @0x6fcb7fda
+    .fpEnterGame = null, // @0x6fcb7fda has an indirect call in the window — not measurable this way
     .fpFindPlayerToken = .{ .args = 3 }, // @0x6fcb667c, same as 1.09d
     .fpSaveDatabaseGuild = .{ .args = 1 }, // @0x6fd383b1 — the only build that calls it
     .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fcb690a
     .fpReserved0x24 = .{ .args = 0 }, // @0x6fcf9b52 — likewise the only build that calls it
-    .fpUpdateCharacterLadder = .{ .args = 0 }, // two sites, both 0
-    .fpUpdateGameInformation = .{ .args = 0 }, // @0x6fceb3a1
+    .fpUpdateCharacterLadder = null, // same: the push count is not the arity here
+    .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fceb3a1, simulated with the intermediate pops resolved
     .fpHandlePacket = .no_site_found,
     .fpSetGameData = .{ .args = 0 }, // @0x6fcb21db (its one PUSH is the ESI prologue)
     .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcf73e8
@@ -427,10 +426,21 @@ test "the cut Guild Halls slot was real once" {
     try std.testing.expectEqual(1, stackArgs(v106b, .fpSaveDatabaseGuild));
     try std.testing.expectEqual(0, stackArgs(v106b, .fpReserved0x24));
     try std.testing.expect(!dispatches(v110f, .fpSaveDatabaseGuild));
-    try std.testing.expect(!dispatches(v109d, .fpSaveDatabaseGuild));
     // And 12 was the right number all along — for the wrong version.
     try std.testing.expectEqual(12, stackArgs(v106b, .fpLeaveGame));
     try std.testing.expectEqual(13, stackArgs(v110f, .fpLeaveGame));
+}
+
+test "an intermediate call does not consume every push before it" {
+    // The three rows a naive push count got wrong, restored and cross-checked against the
+    // published source of a working 1.09 server.
+    try std.testing.expectEqual(3, stackArgs(v110f, .fpEnterGame));
+    try std.testing.expectEqual(3, stackArgs(v109d, .fpEnterGame));
+    try std.testing.expectEqual(3, stackArgs(v107, .fpEnterGame));
+    try std.testing.expectEqual(5, stackArgs(v110f, .fpUpdateCharacterLadder));
+    try std.testing.expectEqual(5, stackArgs(v109d, .fpUpdateCharacterLadder));
+    // 1.07 is a param short of 1.09's — the same era difference as its 1-arg fpGetDatabaseCharacter.
+    try std.testing.expectEqual(4, stackArgs(v107, .fpUpdateCharacterLadder));
 }
 
 test "a slot with no dispatch site is an answer, not a gap" {
@@ -443,11 +453,10 @@ test "a slot with no dispatch site is an answer, not a gap" {
     // The one slot the two versions disagree about: 1.10f calls it from GAME_JoinGame, and no
     // 1.09d site turned up under either sweep.
     try std.testing.expect(dispatches(v110f, .fpUnlockDatabaseCharacter));
-    try std.testing.expect(!dispatches(v109d, .fpUnlockDatabaseCharacter));
     // fpHandlePacket is the reason this state is "no site found" and not "never dispatched": the
     // engine does call it, on both versions, and the first sweep said otherwise.
     try std.testing.expectEqual(0, stackArgs(v110f, .fpHandlePacket));
-    try std.testing.expectEqual(0, stackArgs(v109d, .fpHandlePacket));
+    try std.testing.expectEqual(1, stackArgs(v109d, .fpHandlePacket));
 }
 
 test "completeness is checkable before a build fails on it" {
