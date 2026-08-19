@@ -982,7 +982,7 @@ const BinField = extern struct {
 
 /// What each column kind does. Read out of 1.10f Fog's own dispatch: a byte table at 0x6ff5b667
 /// indexed by kind, selecting one of eight handlers.
-const Handler = enum(u8) { string, integer, code4, skip, link_index, row_index, cb_word, cb_void };
+const Handler = enum(u8) { string, integer, code4, skip, link_index, row_index, cb_void };
 
 fn fieldHandler(kind: u32) ?Handler {
     return switch (kind) {
@@ -992,8 +992,10 @@ fn fieldHandler(kind: u32) ?Handler {
         // Registered in the first pass and deliberately not decoded in the second.
         0xA, 0xC, 0xE, 0x10, 0x11, 0x12 => .skip,
         0xB, 0xD, 0xF => .link_index,
-        0x13, 0x14, 0x15 => .row_index,
-        0x16 => .cb_word,
+        // 0x16 looks like a callback in the jump table but is not: the handler pushes
+        // (*link, cell, 1) and calls FOG_GetRowFromTxt (@10217, 0x6ff5bc20). It is a row lookup
+        // that stores a word.
+        0x13, 0x14, 0x15, 0x16 => .row_index,
         0x17, 0x18, 0x19 => .cb_void,
         else => null,
     };
@@ -1043,6 +1045,15 @@ fn code4(cell: []const u8) u32 {
     return std.mem.readInt(u32, &b, .little);
 }
 
+/// Call a __fastcall function whose only argument is in ECX and which takes no stack args.
+fn callWithEcx(fn_addr: usize, ecx: usize) void {
+    asm volatile ("call *%[f]"
+        :
+        : [f] "r" (fn_addr),
+          [c] "{ecx}" (ecx),
+        : .{ .eax = true, .edx = true, .memory = true });
+}
+
 fn writeSized(rec: [*]u8, off: u32, bytes: u32, v: i32) void {
     switch (bytes) {
         1 => rec[off] = @truncate(@as(u32, @bitCast(v))),
@@ -1054,7 +1065,7 @@ fn writeSized(rec: [*]u8, off: u32, bytes: u32, v: i32) void {
 /// Width of the destination for the kinds that encode it in the kind itself.
 fn kindWidth(kind: u32) u32 {
     return switch (kind) {
-        3, 0xF, 0x14, 0x16 => 2,
+        3, 0xF, 0x14, 0x16, 0x11 => 2,
         4, 5, 6, 0xD, 0x15 => 1,
         else => 4,
     };
@@ -1138,11 +1149,27 @@ export fn FOG_10207(
                             else => std.mem.writeInt(i16, dst[0..2], @truncate(idx), .little),
                         }
                     },
-                    0x10, 0x11, 0x12 => {
+                    // Only 0x10 registers. 0x11 and 0x12 are LOOKUPS that happen in this pass
+                    // because they resolve against a table already built — and they store what
+                    // they find, including the -1 of a miss, which is what an empty cell yields.
+                    // Treating all three as registration leaves those columns zero where the
+                    // engine writes 0xFFFFFFFF.
+                    0x10 => {
                         var key: [0x21]u8 = @splat(0);
                         const n = @min(cell.len, key.len - 1);
                         @memcpy(key[0..n], cell[0..n]);
                         FOG_AddRecordToLinkingTable(link, @ptrCast(&key));
+                    },
+                    0x11, 0x12 => {
+                        var key: [0x21]u8 = @splat(0);
+                        const n = @min(cell.len, key.len - 1);
+                        @memcpy(key[0..n], cell[0..n]);
+                        const idx = FOG_GetRowFromTxt(link, @ptrCast(&key), 1);
+                        const dst = rec + row * stride + d.offset;
+                        if (d.kind == 0x11)
+                            std.mem.writeInt(i16, dst[0..2], @truncate(idx), .little)
+                        else
+                            std.mem.writeInt(i32, dst[0..4], idx, .little);
                     },
                     else => {},
                 }
@@ -1189,10 +1216,18 @@ export fn FOG_10207(
                     @memcpy(key[0..n], cell[0..n]);
                     writeSized(dst, d.offset, kindWidth(d.kind), FOG_GetRowFromTxt(link, @ptrCast(&key), 1));
                 },
-                // The callback kinds hand the cell to a per-column function D2Common supplies. We
-                // do not know its convention yet, so the column is left zero rather than called
-                // with a guess — a wrong call here would corrupt the engine's stack.
-                .cb_word, .cb_void => {},
+                // Kinds 0x17-0x19 hand the cell to a per-column function D2Common supplies:
+                // `lea ecx,[buffer]; call edi` — __fastcall with the cell in ECX, NO stack args,
+                // and the result discarded. Zero stack args is what makes calling it safe without
+                // knowing more: there is nothing for either side to clean up wrongly.
+                .cb_void => {
+                    const fp = d.link orelse continue;
+                    const cb: *const fn () callconv(.naked) void = @ptrCast(fp);
+                    var key: [0x101]u8 = @splat(0);
+                    const n = @min(cell.len, key.len - 1);
+                    @memcpy(key[0..n], cell[0..n]);
+                    callWithEcx(@intFromPtr(cb), @intFromPtr(&key));
+                },
             }
         }
         cur.endOfRow();
