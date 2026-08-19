@@ -960,15 +960,228 @@ export fn FOG_GetRecordCountFromBinFile(bin: ?*BinFile) callconv(.winapi) i32 {
     return if (bin) |b| b.rows else 0;
 }
 
-/// The .txt → record decoder. Filling records needs the D2BinFieldStrc column descriptors, which
-/// are not reversed yet, so this stays a no-op with the right arity: tables load empty and say so.
-export fn FOG_10207(bin: ?*BinFile, fields: ?*anyopaque, txt: ?*anyopaque, count: i32, size: i32) callconv(.winapi) void {
-    _ = bin;
-    _ = fields;
-    _ = txt;
-    _ = count;
-    _ = size;
-    trace("FOG_10207 (txt->record decode, not implemented)");
+/// One column of a table, as D2Common describes it to Fog. 0x14 bytes, and the array is
+/// terminated by a zero `kind` — the real @10207 walks it exactly that way.
+const BinField = extern struct {
+    /// The column header this binds to. Matched against the `.txt`'s first line.
+    name: ?[*:0]const u8,
+    /// What to do with the cell. Zero ends the array. See `fieldHandler`.
+    kind: u32,
+    /// Bytes, for the string kinds; the bit index, for kind 0x1A.
+    size: u32,
+    /// Where in the record this column's value goes.
+    offset: u32,
+    /// For the linked kinds, a pointer TO the linker pointer (the table's linker is allocated
+    /// separately and stored by the caller); for the callback kinds, the callback itself.
+    link: ?*?*Linker,
+};
+
+/// What each column kind does. Read out of 1.10f Fog's own dispatch: a byte table at 0x6ff5b667
+/// indexed by kind, selecting one of eight handlers.
+const Handler = enum(u8) { string, integer, code4, skip, link_index, row_index, cb_word, cb_void };
+
+fn fieldHandler(kind: u32) ?Handler {
+    return switch (kind) {
+        1, 7 => .string,
+        2, 3, 4, 5, 6, 8, 0x1A => .integer,
+        9 => .code4,
+        // Registered in the first pass and deliberately not decoded in the second.
+        0xA, 0xC, 0xE, 0x10, 0x11, 0x12 => .skip,
+        0xB, 0xD, 0xF => .link_index,
+        0x13, 0x14, 0x15 => .row_index,
+        0x16 => .cb_word,
+        0x17, 0x18, 0x19 => .cb_void,
+        else => null,
+    };
+}
+
+/// Cells are NUL-separated in place (that is what @10208 did to the buffer) and a row ends with a
+/// newline, so walking is: read up to the NUL, step past it.
+const Cells = struct {
+    p: [*]u8,
+
+    fn next(self: *Cells) []const u8 {
+        const start = self.p;
+        var n: usize = 0;
+        while (start[n] != 0 and start[n] != '\n') n += 1;
+        self.p = start + n + 1;
+        return start[0..n];
+    }
+
+    /// True once the row separator is reached; consumes it.
+    fn endOfRow(self: *Cells) bool {
+        if (self.p[0] == '\n') {
+            self.p += 1;
+            return true;
+        }
+        return false;
+    }
+};
+
+fn parseInt(cell: []const u8) i32 {
+    var i: usize = 0;
+    var neg = false;
+    if (i < cell.len and (cell[i] == '-' or cell[i] == '+')) {
+        neg = cell[i] == '-';
+        i += 1;
+    }
+    var v: i32 = 0;
+    while (i < cell.len and cell[i] >= '0' and cell[i] <= '9') : (i += 1) {
+        v = v *% 10 +% @as(i32, cell[i] - '0');
+    }
+    return if (neg) -v else v;
+}
+
+/// A four-character code, space-padded — the engine's own normalisation, so a short cell compares
+/// equal to the padded form already in the linking table.
+fn code4(cell: []const u8) u32 {
+    var b: [4]u8 = @splat(' ');
+    for (cell[0..@min(cell.len, 4)], 0..) |c, i| b[i] = c;
+    return std.mem.readInt(u32, &b, .little);
+}
+
+fn writeSized(rec: [*]u8, off: u32, bytes: u32, v: i32) void {
+    switch (bytes) {
+        1 => rec[off] = @truncate(@as(u32, @bitCast(v))),
+        2 => std.mem.writeInt(i16, rec[off..][0..2], @truncate(v), .little),
+        else => std.mem.writeInt(i32, rec[off..][0..4], v, .little),
+    }
+}
+
+/// Width of the destination for the kinds that encode it in the kind itself.
+fn kindWidth(kind: u32) u32 {
+    return switch (kind) {
+        3, 0xF, 0x14, 0x16 => 2,
+        4, 5, 6, 0xD, 0x15 => 1,
+        else => 4,
+    };
+}
+
+/// @10207. Fill `records` from the tokenised `.txt`, one row at a time, driven by the column
+/// descriptors D2Common hands us.
+///
+/// Two passes, because the table is self-referential: the first registers every code and name into
+/// the linking tables (kinds 0xA/0xC/0xE add a 4CC, 0x10 adds a string), so that the second can
+/// resolve columns that refer to rows of this very table. Doing it in one pass would fail on any
+/// forward reference — which is why the engine's own second-pass dispatch marks those kinds
+/// `skip`: they were already consumed.
+///
+/// `n_records`/`stride` are the engine's `nMemHgt`/`nMemSpan`, and it asserts both are non-zero
+/// before touching anything.
+export fn FOG_10207(
+    bin: ?*BinFile,
+    fields: ?[*]BinField,
+    records: ?[*]u8,
+    n_records: u32,
+    stride: u32,
+) callconv(.winapi) void {
+    trace("FOG_10207 @10207 (txt -> records)");
+    const b = bin orelse return;
+    const f = fields orelse return;
+    const rec = records orelse return;
+    if (n_records == 0 or stride == 0) {
+        say("  10207: refusing a zero-sized table");
+        return;
+    }
+    const header = b.data orelse return;
+    const body = b.first_row orelse return;
+    const columns: usize = @intCast(@max(b.columns, 0));
+    const rows: usize = @min(@as(usize, @intCast(@max(b.rows, 0))), n_records);
+
+    // Bind each of the file's columns to a descriptor, by header name. A column the descriptors do
+    // not mention is skipped rather than guessed at — tables carry columns the server ignores.
+    var bound: [EXCEL_MAX_CELLS]?*BinField = @splat(null);
+    var head = Cells{ .p = header };
+    for (0..@min(columns, EXCEL_MAX_CELLS)) |c| {
+        const name = head.next();
+        var i: usize = 0;
+        while (f[i].kind != 0) : (i += 1) {
+            const dn = cstr(f[i].name);
+            if (dn.len == name.len and std.ascii.eqlIgnoreCase(dn, name)) {
+                bound[c] = &f[i];
+                break;
+            }
+        }
+    }
+
+    // Pass 1: register codes and names, so the second pass can resolve references into this table.
+    var needs_registration = false;
+    for (bound[0..@min(columns, EXCEL_MAX_CELLS)]) |maybe| {
+        const d = maybe orelse continue;
+        switch (d.kind) {
+            0xA, 0xC, 0xE, 0x10, 0x11, 0x12 => needs_registration = true,
+            else => {},
+        }
+    }
+    if (needs_registration) {
+        var cur = Cells{ .p = body };
+        for (0..rows) |_| {
+            for (0..columns) |c| {
+                const cell = cur.next();
+                const d = (if (c < EXCEL_MAX_CELLS) bound[c] else null) orelse continue;
+                const link = if (d.link) |pp| pp.* else null;
+                switch (d.kind) {
+                    0xA, 0xC, 0xE => _ = FOG_AddCodeToLinkingTable(link, code4(cell)),
+                    0x10, 0x11, 0x12 => {
+                        var key: [0x21]u8 = @splat(0);
+                        const n = @min(cell.len, key.len - 1);
+                        @memcpy(key[0..n], cell[0..n]);
+                        FOG_AddRecordToLinkingTable(link, @ptrCast(&key));
+                    },
+                    else => {},
+                }
+            }
+            _ = cur.endOfRow();
+        }
+    }
+
+    // Pass 2: decode every cell into its record.
+    var cur = Cells{ .p = body };
+    for (0..rows) |row| {
+        const dst = rec + row * stride;
+        for (0..columns) |c| {
+            const cell = cur.next();
+            const d = (if (c < EXCEL_MAX_CELLS) bound[c] else null) orelse continue;
+            const handler = fieldHandler(d.kind) orelse continue;
+            const link = if (d.link) |pp| pp.* else null;
+            switch (handler) {
+                .skip => {},
+                .string => {
+                    const cap = if (d.size == 0) 1 else d.size;
+                    const n = @min(cell.len, cap - 1);
+                    @memcpy((dst + d.offset)[0..n], cell[0..n]);
+                    dst[d.offset + n] = 0;
+                },
+                .code4 => std.mem.writeInt(u32, (dst + d.offset)[0..4], code4(cell), .little),
+                .integer => {
+                    if (d.kind == 0x1A) {
+                        // A flag column: `size` is the bit, not a width.
+                        const bit = d.size;
+                        const at = d.offset + bit / 8;
+                        const mask: u8 = @as(u8, 1) << @intCast(bit % 8);
+                        if (parseInt(cell) != 0) dst[at] |= mask else dst[at] &= ~mask;
+                    } else if (d.kind == 5 and cell.len != 1) {
+                        // Kind 5 takes a single character only; anything else is left alone.
+                    } else {
+                        writeSized(dst, d.offset, kindWidth(d.kind), parseInt(cell));
+                    }
+                },
+                .link_index => writeSized(dst, d.offset, kindWidth(d.kind), FOG_GetLinkIndex(link, code4(cell), 1)),
+                .row_index => {
+                    var key: [0x21]u8 = @splat(0);
+                    const n = @min(cell.len, key.len - 1);
+                    @memcpy(key[0..n], cell[0..n]);
+                    writeSized(dst, d.offset, kindWidth(d.kind), FOG_GetRowFromTxt(link, @ptrCast(&key), 1));
+                },
+                // The callback kinds hand the cell to a per-column function D2Common supplies. We
+                // do not know its convention yet, so the column is left zero rather than called
+                // with a guess — a wrong call here would corrupt the engine's stack.
+                .cb_word, .cb_void => {},
+            }
+        }
+        _ = cur.endOfRow();
+    }
+    sayFmt("  10207: {d} rows x {d} bytes decoded", .{ rows, stride });
 }
 
 // ── the linker (D2TxtLinkStrc) ───────────────────────────────────────────────
