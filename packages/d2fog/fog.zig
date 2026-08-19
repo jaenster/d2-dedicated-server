@@ -1239,25 +1239,39 @@ export fn FOG_10207(
                         @memcpy(key[0..k], cell[0..k]);
                         FOG_AddRecordToLinkingTable(link, @ptrCast(&key));
                     },
-                    0x11, 0x12 => {
-                        var key: [0x21]u8 = @splat(0);
-                        const n = @min(cell.len, key.len - 1);
-                        @memcpy(key[0..n], cell[0..n]);
-                        const idx = FOG_GetRowFromTxt(link, @ptrCast(&key), 1);
-                        const dst = rec + row * stride + d.offset;
-                        // 0x11 is the DWORD one. The decompiler renders this pair the other way
-                        // round, and the tables settle it: qualityitems' mod2code is 0x11 at
-                        // offset 28, and the shipped record has ffffffff there — a full dword of
-                        // "not found", not a word plus padding.
-                        if (d.kind == 0x12)
-                            std.mem.writeInt(i16, dst[0..2], @truncate(idx), .little)
-                        else
-                            std.mem.writeInt(i32, dst[0..4], idx, .little);
-                    },
                     else => {},
                 }
             }
             cur.endOfRow();
+        }
+
+        // Resolve only once every row is registered. These lookups can point into the table's own
+        // linker, so doing them inline finds every backward reference and misses any forward one.
+        // skills.txt has exactly one: row 69, Skeleton Mastery, requires Raise Skeleton at row 70.
+        // Inline resolution stored -1 there, and 1.09d reads that back as unsigned and dies on
+        // `nLoadedValue < MAX_SKILL_RESTRICTED_STATES` — one cell, and the engine will not boot.
+        var look = Cells{ .p = body };
+        for (0..rows) |row| {
+            for (0..columns) |c| {
+                const cell = look.next();
+                const d = (if (c < EXCEL_MAX_CELLS) bound[c] else null) orelse continue;
+                if (d.kind != 0x11 and d.kind != 0x12) continue;
+                const link = if (d.link) |pp| pp.* else null;
+                var key: [0x21]u8 = @splat(0);
+                const n = @min(cell.len, key.len - 1);
+                @memcpy(key[0..n], cell[0..n]);
+                const idx = FOG_GetRowFromTxt(link, @ptrCast(&key), 1);
+                const dst = rec + row * stride + d.offset;
+                // 0x11 is the DWORD one. The decompiler renders this pair the other way round, and
+                // the tables settle it: qualityitems' mod2code is 0x11 at offset 28, and the
+                // shipped record has ffffffff there — a full dword of "not found", not a word
+                // plus padding.
+                if (d.kind == 0x12)
+                    std.mem.writeInt(i16, dst[0..2], @truncate(idx), .little)
+                else
+                    std.mem.writeInt(i32, dst[0..4], idx, .little);
+            }
+            look.endOfRow();
         }
     }
 
