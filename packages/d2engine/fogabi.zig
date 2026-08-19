@@ -40,6 +40,13 @@ pub fn ordinalArgs(v: version.Version) ?OrdinalArgs {
         // the same way over every Fog ordinal D2Common imports — AllocLinker is the *only* one of
         // the eighteen that moved, on either version.
         .v107, .v108, .v109d => .{ .alloc_linker = 0 },
+        // 1.06b was swept the same way, from the callee's own `ret N` rather than from push counts,
+        // because its Fog.dll is on disk to read. All 47 ordinals it imports pop exactly what
+        // 1.10f's equivalents pop — the classic/LoD boundary renumbered Fog without changing a
+        // single arity. AllocLinker is not among those 47 at all: classic allocates through
+        // 10045/10046/10047, so this field is inert here and 0 is the value that cannot leak if
+        // that ever turns out to be wrong.
+        .v106b => .{ .alloc_linker = 0 },
         else => null,
     };
 }
@@ -53,6 +60,7 @@ test "the LoD family shares ordinals but not arities" {
     try std.testing.expectEqual(@as(u8, 2), ordinalArgs(.v110f).?.alloc_linker);
     try std.testing.expectEqual(@as(u8, 0), ordinalArgs(.v109d).?.alloc_linker);
     try std.testing.expectEqual(@as(u8, 0), ordinalArgs(.v107).?.alloc_linker);
-    // 1.06b is a different Fog numbering entirely and has not been measured.
-    try std.testing.expect(ordinalArgs(.v106b) == null);
+    // 1.06b is a different Fog numbering entirely, and measuring it found no arity moved at all.
+    try std.testing.expectEqual(@as(u8, 0), ordinalArgs(.v106b).?.alloc_linker);
+    try std.testing.expect(ordinalArgs(.v100) == null); // still genuinely unmeasured
 }
