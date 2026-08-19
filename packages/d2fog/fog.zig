@@ -1166,6 +1166,24 @@ export fn FOG_10207(
         }
     }
 
+    // Seed every lookup column with -1 before decoding anything. A descriptor can name a column the
+    // file does not have — automagic's `classspecific` is one — and the engine's compiled table
+    // holds 0xFF there rather than the zero an untouched buffer would give. So "absent" and "present
+    // but not found" end up the same value, which is the answer a lookup column wants either way.
+    {
+        var i: usize = 0;
+        while (f[i].kind != 0) : (i += 1) {
+            const w: u32 = switch (f[i].kind) {
+                0xB, 0xD, 0xF, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16 => kindWidth(f[i].kind),
+                else => continue,
+            };
+            for (0..rows) |row| {
+                const dst = rec + row * stride + f[i].offset;
+                for (0..w) |k| dst[k] = 0xff;
+            }
+        }
+    }
+
     // Pass 1: register codes and names, so the second pass can resolve references into this table.
     var needs_registration = false;
     for (bound[0..@min(columns, EXCEL_MAX_CELLS)]) |maybe| {
