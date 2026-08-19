@@ -282,7 +282,7 @@ pub const v107: StackArgs = .{
     .fpSaveDatabaseGuild = .{ .args = 1 }, // @0x6fd00851
     .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fc66e64
     .fpReserved0x24 = .{ .args = 0 }, // two sites @0x6fca9dda and @0x6fca9ea5
-    .fpUpdateCharacterLadder = .{ .args = 4 }, // @0x6fc67226 simulated; 1.09 grew a 7th param to 5
+    .fpUpdateCharacterLadder = .{ .args = 5 }, // @0x6fc67226, stable across every sane window
     .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fc9ede3
     .fpHandlePacket = .no_site_found,
     .fpSetGameData = .{ .args = 0 }, // @0x6fc6257b (the function opens with the ESI prologue push)
@@ -297,18 +297,25 @@ pub const v107: StackArgs = .{
 /// Four slots have no dispatch site under the sweep (0x1C, 0x24, 0x30, 0x3C). 1.07 does dispatch
 /// 0x1C and 0x24, so these may be sites the sweep missed rather than calls the build does not
 /// make; either way the host leaves them null, which the engine's own guards make safe.
+///
+/// Two more are `null` for a different reason: 1.08's `fpEnterGame` and `fpUpdateCharacterLadder`
+/// sites do not decode to a stable answer. Walking back a different number of instructions gives 2
+/// or 3 for one and 1 or 5 for the other, because a window that starts inside an argument sequence
+/// misses the pushes above it. Every other version measured agrees on 3 and 5, so those are very
+/// likely the values — which is exactly why they are not written down. A wrong arity here unbalances
+/// the engine on character save, and "it matches its neighbours" is not a measurement.
 pub const v108: StackArgs = .{
     .fpCloseGame = .{ .args = 0 }, // @0x6fc690fd
     .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fc62b15 and @0x6fc62bc0
     .fpGetDatabaseCharacter = .{ .args = 1 }, // two sites, both push one; ECX = game, EDX = name
     .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fcad377
-    .fpEnterGame = .{ .args = 3 }, // @0x6fc685c1, simulated with the intermediate pops resolved
+    .fpEnterGame = null, // @0x6fc685c1: windows split 2 vs 3 — needs a hand-read, not a vote
     .fpFindPlayerToken = .{ .args = 3 }, // @0x6fc66b63
     .fpSaveDatabaseGuild = .no_site_found,
     .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fc66df4
     .fpReserved0x24 = .no_site_found,
-    .fpUpdateCharacterLadder = .{ .args = 4 }, // @0x6fc671c4, same as 1.07; 1.09 grew a 7th param
-    .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fca1033
+    .fpUpdateCharacterLadder = null, // @0x6fc671c4: windows split 1 vs 5
+    .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fca1033, 13 of 18 windows agree
     .fpHandlePacket = .no_site_found,
     .fpSetGameData = .{ .args = 0 }, // @0x6fc6256b (its one PUSH is the ESI prologue)
     .fpRelockDatabaseCharacter = .{ .args = 0 }, // @0x6fcad270
@@ -364,20 +371,25 @@ pub const v109d: StackArgs = .{
 /// number this file used to carry for 1.10f. The old value was not invented, it was the right
 /// number for the wrong version.
 ///
-/// Not runnable yet: 1.06b is the classic Fog family, and the 31 classic-era Fog ordinals have no
-/// rosetta row. `hostapi.clientFields` has no 1.06b entry either, so `d2host`'s readiness gate
-/// still refuses it — this records the ABI half of the work, not a claim that it boots.
+/// The three slots this file could not measure at first are measured now. They were not
+/// unmeasurable — the window simply started too early, so a `call dword ptr [...]` that belongs to
+/// the code *before* the argument setup landed inside it. Starting at the top of the sequence and
+/// resolving what each intermediate call pops gives 3, 5 and 2, agreeing with every other version.
+///
+/// Still not runnable: 1.06b is the classic Fog family, so its imports need rewriting through
+/// `fogrosetta` before it will load, and `hostapi.charNameSource` has no 1.06b entry yet — the
+/// probe run that would measure it is the next step.
 pub const v106b: StackArgs = .{
     .fpCloseGame = .{ .args = 0 }, // @0x6fcb8a4d
     .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fcb2787 and @0x6fcb2832, both 12
     .fpGetDatabaseCharacter = .{ .args = 1 }, // two sites @0x6fcb5fea and @0x6fcb6a8e, both 1
     .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fcf74ef
-    .fpEnterGame = null, // @0x6fcb7fda has an indirect call in the window — not measurable this way
+    .fpEnterGame = .{ .args = 3 }, // @0x6fcb7fda: 3 pushes, D2Common thunk pops 2, then 2 more
     .fpFindPlayerToken = .{ .args = 3 }, // @0x6fcb667c, same as 1.09d
     .fpSaveDatabaseGuild = .{ .args = 1 }, // @0x6fd383b1 — the only build that calls it
     .fpUnlockDatabaseCharacter = .{ .args = 0 }, // @0x6fcb690a
     .fpReserved0x24 = .{ .args = 0 }, // @0x6fcf9b52 — likewise the only build that calls it
-    .fpUpdateCharacterLadder = null, // same: the push count is not the arity here
+    .fpUpdateCharacterLadder = .{ .args = 5 }, // @0x6fcb6cee, every intermediate pop resolved
     .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fceb3a1, simulated with the intermediate pops resolved
     .fpHandlePacket = .no_site_found,
     .fpSetGameData = .{ .args = 0 }, // @0x6fcb21db (its one PUSH is the ESI prologue)
@@ -464,8 +476,11 @@ test "an intermediate call does not consume every push before it" {
     try std.testing.expectEqual(3, stackArgs(v107, .fpEnterGame));
     try std.testing.expectEqual(5, stackArgs(v110f, .fpUpdateCharacterLadder));
     try std.testing.expectEqual(5, stackArgs(v109d, .fpUpdateCharacterLadder));
-    // 1.07 is a param short of 1.09's — the same era difference as its 1-arg fpGetDatabaseCharacter.
-    try std.testing.expectEqual(4, stackArgs(v107, .fpUpdateCharacterLadder));
+    // Every version measured agrees on 5 — including 1.06b, which is the oldest. An earlier read
+    // of 1.07's put it at 4, from a window that began after the first `push; call` pair.
+    try std.testing.expectEqual(5, stackArgs(v107, .fpUpdateCharacterLadder));
+    try std.testing.expectEqual(5, stackArgs(v106b, .fpUpdateCharacterLadder));
+    try std.testing.expectEqual(3, stackArgs(v106b, .fpEnterGame));
 }
 
 test "a slot with no dispatch site is an answer, not a gap" {
