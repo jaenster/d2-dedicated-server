@@ -1430,6 +1430,8 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
         if (process_game) |proc| {
             var spins: usize = 0;
             while (spins < 64) : (spins += 1) {
+                // One word is enough: given 128 bytes of room and 1.06b driving it, the engine
+                // wrote slot 0 and nothing else, so EDX really is a single out-parameter here.
                 var game: usize = 0;
                 _ = fastcall.fastcallAt(fn (usize, *usize) callconv(.c) usize)
                     .call(@intFromPtr(proc), .{ worker_ctx, &game });
