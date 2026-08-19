@@ -43,9 +43,14 @@ pub const Confidence = enum {
 
 pub const Row = struct { classic: u16, lod: u16, how: Confidence };
 
-/// Every Fog ordinal 1.06b's D2Game and D2Common import, in ordinal order.
+/// Every Fog ordinal a classic build imports, in ordinal order — D2Game's and D2Common's, plus
+/// the seven only D2CMP takes (10020, 10066, 10067, 10069, 10070, 10072, 10079). Those were
+/// missed at first because the survey stopped at the two modules the host drives directly, and a
+/// rewrite that skips a module leaves it calling whatever the LoD numbering happens to put at that
+/// ordinal — the same silent-wrong-call this file exists to prevent.
 pub const classic_to_lod = [_]Row{
     .{ .classic = 10016, .lod = 10018, .how = .corroborated },
+    .{ .classic = 10020, .lod = 10022, .how = .corroborated }, // D2CMP-only from here
     .{ .classic = 10021, .lod = 10023, .how = .inferred },
     .{ .classic = 10022, .lod = 10024, .how = .inferred },
     .{ .classic = 10023, .lod = 10025, .how = .corroborated },
@@ -57,10 +62,16 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10061, .lod = 10083, .how = .corroborated },
     .{ .classic = 10062, .lod = 10084, .how = .corroborated },
     .{ .classic = 10064, .lod = 10086, .how = .corroborated },
+    .{ .classic = 10066, .lod = 10091, .how = .corroborated },
+    .{ .classic = 10067, .lod = 10093, .how = .inferred },
+    .{ .classic = 10069, .lod = 10094, .how = .measured },
+    .{ .classic = 10070, .lod = 10095, .how = .measured },
+    .{ .classic = 10072, .lod = 10097, .how = .measured }, // strongest of the D2CMP set, 5.73
     .{ .classic = 10075, .lod = 10102, .how = .measured }, // the file I/O block, margin 3.00
     .{ .classic = 10076, .lod = 10103, .how = .measured },
     .{ .classic = 10077, .lod = 10104, .how = .measured },
     .{ .classic = 10078, .lod = 10105, .how = .measured },
+    .{ .classic = 10079, .lod = 10106, .how = .measured },
     .{ .classic = 10086, .lod = 10115, .how = .measured }, // strongest row in the set, score 7.78
     .{ .classic = 10087, .lod = 10118, .how = .corroborated },
     .{ .classic = 10088, .lod = 10119, .how = .corroborated },
@@ -142,8 +153,8 @@ test "an unconfirmed row is refused rather than guessed" {
 }
 
 test "how much of the set is actually established" {
-    try std.testing.expectEqual(@as(usize, 40), classic_to_lod.len);
-    try std.testing.expectEqual(@as(usize, 12), countBy(.measured));
-    try std.testing.expectEqual(@as(usize, 15), countBy(.corroborated));
-    try std.testing.expectEqual(@as(usize, 13), countBy(.inferred));
+    try std.testing.expectEqual(@as(usize, 47), classic_to_lod.len);
+    try std.testing.expectEqual(@as(usize, 16), countBy(.measured));
+    try std.testing.expectEqual(@as(usize, 17), countBy(.corroborated));
+    try std.testing.expectEqual(@as(usize, 14), countBy(.inferred));
 }

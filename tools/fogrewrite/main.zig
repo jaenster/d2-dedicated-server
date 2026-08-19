@@ -116,7 +116,10 @@ fn rewrite(pe: Pe, accept_inferred: bool) !Report {
                 const at = base + k * 4;
                 const v = std.mem.readInt(u32, pe.bytes[at..][0..4], .little);
                 if (v == 0) break;
-                if (v & 0x80000000 == 0) return error.ImportByName; // classic imports by ordinal only
+                // Imports by name need no rosetta: a name means the same thing on both sides of
+                // the renumbering. D2CMP takes `gdwBitMasks` from Fog that way, and our Fog
+                // exports it under exactly that name.
+                if (v & 0x80000000 == 0) continue;
                 const classic: u16 = @truncate(v & 0xffff);
                 const lod = rosetta.lodFor(classic, accept_inferred) orelse {
                     std.debug.print("  REFUSED @{d}: no row good enough to act on\n", .{classic});
