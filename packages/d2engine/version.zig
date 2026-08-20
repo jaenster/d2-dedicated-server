@@ -121,7 +121,32 @@ pub fn spec(comptime v: Version) Spec {
         .v108 => .{ .name = "1.08", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v108 },
         .v109d => .{ .name = "1.09d", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v109d },
         .v110f => .{ .name = "1.10f", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v110f },
-        .v113c => .{ .name = "1.13c", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = .{} },
+        // 1.13c renumbered its whole export table — every entry point we call moved, in D2Game and
+        // D2Common alike, and 10023 there is a bare `ret 4` rather than the callback setter. Each
+        // number below was matched as a byte-level structural twin of its 1.10f counterpart, not by
+        // position. It reads .bin at runtime: the selector takes .txt only when the flag is
+        // non-zero, and the flag defaults to zero.
+        .v113c => .{
+            .name = "1.13c",
+            .fog = .lod,
+            .expansion = true,
+            .modules = &lod_modules,
+            .game = .{
+                .init_server_module = 10038,
+                .init_game_data_table = 10037,
+                .set_server_callbacks = 10048,
+                .init_clock = 10016,
+                .net_messages = 10040,
+                .worker_context = 10021,
+                .process_game = 10056,
+                .flush_game = 10002,
+                .create_empty_game = 10044,
+                .set_init_seed = 10017,
+                .shutdown = 10047,
+            },
+            .common = .{ .load_all_txts = 10943, .set_compile_tables = 10563 },
+            .stack_args = callbacks.v113c,
+        },
         // 1.14d is the monolith: no DLLs to load, and it grew the callback table past 0x40.
         .v114d => .{ .name = "1.14d", .fog = .lod, .expansion = true, .modules = &.{}, .stack_args = callbacks.v114d },
     };

@@ -420,6 +420,32 @@ pub const v109b: StackArgs = .{
     .fpRelockDatabaseCharacter = .{ .args = 1 }, // @0x6fc7dcc5
 };
 
+/// 1.13c, against its own D2Game (base 0x6fc20000, table global 0x6fd31c3c). Counted the same way,
+/// and checked the strong way: with these values plugged back in, every `ret` in all 23 functions
+/// that touch the table balances to an ESP delta of zero, with no unresolved call and no merge
+/// conflict anywhere in their control flow.
+///
+/// It is the furthest build from its neighbours. fpLeaveGame grew to 18 arguments where 1.10f takes
+/// 13, and fpFindPlayerToken to 7 where 1.10f takes 5 — so nothing here is transferable from the
+/// version either side of it. It also calls slot 0x54, which means its table runs past 0x40 the way
+/// 1.14d's does rather than ending there.
+pub const v113c: StackArgs = .{
+    .fpCloseGame = .{ .args = 2 },
+    .fpLeaveGame = .{ .args = 18 }, // 1.10f takes 13
+    .fpGetDatabaseCharacter = .{ .args = 2 },
+    .fpSaveDatabaseCharacter = .{ .args = 4 },
+    .fpEnterGame = .{ .args = 3 },
+    .fpFindPlayerToken = .{ .args = 7 }, // 1.10f takes 5
+    .fpSaveDatabaseGuild = .no_site_found,
+    .fpUnlockDatabaseCharacter = .{ .args = 1 },
+    .fpReserved0x24 = .no_site_found,
+    .fpUpdateCharacterLadder = .{ .args = 5 }, // two sites
+    .fpUpdateGameInformation = .{ .args = 2 },
+    .fpHandlePacket = .{ .args = 0 },
+    .fpSetGameData = .{ .args = 0 },
+    .fpRelockDatabaseCharacter = .{ .args = 1 },
+};
+
 pub const v106b: StackArgs = .{
     .fpCloseGame = .{ .args = 0 }, // @0x6fcb8a4d
     .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fcb2787 and @0x6fcb2832, both 12

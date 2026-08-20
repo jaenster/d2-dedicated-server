@@ -147,7 +147,7 @@ pub const CharNameSource = union(enum) {
 
 pub fn charNameSource(v: version.Version) ?CharNameSource {
     return switch (v) {
-        .v110f, .v114d => .{ .realm_relative = .{ .name = 0x5B, .account = 0x4B } },
+        .v110f, .v113c, .v114d => .{ .realm_relative = .{ .name = 0x5B, .account = 0x4B } },
         // 1.09d's own shape, from the published source of a 1.09 server:
         // `GetDatabaseCharacter(LPGAMEDATA, LPCSTR lpCharName, ...)` is __fastcall, so ECX is the
         // game and EDX is the name — the same shape 1.07 was measured to have, not the
@@ -189,7 +189,8 @@ pub fn clientFields(v: version.Version) ?ClientFieldOffsets {
 /// better than a plausible-looking address that is really another version's.
 pub fn createGame(v: version.Version) ?Location {
     return switch (v) {
-        .v100, .v106b, .v107, .v108, .v109b, .v109d, .v110f, .v113c => .{ .ordinal = 10047 },
+        .v100, .v106b, .v107, .v108, .v109b, .v109d, .v110f => .{ .ordinal = 10047 },
+        .v113c => .{ .ordinal = 10044 }, // renumbered, like everything else on this build
         .v114d => null, // not needed: the injected server is already inside the engine's own path
     };
 }
@@ -197,7 +198,10 @@ pub fn createGame(v: version.Version) ?Location {
 pub fn sendDatabaseCharacter(v: version.Version) ?Location {
     return switch (v) {
         // RET 0x20 for eight stdcall args, and its body calls CLIENTS_AttachSaveFile.
-        .v100, .v106b, .v107, .v108, .v109b, .v109d, .v110f, .v113c => .{ .ordinal = 10007 },
+        .v100, .v106b, .v107, .v108, .v109b, .v109d, .v110f => .{ .ordinal = 10007 },
+        // 1.13c renumbered everything: this one is 10035 there, ret 0x20, a structural twin of
+        // 1.10f's 10007.
+        .v113c => .{ .ordinal = 10035 },
         // CLIENT_OnDatabaseCharacterReceived, in daily use by apps/d2gs.
         .v114d => .{ .address = 0x005306e0 },
     };
@@ -218,10 +222,13 @@ pub fn endAllGames(v: version.Version) ?Location {
     };
 }
 
-test "the DLL era shares one host API" {
+test "the DLL era shares one host API, except where 1.13c renumbered it" {
     try std.testing.expectEqual(@as(u16, 10007), sendDatabaseCharacter(.v110f).?.ordinal);
-    try std.testing.expectEqual(@as(u16, 10007), sendDatabaseCharacter(.v113c).?.ordinal);
     try std.testing.expectEqual(@as(u16, 10047), createGame(.v109d).?.ordinal);
+    // 1.13c is the exception, and it is not a small one: it renumbered its whole export table, so
+    // sharing a number with its neighbours is the thing that would be surprising here.
+    try std.testing.expectEqual(@as(u16, 10035), sendDatabaseCharacter(.v113c).?.ordinal);
+    try std.testing.expectEqual(@as(u16, 10044), createGame(.v113c).?.ordinal);
 }
 
 test "1.14d locates the same function by address, not ordinal" {
