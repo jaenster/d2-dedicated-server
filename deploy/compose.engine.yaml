@@ -1,7 +1,8 @@
 # Overlay for a per-ENGINE end-to-end run: the same realm, with one pre-1.14 game server instead
 # of the 1.14d-native one. Layers on deploy/compose.yaml.
 #
-#   D2_ENGINE=1.09d D2_SUBNET=172.29.9.0/24 \
+#   D2_ENGINE=1.09d D2_SUBNET=172.29.9.0/24 D2_REALM_IP=172.29.9.10 D2_GS_IP=172.29.9.20 \
+#   D2_GSID=109 \
 #     docker compose -p d2e2e-109d -f deploy/compose.yaml -f deploy/compose.engine.yaml \
 #     --profile engine up -d redis postgres realmd gs-engine
 #
@@ -35,9 +36,20 @@ services:
     image: d2gs:${D2_ENGINE:?set D2_ENGINE to the engine tag, e.g. 1.09d}
     depends_on:
       realmd: { condition: service_started }
+    networks:
+      default:
+        # Pinned, because D2GS_GS_ADDR below has to be a dotted IP and a container's address is
+        # not known until it exists.
+        ipv4_address: ${D2_GS_IP:?set D2_GS_IP to a fixed address inside D2_SUBNET}
     environment:
       D2GS_REDIS_ADDR: "redis:6379"
-      D2GS_GS_ADDR: "gs-engine:4000"
+      # A dotted IP, NOT a service name. The address is parsed as four octets; a hostname does not
+      # fail loudly, it falls back to 127.0.0.1 and the realm then hands every client the game
+      # server's own loopback.
+      D2GS_GS_ADDR: "${D2_GS_IP}:4000"
+      # Required, and numeric. Without it the server decides no realm is configured, creates one
+      # game directly and exits — which looks like a crash at startup rather than a missing knob.
+      D2GS_GSID: "${D2_GSID:?set D2_GSID to a number unique to this engine}"
       D2GS_MAX_GAMES: "7"
 
   stress-e2e:
