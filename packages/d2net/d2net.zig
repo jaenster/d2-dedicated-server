@@ -157,6 +157,8 @@ var sizes: []const i32 = &cs.packet_size_110f;
 var join_op: u8 = cs.join_110f;
 /// Classic carries a 15-byte name where LoD carries 16, so this is 28 there and 29 everywhere else.
 var join_len: usize = cs.join_110f_len;
+/// The client speaks 1.14d, whose enter-game is 0x6b; classic wants 0x65.
+var enter_op: u8 = 0x6b;
 
 /// cdecl and by plain name, like Fog's: the engine never calls this, only our host does, and a
 /// stdcall export would pick up mingw's `@4` decoration.
@@ -171,6 +173,7 @@ export fn D2NET_SetEngineVersion(v: u32) callconv(.c) i32 {
             const jp = cs.joinPacket(@enumFromInt(f.value)) orelse return 0;
                 join_op = jp.op;
                 join_len = jp.len;
+                enter_op = cs.enterGamePacket(@enumFromInt(f.value)) orelse 0x6b;
             const sys = cs.systemRange(@enumFromInt(f.value)) orelse return 0;
             system_lo = sys.lo;
             system_hi = sys.hi;
@@ -193,7 +196,15 @@ fn packetLenFor(buf: []const u8) ?usize {
 
 /// Rewrite in place at the head of a client's buffer, before framing sees it.
 fn translateHead(c: *Client) void {
-    if (!translate_join or c.len < cs.join_114d_len) return;
+    if (!translate_join) return;
+    // Enter-game rides the join's block, so it takes the same shift. Left untranslated it lands past
+    // the end of classic's table, which cannot size it and drops the connection.
+    if (c.len >= 1 and c.buf[0] == 0x6b and enter_op != 0x6b) {
+        c.buf[0] = enter_op;
+        sayFmt("d2net: translated enter-game 0x6b into 0x{x}", .{enter_op});
+        return;
+    }
+    if (c.len < cs.join_114d_len) return;
     if (c.buf[0] != cs.join_114d) return;
     var rewritten: [cs.join_110f_len]u8 = undefined;
     const n = cs.translateJoin114dTo(c.buf[0..cs.join_114d_len], &rewritten, join_op, join_len) orelse return;

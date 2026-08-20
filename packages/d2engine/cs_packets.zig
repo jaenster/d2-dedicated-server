@@ -167,6 +167,26 @@ pub fn joinPacket(v: version.Version) ?struct { op: u8, len: usize } {
     };
 }
 
+/// The opcode the client sends to say "I have loaded, put me in the world". It rides the same
+/// block as the join, so it moves with it: 0x6b on every LoD build, and 0x65 on classic, six lower.
+/// A 1.14d-speaking client sends 0x6b, which is past the END of classic's 0x6A-entry table — the
+/// engine cannot even size it, and closes the connection rather than answering.
+pub fn enterGamePacket(v: version.Version) ?u8 {
+    return switch (v) {
+        .v106b => 0x65,
+        .v107, .v108, .v109b, .v109d, .v110f, .v113c, .v114d => 0x6b,
+        else => null,
+    };
+}
+
+test "enter-game moves with the join it shares a block with" {
+    try std.testing.expectEqual(@as(u8, 0x65), enterGamePacket(.v106b).?);
+    try std.testing.expectEqual(@as(u8, 0x6b), enterGamePacket(.v110f).?);
+    // six lower, the same shift the join and the system block take
+    try std.testing.expectEqual(@as(u8, 6), enterGamePacket(.v110f).? - enterGamePacket(.v106b).?);
+    try std.testing.expectEqual(@as(u8, 6), joinPacket(.v110f).?.op - joinPacket(.v106b).?.op);
+}
+
 /// Frame `buf` against an explicit table, so a caller can pick the version's own.
 pub fn packetLenWith(sizes: []const i32, buf: []const u8) ?usize {
     if (buf.len == 0) return null;
@@ -346,7 +366,10 @@ test "a classic join is one byte shorter than a LoD one" {
     try std.testing.expectEqual(@as(usize, 29), translateJoin114dTo(&src, &dst, 0x65, 29).?);
     try std.testing.expectEqual(@as(u8, 0x65), dst[0]);
 
+    // Classic drops the byte from the PREAMBLE, so class and name sit one earlier and the name
+    // keeps its full 16 bytes. Taking it off the name instead put the name one byte late and the
+    // engine read it as empty.
     try std.testing.expectEqual(@as(usize, 28), translateJoin114dTo(&src, &dst, 0x61, 28).?);
-    try std.testing.expectEqual(@as(u8, 1), dst[12]); // class survives the shorter name field
-    try std.testing.expectEqualStrings("Tester", std.mem.sliceTo(dst[13..28], 0));
+    try std.testing.expectEqual(@as(u8, 1), dst[11]);
+    try std.testing.expectEqualStrings("Tester", std.mem.sliceTo(dst[12..28], 0));
 }
