@@ -148,12 +148,16 @@ ENTRYPOINT ["/d2gs-native"]
 # a version whose ABI is not finished cannot be produced at all. Building for 1.06b today fails
 # with "missing fpEnterGame, fpUpdateCharacterLadder", which is exactly what should happen.
 #
-# Fog.dll and D2Net.dll are version-agnostic — they are told which engine they are standing in for
-# at startup — so they build once regardless of D2_VERSION.
+# Fog is version-agnostic — it is told which engine it is standing in for at startup. D2Net is NOT:
+# 1.13c renumbered its exports, and build.zig picks the .def off -Dengine-version, so leaving the
+# flag off here silently shipped every 1.13c image our LoD numbering. It loads and it starts; the
+# ordinals just mean other functions, which is why it looked like the host losing its own handle
+# rather than a wrong DLL.
 FROM zig AS build-d2host
 ARG D2_VERSION=1.10f
 RUN zigbuild d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
-    zigbuild d2fog d2net -Doptimize=ReleaseSafe
+    zigbuild d2fog -Doptimize=ReleaseSafe && \
+    zigbuild d2net -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe
 
 # d2host: headless pre-1.14 wine runtime
 # Distinct from `gs` above: that one injects into 1.14d's Game.exe, this one IS the host and loads
