@@ -125,7 +125,19 @@ postgres:
 
 # ── Redis: sessions, games, the fleet — and saves on their way to Postgres ─────────
 redis:
+  # Run a redis as part of this chart. It is one pod: a restart costs every session and every game,
+  # and the volume below is what keeps it from also costing the saves that had not reached Postgres
+  # yet. Turn it off and set `external.addr` to point at a replicated one instead.
   enabled: true
+
+  # Where every component dials redis when `enabled` is false. host:port.
+  #
+  # Our clients speak plain RESP: one address, no AUTH, no Sentinel, no Cluster redirects. So this
+  # has to be a single endpoint that always answers as a writable master — a Sentinel setup needs
+  # something in front of it that follows the master, and Redis Cluster will not work at all.
+  external:
+    addr: ""
+
   image: redis:7-alpine
 
   # Sessions and games are disposable; a character save is not. It lands here first and a worker

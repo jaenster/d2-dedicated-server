@@ -34,7 +34,7 @@ spec:
             - name: REALMD_INGRESS_PORT
               value: "4000"
             - name: REALMD_REDIS_ADDR
-              value: "realmd-redis:6379"
+              value: {{ include "realm.redisAddr" . | quote }}
             - name: REALMD_LOG_JSON
               value: {{ ternary "1" "0" .Values.d2ingress.logJson | quote }}
           resources:
