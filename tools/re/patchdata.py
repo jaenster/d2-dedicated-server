@@ -9,7 +9,7 @@ a table-name dictionary instead of enumerating.
 usage: patchdata.py <installer.exe> <base-archive.mpq>[,<more.mpq>] <outdir>
 env:   MPQCAT, D2PATCH  (default ./zig-out/bin/{mpqcat,d2patch})
 """
-import io, os, struct, subprocess, sys
+import io, os, struct, subprocess, sys, zlib
 
 MPQCAT = os.environ.get('MPQCAT', './zig-out/bin/mpqcat')
 D2PATCH = os.environ.get('D2PATCH', './zig-out/bin/d2patch')
@@ -74,6 +74,14 @@ playerclass plrmode plrtype properties qualityitems rareprefix raresuffix runes 
 skilldesc skills soundenviron sounds states storepage superuniques treasureclass treasureclassex
 uniqueappellation uniqueitems uniqueprefix uniquesuffix uniquetitle wanderingmon weapons""".split()
 
+def record_src_crc(path):
+    """The record header's srcCRC32, or None for a full-file record (which needs no base)."""
+    h = io.open(path, 'rb').read(8)
+    if len(h) < 8: return None
+    kind = struct.unpack_from('<H', h, 2)[0]
+    if kind & 0x0100: return None
+    return struct.unpack_from('<I', h, 4)[0]
+
 def main():
     if len(sys.argv) != 4: raise SystemExit(__doc__)
     installer, bases, outdir = sys.argv[1], sys.argv[2].split(','), sys.argv[3]
@@ -103,7 +111,12 @@ def main():
         if not got:
             base = os.path.join(work, '.empty')
             io.open(base, 'wb').close()
-        # The delta carries the source CRC32, so a wrong base is refused rather than mis-applied.
+        # Verify the base against the record's own srcCRC32 before applying. `d2patch apply` reads
+        # that field but does not check it, so a same-size wrong base would otherwise reconstruct
+        # silent garbage -- and a table full of plausible garbage is far worse than a hard failure.
+        want = record_src_crc(delta)
+        if want is not None and got and zlib.crc32(io.open(base, 'rb').read()) & 0xFFFFFFFF != want:
+            failed.append(f'{n}(badbase)'); continue
         if subprocess.call([D2PATCH, 'apply', delta, base, os.path.join(outdir, n)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
             ok += 1
