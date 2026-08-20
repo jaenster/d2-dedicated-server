@@ -102,9 +102,19 @@ def main():
         delta = os.path.join(work, n)
         if subprocess.call([MPQCAT, arc, n, delta], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
             failed.append(f'{n}(extract)'); continue
+        # Try every archive and keep the one whose CRC the record actually wants. Stopping at the
+        # first archive that merely HAS the file is wrong: the same name lives in more than one, at
+        # different patch levels, and the older copy is a valid-looking base that produces garbage.
         base = os.path.join(work, 'base_' + n)
-        got = any(subprocess.call([MPQCAT, b, f'data\\global\\excel\\{n}', base],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0 for b in bases)
+        want = record_src_crc(delta)
+        got = False
+        for b in bases:
+            if subprocess.call([MPQCAT, b, f'data\\global\\excel\\{n}', base],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+                continue
+            if want is None or zlib.crc32(io.open(base, 'rb').read()) & 0xFFFFFFFF == want:
+                got = True
+                break
         # Records come in two kinds. 0x0004 is a delta and needs the base it was cut against; 0x0104
         # carries the whole file and declares srcSize 0, so it applies against nothing. A version
         # that adds a table ships it whole, which is why the base lookup legitimately misses.
@@ -114,8 +124,7 @@ def main():
         # Verify the base against the record's own srcCRC32 before applying. `d2patch apply` reads
         # that field but does not check it, so a same-size wrong base would otherwise reconstruct
         # silent garbage -- and a table full of plausible garbage is far worse than a hard failure.
-        want = record_src_crc(delta)
-        if want is not None and got and zlib.crc32(io.open(base, 'rb').read()) & 0xFFFFFFFF != want:
+        if want is not None and not got:
             failed.append(f'{n}(badbase)'); continue
         if subprocess.call([D2PATCH, 'apply', delta, base, os.path.join(outdir, n)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
