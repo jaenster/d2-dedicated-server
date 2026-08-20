@@ -74,9 +74,13 @@ for engine in $ENGINES; do
     tree=" (no game tree — needs an install mounted at /game)"
   fi
   printf '==> %s:%s-%s (%s) ... ' "$REPO" "$engine" "$APP_VERSION" "$target"
-  if docker build -q -f "$ROOT/deploy/Dockerfile" --target "$target" \
+  # Both streams to the same file, and NOT -q. The compiler's refusal goes to stdout; with -q that
+  # is discarded and stderr carries only "failed to solve", so the reason a version was turned down
+  # -- the whole point of the gate -- was never visible. On success the file is thrown away, so the
+  # console stays as quiet as it was.
+  if docker build -f "$ROOT/deploy/Dockerfile" --target "$target" \
        --build-arg "D2_VERSION=$engine" --build-arg "APP_VERSION=$APP_VERSION" $tree_arg \
-       "$@" "$ROOT" >/dev/null 2>"$ROOT/.build-$engine.err"; then
+       "$@" "$ROOT" >"$ROOT/.build-$engine.err" 2>&1; then
     echo "ok${tree}"
     built="$built $engine"
     rm -f "$ROOT/.build-$engine.err"
@@ -85,9 +89,21 @@ for engine in $ENGINES; do
     # strip that; a refusal that does not explain itself is the one thing worse than a refusal.
     why=$(sed -n 's/^#[0-9]* *[0-9.]* *//; s/.*error: //p' "$ROOT/.build-$engine.err" \
           | grep -m1 -E 'is not ready to serve|is not a known version' || true)
-    echo "refused${why:+ — $why}"
-    refused="$refused $engine"
-    rm -f "$ROOT/.build-$engine.err"
+    if [ -n "$why" ]; then
+      # The compiler turned this engine down, which is the designed outcome for one that is not
+      # finished. Report it and carry on.
+      echo "refused — $why"
+      refused="$refused $engine"
+      rm -f "$ROOT/.build-$engine.err"
+    else
+      # Anything else is the build breaking, not the engine being unready, and calling it "refused"
+      # reads as the opposite of what happened -- a broken mirror or a full disk would look like a
+      # deliberate decision. Fail, and show what actually went wrong.
+      echo "FAILED (not a refusal — the build itself broke)"
+      sed -n 's/^#[0-9]* *[0-9.]* *//p' "$ROOT/.build-$engine.err" | tail -15
+      rm -f "$ROOT/.build-$engine.err"
+      exit 1
+    fi
   fi
 done
 

@@ -96,13 +96,25 @@ RUN apk add --no-cache curl && mkdir /gamedata && \
 FROM alpine:3.20 AS gamedata-engine
 ARG D2_VERSION=1.10f
 ARG D2_MINIMAL_ENGINE_BASE=https://files.typeguru.nl/diablo/minimal
+# "No tree published" and "the download broke" are different answers and must not share an exit
+# path. A 404 is a statement -- this engine has no tree yet -- and the build carries on without one.
+# Anything else is infrastructure: retried, and then fatal with a message, because a flaky mirror
+# silently becoming an engine that ships no data is the failure this whole stage exists to prevent.
 RUN apk add --no-cache curl && mkdir -p /gamedata && \
-    if curl -fsSL -o /tmp/tree.tgz \
-         "${D2_MINIMAL_ENGINE_BASE}/${D2_VERSION}/d2-${D2_VERSION}-minimal.tgz"; then \
-      tar -xzf /tmp/tree.tgz -C /gamedata && rm /tmp/tree.tgz && \
-      echo "==> ${D2_VERSION}: baked its own game tree in"; \
-    else \
+    url="${D2_MINIMAL_ENGINE_BASE}/${D2_VERSION}/d2-${D2_VERSION}-minimal.tgz" && \
+    code=$(curl -sSL --retry 5 --retry-all-errors --retry-delay 2 \
+             -o /tmp/tree.tgz -w '%{http_code}' "$url" || echo 000) && \
+    if [ "$code" = 404 ]; then \
       echo "==> ${D2_VERSION}: NO PUBLISHED TREE -- this image needs one mounted at /game"; \
+      rm -f /tmp/tree.tgz; \
+    elif [ "$code" != 200 ]; then \
+      echo "==> ${D2_VERSION}: FETCH FAILED (HTTP $code) for $url"; exit 1; \
+    elif ! tar -xzf /tmp/tree.tgz -C /gamedata; then \
+      echo "==> ${D2_VERSION}: tree downloaded but does not unpack -- refusing to ship half of it"; \
+      exit 1; \
+    else \
+      rm /tmp/tree.tgz; \
+      echo "==> ${D2_VERSION}: baked its own game tree in"; \
     fi
 
 # gs-native: the same server without wine
