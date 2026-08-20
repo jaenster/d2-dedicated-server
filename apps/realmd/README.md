@@ -35,7 +35,10 @@ fleet with no host ports — d2ingress splices to pod IPs):
 
 ## Files
 
-- `main.zig` — entry: config, bind the listeners, spawn the workers.
+- `realmd.zig` — the realm as a library: `run()` (config, bind the listeners, spawn the workers) and the re-exports an extension is built against.
+- `main.zig` — the binary this repo ships: `realmd.run()` and nothing else. A realm with its own
+  extensions is this same file plus a `realm_extensions` declaration.
+- `hook.zig` — the extension surface: which hooks exist, and where the registry comes from.
 - `proto.zig` — little-endian byte `Reader`/`Writer` (bounds-checked; a bad packet yields zeros, never panics a connection thread).
 - `bncs.zig` — BNCS handlers. MVP policy: we are the authority and trust the client (version/password accepted, accounts auto-create). Includes `SID_AUTH_INFO/CHECK`, `SID_LOGONREALMEX`, `SID_QUERYREALMS2`, BNFTP handoff.
 - `bnftp.zig` — BNFTP v1 file server (serves the version MPQ; **reply-header length is u32**, the client asserts if it reads `>0xff`).

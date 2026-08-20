@@ -130,7 +130,7 @@ rolls back via git).
 
 | value | effect |
 |-|-|
-| `postgres.enabled=false` | skip in-cluster Postgres; realmd still reads `realmd-pg/DSN` — override `postgres.auth.*` to point at an external DB |
+| `postgres.enabled=false` | skip the chart's Postgres and read the DSN from `postgres.external.secretName` / `.secretKey` instead — how you point the realm at an operator-managed cluster |
 | `redis.enabled=false` | skip in-cluster Redis (supply an external `realmd-redis:6379`) |
 | `d2ingress.enabled=false` | skip the gateway |
 | `gameServerNative.enabled=true` | additionally run the wine-free GS (`d2gs:1.14d-native`, data baked in like every other tag) |
