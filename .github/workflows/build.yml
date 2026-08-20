@@ -199,7 +199,10 @@ jobs:
             | tar -xJ -C /opt
           echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - name: unit tests
-        run: zig build test
+        # Through the same retrying wrapper the images use: this job fetches the dependency tree
+        # over the network too, and a dependency host having a bad day was failing it as though a
+        # test had broken.
+        run: deploy/zigbuild.sh test
       # `zig build e2e` is NOT here yet, and deliberately. It passes on macOS and wedges on Linux:
       # d2ingress_token_translate reaches "route client_token=N -> GS 127.0.0.1:P [connecting]" and
       # never returns, which cost 37 minutes of runner time before it was cancelled. Running it

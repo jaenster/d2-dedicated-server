@@ -44,29 +44,34 @@ COPY build.zig build.zig.zon ./
 COPY apps ./apps
 COPY packages ./packages
 
+# Every `zig build` below goes through this, so a dependency host having a bad day is retried
+# rather than reported as a broken build. See the script for why it retries the fetch and nothing
+# else.
+COPY deploy/zigbuild.sh /usr/local/bin/zigbuild
+
 # build: realmd (static musl)
 # Node builds the admin web UI (webui/ → one self-contained index.html), which the
 # realmd binary embeds via -Dwebui=true. The UI is served on the health/admin port.
 FROM zig AS build-realmd
 RUN apk add --no-cache nodejs npm
 COPY webui ./webui
-RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dwebui=true
+RUN zigbuild realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dwebui=true
 
 # build: d2ingress (static musl)
 # The game-traffic gateway: token-translating poll() splice proxy fronting the GS
 # fleet, with its own async redis client. No pg dep — never pulls it.
 FROM zig AS build-d2ingress
-RUN zig build d2ingress -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+RUN zigbuild d2ingress -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 
 # build: injected DLLs (x86-windows; dbghelp proxy + d2gs payload only)
 FROM zig AS build-dlls
-RUN zig build dlls -Doptimize=ReleaseSafe
+RUN zigbuild dlls -Doptimize=ReleaseSafe
 
 # build: d2gs-native (static musl, i386)
 # The game is i386 code, so its host has to be i386 too — it is loaded into this process, not
 # launched as a child. Static musl because the runtime image below has nothing else in it.
 FROM zig AS build-native
-RUN zig build d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
+RUN zigbuild d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
 
 # fetch: minimal 1.14d game data
 # tools/make-minimal.sh assembles this from a legitimately owned install (stripped MPQs —
@@ -147,8 +152,8 @@ ENTRYPOINT ["/d2gs-native"]
 # at startup — so they build once regardless of D2_VERSION.
 FROM zig AS build-d2host
 ARG D2_VERSION=1.10f
-RUN zig build d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
-    zig build d2fog d2net -Doptimize=ReleaseSafe
+RUN zigbuild d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
+    zigbuild d2fog d2net -Doptimize=ReleaseSafe
 
 # d2host: headless pre-1.14 wine runtime
 # Distinct from `gs` above: that one injects into 1.14d's Game.exe, this one IS the host and loads
@@ -256,5 +261,5 @@ COPY tools/stress-e2e ./tools/stress-e2e
 # time, instead of on every container start. --rounds 0 --wait-ms 0 is a deliberate no-op run
 # (the round loop never executes and the readiness probe is skipped), so this needs no realm
 # to actually be up yet.
-RUN zig build stress-e2e -- --rounds 0 --wait-ms 0
+RUN zigbuild stress-e2e -- --rounds 0 --wait-ms 0
 ENTRYPOINT ["/src/zig-out/bin/stress-e2e"]
