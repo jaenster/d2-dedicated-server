@@ -196,17 +196,18 @@ fn packetLenFor(buf: []const u8) ?usize {
 
 /// Rewrite in place at the head of a client's buffer, before framing sees it.
 fn translateHead(c: *Client) void {
-    // Nothing to do when the engine already speaks the client's join, which 1.13c does: rewriting a
-    // 0x68/37 into itself is harmless, but rewriting it into 1.10f's 0x67/29 mangles a packet the
-    // engine would have accepted, and it answers by ignoring it rather than by complaining.
-    if (!translate_join or (join_op == cs.join_114d and join_len == cs.join_114d_len)) return;
-    // Enter-game rides the join's block, so it takes the same shift. Left untranslated it lands past
-    // the end of classic's table, which cannot size it and drops the connection.
+    if (!translate_join) return;
+    // Enter-game rides the join's block and moves with it, so it is translated on its own account —
+    // 1.13c needs it (0x6b -> 0x6c) even though its join is already the one the client speaks.
     if (c.len >= 1 and c.buf[0] == 0x6b and enter_op != 0x6b) {
         c.buf[0] = enter_op;
         sayFmt("d2net: translated enter-game 0x6b into 0x{x}", .{enter_op});
         return;
     }
+    // The join itself needs nothing when the engine already speaks the client's: rewriting 0x68/37
+    // into 1.10f's 0x67/29 mangles a packet the engine would have taken, and it answers by ignoring
+    // it rather than by complaining.
+    if (join_op == cs.join_114d and join_len == cs.join_114d_len) return;
     if (c.len < cs.join_114d_len) return;
     if (c.buf[0] != cs.join_114d) return;
     var rewritten: [cs.join_110f_len]u8 = undefined;

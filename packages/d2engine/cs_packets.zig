@@ -197,16 +197,21 @@ pub fn joinPacket(v: version.Version) ?struct { op: u8, len: usize } {
 /// A 1.14d-speaking client sends 0x6b, which is past the END of classic's 0x6A-entry table — the
 /// engine cannot even size it, and closes the connection rather than answering.
 pub fn enterGamePacket(v: version.Version) ?u8 {
-    return switch (v) {
-        .v106b => 0x65,
-        .v107, .v108, .v109b, .v109d, .v110f, .v113c, .v114d => 0x6b,
-        else => null,
-    };
+    // It is always the variable-length slot four past the join, on every table read so far:
+    // 1.06b 0x61 -> 0x65, 1.07..1.09 0x65 -> 0x69, 1.10f 0x67 -> 0x6b, 1.13c 0x68 -> 0x6c.
+    const j = joinPacket(v) orelse return null;
+    return j.op + 4;
 }
 
 test "enter-game moves with the join it shares a block with" {
     try std.testing.expectEqual(@as(u8, 0x65), enterGamePacket(.v106b).?);
     try std.testing.expectEqual(@as(u8, 0x6b), enterGamePacket(.v110f).?);
+    try std.testing.expectEqual(@as(u8, 0x69), enterGamePacket(.v107).?);
+    // 1.13c's join is 0x68, so its enter-game is 0x6c — and its table agrees, that is the
+    // variable-length entry there while 0x6b is a one-byte opcode.
+    try std.testing.expectEqual(@as(u8, 0x6c), enterGamePacket(.v113c).?);
+    try std.testing.expectEqual(@as(i32, -1), packet_size_113c[0x6c]);
+    try std.testing.expectEqual(@as(i32, -1), packet_size_110f[0x6b]);
     // six lower, the same shift the join and the system block take
     try std.testing.expectEqual(@as(u8, 6), enterGamePacket(.v110f).? - enterGamePacket(.v106b).?);
     try std.testing.expectEqual(@as(u8, 6), joinPacket(.v110f).?.op - joinPacket(.v106b).?.op);
