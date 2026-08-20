@@ -196,7 +196,10 @@ fn packetLenFor(buf: []const u8) ?usize {
 
 /// Rewrite in place at the head of a client's buffer, before framing sees it.
 fn translateHead(c: *Client) void {
-    if (!translate_join) return;
+    // Nothing to do when the engine already speaks the client's join, which 1.13c does: rewriting a
+    // 0x68/37 into itself is harmless, but rewriting it into 1.10f's 0x67/29 mangles a packet the
+    // engine would have accepted, and it answers by ignoring it rather than by complaining.
+    if (!translate_join or (join_op == cs.join_114d and join_len == cs.join_114d_len)) return;
     // Enter-game rides the join's block, so it takes the same shift. Left untranslated it lands past
     // the end of classic's table, which cannot size it and drops the connection.
     if (c.len >= 1 and c.buf[0] == 0x6b and enter_op != 0x6b) {
@@ -459,10 +462,10 @@ export fn SERVER_GetClientGameGUID(client: u32) callconv(.winapi) u32 {
     return if (client < clients.len) clients[client].game_guid else 0;
 }
 
-export fn SERVER_WSAGetLastError(a: u32, b: u32, c: u32) callconv(.winapi) u32 {
-    _ = a;
-    _ = b;
-    _ = c;
+/// The real ordinal is a one-instruction thunk straight to WSOCK32!WSAGetLastError and takes
+/// nothing — D2Game pushes no arguments at its single call site and discards the result. Declaring
+/// three popped twelve bytes that were never pushed.
+export fn SERVER_WSAGetLastError() callconv(.winapi) u32 {
     return @bitCast(WSAGetLastError());
 }
 

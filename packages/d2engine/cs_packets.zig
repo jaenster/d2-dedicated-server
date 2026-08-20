@@ -107,6 +107,27 @@ pub const packet_size_106b = [0x6a]i32{
     0,   1, // 0x68-0x69
 };
 
+/// 1.13c, read from its own D2Net at file offset 0xABD8. Its join is 0x68 and 37 bytes — the same
+/// as 1.14d's, not 1.10f's 0x67/29 — so a 1.14d client's join needs NO translation here, and
+/// translating it anyway is what mangled it into something the engine ignored in silence.
+pub const packet_size_113c = [0x71]i32{
+       0,    5,    9,    5,    9,    5,    9,    9, // 0x00-0x07
+       5,    9,    9,    1,    5,    9,    9,    5, // 0x08-0x0F
+       9,    9,    1,    9,   -1,   -1,   13,    5, // 0x10-0x17
+      17,    5,    9,    9,    3,    9,    9,   17, // 0x18-0x1F
+      13,    9,    5,    9,    5,    9,   13,    9, // 0x20-0x27
+       9,    9,    9,    0,    0,    1,    3,    9, // 0x28-0x2F
+       9,    9,   17,   17,    5,   17,    9,    5, // 0x30-0x37
+      13,    5,    3,    3,    9,    5,    5,    3, // 0x38-0x3F
+       1,    1,    1,    1,   17,    9,   13,   13, // 0x40-0x47
+       1,    9,    0,    9,    5,    3,    0,    7, // 0x48-0x4F
+       9,    9,    5,    1,    1,    0,    0,    0, // 0x50-0x57
+       3,   17,    0,    0,    0,    7,    6,    5, // 0x58-0x5F
+       1,    3,    5,    5,    0,    0,   -1,   46, // 0x60-0x67
+      37,    1,    1,    1,   -1,   13,    1,    0, // 0x68-0x6F
+       1, // 0x70-0x70
+};
+
 /// The table `v` frames with. Null means nobody has read that version's out of its D2Net.
 pub fn packetSizes(v: version.Version) ?[]const i32 {
     return switch (v) {
@@ -115,6 +136,7 @@ pub fn packetSizes(v: version.Version) ?[]const i32 {
         .v108 => &packet_size_108,
         .v109b, .v109d => &packet_size_107, // 1.09 is 1.07-shaped; 1.10 is where it moved
         .v110f => &packet_size_110f,
+        .v113c => &packet_size_113c,
         else => null,
     };
 }
@@ -128,6 +150,7 @@ pub fn systemRange(v: version.Version) ?struct { lo: u8, hi: u8 } {
         .v106b => .{ .lo = 0x60, .hi = 0x69 },
         .v107, .v108, .v109b, .v109d => .{ .lo = 0x64, .hi = 0x6d },
         .v110f => .{ .lo = 0x66, .hi = 0x6f },
+        .v113c => .{ .lo = 0x67, .hi = 0x70 }, // the block moved up with the join
         else => null,
     };
 }
@@ -162,6 +185,8 @@ pub fn joinPacket(v: version.Version) ?struct { op: u8, len: usize } {
         // unrelated 0xAA packet on the system list instead of ever binding the client to a game.
         .v107, .v108, .v109b, .v109d => .{ .op = 0x65, .len = 29 },
         .v110f => .{ .op = join_110f, .len = join_110f_len },
+        // 1.13c already speaks 1.14d's join, so nothing has to be rewritten for it.
+        .v113c => .{ .op = join_114d, .len = join_114d_len },
         .v114d => .{ .op = join_114d, .len = join_114d_len },
         else => null,
     };

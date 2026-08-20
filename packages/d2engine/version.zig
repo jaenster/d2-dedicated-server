@@ -91,6 +91,13 @@ pub const LangOrdinals = struct {
     strtable_init: u16 = 10000,
 };
 
+/// D2Net's host-facing entry points. 1.13c renumbered these along with everything else.
+pub const NetOrdinals = struct {
+    initialize: u16 = 10003,
+    set_max_clients: u16 = 10026,
+    set_hacklist: u16 = 10023,
+};
+
 pub const Spec = struct {
     /// As the install directories spell it.
     name: []const u8,
@@ -102,6 +109,7 @@ pub const Spec = struct {
     game: GameOrdinals = .{},
     common: CommonOrdinals = .{},
     lang: LangOrdinals = .{},
+    net: NetOrdinals = .{},
     /// Stack args per callback slot. Counted at the call sites in that version's D2Game; asking
     /// for an uncounted slot is a compile error rather than a guess.
     stack_args: callbacks.StackArgs,
@@ -168,6 +176,7 @@ pub fn spec(comptime v: Version) Spec {
             // (const char*, u32) by stdcall, so calling THAT as the fastcall init dereferences the
             // expansion flag as a pointer and faults on address 1.
             .lang = .{ .strtable_init = 10008 },
+            .net = .{ .initialize = 10005, .set_max_clients = 10022, .set_hacklist = 10012 },
             .stack_args = callbacks.v113c,
         },
         // 1.14d is the monolith: no DLLs to load, and it grew the callback table past 0x40.

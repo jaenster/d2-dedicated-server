@@ -249,7 +249,15 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    d2net.root_module.addObjectFile(b.path("packages/d2net/d2net.def"));
+    // 1.13c renumbered D2Net's exports, so the ordinal map is per engine. The implementation is
+    // shared — it is a permutation of the same functions, not different ones — and only the .def
+    // differs. Selecting the wrong one is a load-time failure rather than a silent wrong call,
+    // because the engine imports by ordinal.
+    const d2net_def = if (engine_version) |ev|
+        (if (std.mem.eql(u8, ev, "1.13c")) "packages/d2net/d2net-113c.def" else "packages/d2net/d2net.def")
+    else
+        "packages/d2net/d2net.def";
+    d2net.root_module.addObjectFile(b.path(d2net_def));
     d2net.root_module.addImport("d2engine", d2engine);
     b.installArtifact(d2net);
     b.step("d2net", "Build our replacement D2Net.dll (x86-windows)")

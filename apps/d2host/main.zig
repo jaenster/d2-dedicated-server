@@ -1259,15 +1259,16 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     }
 
     // D2Net: server up, client cap, hack list — the same three D2Server makes.
-    if (byOrdinal(d2net, 10003)) |p| {
+    const net_ord = comptime d2version.spec(version).net;
+    if (byOrdinal(d2net, net_ord.initialize)) |p| {
         say("d2host: calling D2Net @10003 (SERVER_Initialize)");
         _ = @as(*const fn (u32, u32) callconv(.winapi) i32, @ptrCast(@alignCast(p)))(0, 0);
     }
-    if (byOrdinal(d2net, 10026)) |p| {
+    if (byOrdinal(d2net, net_ord.set_max_clients)) |p| {
         _ = @as(*const fn (u32) callconv(.winapi) i32, @ptrCast(@alignCast(p)))(8);
         say("d2host: D2Net SetMaxClientsPerGame(8)");
     }
-    if (byOrdinal(d2net, 10023)) |p| {
+    if (byOrdinal(d2net, net_ord.set_hacklist)) |p| {
         _ = @as(*const fn (u32) callconv(.winapi) i32, @ptrCast(@alignCast(p)))(1);
         say("d2host: D2Net SetHackListEnabled(1)");
     }
