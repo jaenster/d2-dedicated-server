@@ -13,6 +13,7 @@ const store = @import("store.zig");
 const d2s = @import("d2s.zig");
 const fleet = @import("fleet.zig");
 const guilds = @import("guilds.zig");
+const hook = @import("hook.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d2s create time
 
@@ -147,7 +148,7 @@ fn mintToken() u16 {
     return store.mintToken();
 }
 
-const DConn = struct {
+pub const DConn = struct {
     fd: net.Socket,
     // Outbound packets accumulate here and leave in one write: the game list sends one packet
     // PER GAME plus a terminator, so browsing a busy realm cost a syscall per listed game.
@@ -279,6 +280,7 @@ fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: b
 pub var trace_packets: bool = false;
 
 fn dispatch(c: *DConn, tag: []const u8, id: u8, body: []const u8) void {
+    if (!hook.mcpPacket(c, id, body)) return; // an extension took it
     if (trace_packets) {
         log.line(tag, "rx MCP 0x{x:0>2} ({d} bytes)", .{ id, body.len });
         if (body.len > 0) log.hexdump(tag, body);
@@ -424,6 +426,7 @@ fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const name = r.getStr();
     c.setChar(name); // remember the active char so a later join can name it to the GS
+    hook.charLogon(c.accountName(), name);
     log.line(tag, "char logon '{s}' (account={s}) -> ok", .{ name, c.accountName() });
     var buf: [12]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARLOGON);
@@ -454,6 +457,11 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     if (name.len == 0 or name.len > d2s.name_max or class > 6 or (expansion_only_class and !expansion)) {
         log.line(tag, "char create '{s}' class={d} exp={} -> invalid", .{ name, class, expansion });
         w.putU32(0x15);
+        return finish(c, &w);
+    }
+    if (hook.charCreate(acct, name, class)) |result| {
+        log.line(tag, "char create '{s}' (account={s}) -> refused by extension ({d})", .{ name, acct, result });
+        w.putU32(result);
         return finish(c, &w);
     }
     var probe: [d2s.new_save_size]u8 = undefined;
@@ -555,6 +563,10 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (!validGameName(name)) {
         log.line(tag, "create game '{s}' -> invalid name", .{name});
         return fail(c, &w, CREATE_INVALID_NAME);
+    }
+    if (hook.gameCreate(c.accountName(), c.charName(), name, difficulty)) |result| {
+        log.line(tag, "create game '{s}' -> refused by extension ({d})", .{ name, result });
+        return fail(c, &w, result);
     }
     if (!fleet.ready()) {
         // "Server Down" is the honest one and, more to the point, the only one in the
@@ -689,6 +701,10 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (g.pw_len > 0 and !std.mem.eql(u8, g.pw(), join_pass)) {
         log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD", .{ name, c.accountName() });
         return rejectJoin(c, &w, JOIN_BAD_PASSWORD);
+    }
+    if (hook.gameJoin(c.accountName(), c.charName(), name)) |result| {
+        log.line(tag, "join game '{s}' (account={s}) -> refused by extension ({d})", .{ name, c.accountName(), result });
+        return rejectJoin(c, &w, result);
     }
     // Guild Hall game type (cut feature): a game named exactly after a guild IS that
     // guild's private hall. Only members on the approved list may enter — the wiki's

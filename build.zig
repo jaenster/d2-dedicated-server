@@ -271,20 +271,6 @@ pub fn build(b: *std.Build) void {
 
     // ── apps/realmd ──────────────────────────────────────────────────────────────
 
-    const realmd = b.addExecutable(.{
-        .name = "realmd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/realmd/main.zig"),
-            .target = host,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    realmd.root_module.addImport("realm_proto", realm_proto);
-    realmd.root_module.addImport("realm_infra", realm_infra);
-    realmd.root_module.addImport("realm_store", realm_store);
-    realmd.root_module.addImport("libd2", libd2);
-
     // Web UI: -Dwebui=true builds webui/ (Vite + React → one self-contained
     // dist/index.html) and embeds it; otherwise embed a stub page so plain builds
     // need no Node. webui.zig @embedFile's the "webui_blob" import either way.
@@ -294,7 +280,32 @@ pub fn build(b: *std.Build) void {
         cmd.has_side_effects = true; // npm/vite do their own incremental builds
         break :blk cmd.addOutputFileArg("index.html");
     } else b.path("apps/realmd/webui_stub.html");
-    realmd.root_module.addAnonymousImport("webui_blob", .{ .root_source_file = webui_blob });
+
+    // The realm as a package. Everything realmd needs is attached HERE rather than to the
+    // executable, so a downstream realm gets a working module from one addImport instead of
+    // having to rebuild this wiring — and cannot get it subtly wrong.
+    const realmd_mod = b.addModule("realmd", .{
+        .root_source_file = b.path("apps/realmd/realmd.zig"),
+        .link_libc = true,
+    });
+    realmd_mod.addImport("realm_proto", realm_proto);
+    realmd_mod.addImport("realm_infra", realm_infra);
+    realmd_mod.addImport("realm_store", realm_store);
+    realmd_mod.addImport("libd2", libd2);
+    realmd_mod.addAnonymousImport("webui_blob", .{ .root_source_file = webui_blob });
+
+    // Our own realmd is that package with no extensions — the same arrangement a downstream
+    // realm builds, so the extension path cannot rot without this binary noticing.
+    const realmd = b.addExecutable(.{
+        .name = "realmd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/realmd/main.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    realmd.root_module.addImport("realmd", realmd_mod);
 
     b.installArtifact(realmd);
 

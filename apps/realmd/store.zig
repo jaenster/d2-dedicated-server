@@ -11,6 +11,7 @@
 //! everywhere, nothing to keep in sync.
 const std = @import("std");
 const d2s = @import("d2s.zig");
+const hook = @import("hook.zig");
 const adapter = @import("realm_store");
 const assets = adapter.assets;
 const redis = adapter.redis;
@@ -78,6 +79,7 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
 /// crash-safe.
 pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8) bool {
     if (!redis.saveCharD2s(account, charname, bytes)) return false;
+    hook.charSave(account, charname, bytes);
     // A save redis accepted but that never got marked would sit there looking clean while
     // Postgres stayed behind, so a failed mark has to fail the save.
     return markCharDirty(account, charname) != null;

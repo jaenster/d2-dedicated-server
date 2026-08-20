@@ -25,6 +25,7 @@ const chat = @import("chat.zig");
 const friends = @import("friends.zig");
 const store = @import("store.zig");
 const guilds = @import("guilds.zig");
+const hook = @import("hook.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds, for the banner-ad FILETIME
 const guild = @import("realm_proto").guild;
@@ -129,7 +130,7 @@ fn nextToken() u32 {
     return token_ctr.fetchAdd(0x9e3779b1, .monotonic);
 }
 
-const Conn = struct {
+pub const Conn = struct {
     fd: net.Socket,
     server_token: u32,
     // Outbound packets accumulate here and go out in one write; most requests answer with
@@ -319,6 +320,7 @@ pub var trace_packets: bool = false;
 pub var modern_challenge: bool = false;
 
 fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
+    if (!hook.bncsPacket(c, id, body)) return; // an extension took it
     if (trace_packets) {
         log.line(tag, "rx SID 0x{x:0>2} ({d} bytes)", .{ id, body.len });
         if (body.len > 0) log.hexdump(tag, body);
@@ -456,6 +458,7 @@ fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
 
     const result = logonResult(c, server_token, got);
     if (result == LOGON_OK) friends.setOnline(acct); // presence for friends online-status
+    hook.accountLogin(acct, result == LOGON_OK);
     log.line(tag, "logon account={s} -> result={d}", .{ acct, result });
 
     var buf: [16]u8 = undefined;
@@ -842,6 +845,7 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         return;
     }
     if (handleHelpCmd(c, text)) return;
+    if (hook.chatCommand(c, tag, text)) return;
     if (text.len > 0 and text[0] == '/') {
         // An unknown command must never reach the channel — typing a typo should not say
         // it out loud. It used to answer with an empty INFO line, which looks to the
