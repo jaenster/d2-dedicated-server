@@ -6,15 +6,25 @@
 #
 #   realmd     — clean-room Zig realm server (bnetd + MCP realm on one port). Static musl
 #                binary shipped in scratch: a few-MB image, zero runtime deps.
-#   gs         — headless Diablo II 1.14d under wine, driven by our injected DLLs.
-#                Game data is NOT baked into this image — the chart's load-gamedata
-#                initContainer (or a mounted install) supplies /game at runtime.
-#   gamedata   — the minimal 1.14d data set alone, at /gamedata: what the chart's
-#                initContainer copies into the gs pod's /game. See tools/make-minimal.sh
-#                for how it's assembled; this stage fetches an already-assembled copy
-#                (windows) from files.typeguru.nl rather than rebuilding it in CI.
-#   gs-native  — the wine-free GS: game data IS baked in (the mac minimal set), since
-#                nothing wires an initContainer for it yet — see that target below.
+#   gs         — headless Diablo II 1.14d under wine, driven by our injected DLLs. The
+#                minimal 1.14d data set is baked in at /game, so the image runs with no
+#                volume; mount your own install over /game to replace it.
+#   gs-native  — the same 1.14d server without wine, its data baked in the same way.
+#   d2host     — headless PRE-1.14 server: our host driving the engine's D2Game.dll as a
+#                library, rather than injecting into Game.exe. Built for ONE engine version
+#                and tagged for it, the way a base image is tagged for its distro:
+#
+#                  deploy/build-d2host.sh 0.0.1          # every engine that is ready
+#                  deploy/build-d2host.sh 0.0.1 1.09d     # just one
+#
+#                Tags are <engine>-<our release>: d2gs:1.09d-0.0.1, plus a floating d2gs:1.09d
+#                for the newest build of that engine — the postgres:16 / postgres:16.2 shape.
+#
+#                The version is a build argument on purpose. d2host carries every measured
+#                version and can pick at runtime, but a release artifact should be built FOR
+#                one engine: -Dengine-version makes the readiness gate a COMPILE error, so an
+#                image for an unfinished version cannot be built. Its era-matched game tree is
+#                baked in where one is published — see that target.
 #
 # --target gs builds only the windows DLLs (pg is a lazy dep, never pulled there);
 # --target realmd builds only the realmd binary. Neither builds the other's artifacts.
@@ -34,29 +44,34 @@ COPY build.zig build.zig.zon ./
 COPY apps ./apps
 COPY packages ./packages
 
+# Every `zig build` below goes through this, so a dependency host having a bad day is retried
+# rather than reported as a broken build. See the script for why it retries the fetch and nothing
+# else.
+COPY deploy/zigbuild.sh /usr/local/bin/zigbuild
+
 # build: realmd (static musl)
 # Node builds the admin web UI (webui/ → one self-contained index.html), which the
 # realmd binary embeds via -Dwebui=true. The UI is served on the health/admin port.
 FROM zig AS build-realmd
 RUN apk add --no-cache nodejs npm
 COPY webui ./webui
-RUN zig build realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dwebui=true
+RUN zigbuild realmd-bin -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -Dwebui=true
 
 # build: d2ingress (static musl)
 # The game-traffic gateway: token-translating poll() splice proxy fronting the GS
 # fleet, with its own async redis client. No pg dep — never pulls it.
 FROM zig AS build-d2ingress
-RUN zig build d2ingress -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+RUN zigbuild d2ingress -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 
 # build: injected DLLs (x86-windows; dbghelp proxy + d2gs payload only)
 FROM zig AS build-dlls
-RUN zig build dlls -Doptimize=ReleaseSafe
+RUN zigbuild dlls -Doptimize=ReleaseSafe
 
 # build: d2gs-native (static musl, i386)
 # The game is i386 code, so its host has to be i386 too — it is loaded into this process, not
 # launched as a child. Static musl because the runtime image below has nothing else in it.
 FROM zig AS build-native
-RUN zig build d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
+RUN zigbuild d2gs-native -Dtarget=x86-linux-musl -Doptimize=ReleaseSafe
 
 # fetch: minimal 1.14d game data
 # tools/make-minimal.sh assembles this from a legitimately owned install (stripped MPQs —
@@ -74,12 +89,45 @@ ARG D2_MINIMAL_WINDOWS_URL=https://files.typeguru.nl/diablo/minimal/114d/windows
 RUN apk add --no-cache curl && mkdir /gamedata && \
     curl -fsSL "$D2_MINIMAL_WINDOWS_URL" | tar -xz -C /gamedata
 
-# gamedata: the windows minimal set alone, for the chart's load-gamedata initContainer
-# The data at /gamedata is the point, but the image cannot be `scratch`: it runs as the
-# initContainer that copies itself into the gs pod's game volume, so it has to bring the shell
-# and the `cp` that do it. busybox is the smallest thing that does, at about a megabyte.
-FROM busybox:musl AS gamedata
-COPY --from=gamedata-windows /gamedata /gamedata
+# fetch: the era-matched game tree for ONE pre-1.14 engine
+# The era has to match the tag, not just the licence: a .bin table is a raw struct dump, so an
+# install from another patch level decodes as garbage rather than failing cleanly.
+# tools/make-minimal-engine.sh assembles a tree from a legitimately owned install -- the engine's
+# own DLLs rebuilt from that version's patch installer, its tables, and the shared archives.
+#
+# An engine with no published tree is NOT a build failure. The image still runs; it just needs the
+# matching install mounted at /game the way every pre-1.14 image used to. Say that loudly here
+# rather than baking an empty directory, which would look like data and fail much later.
+FROM alpine:3.20 AS gamedata-engine
+ARG D2_VERSION=1.10f
+ARG D2_MINIMAL_ENGINE_BASE=https://files.typeguru.nl/diablo/minimal
+# The tree's ETag, passed in by build-d2host.sh, for ONE reason: to be part of this layer's cache
+# key. Without it the fetch is keyed on the URL alone, so republishing a corrected tree to the same
+# address leaves every existing builder happily reusing the old one — an image that looks freshly
+# built and ships stale data. Verifying the content inside this stage cannot catch that, because a
+# cached layer does not re-run its own checks. The key itself has to move.
+ARG D2_TREE_ETAG=unknown
+# "No tree published" and "the download broke" are different answers and must not share an exit
+# path. A 404 is a statement -- this engine has no tree yet -- and the build carries on without one.
+# Anything else is infrastructure: retried, and then fatal with a message, because a flaky mirror
+# silently becoming an engine that ships no data is the failure this whole stage exists to prevent.
+RUN apk add --no-cache curl && mkdir -p /gamedata && \
+    echo "tree etag: ${D2_TREE_ETAG}" && \
+    url="${D2_MINIMAL_ENGINE_BASE}/${D2_VERSION}/d2-${D2_VERSION}-minimal.tgz" && \
+    code=$(curl -sSL --retry 5 --retry-all-errors --retry-delay 2 \
+             -o /tmp/tree.tgz -w '%{http_code}' "$url" || echo 000) && \
+    if [ "$code" = 404 ]; then \
+      echo "==> ${D2_VERSION}: NO PUBLISHED TREE -- this image needs one mounted at /game"; \
+      rm -f /tmp/tree.tgz; \
+    elif [ "$code" != 200 ]; then \
+      echo "==> ${D2_VERSION}: FETCH FAILED (HTTP $code) for $url"; exit 1; \
+    elif ! tar -xzf /tmp/tree.tgz -C /gamedata; then \
+      echo "==> ${D2_VERSION}: tree downloaded but does not unpack -- refusing to ship half of it"; \
+      exit 1; \
+    else \
+      rm /tmp/tree.tgz; \
+      echo "==> ${D2_VERSION}: baked its own game tree in"; \
+    fi
 
 # gs-native: the same server without wine
 # One statically linked file against the wine image's debian + wine32 + wine + Xvfb.
@@ -89,17 +137,80 @@ COPY --from=gamedata-windows /gamedata /gamedata
 # without help. The label is metadata; the ELF is what runs.
 FROM --platform=linux/amd64 scratch AS gs-native
 COPY --from=build-native /src/zig-out/bin/d2gs-native /d2gs-native
-# Baked in directly rather than via an initContainer (unlike gs/gamedata above): nothing
-# public wires up a native-GS deployment yet, so there's no chart step to copy it in.
-# A bind mount at /game (below) still overrides this with a different install if you need one.
+# The mac minimal set, since this target loads the Mac image rather than Game.exe. A bind mount
+# at /game still overrides it with a different install if you need one.
 COPY --from=gamedata-mac /gamedata /game
 WORKDIR /game
 ENV D2MAC_BIN=/game/DiabloII_macho
 # The engine writes its resource file to the temporary-items folder during startup, and a scratch
 # image has no /tmp for it to land in. Declaring it as a volume is what creates the directory.
-VOLUME ["/game", "/tmp"]
+# /game is deliberately not one: an anonymous volume over it would hide the baked tree.
+VOLUME ["/tmp"]
 EXPOSE 4000
 ENTRYPOINT ["/d2gs-native"]
+
+# build: d2host (x86-windows) for ONE engine version
+# The version is a BUILD argument, not a runtime one, and that is the point of tagging an image
+# per engine: -Dengine-version turns d2host's readiness gate into a compile error, so an image for
+# a version whose ABI is not finished cannot be produced at all. Building for 1.06b today fails
+# with "missing fpEnterGame, fpUpdateCharacterLadder", which is exactly what should happen.
+#
+# Fog is version-agnostic — it is told which engine it is standing in for at startup. D2Net is NOT:
+# 1.13c renumbered its exports, and build.zig picks the .def off -Dengine-version, so leaving the
+# flag off here silently shipped every 1.13c image our LoD numbering. It loads and it starts; the
+# ordinals just mean other functions, which is why it looked like the host losing its own handle
+# rather than a wrong DLL.
+FROM zig AS build-d2host
+ARG D2_VERSION=1.10f
+RUN zigbuild d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
+    zigbuild d2fog -Doptimize=ReleaseSafe && \
+    zigbuild d2net -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe
+
+# d2host: headless pre-1.14 wine runtime
+# Distinct from `gs` above: that one injects into 1.14d's Game.exe, this one IS the host and loads
+# D2Game.dll/D2Common.dll as libraries. Tag it per engine — e.g.
+#
+#   deploy/build-d2host.sh 0.0.1 1.09d      ->  d2gs:1.09d-0.0.1  (+ d2gs:1.09d)
+#
+# Both halves of the tag are build args: APP_VERSION is our release, D2_VERSION the engine.
+#
+# The era-matched tree is baked in for every engine that has one published, so those tags run with
+# no volume like `gs` does. Where none is published yet the image still needs one mounted at /game,
+# and the era matters as much as the licence: a .bin table is a raw struct dump, so an install from
+# another patch level decodes as garbage rather than failing cleanly.
+FROM debian:bookworm-slim AS d2host
+# wine BEFORE the ARGs, deliberately. An ARG declared above an instruction is part of that
+# instruction's cache key, so declaring the engine first gave every version its own private copy of
+# a 1.1 GB wine install -- seven near-identical layers that share nothing. Below the RUN, the layer
+# is byte-identical for every engine, so it is built once, pushed once and pulled once, and what an
+# engine adds on top is a few megabytes of our own binaries.
+RUN dpkg --add-architecture i386 && apt-get update && \
+    apt-get install -y --no-install-recommends wine wine32 curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+ARG D2_VERSION=1.10f
+# The other half of the tag: <engine>-<APP_VERSION>, e.g. 1.09d-0.0.1.
+ARG APP_VERSION=0.0.0
+COPY --from=build-d2host /src/zig-out/bin/d2host.exe /opt/d2host/
+COPY --from=build-d2host /src/zig-out/bin/Fog.dll /src/zig-out/bin/D2Net.dll /opt/d2host/
+# This engine's own tree, when one is published. The entrypoint symlinks /game into a writable
+# /work/game and drops our Fog.dll and D2Net.dll over the engine's, so a read-only copy is enough
+# -- and a mount over /game still replaces the whole thing.
+COPY --from=gamedata-engine /gamedata /game
+COPY deploy/d2host-entrypoint.sh /opt/d2host/entrypoint.sh
+RUN chmod +x /opt/d2host/entrypoint.sh
+ENV WINEPREFIX=/wine WINEDEBUG=-all
+# Announced, not obeyed: the binary was built for this engine and refuses to be told otherwise, so
+# this is a label for humans and `docker inspect` rather than a switch.
+ENV D2HOST_ENGINE=${D2_VERSION}
+LABEL org.d2gs.engine-version="${D2_VERSION}" \
+      org.opencontainers.image.version="${D2_VERSION}-${APP_VERSION}" \
+      org.opencontainers.image.title="d2gs (pre-1.14 host)" \
+      org.opencontainers.image.description="Headless Diablo II ${D2_VERSION} dedicated server"
+# /game is NOT declared a volume, for the same reason it is not on `gs`: an anonymous volume over
+# it would hide the tree this image ships. A bind mount there still replaces it.
+VOLUME ["/wine", "/work"]
+EXPOSE 4000
+ENTRYPOINT ["/opt/d2host/entrypoint.sh"]
 
 # gs: headless wine runtime (no X, no desktop)
 FROM debian:bookworm-slim AS gs
@@ -117,13 +228,20 @@ RUN dpkg --add-architecture i386 && apt-get update && \
     rm -rf /var/lib/apt/lists/*
 # The GS needs only these two DLLs (dbghelp proxy + payload) — not realmd's checkrev.
 COPY --from=build-dlls /src/zig-out/bin/dbghelp.dll /src/zig-out/bin/d2gs.dll /opt/d2gs/
+# The minimal 1.14d install, baked in. It used to arrive at runtime from a separate
+# `d2-gamedata` image via an initContainer — one more package to publish, keep public and keep in
+# step with this one, for 16 MB that never changes independently of the server that reads it. The
+# entrypoint symlinks /game into a writable /work/game, so a read-only copy here is enough, and a
+# mount over /game still replaces it (a full install, another era, a mod).
+COPY --from=gamedata-windows /gamedata /game
 COPY deploy/gs-entrypoint.sh /opt/d2gs/entrypoint.sh
 RUN chmod +x /opt/d2gs/entrypoint.sh
 ENV WINEPREFIX=/wine WINEDEBUG=-all
-# /game = mounted D2 install (RO), /wine = wine prefix, /work = scratch (assembled game
-# dir + logs), /mods = optional server-mod DLLs (each --loaddll'd after d2gs.dll),
-# /moddata = optional extra data files (MPQs / loose data/ tree) overlaid on the game dir.
-VOLUME ["/game", "/wine", "/work", "/mods", "/moddata"]
+# /game holds the baked install and is NOT declared a volume — an anonymous volume over it would
+# hide the very data this image ships. /wine = wine prefix, /work = scratch (assembled game dir +
+# logs), /mods = optional server-mod DLLs (each --loaddll'd after d2gs.dll), /moddata = optional
+# extra data files (MPQs / loose data/ tree) overlaid on the game dir.
+VOLUME ["/wine", "/work", "/mods", "/moddata"]
 EXPOSE 4000
 ENTRYPOINT ["/opt/d2gs/entrypoint.sh"]
 
@@ -146,7 +264,7 @@ ENTRYPOINT ["/d2ingress"]
 # e2e-runner: tools/stress-e2e, built to run AS A CONTAINER on the compose network
 # (see deploy/compose.e2e.yaml) rather than against published host ports — no exposed ports,
 # no wait-for-host-port shell loop, it dials realmd/gs-native by their compose service names.
-# Not part of the realmd/gs/gs-native/gamedata deploy set; CI-only (and useful for local dev
+# Not part of the realmd / d2gs / d2ingress deploy set; CI-only (and useful for local dev
 # without wine — see run-stress.sh for the bash equivalent this ports).
 FROM zig AS e2e-runner
 COPY tools/stress-e2e ./tools/stress-e2e
@@ -154,5 +272,5 @@ COPY tools/stress-e2e ./tools/stress-e2e
 # time, instead of on every container start. --rounds 0 --wait-ms 0 is a deliberate no-op run
 # (the round loop never executes and the readiness probe is skipped), so this needs no realm
 # to actually be up yet.
-RUN zig build stress-e2e -- --rounds 0 --wait-ms 0
+RUN zigbuild stress-e2e -- --rounds 0 --wait-ms 0
 ENTRYPOINT ["/src/zig-out/bin/stress-e2e"]

@@ -13,23 +13,25 @@
 # takes create/join from its own queue, and reads and writes characters there. It never dials
 # realmd, so the two scale independently.
 #
-# Game files are proprietary: populate the d2-gamefiles PVC with a real 1.14d install
-# (ReadOnlyMany) before scaling up.
+# The image carries the minimal install for its engine at /game, so there is nothing to
+# populate before scaling up. The PVC and the /game mount below are commented out: uncomment
+# both to serve a DIFFERENT install instead — a full one, a mod, or the era matching a
+# pre-1.14 engine tag. A mount at /game hides the copy in the image, which is the point.
 #
-#   docker build -f deploy/Dockerfile --target gs -t d2gs:latest .
+#   docker build -f deploy/Dockerfile --target gs -t d2gs:1.14d .
 #   kubectl apply -f deploy/gs.yaml
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: d2-gamefiles
-  namespace: realmd
-spec:
-  accessModes: ["ReadOnlyMany"]   # populated once with a real D2 1.14d install
-  resources:
-    requests:
-      storage: 4Gi
-  # storageClassName: longhorn
+#---
+#apiVersion: v1
+#kind: PersistentVolumeClaim
+#metadata:
+#  name: d2-gamefiles
+#  namespace: realmd
+#spec:
+#  accessModes: ["ReadOnlyMany"]
+#  resources:
+#    requests:
+#      storage: 4Gi
+#  # storageClassName: longhorn
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -81,7 +83,7 @@ spec:
             # - name: D2GS_EXTRA_ARGS
             #   value: "-direct -txt"
           volumeMounts:
-            - { name: game, mountPath: /game, readOnly: true }
+            # - { name: game, mountPath: /game, readOnly: true }   # see the PVC note above
             - { name: wine, mountPath: /wine }
             - { name: work, mountPath: /work }
             # Server-mod DLLs: each *.dll is --loaddll'd after d2gs.dll.
@@ -89,9 +91,9 @@ spec:
             # Extra data files (MPQs / loose data/ tree) overlaid onto the game dir.
             # - { name: moddata, mountPath: /moddata, readOnly: true }
       volumes:
-        - name: game
-          persistentVolumeClaim:
-            claimName: d2-gamefiles
+        # - name: game
+        #   persistentVolumeClaim:
+        #     claimName: d2-gamefiles
         - name: wine
           emptyDir: {}     # wine prefix re-inits per start; make it a PVC to persist
         - name: work

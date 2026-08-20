@@ -6,12 +6,15 @@
 //!
 //! ⚠ Slots are __fastcall (ECX/EDX + stack, callee-cleanup); Zig's x86 fastcall is buggy
 //! (ziglang/zig#10363), so each is a `.naked` shim adapting fastcall→cdecl and `ret`ing the exact
-//! stack-arg byte count — a wrong count corrupts the stack, confirm per call site.
+//! stack-arg byte count — a wrong count corrupts the stack, confirm per call site. The layout and
+//! the shim construction come from packages/d2engine; the counts below are 1.14d's (`cb.v114d`)
+//! and are NOT the pre-1.14 ones.
 
 const std = @import("std");
 const server = @import("server.zig");
-const fastcall = @import("../runtime/fastcall.zig");
-const gsredis = @import("../realmclient/redis.zig");
+const cb = @import("d2engine").callbacks;
+const hostapi = @import("d2engine").hostapi;
+const gsredis = @import("gs_store");
 const joinctx = @import("../realmclient/joinctx.zig");
 const obs = @import("obs");
 const patch = @import("../runtime/patch.zig");
@@ -24,16 +27,12 @@ pub var table: server.BnetServerService = .{};
 // chunk==total==L stores it in one call (CLIENT_AccumulateSaveData marks it complete) and advances the
 // joining client to state 2 via SendStateCommand(2); CsResult!=0 logs the load error and disconnects.
 // It validates pContainer against pClient->pClientContainer, so we pass the value read off the client.
-const OnDatabaseCharacterReceived: *const fn (
-    n_client_id: u32,
-    p_save: [*]const u8,
-    n_chunk: u32, // this-call chunk size (low 16 bits used)
-    n_total: u32, // total save size (low 16 bits used)
-    cs_result: i32, // 0 = success, nonzero = load error (disconnect)
-    dw_param: u32,
-    pn_filetimes: *const [2]u32, // [0] = FILETIME*, [1] = unk0x194
-    p_container: ?*anyopaque, // must equal pClient->pClientContainer
-) callconv(.winapi) u32 = @ptrFromInt(0x005306e0);
+// The same function the pre-1.14 host reaches as D2Game @10007 ("D2GSSendDatabaseCharacter"),
+// so its shape lives in d2engine and only its location is per-version. Here arg 7 is
+// {FILETIME*, unk0x194} and arg 8 is the client container, which the engine checks against
+// pClient->pClientContainer.
+const OnDatabaseCharacterReceived: *const hostapi.SendDatabaseCharacterFn =
+    @ptrFromInt(hostapi.sendDatabaseCharacter(.v114d).?.address);
 
 var load_filetime: [2]u32 = .{ 0, 0 }; // a zeroed FILETIME (load-time placeholder)
 var load_filetimes: [2]u32 = undefined; // { &load_filetime, unk0x194 }
@@ -139,15 +138,15 @@ pub fn pumpDelivery() void {
         defer slot.busy.store(false, .release);
         if (slot.len == 0) {
             log.print("realm:   char fetch FAILED — refusing join");
-            _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, 0, 0, 1, 0, &load_filetimes, slot.container);
+            _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, 0, 0, 1, 0, &load_filetimes, @intFromPtr(slot.container));
             continue;
         }
-        _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, slot.len, slot.len, 0, 0, &load_filetimes, slot.container);
+        _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, slot.len, slot.len, 0, 0, &load_filetimes, @intFromPtr(slot.container));
         log.print("realm:   char delivered (SendStateCommand 2)");
     }
 }
 
-pub const getDatabaseCharShim = fastcall.Callback2(2, getDatabaseCharImpl).shim;
+pub const getDatabaseCharShim = cb.Shim(cb.v114d, .fpGetDatabaseCharacter, getDatabaseCharImpl).shim;
 
 // fpSaveDatabaseCharacter (slot 0x0C). Called by SaveAllPlayers @0x52ca10 -> SaveGameAllGameTypes
 // @0x532400 -> SaveToFileBnet @0x531eb0 whenever the save CHANGED (~8192 frames / 5.5 min, or on
@@ -184,15 +183,13 @@ fn saveDatabaseCharImpl(ecx: usize, edx: usize, s1: usize, s2: usize, s3: usize,
     return 1;
 }
 
-pub const saveDatabaseCharShim = fastcall.Callback2(4, saveDatabaseCharImpl).shim;
+pub const saveDatabaseCharShim = cb.Shim(cb.v114d, .fpSaveDatabaseCharacter, saveDatabaseCharImpl).shim;
 
 // fpLeaveGame (slot 0x04). Called from CleanUpClient on leave/disconnect. The engine IsBadCodePtr-checks
 // it (a null pointer reads as a bad code pointer and HALTS), so it MUST be a valid function. __fastcall
 // ECX=&pClient->pRealm, EDX + 18 stack args (counted at the call site), return ignored — so a
 // stack-balancing no-op (`ret 0x48`, 18*4 bytes of callee cleanup) is a safe stub.
-fn leaveGameStub() callconv(.naked) void {
-    asm volatile ("ret $0x48");
-}
+const leaveGameStub = cb.BalancedStub(cb.v114d, .fpLeaveGame).shim;
 
 // fpGetDatabaseFileTime (slot 0x54). CalculateGetFlags @0x569d80 calls this through the table WITHOUT an
 // IsBadCodePtr guard (it only checks IsBattleNetServer), so null is a call-to-zero crash during the char
@@ -209,10 +206,10 @@ fn getFileTimeStub() callconv(.naked) void {
 /// Populate the realm callback table. Call before SetupAsBnetServer (i.e. before
 /// bootstrapRealmServer). Wires the char loader + token validation + leave.
 pub fn init() void {
-    table.fpGetDatabaseCharacter = @ptrCast(&getDatabaseCharShim);
-    table.fpSaveDatabaseCharacter = @ptrCast(&saveDatabaseCharShim);
-    table.fpLeaveGame = @ptrCast(&leaveGameStub);
-    table.fpGetDatabaseFileTime = @ptrCast(&getFileTimeStub);
+    table.base.fpGetDatabaseCharacter = @ptrCast(&getDatabaseCharShim);
+    table.base.fpSaveDatabaseCharacter = @ptrCast(&saveDatabaseCharShim);
+    table.base.fpLeaveGame = @ptrCast(&leaveGameStub);
+    table.ext.fpGetDatabaseFileTime = @ptrCast(&getFileTimeStub); // 1.14d only, past the shared table
     enableTokenValidation(); // register fpFindPlayerToken (engine IsBadCodePtr-checks it)
     allowLadderAndLadderless();
 }
@@ -277,12 +274,12 @@ fn findPlayerTokenImpl(
     return 1; // accept — join proceeds to char load
 }
 
-pub const findPlayerTokenShim = fastcall.Callback2(7, findPlayerTokenImpl).shim;
+pub const findPlayerTokenShim = cb.Shim(cb.v114d, .fpFindPlayerToken, findPlayerTokenImpl).shim;
 
 /// Wire fpFindPlayerToken into the table (call before SetupAsBnetServer). Not
 /// invoked yet — staged until the handler is implemented.
 pub fn enableTokenValidation() void {
-    table.fpFindPlayerToken = @ptrCast(&findPlayerTokenShim);
+    table.base.fpFindPlayerToken = @ptrCast(&findPlayerTokenShim);
 }
 
 // Slots to implement, bridging to the user's D2CS/D2DBS (priority order):

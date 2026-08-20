@@ -1,0 +1,27 @@
+; Our D2Net.dll. D2Game and D2Common import 11 ordinals from it and the host calls 3 more; a
+; missing one is a load-time failure, so this list is the measured import union and nothing else.
+; Names are D2MOO's where it has them, from the 1.10f .def.
+LIBRARY D2Net
+EXPORTS
+    SERVER_Initialize @10003 NONAME
+    SERVER_Send @10006 NONAME
+    SERVER_ReadFromMessageList1 @10010 NONAME
+    SERVER_ReadFromMessageList0 @10011 NONAME
+    SERVER_ReadFromMessageList2 @10012 NONAME
+    SERVER_GetIpAddressStringFromClientId @10014 NONAME
+    D2NET_10015 @10015 NONAME
+    SERVER_DisconnectClient @10016 NONAME
+    D2NET_10019 @10019 NONAME
+    SERVER_SetClientGameGUID @10020 NONAME
+    SERVER_GetClientGameGUID @10021 NONAME
+    SERVER_SetHackListEnabled @10023 NONAME
+    SERVER_WSAGetLastError @10024 NONAME
+    SERVER_SetMaxClientsPerGame @10026 NONAME
+    ; Ours, not the engine's — exported by NAME so the host resolves it with GetProcAddress
+    ; instead of an ordinal that would imply it is part of D2Net's ABI.
+    D2NET_SetListenPort @10800
+    D2NET_ConnectedClients @10801
+    D2NET_SetTranslate114dJoin @10802
+    ; Not called. See D2NET_ordinal_ceiling in d2net.zig — this pins where mingw's
+    ; auto-exported decorated aliases start, clear of the real module's ordinals.
+    D2NET_ordinal_ceiling @10900 NONAME

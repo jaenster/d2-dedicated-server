@@ -1,0 +1,69 @@
+# Overlay for a per-ENGINE end-to-end run: the same realm, with one pre-1.14 game server instead
+# of the 1.14d-native one. Layers on deploy/compose.yaml.
+#
+#   D2_ENGINE=1.09d D2_SUBNET=172.29.9.0/24 D2_REALM_IP=172.29.9.10 D2_GS_IP=172.29.9.20 \
+#   D2_GSID=109 \
+#     docker compose -p d2e2e-109d -f deploy/compose.yaml -f deploy/compose.engine.yaml \
+#     --profile engine up -d redis postgres realmd gs-engine
+#
+# Every engine runs in its OWN compose project, network and subnet, and publishes NO host ports,
+# so several can run at once without fighting over 6112/4000 or a shared bridge. That matters:
+# these are wine containers, and two of them racing for the same port fail in ways that look like
+# protocol bugs.
+#
+# The client speaks 1.14d at every engine. d2host translates the join to whatever that engine's
+# own D2Net table calls it ("accepting 1.14d clients (join packet translated)"), so nothing about
+# the test client is version-specific.
+services:
+  realmd:
+    image: e2e-realmd:ci
+    # !override, not `ports: []`: compose MERGES sequences, so an empty list leaves the base file's
+    # published ports in place and every engine then fights for host 6112/4000. The test client is
+    # on this network, so nothing needs a host port at all.
+    ports: !override []
+    networks:
+      default:
+        ipv4_address: ${D2_REALM_IP:-172.29.0.10}
+    environment:
+      # Embedded in the MCP JOINGAME reply as a raw IPv4, so it cannot be a hostname.
+      REALMD_GAME_ADDR: "${D2_REALM_IP:-172.29.0.10}"
+      REALMD_REALM_ADDR: "${D2_REALM_IP:-172.29.0.10}"
+      REALMD_PERMISSIVE_AUTH: "1"
+      REALMD_LOG_JSON: "1"
+
+  gs-engine:
+    profiles: ["engine"]
+    image: d2gs:${D2_ENGINE:?set D2_ENGINE to the engine tag, e.g. 1.09d}
+    depends_on:
+      realmd: { condition: service_started }
+    networks:
+      default:
+        # Pinned, because D2GS_GS_ADDR below has to be a dotted IP and a container's address is
+        # not known until it exists.
+        ipv4_address: ${D2_GS_IP:?set D2_GS_IP to a fixed address inside D2_SUBNET}
+    environment:
+      D2GS_REDIS_ADDR: "redis:6379"
+      # A dotted IP, NOT a service name. The address is parsed as four octets; a hostname does not
+      # fail loudly, it falls back to 127.0.0.1 and the realm then hands every client the game
+      # server's own loopback.
+      D2GS_GS_ADDR: "${D2_GS_IP}:4000"
+      # Required, and numeric. Without it the server decides no realm is configured, creates one
+      # game directly and exits — which looks like a crash at startup rather than a missing knob.
+      D2GS_GSID: "${D2_GSID:?set D2_GSID to a number unique to this engine}"
+      D2GS_MAX_GAMES: "7"
+
+  stress-e2e:
+    profiles: ["engine"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: e2e-runner
+    depends_on:
+      realmd: { condition: service_started }
+      gs-engine: { condition: service_started }
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${D2_SUBNET:?set D2_SUBNET to a /24 unique to this engine}

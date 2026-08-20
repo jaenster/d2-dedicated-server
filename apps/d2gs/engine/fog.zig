@@ -12,7 +12,7 @@ const Alignment = std.mem.Alignment;
 
 const patch = @import("../runtime/patch.zig");
 const trampoline = @import("../runtime/trampoline.zig");
-const fastcall = @import("../runtime/fastcall.zig");
+const fastcall = @import("fastcall");
 
 const DWORD = u32;
 const BYTE = u8;

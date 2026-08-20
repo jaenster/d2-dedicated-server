@@ -56,6 +56,14 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   crashes, no evictions, and the games that run are correct. The shortfall is not yet
   understood, so the default keeps every game landing.
 - Replace the fixed init delay with a proper engine-init hook.
+- **A second kind of game server, on the pre-1.14 DLLs, is in bring-up.** `apps/d2host` drives real
+  1.10f `D2Game`/`D2Common` against our own `Fog.dll` and `D2Net.dll`: 2,636 files served straight
+  out of the archives, the data tables and tilesets loaded, a game created, and a TCP client
+  round-tripping through the engine -- it answers a packet with 357 bytes and calls our
+  `pfHandlePacket`. No assert, crash or hang anywhere in that path. What it cannot do yet is mean
+  anything: the stream is delivered in `recv`-sized chunks rather than split into packets, and the
+  callbacks are reporting stubs rather than realm calls, so no character can join.
+  See [`docs/dll-host.md`](dll-host.md).
 
 ## Related
 

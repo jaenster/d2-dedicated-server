@@ -55,6 +55,26 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("packages/macho/macho.zig"),
     });
 
+    // The engine's host-facing contracts. The server callback table is the same 16 slots from
+    // 1.10f's D2Game.dll to 1.14d's monolith, so one definition serves the injected DLL and any
+    // other host that drives a D2Game build; only the per-slot stack-arg counts differ per version.
+    // It needs the fastcall shim builder, which stays with the DLL that has always owned it.
+    const fastcall_mod = b.createModule(.{ .root_source_file = b.path("apps/d2gs/runtime/fastcall.zig") });
+    const d2engine = b.addModule("d2engine", .{
+        .root_source_file = b.path("packages/d2engine/d2engine.zig"),
+    });
+    d2engine.addImport("fastcall", fastcall_mod);
+
+    // The game server's side of the shared store: the ops a GS needs of the realm — fetch and
+    // save a character, advertise itself, take create/join requests, report events. Domain ops on
+    // the outside, redis on the inside. It lives here rather than inside apps/d2gs because a
+    // second game server already re-implemented it once (apps/d2gs-native/store.zig) and a third
+    // is now driving the pre-1.14 DLLs; the protocol is the same for all of them.
+    const gs_store = b.addModule("gs_store", .{
+        .root_source_file = b.path("packages/gs-store/gs_store.zig"),
+    });
+    gs_store.addImport("resp", resp);
+
     // Host-side infrastructure (net/log/config/lock/store types) for the NATIVE binaries.
     // Deliberately NOT given to the DLL, so libc-socket / POSIX code never enters that build.
     const realm_infra = b.addModule("realm_infra", .{
@@ -105,6 +125,7 @@ pub fn build(b: *std.Build) void {
     });
     dbghelp.root_module.addImport("realm_proto", realm_proto);
     dbghelp.root_module.addImport("obs", obs);
+    dbghelp.root_module.addImport("fastcall", fastcall_mod);
     b.installArtifact(dbghelp);
 
     const d2gs = b.addLibrary(.{
@@ -118,8 +139,129 @@ pub fn build(b: *std.Build) void {
     });
     d2gs.root_module.addImport("realm_proto", realm_proto);
     d2gs.root_module.addImport("resp", resp);
+    d2gs.root_module.addImport("gs_store", gs_store);
     d2gs.root_module.addImport("obs", obs);
+    d2gs.root_module.addImport("d2engine", d2engine);
+    // As a module, not a relative import: the same file is the root of the `fastcall` module that
+    // d2engine uses, and a file may belong to only one module.
+    d2gs.root_module.addImport("fastcall", fastcall_mod);
     b.installArtifact(d2gs);
+
+    // apps/d2host — the pre-1.14 shape of the same server: D2Game.dll driven as a library instead
+    // of a merged Game.exe detoured in place. x86-windows exe, run under wine. See docs/dll-host.md.
+    const d2host = b.addExecutable(.{
+        .name = "d2host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/d2host/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    // Pin the engine version at build time, so a release artifact is built FOR one engine rather
+    // than carrying every one and choosing later. This is what makes a per-version container tag
+    // mean something: `-Dengine-version=1.06b` turns the readiness gate into a BUILD error, so an
+    // image for a version that is not finished cannot be produced at all. Left unset, the binary
+    // keeps the runtime switch and `D2GS_ENGINE_VERSION` picks among the ready versions.
+    const engine_version = b.option([]const u8, "engine-version",
+        "Build d2host for ONE engine (e.g. 1.06b, 1.09d, 1.10f); omit to carry all of them");
+    const d2host_options = b.addOptions();
+    d2host_options.addOption(?[]const u8, "engine_version", engine_version);
+    d2host.root_module.addOptions("build_options", d2host_options);
+    d2host.root_module.addImport("fastcall", fastcall_mod);
+    d2host.root_module.addImport("gs_store", gs_store);
+    d2host.root_module.addImport("d2engine", d2engine);
+    d2host.root_module.addImport("realm_proto", realm_proto);
+    b.installArtifact(d2host);
+    b.step("d2host", "Build the pre-1.14 DLL host (x86-windows exe)")
+        .dependOn(&b.addInstallArtifact(d2host, .{}).step);
+
+    // packages/d2fog — our own Fog.dll. D2Game/D2Common import 53 Fog ordinals and two data symbols,
+    // none of them networking, so this is pure support code we would rather own than reverse.
+    // Ordinals are the ABI: fog.def pins them to the real 1.10f numbers.
+    const d2fog = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "Fog",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/d2fog/fog.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    d2fog.root_module.addObjectFile(b.path("packages/d2fog/fog.def"));
+    // The archive reader: Fog serves the engine's files straight out of the MPQs.
+    d2fog.root_module.addImport("libd2", libd2_win);
+    d2fog.root_module.addImport("d2engine", d2engine);
+    b.installArtifact(d2fog);
+    b.step("d2fog", "Build our replacement Fog.dll (x86-windows)")
+        .dependOn(&b.addInstallArtifact(d2fog, .{}).step);
+
+    // tools/mpqcat — pull one member out of an archive, to diff generated tables against shipped.
+    const mpqcat = b.addExecutable(.{
+        .name = "mpqcat",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/mpqcat/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    mpqcat.root_module.addImport("libd2", libd2);
+    b.installArtifact(mpqcat);
+    b.step("mpqcat", "Extract one member from an MPQ by name")
+        .dependOn(&b.addInstallArtifact(mpqcat, .{}).step);
+
+    // tools/d2patch — rebuild a patched file from its Ptc record. Left out of the build once, which
+    // meant a stale binary silently outlived a fix to the decoder and kept miscompiling tables.
+    const d2patch = b.addExecutable(.{
+        .name = "d2patch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/d2patch/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(d2patch);
+    b.step("d2patch", "Apply a Ptc patch record to its source file")
+        .dependOn(&b.addInstallArtifact(d2patch, .{}).step);
+
+    // tools/fogrewrite — stage a classic-era install against our LoD-numbered Fog.
+    const fogrewrite = b.addExecutable(.{
+        .name = "fogrewrite",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fogrewrite/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    fogrewrite.root_module.addImport("d2engine", d2engine);
+    b.installArtifact(fogrewrite);
+    b.step("fogrewrite", "Rewrite a classic install's Fog imports onto the LoD numbering")
+        .dependOn(&b.addInstallArtifact(fogrewrite, .{}).step);
+
+    // packages/d2net — our own D2Net.dll. The real one forwards every export into Fog's QServer, so
+    // keeping it would mean writing 31 Fog networking ordinals to serve a module we are replacing
+    // anyway. This is 14 stdcall entries, and it is where our own transport goes.
+    const d2net = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "D2Net",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/d2net/d2net.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    // 1.13c renumbered D2Net's exports, so the ordinal map is per engine. The implementation is
+    // shared — it is a permutation of the same functions, not different ones — and only the .def
+    // differs. Selecting the wrong one is a load-time failure rather than a silent wrong call,
+    // because the engine imports by ordinal.
+    const d2net_def = if (engine_version) |ev|
+        (if (std.mem.eql(u8, ev, "1.13c")) "packages/d2net/d2net-113c.def" else "packages/d2net/d2net.def")
+    else
+        "packages/d2net/d2net.def";
+    d2net.root_module.addObjectFile(b.path(d2net_def));
+    d2net.root_module.addImport("d2engine", d2engine);
+    b.installArtifact(d2net);
+    b.step("d2net", "Build our replacement D2Net.dll (x86-windows)")
+        .dependOn(&b.addInstallArtifact(d2net, .{}).step);
 
     // `zig build dlls` — install ONLY the injected DLLs (no realmd, no pg fetch).
     // Used by the game-server container image, which needs the DLLs but not realmd.
@@ -241,6 +383,9 @@ pub fn build(b: *std.Build) void {
         // The native host's crash reporter. Rooted here rather than at main.zig because that one
         // runs the game; this is the part with logic worth asserting.
         .{ "apps/d2gs-native/crash.zig", false, false },
+        // The engine callback contract: its layout asserts are the point, and they fire at
+        // compile time on any target, so they are worth checking here and not only in the DLL.
+        .{ "packages/d2engine/d2engine.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -252,6 +397,7 @@ pub fn build(b: *std.Build) void {
         });
         mod_tests.root_module.addImport("obs", obs);
         mod_tests.root_module.addImport("resp", resp);
+        mod_tests.root_module.addImport("fastcall", fastcall_mod);
         if (spec[1]) mod_tests.root_module.addImport("realm_infra", realm_infra);
         if (spec[2]) {
             if (b.lazyDependency("pg", .{ .target = host, .optimize = optimize })) |pg_dep| {

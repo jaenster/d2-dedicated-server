@@ -7,7 +7,7 @@
 const std = @import("std");
 const async_ = @import("../runtime/async.zig");
 const gameloop = @import("../runtime/gameloop.zig");
-const fastcall = @import("../runtime/fastcall.zig");
+const fastcall = @import("fastcall");
 const log = @import("../log.zig");
 const srvtrace = @import("../runtime/feature/srvtrace.zig");
 

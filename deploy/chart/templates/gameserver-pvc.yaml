@@ -1,4 +1,4 @@
-{{- if not .Values.gameServer.dataImage.repository }}
+{{- if .Values.gameServer.gameFiles.enabled }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -7,9 +7,10 @@ metadata:
     {{- include "realm.labels" . | nindent 4 }}
     app.kubernetes.io/component: gameserver
 spec:
-  # FALLBACK (only when gameServer.dataImage.repository is empty): populated once with a
-  # real, proprietary D2 1.14d install; mounted read-only into every GS pod, so it must
-  # support ReadWriteMany. The recommended path is dataImage (no persistent volume).
+  # An OVERRIDE, not the normal path: the image already carries a minimal install. Populate this
+  # once with the install you want served instead — a full one, a mod, or the era matching a
+  # pre-1.14 engine tag — and it is mounted read-only over /game in every GS pod, so it must
+  # support ReadWriteMany.
   accessModes: ["ReadWriteMany"]
   resources:
     requests:

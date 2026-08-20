@@ -1,0 +1,33 @@
+; Our D2Net.dll, exporting 1.13c's numbering.
+;
+; 1.13c renumbered D2Net the same way it renumbered D2Game and D2Common. The functions are the
+; same eleven D2Game imports either side — this is a permutation, not new functionality — so the
+; implementation is shared and only the ordinals differ. Established by fingerprinting each real
+; export by the Fog ordinal it wraps, its small push immediate and its `ret N`, then corroborating
+; against D2Game's own call sites in both builds.
+;
+; The message-list trio is the part worth stating: the three are near-identical siblings and are
+; separated only by the list index they push, so shape alone cannot tell them apart. D2Game's three
+; drain loops call 10035, then 10016, then 10014, in the same order as 1.10f's 10011/10010/10012.
+LIBRARY D2Net
+EXPORTS
+    SERVER_DisconnectClient @10000 NONAME
+    D2NET_10015 @10001 NONAME
+    SERVER_Send @10002 NONAME
+    SERVER_WSAGetLastError @10003 NONAME
+    SERVER_Initialize @10005 NONAME
+    D2NET_10019 @10009 NONAME
+    SERVER_SetHackListEnabled @10012 NONAME
+    SERVER_ReadFromMessageList2 @10014 NONAME
+    SERVER_GetClientGameGUID @10015 NONAME
+    SERVER_ReadFromMessageList1 @10016 NONAME
+    SERVER_GetIpAddressStringFromClientId @10017 NONAME
+    SERVER_SetClientGameGUID @10021 NONAME
+    SERVER_SetMaxClientsPerGame @10022 NONAME
+    SERVER_ReadFromMessageList0 @10035 NONAME
+    ; Ours, not the engine's — by name, so the host resolves them with GetProcAddress rather than
+    ; an ordinal that would imply they are part of D2Net's ABI.
+    D2NET_SetListenPort @10800
+    D2NET_ConnectedClients @10801
+    D2NET_SetTranslate114dJoin @10802
+    D2NET_ordinal_ceiling @10900 NONAME

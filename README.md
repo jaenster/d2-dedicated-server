@@ -5,7 +5,7 @@
 This repo exists out of multiple components.
 
 - **1.14d** d2gs via wine and **native** on linux (no wine)
-- **1.06b**, **1.09d**, **1.10f** d2gs
+- **1.06b**, **1.07**, **1.08**, **1.09b**, **1.09d**, **1.10f**, **1.13c** d2gs
 - A cloud native realm server
 - D2Ingress, an ingress implementation for 
 
@@ -25,8 +25,8 @@ Just like a typical docker package, that for example is ran with debian or alphi
 | version                                                           | what it is                                                                                             | wine | Needs volume |
 |-------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------|--------------|
 | `d2gs:1.14d`                                                      | The headless game server, running from a 1.14d install via wine                                        | Yes  | No           |
-| `d2gs:1.07`,`d2gs:1.08`, `d2gs:1.09d`, `d2gs:1.10f`               | A headless game server for, using the game's dll's, replacable with your own versions of the dll       | Yes  | No           |
-| `d2gs:1.06b`,                                                     | A headless game server for, just like above yet this is for classic, no LOD                            | Yes  | No           |
+| `d2gs:1.07`, `d2gs:1.08`, `d2gs:1.09b`, `d2gs:1.09d`, `d2gs:1.10f`, `d2gs:1.13c` | A headless game server, using the game's own dll's, replacable with your own versions of the dll | Yes  | No           |
+| `d2gs:1.06b`                                                      | The same, for classic — no LOD                                                                          | Yes  | No           |
 | **[`d2gs:1.14d-native`](#d2gs-native-the-wine-free-game-server)** | Special port of the macos 1.14d version that is ported to linux, to run natively on linux without wine | No   | No           |
 
 
@@ -156,12 +156,41 @@ More: [`REALMD.md`](REALMD.md) (configuration, trust model) and
 
 ### d2gs: the headless game server
 
-It comes in 3 variants -
-- `d2gs:1.14d-latest` - Running game.exe, with the entire game's exe and a d2gs patched into it
-- `d2gs:1.14d-native-latest` - Running the macos modified to a posix linux binary, with d2gs patched into it
+It comes in 3 variants. The engine version is the tag, the way it is for `postgres` — a bare
+`d2gs:1.10f` is the newest build of that engine, and `d2gs:1.10f-0.0.1` pins one. There is no
+separate package per mechanism: which of the three below serves a tag is our problem, not yours.
+
+- `d2gs:1.14d` - Running game.exe, with the entire game's exe and a d2gs patched into it
+- `d2gs:1.14d-native` - Running the macos modified to a posix linux binary, with d2gs patched into it
   More: [`apps/d2gs-native/README.md`](apps/d2gs-native/README.md).
 
-- `d2gs:[1.06b|1.08|1.10f|1.13c]-latest` - a own written zig exe that uses the version's dll's to host a game server
+- `d2gs:[1.06b|1.07|1.08|1.09b|1.09d|1.10f|1.13c]` - a own written zig exe that uses the version's dll's to host a game server
+
+  The engine is compiled in, not selected at runtime: an image tagged for one version refuses to be
+  told to serve another, and a version whose ABI is not fully measured fails the *build* rather than
+  shipping broken.
+
+  Each carries its own era-matched tree, so it runs with no volume like `1.14d` does. The era has to
+  match the tag and not merely the licence -- a `.bin` table is a raw struct dump, so data from
+  another patch level decodes as garbage rather than failing cleanly -- which is why the tree is per
+  tag rather than shared. `tools/make-minimal-engine.sh` assembles one from your own install:
+  `tools/re/patchdata.py` rebuilds that version's tables from its own patch installer, and its DLLs
+  come out of the same installer as Ptc deltas over the 1.07 base.
+
+  Every engine carries one, so there is nothing to mount for any of them, and every one of them
+  reaches the tick loop from the image alone.
+
+  A classic engine gets a DIFFERENT tree, built by `base-classic`: its own `d2data.mpq` and no
+  `d2exp.mpq` at all. The expansion archive is not merely surplus there — the engine opens it
+  first, so every table without a loose override would be read in expansion format by a classic
+  parser. Its string tables come out of its own patch too, into `data/local/lng/ENG`, since they
+  are not excel and were previously being read from the very archive that has to go.
+
+  Every one of them completes a real client join end to end -- login, character, game create,
+  join, `IN GAME` -- verified with the clientless. Note that almost nothing is shared between them:
+  1.13c renumbered its entire export table in D2Game, D2Common, D2Lang AND D2Net, and the join
+  opcode differs three ways across the set (0x61 classic, 0x65 on 1.07-1.09, 0x67 on 1.10f, 0x68 on
+  1.13c and 1.14d).
 
 On a join the server does not read a shared disk, and does not ask the realm -- it reads the character straight from redis and writes it back there when the game ends.
 

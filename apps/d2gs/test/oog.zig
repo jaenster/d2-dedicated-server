@@ -9,7 +9,7 @@
 //! the fix for the old "act before the realm char list loaded" race.
 
 const std = @import("std");
-const fastcall = @import("../runtime/fastcall.zig");
+const fastcall = @import("fastcall");
 const async_ = @import("../runtime/async.zig");
 const gameloop = @import("../runtime/gameloop.zig");
 

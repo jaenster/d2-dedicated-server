@@ -1,26 +1,27 @@
-# Builds the deploy images, runs the real-GS stress e2e against them, and only then promotes
-# `:latest`. GitHub runners are amd64, so everything builds natively (no QEMU) — including the
-# wine `gs` image. The built-in GITHUB_TOKEN pushes to this account's ghcr packages.
+# Builds the deploy images, runs the real-GS stress e2e against them, and only then promotes the
+# floating tags. GitHub runners are amd64, so everything builds natively (no QEMU) — including the
+# wine images. The built-in GITHUB_TOKEN pushes to this account's ghcr packages.
 #
 #   ghcr.io/jaenster/realmd    — clean-room Zig realm server (scratch, static musl)
-#   ghcr.io/jaenster/d2gs      — headless wine GS runtime (game data supplied at runtime,
-#                                 by default via the d2-gamedata initContainer below)
 #   ghcr.io/jaenster/d2ingress — token-translating game-traffic gateway (scratch, musl)
-#   ghcr.io/jaenster/d2gs-native — wine-free GS: the Mac 1.14d image loaded in-process,
-#                                 minimal game data baked in (scratch)
-#   ghcr.io/jaenster/d2-gamedata — the minimal 1.14d data set alone (windows), at /gamedata;
-#                                 what deploy/chart's load-gamedata initContainer copies in.
-#                                 Rebuilds only on a Dockerfile change or workflow_dispatch —
-#                                 the source tarball lives outside this repo (files.typeguru.nl)
-#                                 and isn't otherwise watched for updates.
+#   ghcr.io/jaenster/d2gs      — EVERY game server, one tag per engine: 1.06b … 1.13c host the
+#                                 game's own D2Game.dll, 1.14d injects into Game.exe, and
+#                                 1.14d-native drops wine. Which mechanism serves a given engine
+#                                 is our problem, not the consumer's — they pick a version, the
+#                                 way postgres:16 picks a version. Minimal game data is baked in.
+#
+# There used to be a package per mechanism (d2gs-native) and one for the data alone (d2-gamedata).
+# Both are gone: a variant of the game server is a TAG on the game server, not a separate product,
+# and 16 MB of data that never changes independently of the server reading it does not need its own
+# release train. Nothing publishes to those two names any more.
 #
 # The cluster pulls these anonymously (public packages) — flip a NEW package to public once
 # under github.com/users/jaenster/packages. The PRIVATE d2gs-deploy repo's ArgoCD app rolls out
-# `:latest` (imagePullPolicy: Always), which `promote-latest` below is the only thing that moves.
+# the floating tags (imagePullPolicy: Always), which `promote` below is the only thing that moves.
 name: build
 # Build images only when it matters, not on every commit/branch:
 #  - a PR against main (build + e2e only — see push: false below; nothing to publish yet)
-#  - push to main or a vN.N.N tag (build + e2e, then promote-latest moves :latest)
+#  - push to main or a vN.N.N tag (build + e2e, then promote moves the floating tags)
 #  - ONLY when an image input actually changes (source/Dockerfile/entrypoint/webui) —
 #    deploy manifests + the Helm chart don't affect images, so they don't trigger.
 #  - manual (workflow_dispatch) for ad-hoc builds off any branch during dev.
@@ -34,7 +35,9 @@ on:
       - packages/**
       - webui/**
       - deploy/Dockerfile
+      - deploy/build-d2host.sh
       - deploy/gs-entrypoint.sh
+      - deploy/d2host-entrypoint.sh
       - build.zig
       - build.zig.zon
       # The test suites themselves: a change to what verifies the images has to run before it is
@@ -66,17 +69,8 @@ jobs:
         include:
           - target: realmd
             image: realmd
-          - target: gs
-            image: d2gs
           - target: d2ingress
             image: d2ingress
-          # The wine-free GS: one static i386 ELF in scratch. The image claims linux/amd64 like
-          # the rest — containerd matches an image's platform against the node's and refuses a
-          # linux/386 image outright, while that same node's kernel runs the i386 binary.
-          - target: gs-native
-            image: d2gs-native
-          - target: gamedata
-            image: d2-gamedata
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -95,22 +89,22 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           # No `:latest` here — the commit sha is the immutable handle this job publishes, and
-          # `:latest` only moves once `promote-latest` confirms e2e passed on THIS sha. A vN.N.N
+          # `:latest` only moves once `promote` confirms e2e passed on THIS sha. A vN.N.N
           # push additionally publishes that version. An empty line here is ignored, which is
           # what the non-tag case produces.
           tags: |
             ghcr.io/jaenster/${{ matrix.image }}:${{ github.sha }}
             ${{ github.ref_type == 'tag' && format('ghcr.io/jaenster/{0}:{1}', matrix.image, github.ref_name) || '' }}
 
-      # Hand the two images the e2e job runs to it, rather than have it build them again. It was
-      # rebuilding both from cold — two minutes of a three-minute job, duplicating what this matrix
-      # had already finished in parallel seconds earlier.
+      # Hand the realmd image the e2e job runs to it, rather than have it build one again. It was
+      # rebuilding from cold — two minutes of a three-minute job, duplicating what this matrix had
+      # already finished in parallel seconds earlier.
       #
       # A second buildx call rather than one build with two outputs: this one costs seconds because
       # the builder still holds the layers it just produced, and it keeps the publish path above
       # exactly as it was rather than rewriting it to emit a tarball as well.
       - name: hand the image to the e2e job
-        if: matrix.target == 'realmd' || matrix.target == 'gs-native'
+        if: matrix.target == 'realmd'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -118,15 +112,74 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           load: true
-          tags: e2e-${{ matrix.target }}:ci
+          tags: e2e-realmd:ci
       - name: save it
-        if: matrix.target == 'realmd' || matrix.target == 'gs-native'
-        run: docker save e2e-${{ matrix.target }}:ci -o /tmp/${{ matrix.target }}.tar
+        if: matrix.target == 'realmd'
+        run: docker save e2e-realmd:ci -o /tmp/realmd.tar
       - uses: actions/upload-artifact@v4
-        if: matrix.target == 'realmd' || matrix.target == 'gs-native'
+        if: matrix.target == 'realmd'
         with:
-          name: image-${{ matrix.target }}
-          path: /tmp/${{ matrix.target }}.tar
+          name: image-realmd
+          path: /tmp/realmd.tar
+          retention-days: 1
+
+  # Every engine, in ONE job, driven by deploy/build-d2host.sh.
+  #
+  # One job rather than a matrix of nine, deliberately. The versions share a ~750 MB debian + wine
+  # layer and a zig cache; built in sequence on one runner they are paid for once and the engines
+  # after the first cost a couple of megabytes and a compile each. A matrix would build that same
+  # wine layer nine times on nine cold runners — faster on the wall clock, roughly twice the
+  # runner-minutes, for images that are byte-identical below the top three layers anyway.
+  #
+  # The script decides which engines exist, because the readiness gate is a compile error: an
+  # unfinished version cannot produce a binary, so it is refused and the rest carry on. A list of
+  # version strings in this file would be a second source of truth that goes stale the day a
+  # version becomes ready.
+  engines:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      built: ${{ steps.build.outputs.built }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build every ready engine
+        id: build
+        env:
+          D2GS_IMAGE_REPO: ghcr.io/jaenster/d2gs
+          # The floating d2gs:<engine> means "the build that passed e2e", so this job must not
+          # move it — `promote` does, and only after the e2e job is green.
+          D2GS_TAG_FLOATING: "0"
+          D2GS_PUSH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+          D2GS_BUILT_FILE: /tmp/engines.txt
+        # On a vN.N.N tag the release number is the headline suffix and the sha rides along; off a
+        # tag the sha is all there is to say. Either way every engine gets an immutable
+        # <engine>-<sha> handle for `promote` to copy from.
+        run: |
+          if [ "${{ github.ref_type }}" = tag ]; then
+            app="${GITHUB_REF_NAME#v}"
+            export D2GS_TAG_EXTRA="$GITHUB_SHA"
+          else
+            app="$GITHUB_SHA"
+          fi
+          deploy/build-d2host.sh "$app"
+          echo "built=$(cat /tmp/engines.txt)" >> "$GITHUB_OUTPUT"
+      # gs-native is the engine the e2e job drives (it bakes its data in and needs no wine or Xvfb
+      # on the runner). Seconds, not a rebuild: the builder still holds every layer.
+      - name: hand 1.14d-native to the e2e job
+        run: |
+          docker build -f deploy/Dockerfile --target gs-native --load -t e2e-gs-native:ci .
+          docker save e2e-gs-native:ci -o /tmp/gs-native.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-gs-native
+          path: /tmp/gs-native.tar
           retention-days: 1
 
   # Unit tests + the clientless scenario suite. Runs on the runner rather than in an image: the
@@ -146,7 +199,10 @@ jobs:
             | tar -xJ -C /opt
           echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - name: unit tests
-        run: zig build test
+        # Through the same retrying wrapper the images use: this job fetches the dependency tree
+        # over the network too, and a dependency host having a bad day was failing it as though a
+        # test had broken.
+        run: deploy/zigbuild.sh test
       # `zig build e2e` is NOT here yet, and deliberately. It passes on macOS and wedges on Linux:
       # d2ingress_token_translate reaches "route client_token=N -> GS 127.0.0.1:P [connecting]" and
       # never returns, which cost 37 minutes of runner time before it was cancelled. Running it
@@ -158,13 +214,13 @@ jobs:
   # GS instead of a bash + subprocess fleet — see that tool's doc comment). The test client runs
   # AS A CONTAINER on the same compose network as realmd/gs-native (deploy/compose.e2e.yaml),
   # dialling them by service name — no published host ports, no host-side wait loop (the binary's
-  # own --wait-ms probe handles readiness). Builds its own images straight from the working tree
-  # via compose rather than pulling what `build` just pushed: simpler than threading registry
-  # auth / sha-pinned image refs through compose for a job that already needs `build` to have
-  # succeeded first, at the cost of one extra compile. gs-native, not the wine `gs`, is the CI
-  # target: it bakes its own game data in and needs no wine/Xvfb on the runner.
+  # own --wait-ms probe handles readiness). Builds its own test-client image straight from the
+  # working tree via compose rather than pulling what the build jobs just pushed: simpler than
+  # threading registry auth / sha-pinned image refs through compose, at the cost of one compile.
+  # 1.14d-native, not the wine engines, is the CI target: it bakes its own game data in and needs
+  # no wine/Xvfb on the runner.
   e2e:
-    needs: build
+    needs: [build, engines]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -222,16 +278,18 @@ jobs:
         if: always()
         run: $COMPOSE down -v
 
-  # Moves `:latest` to the sha `build` just pushed — a manifest copy, no rebuild. Only after e2e
-  # passes, and only on a real push to main (never a PR: there's nothing to promote yet).
-  promote-latest:
-    needs: [build, test, e2e]
+  # Moves the floating tags to the sha the build jobs just pushed — a manifest copy, no rebuild.
+  # Only after e2e passes, and only on a real push to main (never a PR: there's nothing to promote).
+  #
+  # For the engines that is d2gs:<engine>, from the list the engines job actually built — an engine
+  # that was refused has no sha tag to copy and is silently absent here, which is the same
+  # compiler-decides rule the build follows. d2gs:latest points at 1.14d: an unqualified `d2gs`
+  # should be the newest engine the game ever shipped, not the newest one we happened to add.
+  promote:
+    needs: [build, engines, test, e2e]
     timeout-minutes: 10
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        image: [realmd, d2gs, d2ingress, d2gs-native, d2-gamedata]
     steps:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -239,7 +297,20 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - run: |
+      - name: realmd + d2ingress -> :latest
+        run: |
+          for image in realmd d2ingress; do
+            docker buildx imagetools create \
+              -t "ghcr.io/jaenster/$image:latest" \
+              "ghcr.io/jaenster/$image:${{ github.sha }}"
+          done
+      - name: each engine -> its floating tag
+        run: |
+          for engine in ${{ needs.engines.outputs.built }}; do
+            docker buildx imagetools create \
+              -t "ghcr.io/jaenster/d2gs:$engine" \
+              "ghcr.io/jaenster/d2gs:$engine-${{ github.sha }}"
+          done
           docker buildx imagetools create \
-            -t ghcr.io/jaenster/${{ matrix.image }}:latest \
-            ghcr.io/jaenster/${{ matrix.image }}:${{ github.sha }}
+            -t ghcr.io/jaenster/d2gs:latest \
+            "ghcr.io/jaenster/d2gs:1.14d-${{ github.sha }}"

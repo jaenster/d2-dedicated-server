@@ -28,7 +28,7 @@ deployment {
     description 'GitOps: syncs the PRIVATE d2gs-deploy repo onto the cluster'
   }
   service ghcr 'ghcr (CI images)' {
-    description 'CI builds + pushes the realmd / d2gs / d2ingress / d2-gamedata images'
+    description 'CI builds + pushes realmd / d2ingress, and one d2gs tag per engine version'
   }
 
   cluster prod 'Hetzner k3s cluster (Cilium, ns realmd)' {
@@ -55,10 +55,11 @@ deployment {
       instanceOf d2gs.realmd.fleet
       instanceOf d2gs.realmd.health
     }
-    // initContainer: serves the version-check MPQ over BNFTP. Copies ver-IX86-1.mpq
-    // from the d2-gamedata image into the bnftp emptyDir realmd serves from.
-    workload realmd_vermpq 'load-vermpq init (d2-gamedata)' {
-      description 'initContainer from ghcr d2-gamedata: copies ver-IX86-1.mpq into <data_dir>/bnftp for BNFTP version-check'
+    // initContainer: serves the version-check MPQ over BNFTP, from wherever the deployment
+    // sources it. Not the game-data set — that carries no ver-IX86-1.mpq — and not something
+    // deploy/chart wires up; realmd replies size 0 without it.
+    workload realmd_vermpq 'load-vermpq init' {
+      description 'initContainer: copies ver-IX86-1.mpq into <data_dir>/bnftp for the BNFTP version-check'
     }
 
     // d2ingress public Service (LoadBalancer, externalIPs=FIP) — the one public :4000
@@ -83,10 +84,10 @@ deployment {
 
     // GS fleet as a stateless Deployment — INTERNAL pods, no hostPort / public
     // exposure. Each publishes its POD IP (status.podIP:4000) into redis; the d2ingress
-    // dials that pod IP to splice. Game data from the d2-gamedata init image into an
-    // emptyDir (no persistent volume); health probe on :8086.
+    // dials that pod IP to splice. Game data is baked into the d2gs image (no volume at all);
+    // health probe on :8086.
     workload gs_set 'd2gs Deployment (fleet, stateless)' {
-      description 'soft anti-affinity. INTERNAL only (no hostPort); publishes status.podIP:4000 into redis; game data via a d2-gamedata initContainer into an emptyDir; health :8086.'
+      description 'soft anti-affinity. INTERNAL only (no hostPort); publishes status.podIP:4000 into redis; game data baked into the image; health :8086.'
 
       pod gs_pod_a 'd2gs pod' {
         description 'Internal :4000; publishes status.podIP:4000 into redis; health :8086'
@@ -107,7 +108,7 @@ deployment {
   ghcr -> realmd_deploy 'realmd image'
   ghcr -> d2ingress_deploy 'd2ingress image (private; ghcr pull secret)'
   ghcr -> gs_set 'd2gs image'
-  ghcr -> realmd_vermpq 'd2-gamedata image (ver-IX86-1.mpq)'
+  ghcr -> realmd_vermpq 'version-check MPQ (ver-IX86-1.mpq)'
 
   // Player login goes through the floating IP to the realmd public Service.
   lb_player -> fip 'login + realm (:6112, muxed) + game (:4000)'

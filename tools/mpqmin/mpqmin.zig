@@ -50,6 +50,10 @@ fn lastError() i32 {
 }
 
 const info_byte_offset: u32 = 49;
+const info_locale: u32 = 47;
+const info_file_time: u32 = 50;
+const info_file_size: u32 = 51;
+const info_flags: u32 = 53;
 
 const create_listfile: u32 = 0x0010_0000;
 const file_implode: u32 = 0x0000_0100;
@@ -88,6 +92,13 @@ const ui_dirs = [_][]const u8{ "data\\local\\font\\", "data\\global\\ui\\cursor\
 /// load still run. Measured, not guessed: without `data\global\palette\ACT1\Pal.PL2` that boot
 /// segfaults immediately after reading the act's `pal.dat`.
 var keep_ui = false;
+
+/// An external listfile. An MPQ's `(listfile)` is an ordinary, optional member, and retail's
+/// archives do not name everything they hold — `data\global\excel\CompCode.bin` is in Patch_D2.mpq
+/// and in no listing of it. Enumerating with only the internal listfile therefore drops members
+/// silently, which in a *minimal* archive means a file the server needs simply is not there. A
+/// community listfile of every known D2 member closes that gap.
+var listfile: ?[*:0]const u8 = null;
 
 fn keeps(name: []const u8) bool {
     const cut = std.mem.lastIndexOfAny(u8, name, "\\/");
@@ -131,7 +142,7 @@ fn readMember(mpq: HANDLE, name: [*:0]const u8, locale: u32) ?[]u8 {
 
 fn list(mpq: HANDLE) u8 {
     var d: FindData = undefined;
-    const find = SFileFindFirstFile(mpq, "*", &d, null) orelse {
+    const find = SFileFindFirstFile(mpq, "*", &d, listfile) orelse {
         std.debug.print("cannot enumerate the archive (no (listfile)?)\n", .{});
         return 1;
     };
@@ -155,6 +166,8 @@ fn list(mpq: HANDLE) u8 {
 /// The member names to copy, in archive order. `wanted` null means "apply the keep rule".
 fn plan(mpq: HANDLE, wanted: ?*const std.StringHashMap(void)) !std.ArrayList(FindData) {
     var out: std.ArrayList(FindData) = .empty;
+    var seen: std.StringHashMap(void) = .init(gpa);
+    defer seen.deinit();
     var d: FindData = undefined;
     const find = SFileFindFirstFile(mpq, "*", &d, null) orelse return error.NoListfile;
     defer _ = SFileFindClose(find);
@@ -163,10 +176,58 @@ fn plan(mpq: HANDLE, wanted: ?*const std.StringHashMap(void)) !std.ArrayList(Fin
         // The internal files are rebuilt by the writer, never copied.
         const internal = name.len != 0 and name[0] == '(';
         const take = if (wanted) |w| w.contains(lowered(name)) else keeps(name);
+        if (!internal) try seen.put(try gpa.dupe(u8, lowered(name)), {});
         if (!internal and take) try out.append(gpa, d);
         if (!SFileFindNextFile(find, &d)) break;
     }
+    if (listfile) |lf| try addUnlisted(mpq, lf, wanted, &seen, &out);
     return out;
+}
+
+/// Recover members the archive holds but does not name. StormLib treats an external listfile as a
+/// *fallback* for archives with no `(listfile)`, so it will not supplement one that exists — and
+/// retail's do exist and are still incomplete: Patch_D2.mpq names 209 members and
+/// `data\global\excel\CompCode.bin` is not among them, yet the loader requires it. Lookup is by
+/// name hash, so a name from any source either opens or it does not; that is the test used here.
+fn addUnlisted(
+    mpq: HANDLE,
+    path: [*:0]const u8,
+    wanted: ?*const std.StringHashMap(void),
+    seen: *std.StringHashMap(void),
+    out: *std.ArrayList(FindData),
+) !void {
+    var names = try readKeepList(path);
+    defer names.deinit();
+    var found: usize = 0;
+    var it = names.keyIterator();
+    while (it.next()) |key| {
+        const name = key.*;
+        // The writer rebuilds (listfile)/(attributes) itself; copying them is an error.
+        if (name.len != 0 and name[0] == '(') continue;
+        if (seen.contains(name)) continue;
+        const take = if (wanted) |w| w.contains(name) else keeps(name);
+        if (!take) continue;
+
+        const cname = try gpa.dupeZ(u8, name);
+        defer gpa.free(cname);
+        var fh: HANDLE = null;
+        if (!SFileOpenFileEx(mpq, cname.ptr, 0, &fh)) continue;
+        defer _ = SFileCloseFile(fh);
+
+        var d: FindData = std.mem.zeroes(FindData);
+        if (cname.len + 1 > d.name.len) continue;
+        @memcpy(d.name[0..cname.len], cname[0..cname.len]);
+        var time: u64 = 0;
+        _ = SFileGetFileInfo(fh, info_locale, &d.locale, @sizeOf(u32), null);
+        _ = SFileGetFileInfo(fh, info_flags, &d.flags, @sizeOf(u32), null);
+        _ = SFileGetFileInfo(fh, info_file_size, &d.size, @sizeOf(u32), null);
+        _ = SFileGetFileInfo(fh, info_file_time, &time, @sizeOf(u64), null);
+        d.time_lo = @truncate(time);
+        d.time_hi = @truncate(time >> 32);
+        try out.append(gpa, d);
+        found += 1;
+    }
+    if (found != 0) std.debug.print("recovered {d} unlisted member(s) via the external listfile\n", .{found});
 }
 
 /// A DT1 is a header, a table of 96-byte tile records, and then the graphics blocks those records
@@ -274,17 +335,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = it.next();
     var first = it.next() orelse return usage();
 
+    // Options in any order, so a caller can add one without knowing where it was slotted in.
     var keep_list: ?std.StringHashMap(void) = null;
-    if (std.mem.eql(u8, first, "--ui")) {
-        keep_ui = true;
-        first = it.next() orelse return usage();
-    }
-    if (std.mem.eql(u8, first, "--keep")) {
-        const p = it.next() orelse return usage();
-        keep_list = readKeepList(p.ptr) catch |e| {
-            std.debug.print("cannot read keep-list {s}: {s}\n", .{ p, @errorName(e) });
-            return 1;
-        };
+    while (true) {
+        if (std.mem.eql(u8, first, "--ui")) {
+            keep_ui = true;
+        } else if (std.mem.eql(u8, first, "--listfile")) {
+            const p = it.next() orelse return usage();
+            listfile = (gpa.dupeZ(u8, p) catch return 1).ptr;
+        } else if (std.mem.eql(u8, first, "--keep")) {
+            const p = it.next() orelse return usage();
+            keep_list = readKeepList(p.ptr) catch |e| {
+                std.debug.print("cannot read keep-list {s}: {s}\n", .{ p, @errorName(e) });
+                return 1;
+            };
+        } else break;
         first = it.next() orelse return usage();
     }
     const listing = std.mem.eql(u8, first, "--list");
@@ -311,6 +376,7 @@ fn usage() u8 {
         \\usage: mpqmin [--ui] <src.mpq> <dst.mpq>     rebuild with only what a server reads
         \\       mpqmin --list <src.mpq>               flags size csize offset locale name
         \\       mpqmin --keep <list> <src> <dst>      keep exactly the named members
+        \\       mpqmin --listfile <f> ...             enumerate with an external listfile
         \\
         \\  --ui  also keep the palette/font/cursor files a client-mode boot loads (macOS build)
         \\
