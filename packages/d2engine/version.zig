@@ -82,6 +82,15 @@ pub const CommonOrdinals = struct {
     set_compile_tables: ?u16 = 11242,
 };
 
+/// D2Lang's host-facing entry points. Its NAMED exports are the `Unicode::` C++ methods and they
+/// did not move; the NONAME block 10000-10013 did, and 1.13c permuted all fourteen of them.
+pub const LangOrdinals = struct {
+    /// `STRTABLE_Init(hArchive, szLanguage, bExpansion)`, __fastcall, `ret 4`. hArchive is ignored —
+    /// 1.13c's own callers reach it through D2Win @10016, which is literally `xor eax,eax; ret`.
+    /// Skipping this leaves sghStringTable null and D2Common's charstats load asserts in strtable.cpp.
+    strtable_init: u16 = 10000,
+};
+
 pub const Spec = struct {
     /// As the install directories spell it.
     name: []const u8,
@@ -92,6 +101,7 @@ pub const Spec = struct {
     modules: []const [:0]const u8,
     game: GameOrdinals = .{},
     common: CommonOrdinals = .{},
+    lang: LangOrdinals = .{},
     /// Stack args per callback slot. Counted at the call sites in that version's D2Game; asking
     /// for an uncounted slot is a compile error rather than a guess.
     stack_args: callbacks.StackArgs,
@@ -145,6 +155,10 @@ pub fn spec(comptime v: Version) Spec {
                 .shutdown = 10047,
             },
             .common = .{ .load_all_txts = 10943, .set_compile_tables = 10563 },
+            // 1.13c permuted D2Lang's whole NONAME block: its 10000 is a string hash taking
+            // (const char*, u32) by stdcall, so calling THAT as the fastcall init dereferences the
+            // expansion flag as a pointer and faults on address 1.
+            .lang = .{ .strtable_init = 10008 },
             .stack_args = callbacks.v113c,
         },
         // 1.14d is the monolith: no DLLs to load, and it grew the callback table past 0x40.

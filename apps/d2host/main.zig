@@ -1200,8 +1200,8 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     // ordinal table is not: 10000-10013 are the NONAME C API and 10014+ are the named C++ ones.
     // It is __fastcall(hArchive, szLanguage, bExpansion), which is why calling it as stdcall faulted.
     // Skipping it leaves sghStringTable null and D2Common's charstats load asserts in strtable.cpp.
-    if (byOrdinal(d2lang, 10000)) |p| {
-        say("d2host: calling D2Lang @10000 (STRTABLE_Init)");
+    if (byOrdinal(d2lang, comptime d2version.spec(version).lang.strtable_init)) |p| {
+        say("d2host: calling D2Lang STRTABLE_Init");
         const Init = fn (u32, [*:0]const u8, u32) callconv(.c) u32;
         const r = fastcall.fastcallAt(Init).call(@intFromPtr(p), .{ 0, "ENG", 1 });
         sayHex("d2host: D2Lang init returned=", r);
