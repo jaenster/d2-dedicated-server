@@ -1172,12 +1172,17 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     const d2lang = moduleHandle(&modules, "D2Lang.dll").?;
     const d2net = moduleHandle(&modules, "D2Net.dll").?;
 
-    const init_table = byOrdinal(d2game, 10002) orelse {
-        say("d2host: D2Game ordinal 10002 (GAME_InitGameDataTable) missing");
+    // Every one of these comes from the version spec. They were literals, and 1.13c is the build
+    // that proves why: it renumbered its whole export table, so 10002 there is the client flush
+    // and 10023 a bare `ret 4`. Calling those with this one's arguments faults on the first
+    // instruction, which looks like a bad pointer rather than the wrong function.
+    const game_ord = comptime d2version.spec(version).game;
+    const init_table = byOrdinal(d2game, game_ord.init_game_data_table) orelse {
+        say("d2host: D2Game init_game_data_table missing");
         return error.MissingOrdinal;
     };
-    const set_callbacks = byOrdinal(d2game, 10023) orelse {
-        say("d2host: D2Game ordinal 10023 (GAME_SetServerCallbackFunctions) missing");
+    const set_callbacks = byOrdinal(d2game, game_ord.set_server_callbacks) orelse {
+        say("d2host: D2Game set_server_callbacks missing");
         return error.MissingOrdinal;
     };
     sayHex("d2host: GAME_InitGameDataTable=", @intFromPtr(init_table));
@@ -1267,37 +1272,47 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
         say("d2host: D2Net SetHackListEnabled(1)");
     }
 
-    // D2Game @10046 — the module init, and it must come FIRST. It runs
-    // InitializeCriticalSection on the game-list lock; skip it and the first game-list operation
-    // blocks forever on an uninitialised section (wine says it plainly:
-    // "RtlpWaitForCriticalSection section 6FD45800 blocked by 0000"). It also clears the 0x400-entry
+    // Two orders exist, and the version decides. On 1.07 through 1.10f the module init must come
+    // FIRST: it runs InitializeCriticalSection on the game-list lock, and skipping it leaves the
+    // first game-list operation blocked forever on an uninitialised section — wine says it plainly,
+    // "RtlpWaitForCriticalSection section 6FD45800 blocked by 0000". It also clears the 0x400-entry
     // game array, initialises the client table, installs D2Game's Fog error handler and fills the
     // item cache.
-    if (byOrdinal(d2game, 10046)) |p| {
-        const InitModule = *const fn () callconv(.winapi) i32;
-        say("d2host: calling D2Game @10046 (GAME_InitServerModule)");
-        const r = @as(InitModule, @ptrCast(@alignCast(p)))();
-        sayHex("d2host: GAME_InitServerModule returned=", @intCast(r));
-    } else {
-        say("d2host: ordinal 10046 missing — the game-list lock will never be initialised");
+    //
+    // 1.13c wants the opposite, and that is not a guess: Marsgod's working 1.13c D2Server.dll
+    // registers the callback table and the game-data table and only THEN calls the module init.
+    // Doing it our way there faults inside the init itself.
+    const init_last = comptime version == .v113c;
+
+    const InitModule = *const fn () callconv(.winapi) i32;
+    const SetFn = *const fn (*anyopaque) callconv(.winapi) void;
+    const InitFn = *const fn (*anyopaque, *anyopaque) callconv(.winapi) void;
+    const init_module = byOrdinal(d2game, game_ord.init_server_module) orelse {
+        say("d2host: init_server_module missing — the game-list lock will never be initialised");
         return error.MissingOrdinal;
+    };
+
+    if (!init_last) {
+        say("d2host: calling GAME_InitServerModule");
+        sayHex("d2host: GAME_InitServerModule returned=", @intCast(@as(InitModule, @ptrCast(@alignCast(init_module)))()));
     }
 
-    // GAME_SetServerCallbackFunctions(pTable) — stdcall, stores the pointer.
-    const SetFn = *const fn (*anyopaque) callconv(.winapi) void;
-    const set: SetFn = @ptrCast(@alignCast(set_callbacks));
+    // GAME_SetServerCallbackFunctions(pTable) — stdcall, stores the pointer (does not copy).
     say("d2host: calling GAME_SetServerCallbackFunctions");
-    set(@ptrCast(&callbacks));
+    @as(SetFn, @ptrCast(@alignCast(set_callbacks)))(@ptrCast(&callbacks));
     say("d2host: GAME_SetServerCallbackFunctions returned");
-    // GAME_InitGameDataTable(ptGameDataTbl, phGameList) — stdcall, both asserted non-null.
-    const InitFn = *const fn (*anyopaque, *anyopaque) callconv(.winapi) void;
-    const init: InitFn = @ptrCast(@alignCast(init_table));
-    buildGameDataTable();
 
+    // GAME_InitGameDataTable(ptGameDataTbl, phGameList) — stdcall, both asserted non-null.
+    buildGameDataTable();
     say("d2host: calling GAME_InitGameDataTable");
-    init(@ptrCast(&game_data_table), @ptrCast(&game_list));
+    @as(InitFn, @ptrCast(@alignCast(init_table)))(@ptrCast(&game_data_table), @ptrCast(&game_list));
     say("d2host: GAME_InitGameDataTable returned");
     sayHex("d2host: esp after InitGameDataTable = ", espNow());
+
+    if (init_last) {
+        say("d2host: calling GAME_InitServerModule (after registration, 1.13c's order)");
+        sayHex("d2host: GAME_InitServerModule returned=", @intCast(@as(InitModule, @ptrCast(@alignCast(init_module)))()));
+    }
 
     say("d2host: init sequence survived");
 
@@ -1317,8 +1332,9 @@ inline fn espNow() usize {
 }
 
 fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
+    const game_ord = comptime d2version.spec(version).game;
     // TASK_InitializeClock @10039 — the game clock the tick functions read.
-    if (byOrdinal(d2game, 10039)) |p| {
+    if (byOrdinal(d2game, game_ord.init_clock)) |p| {
         const InitClock = *const fn () callconv(.winapi) void;
         say("d2host: calling TASK_InitializeClock");
         @as(InitClock, @ptrCast(@alignCast(p)))();
@@ -1326,7 +1342,7 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     } else say("d2host: ordinal 10039 (TASK_InitializeClock) missing");
 
     // GAME_SetInitSeed @10010 — fixes the world seed so a run is reproducible.
-    if (byOrdinal(d2game, 10010)) |p| {
+    if (byOrdinal(d2game, game_ord.set_init_seed)) |p| {
         const SetSeed = *const fn (i32) callconv(.winapi) void;
         say("d2host: calling GAME_SetInitSeed(1)");
         @as(SetSeed, @ptrCast(@alignCast(p)))(1);
@@ -1334,7 +1350,7 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     } else say("d2host: ordinal 10010 (GAME_SetInitSeed) missing");
 
     // GAME_CreateNewEmptyGame @10047 — stdcall, returns BOOL and writes the game id.
-    const create = byOrdinal(d2game, 10047) orelse {
+    const create = byOrdinal(d2game, game_ord.create_empty_game) orelse {
         say("d2host: ordinal 10047 (GAME_CreateNewEmptyGame) missing");
         return error.MissingOrdinal;
     };
@@ -1394,7 +1410,6 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     // Calling @10005 directly instead — it is the flush's inner half — halts the engine with
     // "This should never happen! [sUpdateClients]"; it is reached *through* @10045, and D2Server
     // does not import it at all.
-    const game_ord = comptime d2version.spec(version).game;
     const netmsgs = byOrdinal(d2game, game_ord.net_messages);
     const worker_ctx_fn = byOrdinal(d2game, game_ord.worker_context);
     const process_game = byOrdinal(d2game, game_ord.process_game);
