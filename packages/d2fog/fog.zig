@@ -918,6 +918,21 @@ fn tokenizeLine(buf: []u8, from: usize, tabs: *i32) ?usize {
     return null;
 }
 
+/// Fog @10200, transcribed from 1.10f's own body: it allocates 0x400 bytes and stamps "BOND" over
+/// the first dword, taking nothing and returning the block. Faithful down to the tag, because the
+/// tag is how the engine recognises the thing later.
+///
+/// 1.06b reaches this on the join path — classic imports it as @10152 — and until it existed wine
+/// aborted the process on an unimplemented ordinal, which reads as a silent hang rather than a
+/// missing function. See packages/d2engine/fogrosetta.zig, where that row is still `.inferred`:
+/// the mapping is what remains unproven, not this body.
+export fn FOG_AllocBond() callconv(.winapi) ?*anyopaque {
+    trace("FOG_AllocBond @10200");
+    const p = heapZeroed(0x400) orelse return null;
+    std.mem.writeInt(u32, p[0..4], 0x444e4f42, .little); // 'BOND'
+    return @ptrCast(p);
+}
+
 export fn FOG_CreateBinFile(data: ?[*]u8, size: i32) callconv(.winapi) ?*BinFile {
     trace("FOG_CreateBinFile @10208");
     const p = data orelse return null;

@@ -38,6 +38,7 @@ EXPORTS
     FOG_CreateNewPoolSystem @10142 NONAME
     FOG_DestroyMemoryPoolSystem @10143 NONAME
     FOG_GetMemoryUsage @10147 NONAME
+    FOG_AllocBond @10200 NONAME
     FOG_10207 @10207 NONAME
     FOG_CreateBinFile @10208 NONAME
     FOG_FreeBinFile @10209 NONAME

@@ -236,8 +236,8 @@ test "the same field surgery serves both join opcodes" {
     @memcpy(src[21..25], "Tenf");
     var a: [64]u8 = @splat(0);
     var b: [64]u8 = @splat(0);
-    _ = translateJoin114dTo(&src, &a, 0x65).?;
-    _ = translateJoin114dTo(&src, &b, 0x67).?;
+    _ = translateJoin114dTo(&src, &a, 0x65, 29).?;
+    _ = translateJoin114dTo(&src, &b, 0x67, 29).?;
     try std.testing.expectEqual(@as(u8, 0x65), a[0]);
     try std.testing.expectEqual(@as(u8, 0x67), b[0]);
     try std.testing.expectEqualSlices(u8, a[1..29], b[1..29]);
@@ -286,22 +286,26 @@ pub const join_114d_len: usize = 37;
 pub const join_110f: u8 = 0x67;
 pub const join_110f_len: usize = 29;
 
-/// Rewrite a 1.14d join in `src` into the 1.10f form in `dst`, returning its length. Null when
-/// `src` is not a 1.14d join, so a caller can pass every packet through and only pay for the one.
-/// Rewrite a 1.14d join into `target_op`'s 29-byte pre-1.14 shape. The payload is identical on
-/// every pre-1.14 build measured — only the opcode moved, because 1.10f inserted two opcodes ahead
-/// of it — so the same field surgery serves 1.07's 0x65 and 1.10f's 0x67.
-pub fn translateJoin114dTo(src: []const u8, dst: []u8, target_op: u8) ?usize {
+/// Rewrite a 1.14d join into `target_op`'s pre-1.14 shape. The field surgery is identical on every
+/// build measured — only the opcode moved — but the LENGTH is not: classic carries a 15-byte
+/// character name where LoD carries 16, so 1.06b's join is 28 bytes and every LoD build's is 29.
+/// Emitting 29 to a classic engine strands a byte of the next packet, and it answers by closing the
+/// connection rather than by complaining.
+pub fn translateJoin114dTo(src: []const u8, dst: []u8, target_op: u8, target_len: usize) ?usize {
     if (src.len != join_114d_len or src[0] != join_114d) return null;
-    if (dst.len < join_110f_len) return null;
+    if (target_len < 13 or target_len > join_110f_len) return null;
+    if (dst.len < target_len) return null;
+    // Where the byte comes off is what matters, and it is not the name: classic keeps the full
+    // 16-byte name and carries a SHORTER preamble, so the class and name sit one byte earlier.
+    const pre: usize = if (target_len == join_110f_len) 12 else 11;
     dst[0] = target_op;
-    @memcpy(dst[1..12], src[1..12]); // hash, token/gameId, and the two fields after it
-    @memcpy(dst[12..join_110f_len], src[20..join_114d_len]); // class + name, past the 8 dropped bytes
-    return join_110f_len;
+    @memcpy(dst[1..pre], src[1..pre]); // hash, token/gameId, and the fields after it
+    @memcpy(dst[pre..target_len], src[20..][0 .. target_len - pre]); // class + name
+    return target_len;
 }
 
 pub fn translateJoin114dTo110f(src: []const u8, dst: []u8) ?usize {
-    return translateJoin114dTo(src, dst, join_110f);
+    return translateJoin114dTo(src, dst, join_110f, join_110f_len);
 }
 
 test "a 1.14d join becomes a 1.10f join, field for field" {
@@ -330,4 +334,19 @@ test "anything that is not a 1.14d join is left alone" {
     try std.testing.expect(translateJoin114dTo110f(&[_]u8{0x67}, &dst) == null);
     const wrong_len = [_]u8{join_114d} ** 20;
     try std.testing.expect(translateJoin114dTo110f(&wrong_len, &dst) == null);
+}
+
+test "a classic join is one byte shorter than a LoD one" {
+    var src: [join_114d_len]u8 = @splat(0);
+    src[0] = join_114d;
+    src[20] = 1; // class
+    @memcpy(src[21..][0.."Tester".len], "Tester");
+    var dst: [join_110f_len]u8 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 29), translateJoin114dTo(&src, &dst, 0x65, 29).?);
+    try std.testing.expectEqual(@as(u8, 0x65), dst[0]);
+
+    try std.testing.expectEqual(@as(usize, 28), translateJoin114dTo(&src, &dst, 0x61, 28).?);
+    try std.testing.expectEqual(@as(u8, 1), dst[12]); // class survives the shorter name field
+    try std.testing.expectEqualStrings("Tester", std.mem.sliceTo(dst[13..28], 0));
 }
