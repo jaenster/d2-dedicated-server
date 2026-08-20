@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build one pre-1.14 game-server image per engine version.
+# Build one game-server image per engine version — every variant of the server, under one
+# `d2gs` repository.
 #
 #   deploy/build-d2host.sh 0.0.1            # every engine that is ready
 #   deploy/build-d2host.sh 0.0.1 1.09d ...  # only the ones named
@@ -12,7 +13,19 @@
 # There is no list here of which engines are finished, on purpose. The version is compiled in
 # (-Dengine-version), so d2host's readiness gate is a COMPILE error and an unfinished engine
 # simply fails to build — the filter is the compiler, not a list someone has to remember to
-# update. A refusal here is a correct outcome, not a broken pipeline.
+# update. A refusal here is a correct outcome, not a broken pipeline. That is also why CI drives
+# this script rather than carrying its own matrix of version strings: a list in a workflow goes
+# stale the day a version becomes ready and nobody remembers to add it.
+#
+# Environment, all optional — the defaults are what a developer building locally wants:
+#   D2GS_IMAGE_REPO   where the images go (default `d2gs`; CI sets ghcr.io/jaenster/d2gs)
+#   D2GS_TAG_EXTRA    further release suffixes, space-separated: `abc123` -> d2gs:1.09d-abc123.
+#                     CI publishes the commit sha this way, as an immutable handle.
+#   D2GS_TAG_FLOATING 1 (default) also tags the bare d2gs:<engine>. CI sets 0: that tag means
+#                     "the build that passed", so only the promote step is allowed to move it.
+#   D2GS_PUSH         1 pushes every tag as its image is built.
+#   D2GS_BUILT_FILE   write the engines that built, space-separated, to this path — how CI hands
+#                     the list to the step that promotes them.
 set -e
 
 APP_VERSION="${1:?usage: build-d2host.sh <app-version> [engine ...]}"
@@ -38,15 +51,18 @@ target_for() {
 
 built="" refused=""
 for engine in $ENGINES; do
-  tag="${REPO}:${engine}-${APP_VERSION}"
-  floating="${REPO}:${engine}"
+  # -t once per release suffix, plus the floating tag unless something else owns it.
+  set -- -t "${REPO}:${engine}-${APP_VERSION}"
+  for extra in $D2GS_TAG_EXTRA; do set -- "$@" -t "${REPO}:${engine}-${extra}"; done
+  if [ "${D2GS_TAG_FLOATING:-1}" = 1 ]; then set -- "$@" -t "${REPO}:${engine}"; fi
+  if [ "${D2GS_PUSH:-0}" = 1 ]; then set -- "$@" --push; fi
   target=$(target_for "$engine")
-  printf '==> %s (%s) ... ' "$tag" "$target"
+  printf '==> %s:%s-%s (%s) ... ' "$REPO" "$engine" "$APP_VERSION" "$target"
   if docker build -q -f "$ROOT/deploy/Dockerfile" --target "$target" \
        --build-arg "D2_VERSION=$engine" --build-arg "APP_VERSION=$APP_VERSION" \
-       -t "$tag" -t "$floating" "$ROOT" >/dev/null 2>"$ROOT/.build-$engine.err"; then
+       "$@" "$ROOT" >/dev/null 2>"$ROOT/.build-$engine.err"; then
     echo "ok"
-    built="$built $tag"
+    built="$built $engine"
     rm -f "$ROOT/.build-$engine.err"
   else
     # Say why, in the compiler's own words. docker prefixes build output with "#NN T.TT ", so
@@ -62,3 +78,10 @@ done
 echo
 echo "built:  ${built:-<none>}"
 echo "refused:${refused:-<none>}"
+
+# The list is an output, not just a log line: whatever promotes these tags has to know which
+# engines exist without re-deriving readiness itself.
+if [ -n "$D2GS_BUILT_FILE" ]; then printf '%s\n' "${built# }" > "$D2GS_BUILT_FILE"; fi
+
+# A build that produced nothing is a failure even though each refusal was individually fine.
+[ -n "$built" ] || { echo "no engine built at all"; exit 1; }
