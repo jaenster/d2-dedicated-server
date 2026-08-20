@@ -141,12 +141,17 @@ RUN zig build d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
 # table is a raw struct dump, so an install from another patch level decodes as garbage rather than
 # failing cleanly. Mount the matching era at /game.
 FROM debian:bookworm-slim AS d2host
-ARG D2_VERSION=1.10f
-# The other half of the tag: <engine>-<APP_VERSION>, e.g. 1.09d-0.0.1.
-ARG APP_VERSION=0.0.0
+# wine BEFORE the ARGs, deliberately. An ARG declared above an instruction is part of that
+# instruction's cache key, so declaring the engine first gave every version its own private copy of
+# a 1.1 GB wine install -- seven near-identical layers that share nothing. Below the RUN, the layer
+# is byte-identical for every engine, so it is built once, pushed once and pulled once, and what an
+# engine adds on top is a few megabytes of our own binaries.
 RUN dpkg --add-architecture i386 && apt-get update && \
     apt-get install -y --no-install-recommends wine wine32 curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
+ARG D2_VERSION=1.10f
+# The other half of the tag: <engine>-<APP_VERSION>, e.g. 1.09d-0.0.1.
+ARG APP_VERSION=0.0.0
 COPY --from=build-d2host /src/zig-out/bin/d2host.exe /opt/d2host/
 COPY --from=build-d2host /src/zig-out/bin/Fog.dll /src/zig-out/bin/D2Net.dll /opt/d2host/
 COPY deploy/d2host-entrypoint.sh /opt/d2host/entrypoint.sh
