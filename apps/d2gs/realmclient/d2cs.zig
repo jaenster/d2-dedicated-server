@@ -340,7 +340,7 @@ var last_publish_ms: u32 = 0;
 fn publish() void {
     if (!redis.enabled() or gsid == 0) return;
     const full = poolstat.freeManagers() == 0;
-    if (redis.putHeartbeat(gsid, public_ip, public_port, max_games, liveGames(), full, heartbeat_ttl_s)) {
+    if (redis.putHeartbeat(gsid, public_ip, public_port, max_games, liveGames(), full, heartbeat_ttl_s, "v=1.14d")) {
         last_publish_ms = GetTickCount();
         registered = true;
     }
