@@ -39,7 +39,7 @@ pub fn ordinalArgs(v: version.Version) ?OrdinalArgs {
         // 1.07 and 1.09d agree, and both differ from 1.10f: the debug pair was added later. Swept
         // the same way over every Fog ordinal D2Common imports — AllocLinker is the *only* one of
         // the eighteen that moved, on either version.
-        .v107, .v108, .v109d => .{ .alloc_linker = 0 },
+        .v107, .v108, .v109b, .v109d => .{ .alloc_linker = 0 },
         // 1.06b was swept the same way, from the callee's own `ret N` rather than from push counts,
         // because its Fog.dll is on disk to read. All 47 ordinals it imports pop exactly what
         // 1.10f's equivalents pop — the classic/LoD boundary renumbered Fog without changing a
