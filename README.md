@@ -25,8 +25,9 @@ Just like a typical docker package, that for example is ran with debian or alphi
 | version                                                           | what it is                                                                                             | wine | Needs volume |
 |-------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------|--------------|
 | `d2gs:1.14d`                                                      | The headless game server, running from a 1.14d install via wine                                        | Yes  | No           |
-| `d2gs:1.07`, `d2gs:1.08`, `d2gs:1.09b`, `d2gs:1.09d`, `d2gs:1.10f`, `d2gs:1.13c` | A headless game server, using the game's own dll's, replacable with your own versions of the dll | Yes  | Yes          |
-| `d2gs:1.06b`                                                      | The same, for classic — no LOD                                                                          | Yes  | Yes          |
+| `d2gs:1.07`, `d2gs:1.08`, `d2gs:1.09b`, `d2gs:1.09d`, `d2gs:1.10f` | A headless game server, using the game's own dll's, replacable with your own versions of the dll | Yes  | No           |
+| `d2gs:1.13c`                                                      | The same. No tree is published for it yet, so mount a 1.13c install at `/game`                          | Yes  | Yes          |
+| `d2gs:1.06b`                                                      | The same, for classic — no LOD. Also still needs a mounted install                                      | Yes  | Yes          |
 | **[`d2gs:1.14d-native`](#d2gs-native-the-wine-free-game-server)** | Special port of the macos 1.14d version that is ported to linux, to run natively on linux without wine | No   | No           |
 
 
@@ -168,9 +169,19 @@ separate package per mechanism: which of the three below serves a tag is our pro
 
   The engine is compiled in, not selected at runtime: an image tagged for one version refuses to be
   told to serve another, and a version whose ABI is not fully measured fails the *build* rather than
-  shipping broken. Unlike `1.14d`, these need the matching game data mounted at `/game` -- a `.bin`
-  table is a raw struct dump, so data from another patch level decodes as garbage rather than
-  failing cleanly. `tools/re/patchdata.py` rebuilds a version's tables from its own patch installer.
+  shipping broken.
+
+  Each carries its own era-matched tree, so it runs with no volume like `1.14d` does. The era has to
+  match the tag and not merely the licence -- a `.bin` table is a raw struct dump, so data from
+  another patch level decodes as garbage rather than failing cleanly -- which is why the tree is per
+  tag rather than shared. `tools/make-minimal-engine.sh` assembles one from your own install:
+  `tools/re/patchdata.py` rebuilds that version's tables from its own patch installer, and its DLLs
+  come out of the same installer as Ptc deltas over the 1.07 base.
+
+  Two engines have no published tree yet and still need a matching install mounted at `/game`:
+  **1.13c**, whose rebuilt `D2Game.dll` has no export at the ordinal the host wants for
+  `init_server_module`, and **1.06b**, whose classic patch members are bare filenames whose
+  destination depends on their type, so only 18 of its tables are recovered.
 
   Every one of them completes a real client join end to end -- login, character, game create,
   join, `IN GAME` -- verified with the clientless. Note that almost nothing is shared between them:

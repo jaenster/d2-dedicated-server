@@ -65,13 +65,36 @@ engine)
             INST="$PATCHES/D2Patch_${VER//./}.exe"
             LOD="${D2_CLASSIC_BASE:?set D2_CLASSIC_BASE to the v1.00 classic PE files - classic engines rebase those, not the 1.07 ones}"
             ;;
+        1.07)
+            # 1.07 IS the expansion base: there is no patch to apply and no delta to rebase, so its
+            # DLLs are copied straight out of that tree. Its tables are the base archives' own
+            # members for the same reason -- every later patch overlaid Patch_D2.mpq rather than
+            # rewriting d2data/d2exp, which is exactly why those members are still what the deltas
+            # for 1.08 onward are cut against.
+            INST=""
+            LOD="${D2_LOD_BASE:?set D2_LOD_BASE to the 1.07 expansion PE files}"
+            ;;
         *)
+            # The final build of a patch line is the installer Blizzard shipped: 1.10f is
+            # LODPatch_110, not a LODPatch_110f that never existed.
             INST="$PATCHES/LODPatch_${VER//./}.exe"
+            [ -f "$INST" ] || INST="$PATCHES/LODPatch_$(echo "${VER//./}" | sed 's/[a-z]$//').exe"
             LOD="${D2_LOD_BASE:?set D2_LOD_BASE to the 1.07 expansion PE files}"
             ;;
     esac
-    [ -f "$INST" ] || { echo "missing $INST"; exit 1; }
+    [ -z "$INST" ] || [ -f "$INST" ] || { echo "missing $INST"; exit 1; }
     mkdir -p "$OUT/data/global/excel"
+
+    # 1.07: copy, do not patch.
+    if [ -z "$INST" ]; then
+        echo "==> taking $VER DLLs from the expansion base"
+        for m in D2Game.dll D2Common.dll D2Lang.dll D2CMP.dll Storm.dll; do
+            cp "$LOD/$m" "$OUT/$m" && echo "   $m ok"
+        done
+        rmdir "$OUT/data/global/excel" "$OUT/data/global" "$OUT/data" 2>/dev/null || true
+        du -sh "$OUT" | sed 's/^/==> engine layer: /'
+        exit 0
+    fi
 
     # The DLLs are Ptc deltas against the 1.07 base, same as the tables — so one installer yields
     # both halves of what this engine needs and there is nothing else to source.

@@ -23,8 +23,8 @@
 #                The version is a build argument on purpose. d2host carries every measured
 #                version and can pick at runtime, but a release artifact should be built FOR
 #                one engine: -Dengine-version makes the readiness gate a COMPILE error, so an
-#                image for an unfinished version cannot be built. Game data is not baked in,
-#                and the era has to match the tag — see that target.
+#                image for an unfinished version cannot be built. Its era-matched game tree is
+#                baked in where one is published — see that target.
 #
 # --target gs builds only the windows DLLs (pg is a lazy dep, never pulled there);
 # --target realmd builds only the realmd binary. Neither builds the other's artifacts.
@@ -84,6 +84,27 @@ ARG D2_MINIMAL_WINDOWS_URL=https://files.typeguru.nl/diablo/minimal/114d/windows
 RUN apk add --no-cache curl && mkdir /gamedata && \
     curl -fsSL "$D2_MINIMAL_WINDOWS_URL" | tar -xz -C /gamedata
 
+# fetch: the era-matched game tree for ONE pre-1.14 engine
+# The era has to match the tag, not just the licence: a .bin table is a raw struct dump, so an
+# install from another patch level decodes as garbage rather than failing cleanly.
+# tools/make-minimal-engine.sh assembles a tree from a legitimately owned install -- the engine's
+# own DLLs rebuilt from that version's patch installer, its tables, and the shared archives.
+#
+# An engine with no published tree is NOT a build failure. The image still runs; it just needs the
+# matching install mounted at /game the way every pre-1.14 image used to. Say that loudly here
+# rather than baking an empty directory, which would look like data and fail much later.
+FROM alpine:3.20 AS gamedata-engine
+ARG D2_VERSION=1.10f
+ARG D2_MINIMAL_ENGINE_BASE=https://files.typeguru.nl/diablo/minimal
+RUN apk add --no-cache curl && mkdir -p /gamedata && \
+    if curl -fsSL -o /tmp/tree.tgz \
+         "${D2_MINIMAL_ENGINE_BASE}/${D2_VERSION}/d2-${D2_VERSION}-minimal.tgz"; then \
+      tar -xzf /tmp/tree.tgz -C /gamedata && rm /tmp/tree.tgz && \
+      echo "==> ${D2_VERSION}: baked its own game tree in"; \
+    else \
+      echo "==> ${D2_VERSION}: NO PUBLISHED TREE -- this image needs one mounted at /game"; \
+    fi
+
 # gs-native: the same server without wine
 # One statically linked file against the wine image's debian + wine32 + wine + Xvfb.
 # Labelled amd64, not 386, even though the binary inside is a 32-bit ELF. containerd matches the
@@ -99,7 +120,8 @@ WORKDIR /game
 ENV D2MAC_BIN=/game/DiabloII_macho
 # The engine writes its resource file to the temporary-items folder during startup, and a scratch
 # image has no /tmp for it to land in. Declaring it as a volume is what creates the directory.
-VOLUME ["/game", "/tmp"]
+# /game is deliberately not one: an anonymous volume over it would hide the baked tree.
+VOLUME ["/tmp"]
 EXPOSE 4000
 ENTRYPOINT ["/d2gs-native"]
 
@@ -124,9 +146,10 @@ RUN zig build d2host -Dengine-version=${D2_VERSION} -Doptimize=ReleaseSafe && \
 #
 # Both halves of the tag are build args: APP_VERSION is our release, D2_VERSION the engine.
 #
-# Game data is NOT baked in, same as `gs`, and here the era matters as much as the licence: a .bin
-# table is a raw struct dump, so an install from another patch level decodes as garbage rather than
-# failing cleanly. Mount the matching era at /game.
+# The era-matched tree is baked in for every engine that has one published, so those tags run with
+# no volume like `gs` does. Where none is published yet the image still needs one mounted at /game,
+# and the era matters as much as the licence: a .bin table is a raw struct dump, so an install from
+# another patch level decodes as garbage rather than failing cleanly.
 FROM debian:bookworm-slim AS d2host
 # wine BEFORE the ARGs, deliberately. An ARG declared above an instruction is part of that
 # instruction's cache key, so declaring the engine first gave every version its own private copy of
@@ -141,6 +164,10 @@ ARG D2_VERSION=1.10f
 ARG APP_VERSION=0.0.0
 COPY --from=build-d2host /src/zig-out/bin/d2host.exe /opt/d2host/
 COPY --from=build-d2host /src/zig-out/bin/Fog.dll /src/zig-out/bin/D2Net.dll /opt/d2host/
+# This engine's own tree, when one is published. The entrypoint symlinks /game into a writable
+# /work/game and drops our Fog.dll and D2Net.dll over the engine's, so a read-only copy is enough
+# -- and a mount over /game still replaces the whole thing.
+COPY --from=gamedata-engine /gamedata /game
 COPY deploy/d2host-entrypoint.sh /opt/d2host/entrypoint.sh
 RUN chmod +x /opt/d2host/entrypoint.sh
 ENV WINEPREFIX=/wine WINEDEBUG=-all
@@ -151,7 +178,9 @@ LABEL org.d2gs.engine-version="${D2_VERSION}" \
       org.opencontainers.image.version="${D2_VERSION}-${APP_VERSION}" \
       org.opencontainers.image.title="d2gs (pre-1.14 host)" \
       org.opencontainers.image.description="Headless Diablo II ${D2_VERSION} dedicated server"
-VOLUME ["/game", "/wine", "/work"]
+# /game is NOT declared a volume, for the same reason it is not on `gs`: an anonymous volume over
+# it would hide the tree this image ships. A bind mount there still replaces it.
+VOLUME ["/wine", "/work"]
 EXPOSE 4000
 ENTRYPOINT ["/opt/d2host/entrypoint.sh"]
 

@@ -6,10 +6,11 @@
 # Fog.dll and D2Net.dll itself. The image is built FOR one engine version — see the
 # `d2host` target in deploy/Dockerfile — and the binary refuses to run as any other.
 #
-# Mounts (only /game is required):
-#   /game   the engine's own DLLs + that ERA's data archives, READ-ONLY (proprietary;
-#           never baked in). Must match the version this image was built for: a .bin
-#           table is a raw struct dump, so another era's tables decode as garbage.
+# Mounts (none are required when the image carries its own tree):
+#   /game   the engine's own DLLs + that ERA's data archives. Baked into the image for every
+#           engine with a published tree; mount one here to replace it, or to supply it at all
+#           for an engine that has none. Must match the version this image was built for: a
+#           .bin table is a raw struct dump, so another era's tables decode as garbage.
 #   /wine   wine prefix (persist on a volume to skip re-init)
 #   /work   scratch: the assembled game dir + logs
 #
@@ -22,7 +23,7 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 # without a window, and d2host has no WinMain — it is our own console exe.
 WINE_HEADLESS_OVERRIDES="mscoree=d;mshtml=d;winemenubuilder.exe=d"
 
-[ -f /game/D2Game.dll ] || { echo "FATAL: mount an engine install at /game (no D2Game.dll found)"; exit 1; }
+[ -f /game/D2Game.dll ] || { echo "FATAL: no D2Game.dll at /game. This image carries no tree for ${D2HOST_ENGINE:-this engine}, so mount a matching ${D2HOST_ENGINE:-} install there."; exit 1; }
 
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
   echo "initialising wine prefix at $WINEPREFIX ..."

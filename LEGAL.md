@@ -6,10 +6,12 @@ code**. The only binary fixture is `tools/stub.mpq` — an *empty* MPQ container
 (header + empty tables, no files inside), used as a placeholder for media
 archives the headless server doesn't need.
 
-`tools/make-minimal.sh` builds a minimal 1.14d install from a local copy: every
-MPQ member a headless server never opens is stripped, and graphics blocks are
-stripped out of the tilesets it keeps (`tools/mpqmin`) — no audio, no video, no
-CD keys. Every published `ghcr.io/jaenster/d2gs` image bakes in a copy of that stripped
+`tools/make-minimal.sh` builds a minimal 1.14d install from a local copy, and
+`tools/make-minimal-engine.sh` does the same per pre-1.14 engine — that version's
+own DLLs rebuilt from its patch installer, its tables, and the shared archives.
+Every MPQ member a headless server never opens is stripped, and graphics blocks
+are stripped out of the tilesets it keeps (`tools/mpqmin`) — no audio, no video,
+no CD keys. Every published `ghcr.io/jaenster/d2gs` image bakes in a copy of that stripped
 set, fetched at build time from a mirror at files.typeguru.nl, so the images run
 without a manual data-supply step. Diablo II 1.14d receives no further updates or
 enforcement from Blizzard and is treated here as abandonware; if that changes,
