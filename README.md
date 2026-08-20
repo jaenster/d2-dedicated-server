@@ -5,7 +5,7 @@
 This repo exists out of multiple components.
 
 - **1.14d** d2gs via wine and **native** on linux (no wine)
-- **1.06b**, **1.09d**, **1.10f** d2gs
+- **1.06b**, **1.07**, **1.08**, **1.09b**, **1.09d**, **1.10f** d2gs
 - A cloud native realm server
 - D2Ingress, an ingress implementation for 
 
@@ -25,8 +25,8 @@ Just like a typical docker package, that for example is ran with debian or alphi
 | version                                                           | what it is                                                                                             | wine | Needs volume |
 |-------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------|--------------|
 | `d2gs:1.14d`                                                      | The headless game server, running from a 1.14d install via wine                                        | Yes  | No           |
-| `d2gs:1.07`,`d2gs:1.08`, `d2gs:1.09d`, `d2gs:1.10f`               | A headless game server for, using the game's dll's, replacable with your own versions of the dll       | Yes  | No           |
-| `d2gs:1.06b`,                                                     | A headless game server for, just like above yet this is for classic, no LOD                            | Yes  | No           |
+| `d2gs:1.07`, `d2gs:1.08`, `d2gs:1.09b`, `d2gs:1.09d`, `d2gs:1.10f` | A headless game server for, using the game's dll's, replacable with your own versions of the dll       | Yes  | Yes          |
+| `d2gs:1.06b`                                                      | A headless game server for, just like above yet this is for classic, no LOD                            | Yes  | Yes          |
 | **[`d2gs:1.14d-native`](#d2gs-native-the-wine-free-game-server)** | Special port of the macos 1.14d version that is ported to linux, to run natively on linux without wine | No   | No           |
 
 
@@ -161,7 +161,15 @@ It comes in 3 variants -
 - `d2gs:1.14d-native-latest` - Running the macos modified to a posix linux binary, with d2gs patched into it
   More: [`apps/d2gs-native/README.md`](apps/d2gs-native/README.md).
 
-- `d2gs:[1.06b|1.08|1.10f|1.13c]-latest` - a own written zig exe that uses the version's dll's to host a game server
+- `d2gs:[1.06b|1.07|1.08|1.09b|1.09d|1.10f]-latest` - a own written zig exe that uses the version's dll's to host a game server
+
+  The engine is compiled in, not selected at runtime: an image tagged for one version refuses to be
+  told to serve another, and a version whose ABI is not fully measured fails the *build* rather than
+  shipping broken. Unlike `1.14d`, these need the matching game data mounted at `/game` -- a `.bin`
+  table is a raw struct dump, so data from another patch level decodes as garbage rather than
+  failing cleanly. `tools/re/patchdata.py` rebuilds a version's tables from its own patch installer.
+
+  **1.13c is not working yet** -- its ABI is measured but it faults during game-data-table init.
 
 On a join the server does not read a shared disk, and does not ask the realm -- it reads the character straight from redis and writes it back there when the game ends.
 
