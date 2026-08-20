@@ -1,59 +1,111 @@
 #!/bin/bash
-# make-minimal-engine.sh — assemble a minimal, era-matched /game tree for ONE pre-1.14 engine.
+# make-minimal-engine.sh — build the game tree for the pre-1.14 engines, in two layers.
 #
-# The 1.14d recipe (tools/make-minimal.sh) rebuilds that version's own archives. The older engines
-# need something extra: their tables do not exist as files anywhere. Each patch shipped them as Ptc
-# deltas over the expansion base, so they are recovered from the patch installer first
-# (tools/re/patchdata.py) and dropped in as loose files, which our Fog prefers over the archives.
+#   tools/make-minimal-engine.sh base   <out>            the archives, ONCE, shared by every engine
+#   tools/make-minimal-engine.sh engine <ver> <out>      that engine's DLLs and tables
 #
-# This ships the RECIPE, not Blizzard's bytes: you supply the base archives and the patch installer.
+# The split is the point. mpqmin keeps by EXTENSION, not by version, so the minimised archives come
+# out identical whichever engine you build them for — about 10 MB that every image can share rather
+# than carry a copy of. What genuinely differs per engine is small: its DLLs and its tables.
 #
-#   D2_BASE=/path/with/d2data.mpq,d2exp.mpq \
-#   D2_PATCHES=/path/with/LODPatch_109b.exe \
-#     tools/make-minimal-engine.sh 1.09b out/game-1.09b
+# It is fine that the shared set carries expansion files a classic engine never opens. Sharing costs
+# a few megabytes once; splitting costs a separate archive per engine forever.
 #
-# Why loose tables rather than a rebuilt Patch_D2.mpq: a .bin is a raw struct dump with no version
-# marker, so the ONLY thing keeping an engine from reading another era's table as garbage is that
-# the right file is in front of it. Loose files make that visible in the tree instead of hidden
-# inside an archive.
+# Both layers come out of the same two inputs, so there is one thing to supply:
+#   D2_BASE      a directory holding d2data.mpq and d2exp.mpq
+#   D2_PATCHES   the directory of LODPatch_*/D2Patch_* installers
+#   D2_LOD_BASE  the 1.07 expansion PE files, which every later DLL is a delta against
+#
+# This ships the RECIPE, not Blizzard's bytes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 [ -f "$ROOT/.env" ] && { set -a; . "$ROOT/.env"; set +a; }
-
-ENGINE="${1:?usage: make-minimal-engine.sh <engine> <outdir>   e.g. 1.09b out/game-1.09b}"
-OUT="${2:?usage: make-minimal-engine.sh <engine> <outdir>}"
-BASE="${D2_BASE:?set D2_BASE to a directory holding d2data.mpq and d2exp.mpq}"
-PATCHES="${D2_PATCHES:?set D2_PATCHES to the directory holding the LODPatch_*/D2Patch_* installers}"
 MPQMIN="${MPQMIN:-$ROOT/tools/mpqmin/mpqmin}"
+MPQCAT="${MPQCAT:-$ROOT/zig-out/bin/mpqcat}"
+D2PATCH="${D2PATCH:-$ROOT/zig-out/bin/d2patch}"
 
-# Classic engines predate the expansion and read only d2data; LoD ones read both.
-case "$ENGINE" in
-    1.00|1.06b) ARCHIVES="d2data.mpq"; INSTALLER="D2Patch_${ENGINE/./}" ;;
-    *)          ARCHIVES="d2data.mpq d2exp.mpq"; INSTALLER="LODPatch_${ENGINE//./}" ;;
-esac
-INSTALLER="$PATCHES/${INSTALLER/D2Patch_106b/D2Patch_106b}.exe"
+usage() { sed -n '2,12p' "$0"; exit 1; }
+MODE="${1:-}"; shift || usage
 
-mkdir -p "$OUT/data/global/excel"
+case "$MODE" in
+base)
+    OUT="${1:?usage: make-minimal-engine.sh base <out>}"
+    BASE="${D2_BASE:?set D2_BASE to a directory holding d2data.mpq and d2exp.mpq}"
+    # An archive's (listfile) is optional and older ones are badly incomplete: v1.00's d2data names
+    # a few hundred bytes worth. A member the listfile does not name is invisible to the rebuild and
+    # gets dropped, which does not fail loudly -- the engine asserts deep inside LoadAllTxts on a
+    # table that is simply absent. Point D2_LISTFILE at a community listfile for pre-1.14 archives.
+    LF=""
+    [ -n "${D2_LISTFILE:-}" ] && LF="--listfile $D2_LISTFILE"
+    if [ -z "$LF" ]; then
+        echo "!!  no D2_LISTFILE set. 1.14d archives name everything they hold, but the older ones do"
+        echo "!!  not, and what the listfile omits is dropped silently. Verify the result boots."
+    fi
+    mkdir -p "$OUT"
+    # Both archives, always: a classic engine ignores d2exp rather than tripping over it, and one
+    # shared layer is worth more than the megabytes saved by tailoring it.
+    for a in d2data.mpq d2exp.mpq; do
+        [ -f "$BASE/$a" ] || { echo "missing $BASE/$a"; exit 1; }
+        echo "==> minimising $a"
+        "$MPQMIN" $LF "$BASE/$a" "$OUT/$a"
+    done
+    du -sh "$OUT" | sed 's/^/==> shared base: /'
+    ;;
+engine)
+    VER="${1:?usage: make-minimal-engine.sh engine <ver> <out>}"
+    OUT="${2:?usage: make-minimal-engine.sh engine <ver> <out>}"
+    BASE="${D2_BASE:?set D2_BASE}"
+    PATCHES="${D2_PATCHES:?set D2_PATCHES}"
+    # Which base a DLL delta is cut against follows the era, not the date: classic patches rebase
+    # the v1.00 CD files, expansion patches rebase 1.07's. Handing a delta the wrong base is caught
+    # by its own source CRC rather than silently producing a broken DLL.
+    case "$VER" in
+        1.00|1.06b)
+            INST="$PATCHES/D2Patch_${VER//./}.exe"
+            LOD="${D2_CLASSIC_BASE:?set D2_CLASSIC_BASE to the v1.00 classic PE files - classic engines rebase those, not the 1.07 ones}"
+            ;;
+        *)
+            INST="$PATCHES/LODPatch_${VER//./}.exe"
+            LOD="${D2_LOD_BASE:?set D2_LOD_BASE to the 1.07 expansion PE files}"
+            ;;
+    esac
+    [ -f "$INST" ] || { echo "missing $INST"; exit 1; }
+    mkdir -p "$OUT/data/global/excel"
 
-# 1. Strip the archives to what a headless server reads. mpqmin's default rule keeps the data
-#    extensions and drops the graphics blocks, which is most of a 256 MB d2data.
-for a in $ARCHIVES; do
-    [ -f "$BASE/$a" ] || { echo "missing $BASE/$a"; exit 1; }
-    echo "==> minimising $a"
-    "$MPQMIN" "$BASE/$a" "$OUT/$a"
-done
+    # The DLLs are Ptc deltas against the 1.07 base, same as the tables — so one installer yields
+    # both halves of what this engine needs and there is nothing else to source.
+    echo "==> rebuilding $VER DLLs from $(basename "$INST")"
+    WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+    "$D2PATCH" carve "$INST" "$WORK/patch.mpq" >/dev/null
+    for m in D2Game.dll D2Common.dll D2Lang.dll D2CMP.dll Storm.dll; do
+        "$MPQCAT" "$WORK/patch.mpq" "$m" "$WORK/$m.delta" >/dev/null 2>&1 || { echo "   $m: absent"; continue; }
+        if "$D2PATCH" apply "$WORK/$m.delta" "$LOD/$m" "$OUT/$m" >/dev/null 2>&1; then
+            echo "   $m ok"
+        else
+            echo "   $m FAILED"; exit 1
+        fi
+    done
 
-# 2. Recover this engine's own tables from its patch installer. 1.06b is the exception: it reads
-#    .txt straight from the archive and its patch carries no tables, so there is nothing to add.
-if [ -f "$INSTALLER" ]; then
-    echo "==> recovering tables from $(basename "$INSTALLER")"
-    MPQCAT="$ROOT/zig-out/bin/mpqcat" D2PATCH="$ROOT/zig-out/bin/d2patch" \
-        python3 tools/re/patchdata.py "$INSTALLER" "$(echo $ARCHIVES | tr ' ' '\n' | sed "s|^|$BASE/|" | paste -sd, -)" \
-        "$OUT/data/global/excel"
+    # Classic Fog was renumbered at the LoD boundary, so a classic module's imports mean something
+    # else to our Fog — sometimes a DIFFERENT function of the same number. Retarget them here rather
+    # than leaving a trap for whoever assembles the image.
+    case "$VER" in
+        1.00|1.06b)
+            echo "==> retargeting $VER Fog imports onto the LoD numbering"
+            for m in D2Game.dll D2Common.dll D2CMP.dll D2Lang.dll; do
+                [ -f "$OUT/$m" ] || continue
+                "$ROOT/zig-out/bin/fogrewrite" "$OUT/$m" "$OUT/$m.rw" --accept-inferred >/dev/null
+                mv "$OUT/$m.rw" "$OUT/$m"
+            done
+            ;;
+    esac
+
+    echo "==> recovering $VER tables"
+    MPQCAT="$MPQCAT" D2PATCH="$D2PATCH" python3 tools/re/patchdata.py "$INST" \
+        "$BASE/d2exp.mpq,$BASE/d2data.mpq" "$OUT/data/global/excel"
     rm -rf "$OUT/data/global/excel/.patchdata"
-else
-    echo "==> no installer at $INSTALLER — the archives alone are this engine's era"
-fi
-
-du -sh "$OUT" | sed 's/^/==> /'
+    du -sh "$OUT" | sed 's/^/==> engine layer: /'
+    ;;
+*) usage ;;
+esac
