@@ -1340,10 +1340,17 @@ fn onChangePassword(c: *Conn, tag: []const u8, body: []const u8) void {
     var ok = false;
     var stored: [20]u8 = undefined;
     if (store.accountPwHash(user, &stored)) |has_pw| {
-        var verified = !has_pw; // password-less account: nothing to prove
-        if (!verified) {
+        // A password-less account has no proof to offer, and treating that as "nothing to prove"
+        // hands it to whoever asks first: an unauthenticated client could set a password on any
+        // such account and own it. The only proof it can give is that this connection is ALREADY
+        // logged in as that account, so that is what is required.
+        var verified = false;
+        if (has_pw) {
             const expect = xsha1.doubleHash(client_token, server_token, stored);
             verified = std.mem.eql(u8, &expect, &old_proof);
+        } else {
+            verified = c.account_len != 0 and std.ascii.eqlIgnoreCase(c.accountName(), user);
+            if (!verified) log.line(tag, "changepassword '{s}' refused: password-less and this connection is not logged in as it", .{user});
         }
         if (verified) ok = store.setAccountPassword(user, new_hash);
     } // null = no such account -> ok stays false
