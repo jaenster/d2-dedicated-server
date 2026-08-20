@@ -292,6 +292,15 @@ fn takeMessageFor(list: u32, buf: ?[*]u8, cap: u32) u32 {
             c.* = .{};
             continue;
         }
+        // The enter-game opcode is also the save-upload opcode, and the engine's upload handler is
+        // ungated: it appends into the same buffer the realm's fetch filled. A closed game does not
+        // refuse it, it overflows on it. Nothing legitimate needs more than a few bytes here.
+        if (c.buf[0] == enter_op and n > cs.max_enter_game) {
+            sayFmt("d2net: client {d} sent {d} bytes as enter-game 0x{x} — refusing a character upload", .{ i, n, enter_op });
+            _ = closesocket(c.sock);
+            c.* = .{};
+            continue;
+        }
         const total = 4 + n;
         if (total > cap) {
             sayFmt("d2net: client {d} packet too long for the engine buffer ({d} > {d})", .{ i, total, cap });

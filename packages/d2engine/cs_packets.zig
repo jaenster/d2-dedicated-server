@@ -196,6 +196,20 @@ pub fn joinPacket(v: version.Version) ?struct { op: u8, len: usize } {
 /// block as the join, so it moves with it: 0x6b on every LoD build, and 0x65 on classic, six lower.
 /// A 1.14d-speaking client sends 0x6b, which is past the END of classic's 0x6A-entry table — the
 /// engine cannot even size it, and closes the connection rather than answering.
+/// The largest an enter-game packet is ever legitimately allowed to be.
+///
+/// This opcode does double duty. Saying "I have loaded, put me in the world" is one job; carrying a
+/// client-supplied character save in an OPEN game is the other, and the engine's handler for it is
+/// UNGATED on every version measured — its only check is a stub that returns 1. It appends into
+/// pClient->pSaveGame, the same buffer the realm's fetch fills, so on a closed game it is not
+/// refused: it lands past the real save and eventually trips the engine's overflow assert, which
+/// halts the process.
+///
+/// We never want a client-supplied save, on any version, so the opcode is bounded to the size the
+/// real job needs. That is the whole of the defence and it belongs here rather than at the ingress,
+/// because the opcode number is version-specific and the ingress is deliberately version-blind.
+pub const max_enter_game: usize = 16;
+
 pub fn enterGamePacket(v: version.Version) ?u8 {
     // It is always the variable-length slot four past the join, on every table read so far:
     // 1.06b 0x61 -> 0x65, 1.07..1.09 0x65 -> 0x69, 1.10f 0x67 -> 0x6b, 1.13c 0x68 -> 0x6c.
@@ -212,6 +226,12 @@ test "enter-game moves with the join it shares a block with" {
     try std.testing.expectEqual(@as(u8, 0x6c), enterGamePacket(.v113c).?);
     try std.testing.expectEqual(@as(i32, -1), packet_size_113c[0x6c]);
     try std.testing.expectEqual(@as(i32, -1), packet_size_110f[0x6b]);
+    // It is variable-length on every build, which is exactly what makes it usable as an upload —
+    // and why it is bounded rather than trusted.
+    for ([_]version.Version{ .v106b, .v107, .v108, .v109b, .v109d, .v110f, .v113c }) |v| {
+        const op = enterGamePacket(v).?;
+        try std.testing.expectEqual(@as(i32, -1), packetSizes(v).?[op]);
+    }
     // six lower, the same shift the join and the system block take
     try std.testing.expectEqual(@as(u8, 6), enterGamePacket(.v110f).? - enterGamePacket(.v106b).?);
     try std.testing.expectEqual(@as(u8, 6), joinPacket(.v110f).?.op - joinPacket(.v106b).?.op);
