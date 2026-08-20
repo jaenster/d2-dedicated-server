@@ -5,7 +5,7 @@
 This repo exists out of multiple components.
 
 - **1.14d** d2gs via wine and **native** on linux (no wine)
-- **1.06b**, **1.07**, **1.08**, **1.09b**, **1.09d**, **1.10f** d2gs
+- **1.06b**, **1.07**, **1.08**, **1.09b**, **1.09d**, **1.10f**, **1.13c** d2gs
 - A cloud native realm server
 - D2Ingress, an ingress implementation for 
 
@@ -161,7 +161,7 @@ It comes in 3 variants -
 - `d2gs:1.14d-native-latest` - Running the macos modified to a posix linux binary, with d2gs patched into it
   More: [`apps/d2gs-native/README.md`](apps/d2gs-native/README.md).
 
-- `d2gs:[1.06b|1.07|1.08|1.09b|1.09d|1.10f]-latest` - a own written zig exe that uses the version's dll's to host a game server
+- `d2gs:[1.06b|1.07|1.08|1.09b|1.09d|1.10f|1.13c]-latest` - a own written zig exe that uses the version's dll's to host a game server
 
   The engine is compiled in, not selected at runtime: an image tagged for one version refuses to be
   told to serve another, and a version whose ABI is not fully measured fails the *build* rather than
@@ -169,7 +169,11 @@ It comes in 3 variants -
   table is a raw struct dump, so data from another patch level decodes as garbage rather than
   failing cleanly. `tools/re/patchdata.py` rebuilds a version's tables from its own patch installer.
 
-  **1.13c is not working yet** -- its ABI is measured but it faults during game-data-table init.
+  Every one of them completes a real client join end to end -- login, character, game create,
+  join, `IN GAME` -- verified with the clientless. Note that almost nothing is shared between them:
+  1.13c renumbered its entire export table in D2Game, D2Common, D2Lang AND D2Net, and the join
+  opcode differs three ways across the set (0x61 classic, 0x65 on 1.07-1.09, 0x67 on 1.10f, 0x68 on
+  1.13c and 1.14d).
 
 On a join the server does not read a shared disk, and does not ask the realm -- it reads the character straight from redis and writes it back there when the game ends.
 
