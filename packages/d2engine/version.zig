@@ -141,17 +141,26 @@ pub fn spec(comptime v: Version) Spec {
             .fog = .lod,
             .expansion = true,
             .modules = &lod_modules,
+            // Confirmed against Marsgod's 1.13c D2Server.dll, which imports these by number:
+            // 10048 takes the callback table, 10037 the game-data table, 10038 initialises, 10040
+            // pumps the network, 10044 creates a game, 10047 shuts down.
+            //
+            // UNVERIFIED, and the reference never calls them, so nothing corroborates the
+            // structural match: init_clock, set_init_seed, process_game. Treat them as suspect —
+            // worker_context was structurally matched to 10021 the same way and 10021 turned out to
+            // be a FOG ordinal, not a D2Game one at all. It is left wrong-but-named here only
+            // because 1.13c does not reach the tick loop yet; fix it before it does.
             .game = .{
                 .init_server_module = 10038,
                 .init_game_data_table = 10037,
                 .set_server_callbacks = 10048,
-                .init_clock = 10016,
+                .init_clock = 10016, // unverified
                 .net_messages = 10040,
-                .worker_context = 10021,
-                .process_game = 10056,
+                .worker_context = 10021, // WRONG — 10021 is a Fog ordinal; the real one is unknown
+                .process_game = 10056, // unverified
                 .flush_game = 10002,
                 .create_empty_game = 10044,
-                .set_init_seed = 10017,
+                .set_init_seed = 10017, // unverified
                 .shutdown = 10047,
             },
             .common = .{ .load_all_txts = 10943, .set_compile_tables = 10563 },
