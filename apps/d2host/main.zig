@@ -1459,7 +1459,6 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     var i: usize = 0;
     var last_beat: usize = 0;
     while (realmConfigured() or i < tick_frames) : (i += 1) {
-        pumpCharacterLoads();
         if (realmConfigured()) {
             pumpRealm();
             // ~5s at 50ms a frame. The record carries a 90s TTL, so missing a few beats under
@@ -1470,6 +1469,19 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
             }
         }
         if (netmsgs) |p| @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();
+
+        // Immediately after the network pump and BEFORE the game tasks run, because a join is
+        // processed in the call above and the fetch it queues has to reach the engine within the
+        // same frame. Left until the next one, `sSrvTaskProcessGame` gets there first, finds a game
+        // whose only client has no player unit yet, and deletes it as empty -- so the delivery then
+        // looks up a game that no longer exists, the lock returns null, and the engine reports
+        // `SrvRecvDatabaseCharacter: *** Failed SrvLockGame ***` and drops the client.
+        //
+        // Still outside the callback, which is the thing that must not happen: delivering from
+        // inside fpGetDatabaseCharacter would re-enter the engine's join continuation halfway
+        // through its own join call. After the pump returns is late enough for that and early
+        // enough for this.
+        pumpCharacterLoads();
 
         // Drain every game the worker has ready, not just one per frame: at 50 ms a frame a
         // single game per tick is a hard cap on how fast anything reaches a client.

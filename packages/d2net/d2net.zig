@@ -159,6 +159,8 @@ var join_op: u8 = cs.join_110f;
 var join_len: usize = cs.join_110f_len;
 /// The client speaks 1.14d, whose enter-game is 0x6b; classic wants 0x65.
 var enter_op: u8 = 0x6b;
+/// How far this engine's join block sits below the one a 1.14d client speaks.
+var op_delta: u8 = 0;
 
 /// cdecl and by plain name, like Fog's: the engine never calls this, only our host does, and a
 /// stdcall export would pick up mingw's `@4` decoration.
@@ -174,6 +176,7 @@ export fn D2NET_SetEngineVersion(v: u32) callconv(.c) i32 {
                 join_op = jp.op;
                 join_len = jp.len;
                 enter_op = cs.enterGamePacket(@enumFromInt(f.value)) orelse 0x6b;
+                op_delta = cs.join_114d - join_op;
             const sys = cs.systemRange(@enumFromInt(f.value)) orelse return 0;
             system_lo = sys.lo;
             system_hi = sys.hi;
@@ -197,12 +200,23 @@ fn packetLenFor(buf: []const u8) ?usize {
 /// Rewrite in place at the head of a client's buffer, before framing sees it.
 fn translateHead(c: *Client) void {
     if (!translate_join) return;
-    // Enter-game rides the join's block and moves with it, so it is translated on its own account —
-    // 1.13c needs it (0x6b -> 0x6c) even though its join is already the one the client speaks.
-    if (c.len >= 1 and c.buf[0] == 0x6b and enter_op != 0x6b) {
-        c.buf[0] = enter_op;
-        sayFmt("d2net: translated enter-game 0x6b into 0x{x}", .{enter_op});
-        return;
+    // The handshake opcodes after the join move WITH the join, as a block. Reading the versions
+    // side by side against their own join, every one is the same shape — join, three one-byte
+    // packets, then the variable-length slot — so the client's are translated by the same delta
+    // its join is, and nothing has to be special-cased per version.
+    //
+    // Getting this wrong is silent both ways. The client's 0x6b is the ONE-BYTE ready signal, not
+    // the variable slot four past the join; rewriting it to that slot hands the engine a
+    // save-upload header with no body, and sending it unshifted lands on whatever that number
+    // happens to mean on an older build — on 1.10f it is answered by removing the client from the
+    // game it just joined.
+    if (op_delta != 0 and c.len >= 1) {
+        const op = c.buf[0];
+        if (op > cs.join_114d and op <= cs.join_114d + 4) {
+            c.buf[0] = op - op_delta;
+            sayFmt("d2net: shifted handshake 0x{x} into this engine's 0x{x}", .{ op, c.buf[0] });
+            return;
+        }
     }
     // The join itself needs nothing when the engine already speaks the client's: rewriting 0x68/37
     // into 1.10f's 0x67/29 mangles a packet the engine would have taken, and it answers by ignoring
