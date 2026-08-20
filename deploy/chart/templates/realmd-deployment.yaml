@@ -49,9 +49,15 @@ spec:
               value: {{ required "gameAddr is required: the d2ingress address clients dial for game traffic (defaults to the first floatingIP when set)" $gameAddr | quote }}
             - name: REALMD_REDIS_ADDR
               value: "realmd-redis:6379"
+            {{- $pgSecret := "realmd-pg" }}
+            {{- $pgKey := "DSN" }}
+            {{- if not .Values.postgres.enabled }}
+              {{- $pgSecret = required "postgres.external.secretName is required when postgres.enabled is false: realmd has nowhere to read its DSN from" .Values.postgres.external.secretName }}
+              {{- $pgKey = .Values.postgres.external.secretKey }}
+            {{- end }}
             - name: REALMD_PG_DSN
               valueFrom:
-                secretKeyRef: { name: realmd-pg, key: DSN }
+                secretKeyRef: { name: {{ $pgSecret | quote }}, key: {{ $pgKey | quote }} }
             - name: REALMD_REQUIRE_GS
               value: {{ ternary "1" "0" .Values.requireGS | quote }}
             - name: REALMD_LOG_JSON

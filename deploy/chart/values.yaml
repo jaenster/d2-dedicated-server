@@ -94,7 +94,21 @@ realmd:
 
 # ── Postgres: durable character saves ──────────────────────────────────────────────
 postgres:
+  # Run a Postgres as part of this chart. It is one pod with one volume and no backups, which
+  # is fine for trying the realm out and is not where characters should live for long. Turn it
+  # off and set `external` below to use a database the cluster already runs — an operator-managed
+  # cluster with failover and point-in-time recovery is the difference between losing a node and
+  # losing everyone's characters.
   enabled: true
+
+  # Where realmd's DSN comes from when `enabled` is false: a Secret you already have, which is
+  # normally the one the Postgres operator generated. Naming the secret rather than the DSN keeps
+  # the password out of your values file, and out of whatever git repo that lives in.
+  external:
+    # Secret holding the connection string. REQUIRED when postgres.enabled is false.
+    secretName: ""
+    # Key within it. CloudNativePG writes a ready-made `uri`; other operators differ.
+    secretKey: uri
   image: postgres:16-alpine
   auth:
     username: realmd
