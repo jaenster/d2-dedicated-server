@@ -24,7 +24,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # is injected into Game.exe rather than hosting D2Game.dll as a library, and 1.14d-native drops
 # wine entirely — but that is an implementation detail the tag has no business exposing. A consumer
 # picks an engine; which Dockerfile target builds it is our problem.
-ALL="1.00 1.06b 1.07 1.08 1.09d 1.10f 1.13c 1.14d 1.14d-native"
+ALL="1.00 1.06b 1.07 1.08 1.09b 1.09d 1.10f 1.13c 1.14d 1.14d-native"
 ENGINES="${*:-$ALL}"
 
 # Which target builds a given engine. Only the pre-1.14 ones take -Dengine-version.

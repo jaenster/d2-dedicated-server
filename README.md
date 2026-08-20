@@ -25,8 +25,8 @@ Just like a typical docker package, that for example is ran with debian or alphi
 | version                                                           | what it is                                                                                             | wine | Needs volume |
 |-------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------|--------------|
 | `d2gs:1.14d`                                                      | The headless game server, running from a 1.14d install via wine                                        | Yes  | No           |
-| `d2gs:1.07`, `d2gs:1.08`, `d2gs:1.09b`, `d2gs:1.09d`, `d2gs:1.10f` | A headless game server for, using the game's dll's, replacable with your own versions of the dll       | Yes  | Yes          |
-| `d2gs:1.06b`                                                      | A headless game server for, just like above yet this is for classic, no LOD                            | Yes  | Yes          |
+| `d2gs:1.07`, `d2gs:1.08`, `d2gs:1.09b`, `d2gs:1.09d`, `d2gs:1.10f`, `d2gs:1.13c` | A headless game server, using the game's own dll's, replacable with your own versions of the dll | Yes  | Yes          |
+| `d2gs:1.06b`                                                      | The same, for classic — no LOD                                                                          | Yes  | Yes          |
 | **[`d2gs:1.14d-native`](#d2gs-native-the-wine-free-game-server)** | Special port of the macos 1.14d version that is ported to linux, to run natively on linux without wine | No   | No           |
 
 
