@@ -81,6 +81,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The same string the engines job builds its tags from. Actions expressions cannot strip a
+      # prefix — there is no substring() — so it is done here, once, rather than spelled two ways.
+      - name: work out the release version
+        id: ver
+        run: |
+          if [ "${{ github.ref_type }}" = tag ]; then
+            echo "release=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -92,9 +102,13 @@ jobs:
           # `:latest` only moves once `promote` confirms e2e passed on THIS sha. A vN.N.N
           # push additionally publishes that version. An empty line here is ignored, which is
           # what the non-tag case produces.
+          #
+          # The version is the tag WITHOUT its `v`, because that is what the engines job stamps.
+          # A release that publishes d2gs:1.10f-0.3.0 alongside realmd:v0.3.0 spells its own
+          # version two ways, and a deployment pinning both gets exactly one of them wrong.
           tags: |
             ghcr.io/jaenster/${{ matrix.image }}:${{ github.sha }}
-            ${{ github.ref_type == 'tag' && format('ghcr.io/jaenster/{0}:{1}', matrix.image, github.ref_name) || '' }}
+            ${{ steps.ver.outputs.release && format('ghcr.io/jaenster/{0}:{1}', matrix.image, steps.ver.outputs.release) || '' }}
 
       # Hand the realmd image the e2e job runs to it, rather than have it build one again. It was
       # rebuilding from cold — two minutes of a three-minute job, duplicating what this matrix had
