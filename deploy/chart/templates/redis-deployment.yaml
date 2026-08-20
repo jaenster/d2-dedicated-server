@@ -1,4 +1,25 @@
 {{- if .Values.redis.enabled }}
+{{- if .Values.redis.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: realmd-redis
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+  annotations:
+    # The realm's in-flight saves live here. A prune would take them with it.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.redis.persistence.size | quote }}
+  {{- with .Values.redis.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,6 +30,12 @@ metadata:
 spec:
   replicas: 1
   revisionHistoryLimit: {{ .Values.realmd.revisionHistoryLimit }}
+  {{- if .Values.redis.persistence.enabled }}
+  # One ReadWriteOnce volume cannot be held by the old pod and the new one at once, so a rolling
+  # update would deadlock on itself. Take the realm's state down for the seconds it takes instead.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "realm.selectorLabels" (dict "root" . "component" "redis") | nindent 6 }}
@@ -20,11 +47,34 @@ spec:
       containers:
         - name: redis
           image: {{ .Values.redis.image | quote }}
+          args:
+            {{- if .Values.redis.persistence.enabled }}
+            # appendonly, not the default snapshot: a save that arrived since the last RDB write
+            # is exactly the one worth keeping.
+            - --appendonly
+            - "yes"
+            {{- end }}
+            {{- with .Values.redis.maxmemory }}
+            - --maxmemory
+            - {{ . | quote }}
+            - --maxmemory-policy
+            - {{ $.Values.redis.maxmemoryPolicy | quote }}
+            {{- end }}
           ports:
             - { containerPort: 6379, name: redis }
+          {{- if .Values.redis.persistence.enabled }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          {{- end }}
           readinessProbe:
             exec: { command: ["redis-cli", "ping"] }
             periodSeconds: 5
           resources:
             {{- toYaml .Values.redis.resources | nindent 12 }}
+      {{- if .Values.redis.persistence.enabled }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: realmd-redis
+      {{- end }}
 {{- end }}
