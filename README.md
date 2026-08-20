@@ -177,12 +177,14 @@ separate package per mechanism: which of the three below serves a tag is our pro
   `tools/re/patchdata.py` rebuilds that version's tables from its own patch installer, and its DLLs
   come out of the same installer as Ptc deltas over the 1.07 base.
 
-  Every engine carries one, so there is nothing to mount for any of them. Two are still finishing
-  bring-up in the *host* rather than in their data: **1.13c** loads its whole table set and then
-  faults calling `GAME_SetServerCallbackFunctions` — some of its ordinals are structural guesses
-  that `packages/d2engine/version.zig` marks as unverified — and **1.06b** faults inside `d2host`
-  itself just after D2Lang init. Mounting a real install changes neither, which is why both still
-  ship their tree.
+  Every engine carries one, so there is nothing to mount for any of them, and every one of them
+  reaches the tick loop from the image alone.
+
+  A classic engine gets a DIFFERENT tree, built by `base-classic`: its own `d2data.mpq` and no
+  `d2exp.mpq` at all. The expansion archive is not merely surplus there — the engine opens it
+  first, so every table without a loose override would be read in expansion format by a classic
+  parser. Its string tables come out of its own patch too, into `data/local/lng/ENG`, since they
+  are not excel and were previously being read from the very archive that has to go.
 
   Every one of them completes a real client join end to end -- login, character, game create,
   join, `IN GAME` -- verified with the clientless. Note that almost nothing is shared between them:
