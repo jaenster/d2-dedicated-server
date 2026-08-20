@@ -428,7 +428,22 @@ fn pumpCharacterLoads() void {
         } else if (send_character) |send| {
             _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetimes, p.container);
         } else return;
-        if (!refused) sayHex("d2host: character delivered, bytes ", p.len);
+        if (!refused) {
+            sayHex("d2host: character delivered, bytes ", p.len);
+            // The four fields the engine's header parser gates on, before it will build anything.
+            // Every one of its rejections comes back as the same opaque "Error:14=nError", so the
+            // only way to tell a bad checksum from a stale new-character bit is to say what we sent.
+            if (p.len >= 0x28) {
+                const sig = std.mem.readInt(u32, p.save[0..4], .little);
+                const ver = std.mem.readInt(u32, p.save[4..8], .little);
+                const declared = std.mem.readInt(u32, p.save[8..12], .little);
+                const status = std.mem.readInt(u32, p.save[0x24..0x28], .little);
+                sayFmt("d2host: save sig=0x{x} ver=0x{x} declared={d} actual={d} status=0x{x} new_char={s}", .{
+                    sig, ver, declared, p.len, status,
+                    if (status & 1 != 0) "yes" else "NO — the engine will want a full save body",
+                });
+            }
+        }
     }
 }
 

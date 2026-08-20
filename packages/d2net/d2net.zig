@@ -212,6 +212,29 @@ fn translateHead(c: *Client) void {
     // game it just joined.
     if (op_delta != 0 and c.len >= 1) {
         const op = c.buf[0];
+        // The keep-alive moves with the block like everything else, but it is also the one that
+        // cannot simply be renumbered: it is thirteen bytes on 1.14d and nine on 1.10f, so a
+        // shifted-but-unresized ping leaves four bytes behind and every command after it is read
+        // at an offset. Truncating to the engine's own length keeps the stream in step; the first
+        // dword (the tick) is what the handler reads.
+        //
+        // Getting this wrong is not a framing nuisance. On 1.10f the UNSHIFTED 0x6d is
+        // GAME_VerifyDisconnect -> GAME_DisconnectClientById, so a 1.14d client's keep-alive asks
+        // the server to hang it up — moments after it finally got into the world.
+        if (op == cs.ping_114d) {
+            const want = op - op_delta;
+            const size = if (want < sizes.len) sizes[want] else 0;
+            if (size > 0 and c.len >= @as(usize, @intCast(size))) {
+                const n: usize = @intCast(size);
+                c.buf[0] = want;
+                if (c.len > cs.ping_114d_len) {
+                    std.mem.copyForwards(u8, c.buf[n..], c.buf[cs.ping_114d_len..c.len]);
+                }
+                c.len -= cs.ping_114d_len - n;
+                sayFmt("d2net: keep-alive 0x{x}/{d} reshaped into 0x{x}/{d}", .{ op, cs.ping_114d_len, want, n });
+            }
+            return;
+        }
         if (op > cs.join_114d and op <= cs.join_114d + 4) {
             c.buf[0] = op - op_delta;
             sayFmt("d2net: shifted handshake 0x{x} into this engine's 0x{x}", .{ op, c.buf[0] });

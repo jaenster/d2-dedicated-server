@@ -502,12 +502,33 @@ export fn FOG_Encode14BitsToString(chars: ?*[2]u16, value: u32) callconv(.winapi
     _ = value;
 }
 
-/// `(void* pData, size_t dwSize)` — two args, not one value.
+/// `(void* pData, size_t dwSize)` — two args, not one value, and it is NOT a general-purpose hash.
+///
+/// This is the .d2s save checksum, and the engine verifies a delivered character with it before it
+/// will load one: `FUN_6fc8dd00` (1.10f D2Game's save-header parser) computes it over the whole
+/// buffer and compares against the dword the save carries, returning code 6 on a mismatch. Every
+/// one of that parser's rejections reaches a host as the same opaque
+/// `[PLAYER LOAD] ClientAddPlayerToGame() Error Loading:<name> Error:14=nError`, so getting this
+/// wrong reads as "the save is bad" and never as "the checksum function is".
+///
+/// Transcribed from the real 1.10f Fog @10229 (rva 0x3940), which is a rotate-left-through-carry:
+///
+///     mov dl, [ecx+edi]      ; b
+///     test eax, eax
+///     setl bl                ; carry = sum's sign bit, i.e. bit 31
+///     add edx, ebx           ; b + carry
+///     lea eax, [edx + eax*2] ; sum = b + carry + sum*2
+///
+/// It had been a djb2 (`sum*33 + b`) placeholder, which agrees with the real one on no input at
+/// all. libd2's `formats.d2s.checksum` WRITES saves with the algorithm below, so the writer and
+/// this verifier now match — which is the whole point: a save we produced could never be loaded by
+/// an engine whose Fog we also supply.
 export fn FOG_ComputeChecksum(p: ?[*]const u8, n: u32) callconv(.winapi) u32 {
     trace("FOG_ComputeChecksum @10229");
     var sum: u32 = 0;
     if (p) |q| for (q[0..n]) |b| {
-        sum = sum *% 33 +% b;
+        const carry: u32 = @intFromBool(sum & 0x8000_0000 != 0);
+        sum = @as(u32, b) +% carry +% (sum *% 2);
     };
     return sum;
 }

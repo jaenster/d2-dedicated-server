@@ -351,6 +351,12 @@ test "an unframeable opcode is reported, not guessed" {
 // and that lands on 1.10f's gameId field unchanged.
 
 /// 1.14d's join opcode and length. `join_110f` is what the 1.10f engine expects.
+/// The 1.14d keep-alive, and its length. Called out separately from the join block because the
+/// same NUMBER is GAME_VerifyDisconnect on 1.10f — a client's ping is that engine's hang-up — and
+/// because its length moves too (13 there, 9 at 1.10f), so it is renumbered AND resized.
+pub const ping_114d: u8 = 0x6d;
+pub const ping_114d_len: usize = 13;
+
 pub const join_114d: u8 = 0x68;
 pub const join_114d_len: usize = 37;
 pub const join_110f: u8 = 0x67;
