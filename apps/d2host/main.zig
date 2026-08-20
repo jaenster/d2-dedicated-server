@@ -1229,8 +1229,16 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     // Skipping it leaves sghStringTable null and D2Common's charstats load asserts in strtable.cpp.
     if (byOrdinal(d2lang, comptime d2version.spec(version).lang.strtable_init)) |p| {
         say("d2host: calling D2Lang STRTABLE_Init");
-        const Init = fn (u32, [*:0]const u8, u32) callconv(.c) u32;
-        const r = fastcall.fastcallAt(Init).call(@intFromPtr(p), .{ 0, "ENG", 1 });
+        // Classic takes the two register arguments and nothing else. Pushing `bExpansion` at a
+        // build that ends `ret 0` strands it: ESP is left four bytes low and the fault surfaces on
+        // the next aligned SSE spill in OUR code, nowhere near a string table.
+        const r = if (comptime d2version.spec(version).lang.strtable_init_takes_expansion) blk: {
+            const Init = fn (u32, [*:0]const u8, u32) callconv(.c) u32;
+            break :blk fastcall.fastcallAt(Init).call(@intFromPtr(p), .{ 0, "ENG", 1 });
+        } else blk: {
+            const Init = fn (u32, [*:0]const u8) callconv(.c) u32;
+            break :blk fastcall.fastcallAt(Init).call(@intFromPtr(p), .{ 0, "ENG" });
+        };
         sayHex("d2host: D2Lang init returned=", r);
     } else say("d2host: D2Lang @10000 missing");
 

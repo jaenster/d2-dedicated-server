@@ -85,10 +85,18 @@ pub const CommonOrdinals = struct {
 /// D2Lang's host-facing entry points. Its NAMED exports are the `Unicode::` C++ methods and they
 /// did not move; the NONAME block 10000-10013 did, and 1.13c permuted all fourteen of them.
 pub const LangOrdinals = struct {
-    /// `STRTABLE_Init(hArchive, szLanguage, bExpansion)`, __fastcall, `ret 4`. hArchive is ignored —
+    /// `STRTABLE_Init(hArchive, szLanguage, bExpansion)`, __fastcall. hArchive is ignored —
     /// 1.13c's own callers reach it through D2Win @10016, which is literally `xor eax,eax; ret`.
     /// Skipping this leaves sghStringTable null and D2Common's charstats load asserts in strtable.cpp.
     strtable_init: u16 = 10000,
+    /// Whether it takes the third argument at all. An expansion build ends `ret 4` and pops the
+    /// pushed `bExpansion`; classic ends `ret 0` because there is no expansion for it to be told
+    /// about, so the two register arguments are the whole signature.
+    ///
+    /// Getting this wrong does not look like an ABI bug. The stack is left four bytes low, and the
+    /// fault lands on the next `movaps` the compiler emits in OUR code — an aligned SSE spill in a
+    /// function that has nothing to do with string tables.
+    strtable_init_takes_expansion: bool = true,
 };
 
 /// D2Net's host-facing entry points. 1.13c renumbered these along with everything else.
@@ -120,7 +128,14 @@ const lod_modules = classic_modules;
 
 pub fn spec(comptime v: Version) Spec {
     return switch (v) {
-        .v100 => .{ .name = "1.00", .fog = .classic, .expansion = false, .modules = &classic_modules, .stack_args = .{} },
+        .v100 => .{
+            .name = "1.00",
+            .fog = .classic,
+            .expansion = false,
+            .modules = &classic_modules,
+            .lang = .{ .strtable_init_takes_expansion = false },
+            .stack_args = .{},
+        },
         // 1.06b's table loader is @10554, not @10576 — @10576 there is an unrelated bounds check,
         // and calling it returns without reading a single table. It has no compile-tables setter at
         // all, which costs nothing: 1.06b reads .txt directly and never wants compiled tables.
@@ -130,6 +145,8 @@ pub fn spec(comptime v: Version) Spec {
             .expansion = false,
             .modules = &classic_modules,
             .common = .{ .load_all_txts = 10554, .set_compile_tables = null },
+            // `ret 0`, not `ret 4`: there is no expansion to tell a classic build about.
+            .lang = .{ .strtable_init_takes_expansion = false },
             .stack_args = callbacks.v106b,
         },
         // 1.09b is a hybrid, not an early 1.09d: it keeps 1.06b-through-1.08's 12-argument
