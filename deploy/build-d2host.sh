@@ -31,6 +31,9 @@ set -e
 APP_VERSION="${1:?usage: build-d2host.sh <app-version> [engine ...]}"
 shift
 REPO="${D2GS_IMAGE_REPO:-d2gs}"
+# Same default as the Dockerfile ARG of this name, and passed down so the two cannot disagree
+# about where a tree comes from.
+D2_MINIMAL_ENGINE_BASE="${D2_MINIMAL_ENGINE_BASE:-https://files.typeguru.nl/diablo/minimal}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Every engine, in release order. 1.14d is one of them: it is a different mechanism — the server
@@ -57,11 +60,24 @@ for engine in $ENGINES; do
   if [ "${D2GS_TAG_FLOATING:-1}" = 1 ]; then set -- "$@" -t "${REPO}:${engine}"; fi
   if [ "${D2GS_PUSH:-0}" = 1 ]; then set -- "$@" --push; fi
   target=$(target_for "$engine")
+  # Whether a game tree is published for this engine, asked of the same place the Dockerfile
+  # fetches it from. The image builds either way -- one without a tree still runs off a mounted
+  # install -- but the two must not look alike here, or an image that ships no data reads as a
+  # clean build. Asked over HTTP rather than read out of the build log because a cached layer
+  # prints nothing, and "cached" would then be indistinguishable from "no tree".
+  tree="" tree_arg=""
+  if [ "$target" = d2host ]; then
+    tree_arg="--build-arg D2_MINIMAL_ENGINE_BASE=$D2_MINIMAL_ENGINE_BASE"
+  fi
+  if [ "$target" = d2host ] && \
+     ! curl -fsI "${D2_MINIMAL_ENGINE_BASE}/${engine}/d2-${engine}-minimal.tgz" >/dev/null 2>&1; then
+    tree=" (no game tree — needs an install mounted at /game)"
+  fi
   printf '==> %s:%s-%s (%s) ... ' "$REPO" "$engine" "$APP_VERSION" "$target"
   if docker build -q -f "$ROOT/deploy/Dockerfile" --target "$target" \
-       --build-arg "D2_VERSION=$engine" --build-arg "APP_VERSION=$APP_VERSION" \
+       --build-arg "D2_VERSION=$engine" --build-arg "APP_VERSION=$APP_VERSION" $tree_arg \
        "$@" "$ROOT" >/dev/null 2>"$ROOT/.build-$engine.err"; then
-    echo "ok"
+    echo "ok${tree}"
     built="$built $engine"
     rm -f "$ROOT/.build-$engine.err"
   else
