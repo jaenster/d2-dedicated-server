@@ -123,10 +123,30 @@ postgres:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
 
-# ── Redis: ephemeral sessions + games (native TTL) ─────────────────────────────────
+# ── Redis: sessions, games, the fleet — and saves on their way to Postgres ─────────
 redis:
   enabled: true
   image: redis:7-alpine
+
+  # Sessions and games are disposable; a character save is not. It lands here first and a worker
+  # moves it to Postgres afterwards, so a redis that comes back empty has silently thrown away
+  # every save still inside that window. A small volume and an append-only log is what makes a
+  # restart cost a reconnect instead of somebody's last hour.
+  persistence:
+    enabled: true
+    size: 1Gi
+    # Empty string uses the cluster default StorageClass.
+    storageClass: ""
+
+  # Keep redis under its own ceiling so it refuses writes instead of being OOM-killed with the
+  # realm's live state in it. Set this below `resources.limits.memory` — the process needs room
+  # above the dataset for buffers and the rewrite.
+  maxmemory: 96mb
+  # noeviction on purpose. Every other policy answers memory pressure by deleting a key, and the
+  # keys here are sessions, live games and unflushed characters — losing one quietly is worse
+  # than a write that fails loudly.
+  maxmemoryPolicy: noeviction
+
   resources:
     requests: { cpu: 50m, memory: 32Mi }
     limits: { cpu: 200m, memory: 128Mi }
