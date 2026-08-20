@@ -263,18 +263,25 @@ pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) boo
 
 /// Publish this server's heartbeat: it exists, where clients reach it, and how loaded it is.
 /// The TTL is what makes a server that dies disappear without anyone having to notice.
-pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32, full: bool, ttl_s: u32) bool {
+/// Publish this server into the realm's view. `labels` is what it says it IS — `k=v` pairs
+/// separated by newlines, `v=<engine>` first — appended after the fixed part so a realm that
+/// predates labels reads the record unchanged. A fleet hosting more than one engine is not
+/// interchangeable, and this is how the realm can ask for the right one instead of the free one.
+pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32, full: bool, ttl_s: u32, labels: []const u8) bool {
     var kb: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, "realmd:gs:{x}", .{gsid}) catch return false;
-    var vb: [15]u8 = undefined;
+    var vb: [15 + 96]u8 = undefined;
     @memcpy(vb[0..4], &ip);
     std.mem.writeInt(u16, vb[4..6], gs_port, .little);
     std.mem.writeInt(u32, vb[6..10], maxgame, .little);
     std.mem.writeInt(u32, vb[10..14], live, .little);
     vb[14] = @intFromBool(full);
+    const nlab = @min(labels.len, vb.len - 15);
+    @memcpy(vb[15..][0..nlab], labels[0..nlab]);
+    const val = vb[0 .. 15 + nlab];
     var pb: [16]u8 = undefined;
     const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
-    const rep = command(&.{ "SET", key, &vb, "PX", px }) orelse return false;
+    const rep = command(&.{ "SET", key, val, "PX", px }) orelse return false;
     switch (rep.value) {
         .status, .int => {},
         .bulk => |b| if (b == null) return false,

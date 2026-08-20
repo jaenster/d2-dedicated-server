@@ -81,6 +81,14 @@ var public_port: u16 = 4100;
 var max_games: u32 = 7;
 var live_games: u32 = 0;
 
+/// What this server publishes about itself, so a realm can choose WHICH server rather than
+/// whichever is free. `v` is the engine, and it is set from the version this instantiation of `run`
+/// was generated for — so it cannot disagree with what the process actually drives.
+///
+/// A fleet stops being interchangeable the moment it hosts more than one engine: a 1.10f client
+/// sent to a 1.13c server does not get a worse game, it gets no game.
+var gs_labels: []const u8 = "";
+
 /// The realm link is optional. Without a store address this stays a standalone spike that creates
 /// one game and ticks — which is exactly what it was, and still the quickest way to prove a build.
 fn realmConfigured() bool {
@@ -1470,6 +1478,8 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     // only naming the call in flight distinguishes "hung in @10004" from "hung in @10005".
     // Long enough to connect to by hand. The transport polls inside the read path, so a frame is
     // also a network poll — there is no separate accept loop to run.
+    gs_labels = "v=" ++ comptime d2version.spec(version).name;
+    sayFmt("d2host: publishing labels [{s}]", .{gs_labels});
     say("d2host: ticking");
     var i: usize = 0;
     var last_beat: usize = 0;
@@ -1480,7 +1490,7 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
             // load takes this server out of rotation rather than handing the realm a stale route.
             if (i - last_beat >= 100) {
                 last_beat = i;
-                _ = store.putHeartbeat(gsid, public_ip, public_port, max_games, live_games, live_games >= max_games, 90);
+                _ = store.putHeartbeat(gsid, public_ip, public_port, max_games, live_games, live_games >= max_games, 90, gs_labels);
             }
         }
         if (netmsgs) |p| @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();

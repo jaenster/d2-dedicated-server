@@ -142,6 +142,13 @@ COPY --from=build-native /src/zig-out/bin/d2gs-native /d2gs-native
 COPY --from=gamedata-mac /gamedata /game
 WORKDIR /game
 ENV D2MAC_BIN=/game/DiabloII_macho
+# The same ENGINE as the wine 1.14d image — a client is choosing a game version, not a runtime.
+ARG APP_VERSION=0.0.0
+LABEL org.d2gs.engine-version="1.14d" \
+      org.d2gs.runtime="native" \
+      org.opencontainers.image.version="1.14d-native-${APP_VERSION}" \
+      org.opencontainers.image.title="d2gs (1.14d, wine-free)" \
+      org.opencontainers.image.description="Headless Diablo II 1.14d dedicated server, no wine"
 # The engine writes its resource file to the temporary-items folder during startup, and a scratch
 # image has no /tmp for it to land in. Declaring it as a volume is what creates the directory.
 # /game is deliberately not one: an anonymous volume over it would hide the baked tree.
@@ -226,6 +233,7 @@ FROM debian:bookworm-slim AS gs
 RUN dpkg --add-architecture i386 && apt-get update && \
     apt-get install -y --no-install-recommends wine wine32 curl ca-certificates xvfb && \
     rm -rf /var/lib/apt/lists/*
+ARG APP_VERSION=0.0.0
 # The GS needs only these two DLLs (dbghelp proxy + payload) — not realmd's checkrev.
 COPY --from=build-dlls /src/zig-out/bin/dbghelp.dll /src/zig-out/bin/d2gs.dll /opt/d2gs/
 # The minimal 1.14d install, baked in. It used to arrive at runtime from a separate
@@ -237,6 +245,13 @@ COPY --from=gamedata-windows /gamedata /game
 COPY deploy/gs-entrypoint.sh /opt/d2gs/entrypoint.sh
 RUN chmod +x /opt/d2gs/entrypoint.sh
 ENV WINEPREFIX=/wine WINEDEBUG=-all
+# The engine this image serves, stated the same way every other d2gs tag states it. A deployment
+# selects a game server by version, so the version has to be legible from the image and not only
+# from the tag someone happened to pull it under.
+LABEL org.d2gs.engine-version="1.14d" \
+      org.opencontainers.image.version="1.14d-${APP_VERSION}" \
+      org.opencontainers.image.title="d2gs (1.14d, wine)" \
+      org.opencontainers.image.description="Headless Diablo II 1.14d dedicated server"
 # /game holds the baked install and is NOT declared a volume — an anonymous volume over it would
 # hide the very data this image ships. /wine = wine prefix, /work = scratch (assembled game dir +
 # logs), /mods = optional server-mod DLLs (each --loaddll'd after d2gs.dll), /moddata = optional

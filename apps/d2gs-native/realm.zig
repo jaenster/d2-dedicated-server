@@ -710,7 +710,10 @@ const event_ttl_s: u32 = 3600;
 /// Our record: address, capacity, load, and whether we are full. `full` answers what the count
 /// alone cannot — a finished game holds its slot until the engine collects it.
 fn publish() void {
-    _ = store.putHeartbeat(gsid, public_ip, public_port, game_cap, liveGames(), liveGames() >= game_cap, heartbeat_ttl_s);
+    // Same ENGINE as the wine 1.14d server — the realm is choosing a game version, not a runtime.
+    // Which of the two hosts it is is our business, and `d2gs:1.14d-native` already says it to a
+    // human; a client only cares that it is 1.14d.
+    _ = store.putHeartbeat(gsid, public_ip, public_port, game_cap, liveGames(), liveGames() >= game_cap, heartbeat_ttl_s, "v=1.14d");
 }
 
 /// A server that just started hosts nothing, so the realm must drop whatever still names it.

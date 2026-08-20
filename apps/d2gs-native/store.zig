@@ -156,18 +156,23 @@ pub fn ping() bool {
 
 /// Publish this server: where clients reach it, its capacity, its load, and whether it is full.
 /// The TTL is how a server that dies leaves the fleet without anyone having to notice.
-pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32, full: bool, ttl_s: u32) bool {
+/// `labels` is what this server says it IS — `k=v` pairs, newline-separated, `v=<engine>` first —
+/// appended after the fixed part so a realm that predates labels reads the record unchanged.
+pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32, full: bool, ttl_s: u32, labels: []const u8) bool {
     var kb: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, "realmd:gs:{x}", .{gsid}) catch return false;
-    var v: [15]u8 = undefined;
-    @memcpy(v[0..4], &ip);
-    std.mem.writeInt(u16, v[4..6], gs_port, .little);
-    std.mem.writeInt(u32, v[6..10], maxgame, .little);
-    std.mem.writeInt(u32, v[10..14], live, .little);
-    v[14] = @intFromBool(full);
+    var vb: [15 + 96]u8 = undefined;
+    @memcpy(vb[0..4], &ip);
+    std.mem.writeInt(u16, vb[4..6], gs_port, .little);
+    std.mem.writeInt(u32, vb[6..10], maxgame, .little);
+    std.mem.writeInt(u32, vb[10..14], live, .little);
+    vb[14] = @intFromBool(full);
+    const nlab = @min(labels.len, vb.len - 15);
+    @memcpy(vb[15..][0..nlab], labels[0..nlab]);
+    const v = vb[0 .. 15 + nlab];
     var pb: [16]u8 = undefined;
     const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
-    const r = cmd(&.{ "SET", key, &v, "PX", px }) orelse return false;
+    const r = cmd(&.{ "SET", key, v, "PX", px }) orelse return false;
     switch (r) {
         .status, .int => {},
         .bulk => |b| if (b == null) return false,

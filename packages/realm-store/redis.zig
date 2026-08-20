@@ -1597,13 +1597,17 @@ pub fn registerGs(rec: types.GsRec, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
     const key = gsKey(&kb, rec.gsid);
     if (key.len == 0) return false;
-    // ip[4] ++ port(u16) ++ maxgame(u32) ++ live(u32) ++ full(u8) = 15 bytes.
-    var vb: [15]u8 = undefined;
+    // ip[4] ++ port(u16) ++ maxgame(u32) ++ live(u32) ++ full(u8) = 15 bytes, then the server's
+    // labels. The tail is append-only for a reason: a reader that predates it stops at 15 and is
+    // unaffected, and the Lua that decrements the live count keeps everything from byte 15 on.
+    var vb: [15 + types.labels_max]u8 = undefined;
     @memcpy(vb[0..4], &rec.gs_ip);
     std.mem.writeInt(u16, vb[4..6], rec.gs_port, .little);
     std.mem.writeInt(u32, vb[6..10], rec.maxgame, .little);
     std.mem.writeInt(u32, vb[10..14], rec.live_games, .little);
     vb[14] = @intFromBool(rec.full);
+    @memcpy(vb[15..][0..rec.labels_len], rec.labels[0..rec.labels_len]);
+    const val = vb[0 .. 15 + @as(usize, rec.labels_len)];
 
     var idb: [16]u8 = undefined;
     const idstr = std.fmt.bufPrint(&idb, "{x}", .{rec.gsid}) catch return false;
@@ -1616,9 +1620,9 @@ pub fn registerGs(rec: types.GsRec, ttl_s: u32) bool {
     if (ttl_s > 0) {
         var pb: [16]u8 = undefined;
         const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
-        c.add(&.{ "SET", key, &vb, "PX", px });
+        c.add(&.{ "SET", key, val, "PX", px });
     } else {
-        c.add(&.{ "SET", key, &vb });
+        c.add(&.{ "SET", key, val });
     }
     c.add(&.{ "SADD", prefix ++ "gs", idstr });
     c.flush();
@@ -1967,6 +1971,9 @@ pub fn snapshotGs(out: []types.GsRec) usize {
             .live_games = std.mem.readInt(u32, val[10..14], .little),
             .full = val[14] != 0,
         };
+        // Anything past the fixed part is what the server says it is. A record written before
+        // labels existed simply has none, which reads as "matches no requirement".
+        if (val.len > 15) out[n].setLabels(val[15..]);
         n += 1;
     }
 

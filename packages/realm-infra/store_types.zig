@@ -1,4 +1,6 @@
 //! Types shared by the persistence facade (store.zig) and its backends.
+const std = @import("std");
+
 pub const max_chars = 16;
 
 pub const Name = struct {
@@ -90,7 +92,52 @@ pub const GsRec = struct {
     /// The server itself answered "full" — it knows about slots still held by the reap window,
     /// which `live_games` cannot see.
     full: bool = false,
+    /// What this server says it IS, as `k=v` pairs separated by newlines. A fleet is not
+    /// interchangeable once it hosts more than one engine: a 1.10f client cannot be sent to a
+    /// 1.13c server, so the realm has to be able to ask for one by what it is rather than take
+    /// whichever has room.
+    ///
+    /// `v` is the engine version and the first label anything selects on (`v=1.10f`). Free-form on
+    /// purpose — a server can publish whatever else it wants to be chosen by, and a realm that does
+    /// not know a key simply never asks for it.
+    ///
+    /// Carried on the wire AFTER the fixed 15 bytes, which is what keeps an older reader working:
+    /// it stops at 15 and never sees them, and the Lua that adjusts the live count preserves the
+    /// tail (`string.sub(rec,15)`) rather than truncating it.
+    labels: [labels_max]u8 = [_]u8{0} ** labels_max,
+    labels_len: u8 = 0,
+
+    pub fn setLabels(self: *GsRec, text: []const u8) void {
+        const n = @min(text.len, labels_max);
+        @memcpy(self.labels[0..n], text[0..n]);
+        self.labels_len = @intCast(n);
+    }
+
+    /// The value of one label, or null when this server never published it. An absent label is not
+    /// a mismatch — see `matchesLabel`.
+    pub fn label(self: *const GsRec, key: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, self.labels[0..self.labels_len], '\n');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+        }
+        return null;
+    }
+
+    /// Whether this server satisfies a `key=value` requirement.
+    ///
+    /// A server that does not publish the key at all does NOT match. That is deliberate: the
+    /// alternative is a fleet where an unlabelled server answers every request, which is exactly
+    /// the mistake that sends a 1.10f client to whatever happened to be free.
+    pub fn matchesLabel(self: *const GsRec, key: []const u8, want: []const u8) bool {
+        const have = self.label(key) orelse return false;
+        return std.mem.eql(u8, have, want);
+    }
 };
+
+/// Enough for a handful of short `k=v` pairs. Fixed rather than allocated: this record is written
+/// on every heartbeat and every game create, on paths that do not allocate.
+pub const labels_max = 96;
 
 /// A game enumerated from the shared store (name + record) — used to serve /admin/games
 /// when sessions/games live in redis/pg rather than the per-instance in-memory table.
@@ -119,3 +166,25 @@ pub const NamedGame = struct {
         g.desc_len = n;
     }
 };
+
+
+test "a server matches a label it published, and never one it did not" {
+    var rec = GsRec{ .gsid = 1, .gs_ip = .{ 127, 0, 0, 1 } };
+    rec.setLabels("v=1.10f\nrt=wine");
+
+    try std.testing.expectEqualStrings("1.10f", rec.label("v").?);
+    try std.testing.expectEqualStrings("wine", rec.label("rt").?);
+    try std.testing.expect(rec.label("nope") == null);
+
+    try std.testing.expect(rec.matchesLabel("v", "1.10f"));
+    try std.testing.expect(!rec.matchesLabel("v", "1.13c"));
+    // A prefix is not a match: 1.09b and 1.09d are different servers.
+    try std.testing.expect(!rec.matchesLabel("v", "1.10"));
+
+    // The case that matters most: a server that says nothing must NOT answer a request for a
+    // specific engine. Matching an unlabelled server is how a 1.10f client ends up on a 1.13c
+    // server, which does not degrade — it fails.
+    var silent = GsRec{ .gsid = 2, .gs_ip = .{ 127, 0, 0, 1 } };
+    try std.testing.expect(silent.label("v") == null);
+    try std.testing.expect(!silent.matchesLabel("v", "1.10f"));
+}
