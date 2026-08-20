@@ -16,14 +16,14 @@ Next steps:
      realmAddr is set to {{ .Values.realmAddr }} — make sure it matches that IP.
 {{- end }}
 
-  2. Supply the proprietary D2 1.14d game data before the GS will start (the entrypoint
-     exits if /game/Game.exe is missing):
-{{- if .Values.gameServer.dataImage.repository }}
-     dataImage {{ .Values.gameServer.dataImage.repository }}:{{ .Values.gameServer.dataImage.tag }} — the load-gamedata initContainer
-     copies /gamedata into an emptyDir per pod (no persistent volume).
+  2. Game data:
+{{- if .Values.gameServer.gameFiles.enabled }}
+     gameServer.gameFiles is on — populate the d2-gamefiles PVC with the install you want
+     served. It is mounted over /game and HIDES the copy in the image, so the GS will not
+     start until it holds a real install (the entrypoint exits without /game/Game.exe).
 {{- else }}
-     no dataImage set — populate the d2-gamefiles PVC fallback with a real install, or set
-     gameServer.dataImage.repository to a private image carrying the minimal data set.
+     nothing to do — {{ .Values.images.gs.repository }}:{{ .Values.images.gs.tag }} carries a minimal
+     install at /game. Set gameServer.gameFiles.enabled to serve a different one instead.
 {{- end }}
 
   3. Clients connect to {{ if .Values.realmAddr }}{{ .Values.realmAddr }}{{ else }}<realmd-LB-IP>{{ end }}; realmd won't accept

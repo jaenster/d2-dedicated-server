@@ -258,7 +258,7 @@ model {
       }
       bnftp = component 'bnftp' {
         #ours
-        description 'BNFTP file transfer for the version check. The ONLY thing the realm reads from local disk (packages/realm-store/assets.zig): read-only image content — the version-check MPQ (ver-IX86-1.mpq) and the banner ad — identical on every instance, so there is nothing to keep in sync. On k8s <data_dir>/bnftp is populated by a load-vermpq initContainer from the d2-gamedata image.'
+        description 'BNFTP file transfer for the version check. The ONLY thing the realm reads from local disk (packages/realm-store/assets.zig): read-only image content — the version-check MPQ (ver-IX86-1.mpq) and the banner ad — identical on every instance, so there is nothing to keep in sync. On k8s <data_dir>/bnftp is populated by a load-vermpq initContainer; the game-data set carries no ver-IX86-1.mpq, so that file comes from wherever the deployment sources it.'
       }
       rd2cs = component 'd2cs' {
         #ours

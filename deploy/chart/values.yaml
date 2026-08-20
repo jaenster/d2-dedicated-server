@@ -4,7 +4,7 @@
 #
 # These defaults are GENERIC and safe to publish: no real cluster IPs or passwords.
 # At minimum you must set `realmAddr` (the public address clients dial) — game data
-# ships baked into the default `gameServer.dataImage`, so no manual data step is needed.
+# is baked into the game-server image itself, so no manual data step is needed.
 
 # Realm display name shown in the client realm list.
 realmName: MyRealm
@@ -55,17 +55,20 @@ images:
     repository: ghcr.io/jaenster/realmd
     tag: latest
     pullPolicy: Always
+  # Every game server is a tag on the ONE d2gs repository — the engine version is the tag, the
+  # way it is for postgres. 1.14d serves via wine, 1.14d-native without it, and 1.06b … 1.13c
+  # host the game's own DLLs; which one a tag uses is not something a values file has to know.
   gs:
     repository: ghcr.io/jaenster/d2gs
-    tag: latest
+    tag: "1.14d"
     pullPolicy: Always
   d2ingress:
     repository: ghcr.io/jaenster/d2ingress
     tag: latest
     pullPolicy: Always
   gsNative:
-    repository: ghcr.io/jaenster/d2gs-native
-    tag: latest
+    repository: ghcr.io/jaenster/d2gs
+    tag: "1.14d-native"
     pullPolicy: Always
 
 # ── realmd: the stateless protocol front (bnetd + MCP realm) ───────────────────────
@@ -125,23 +128,13 @@ gameServer:
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: 1000m, memory: 1Gi }
-  # Ships the minimal 1.14d data set in a small image: a load-gamedata initContainer
-  # copies /gamedata into an emptyDir game volume — NO persistent volume, ~16MB rides
-  # in the image, nothing for Longhorn to replicate. Defaults to the public image this
-  # repo's pipeline builds (deploy/Dockerfile's `gamedata` target, fetched from
-  # files.typeguru.nl — see tools/make-minimal.sh and LEGAL.md) — a bare `helm install`
-  # gets a working GS with zero manual data step. Point it at your own image instead to
-  # ship different/updated data; set `repository` to "" to fall back to the gameFiles
-  # PVC below (mount your own install by hand).
-  dataImage:
-    repository: "ghcr.io/jaenster/d2-gamedata"
-    tag: latest
-    pullPolicy: Always
-    pullSecret: ""        # imagePullSecret name, only needed for a private data image
+  # The minimal data set rides in the image itself (see LEGAL.md and tools/make-minimal.sh),
+  # so a bare `helm install` gets a working GS with no data step, no initContainer and nothing
+  # for storage to replicate. Turn this on only to serve a DIFFERENT install — a full one, a
+  # mod, or an era that matches a pre-1.14 engine tag — from an RWX volume mounted over /game.
   gameFiles:
-    # FALLBACK (only used when dataImage.repository is empty): RWX PVC holding a
-    # D2 1.14d install. Populate it once before scaling up; it is mounted read-only
-    # into every GS pod. ~16MB is the minimal set, so 256Mi is plenty.
+    enabled: false
+    # Populate it once before scaling up; it is mounted read-only into every GS pod.
     size: 256Mi
     # Empty string uses the cluster default StorageClass. Must support ReadWriteMany.
     storageClass: ""
@@ -154,7 +147,7 @@ gameServer:
 # ── gameServerNative: the wine-free GS, alongside the wine fleet above ─────────────
 # Off by default: it runs the 1.14d Mac image in-process and is newer than the wine path, so a
 # realm that enables it will have some games hosted by each. Its data is baked into the image, so
-# there is no dataImage / gameFiles here.
+# there is no gameFiles override here.
 gameServerNative:
   enabled: false
   replicas: 1
@@ -164,7 +157,7 @@ gameServerNative:
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: 1000m, memory: 1Gi }
-  # imagePullSecret name — the d2gs-native package is private, unlike realmd/d2gs/d2ingress.
+  # imagePullSecret name, only needed if you point images.gsNative at a private repository.
   pullSecret: ""
 
 # ── d2ingress: token-translating game gateway (public on the FIPs when floatingIPs set) ─

@@ -38,21 +38,6 @@ spec:
                   matchLabels:
                     {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 20 }}
                 topologyKey: kubernetes.io/hostname
-      {{- if .Values.gameServer.dataImage.repository }}
-      {{- if .Values.gameServer.dataImage.pullSecret }}
-      # Pull the private game-data init image.
-      imagePullSecrets:
-        - name: {{ .Values.gameServer.dataImage.pullSecret }}
-      {{- end }}
-      # Copy the minimal game data into the game emptyDir — no persistent volume.
-      initContainers:
-        - name: load-gamedata
-          image: "{{ .Values.gameServer.dataImage.repository }}:{{ .Values.gameServer.dataImage.tag }}"
-          imagePullPolicy: {{ .Values.gameServer.dataImage.pullPolicy }}
-          command: ["sh", "-c", "cp -a /gamedata/. /game/"]
-          volumeMounts:
-            - { name: game, mountPath: /game }
-      {{- end }}
       containers:
         - name: d2gs
           image: "{{ .Values.images.gs.repository }}:{{ .Values.images.gs.tag }}"
@@ -87,7 +72,11 @@ spec:
               value: {{ .Values.gameServer.extraArgs | quote }}
             {{- end }}
           volumeMounts:
+            # No `game` mount by default: the image carries its own install at /game. A mount here
+            # HIDES it, which is exactly what serving a different one means.
+            {{- if .Values.gameServer.gameFiles.enabled }}
             - { name: game, mountPath: /game, readOnly: true }
+            {{- end }}
             - { name: wine, mountPath: /wine }
             - { name: work, mountPath: /work }
           resources:
@@ -113,13 +102,11 @@ spec:
             periodSeconds: 15
             failureThreshold: 4
       volumes:
+        {{- if .Values.gameServer.gameFiles.enabled }}
         - name: game
-          {{- if .Values.gameServer.dataImage.repository }}
-          emptyDir: {}     # minimal game data copied in by the load-gamedata initContainer
-          {{- else }}
           persistentVolumeClaim:
             claimName: d2-gamefiles
-          {{- end }}
+        {{- end }}
         - name: wine
           emptyDir: {}     # wine prefix re-inits per start; make it a PVC to persist
         - name: work

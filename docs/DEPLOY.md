@@ -40,13 +40,13 @@ helm install myrealm deploy/chart \
   --set postgres.auth.password=$(openssl rand -hex 16)
 ```
 
-Game data ships baked into the default `gameServer.dataImage` (a public image this repo's
-pipeline builds from the minimal 1.14d set — see `tools/make-minimal.sh`); point `realmAddr`
-at the realmd LoadBalancer's external IP and there's no further data step.
+Game data is baked into the game-server image itself (the minimal set for that engine — see
+`tools/make-minimal.sh`); point `realmAddr` at the realmd LoadBalancer's external IP and there's
+no further data step.
 
 Useful toggles: `postgres.enabled` / `redis.enabled` (use external backends), `d2ingress.enabled`,
-`gameServer.dataImage.repository` (ship data via an initContainer instead of a PVC),
-`gameServer.maxGames`. The raw manifests behind the chart are also in [`deploy/`](../deploy/)
+`images.gs.tag` (which engine the fleet serves), `gameServer.gameFiles.enabled` (mount your own
+install over the baked-in one), `gameServer.maxGames`. The raw manifests behind the chart are also in [`deploy/`](../deploy/)
 (`realmd.yaml`, `gs.yaml`).
 
 ## Docker Compose

@@ -6,7 +6,7 @@ This chart deploys a complete, fleet-shaped Diablo II 1.14d realm on Kubernetes:
   a `LoadBalancer`. Scales freely because all state lives in backing services.
 - **game-server fleet (d2gs)** — headless `Game.exe` under wine. Internal (pod-IP only);
   clients never dial it. See Topology.
-- **game server, wine-free (d2gs-native)** — optional (`gameServerNative.enabled`), the same
+- **game server, wine-free (`d2gs:1.14d-native`)** — optional (`gameServerNative.enabled`), the same
   server as one native process with its data baked in. Publishes into the same redis as the wine
   fleet, so enabling it puts both kinds of server on one realm.
 - **d2ingress** — a token-translating splice gateway, the single public game entry on the
@@ -45,8 +45,8 @@ helm install myrealm deploy/chart \
   --set postgres.auth.password=$(openssl rand -hex 16)
 ```
 
-Game data ships baked into the default `gameServer.dataImage` (see gotchas) — no manual
-step needed unless you want different data. Watch the `realmd` LoadBalancer for its
+Game data is baked into the game-server image (see gotchas) — no manual step needed
+unless you want to serve a different install. Watch the `realmd` LoadBalancer for its
 external IP — that IP is what `realmAddr` must be.
 
 ## Environment contract
@@ -106,15 +106,14 @@ rolls back via git).
 - **No `hostPort`; anti-affinity is soft.** Without a node-level bind the fleet can exceed
   the node count, so pod anti-affinity is `preferred` (weight 100) — it still spreads
   replicas across nodes for fault tolerance but won't block scheduling.
-- **Game data ships via an image (no Longhorn).** `gameServer.dataImage.repository`
-  defaults to this repo's published `d2-gamedata` image — the minimal (~16MB) 1.14d data
-  set (see `tools/make-minimal.sh`, `LEGAL.md`) baked in at `/gamedata`; a `load-gamedata`
-  initContainer `cp -a`s it into an emptyDir game volume per pod — no persistent volume,
-  nothing for Longhorn to replicate. Point it at your own image for different/updated
-  data (`gameServer.dataImage.pullSecret` if that image is private). **Fallback:** set
-  `dataImage.repository` to `""` to instead mount a real D2 1.14d install into the RWX
-  `d2-gamefiles` PVC yourself (read-only into each pod). The entrypoint aborts if
-  `/game/Game.exe` is missing.
+- **Game data rides in the game-server image (no volume, no Longhorn).** Every `d2gs` tag
+  carries the minimal (~16MB) data set for its engine at `/game` (see `tools/make-minimal.sh`,
+  `LEGAL.md`), so a bare install has no data step, no initContainer and nothing for storage to
+  replicate. It used to arrive from a separate `d2-gamedata` image through a `load-gamedata`
+  initContainer; that package is gone. **To serve a different install** — a full one, a mod, or
+  the era matching a pre-1.14 engine tag — set `gameServer.gameFiles.enabled=true` and populate
+  the RWX `d2-gamefiles` PVC: it is mounted read-only over `/game` and HIDES the copy in the
+  image, so the entrypoint aborts until it holds a real install (`/game/Game.exe`).
 - **`REALMD_REQUIRE_GS` gates client traffic** until a game server publishes itself, so
   clients never connect to a realm with no games behind it.
 - **A hostname in `realmAddr`/`gameAddr` is resolved by realmd, inside the cluster.** Both are
@@ -134,9 +133,10 @@ rolls back via git).
 | `postgres.enabled=false` | skip in-cluster Postgres; realmd still reads `realmd-pg/DSN` — override `postgres.auth.*` to point at an external DB |
 | `redis.enabled=false` | skip in-cluster Redis (supply an external `realmd-redis:6379`) |
 | `d2ingress.enabled=false` | skip the gateway |
-| `gameServerNative.enabled=true` | additionally run the wine-free GS (data baked into its image; `gameServerNative.pullSecret` for the private package) |
+| `gameServerNative.enabled=true` | additionally run the wine-free GS (`d2gs:1.14d-native`, data baked in like every other tag) |
 | `permissiveAuth=true` | auto-register unknown accounts password-less instead of rejecting them (test realms) |
-| `gameServer.dataImage.repository=<img>` | ship game data via the load-gamedata initContainer + emptyDir (no PVC); defaults to `ghcr.io/jaenster/d2-gamedata`; empty = use the `d2-gamefiles` PVC fallback |
+| `gameServer.gameFiles.enabled=true` | mount the RWX `d2-gamefiles` PVC over `/game`, replacing the install baked into the image |
+| `images.gs.tag=<engine>` | serve a different engine — any tag the pipeline publishes (`1.06b` … `1.13c`, `1.14d`, `1.14d-native`) |
 | `realmd.recreate=true` | force `strategy: Recreate` (not needed any more; RollingUpdate is the default) |
 | `d2ingress.pullSecret=<name>` | imagePullSecret for the (usually private) d2ingress image |
 

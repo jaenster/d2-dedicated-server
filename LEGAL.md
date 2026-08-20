@@ -9,10 +9,9 @@ archives the headless server doesn't need.
 `tools/make-minimal.sh` builds a minimal 1.14d install from a local copy: every
 MPQ member a headless server never opens is stripped, and graphics blocks are
 stripped out of the tilesets it keeps (`tools/mpqmin`) — no audio, no video, no
-CD keys. The published container images (`ghcr.io/jaenster/d2gs`,
-`d2gs-native`, `d2-gamedata`) bake in a copy of that stripped set, fetched at
-build time from a mirror at files.typeguru.nl, so the images run without a
-manual data-supply step. Diablo II 1.14d receives no further updates or
+CD keys. Every published `ghcr.io/jaenster/d2gs` image bakes in a copy of that stripped
+set, fetched at build time from a mirror at files.typeguru.nl, so the images run
+without a manual data-supply step. Diablo II 1.14d receives no further updates or
 enforcement from Blizzard and is treated here as abandonware; if that changes,
 this section will too.
 

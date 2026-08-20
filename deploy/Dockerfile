@@ -6,15 +6,10 @@
 #
 #   realmd     — clean-room Zig realm server (bnetd + MCP realm on one port). Static musl
 #                binary shipped in scratch: a few-MB image, zero runtime deps.
-#   gs         — headless Diablo II 1.14d under wine, driven by our injected DLLs.
-#                Game data is NOT baked into this image — the chart's load-gamedata
-#                initContainer (or a mounted install) supplies /game at runtime.
-#   gamedata   — the minimal 1.14d data set alone, at /gamedata: what the chart's
-#                initContainer copies into the gs pod's /game. See tools/make-minimal.sh
-#                for how it's assembled; this stage fetches an already-assembled copy
-#                (windows) from files.typeguru.nl rather than rebuilding it in CI.
-#   gs-native  — the wine-free GS: game data IS baked in (the mac minimal set), since
-#                nothing wires an initContainer for it yet — see that target below.
+#   gs         — headless Diablo II 1.14d under wine, driven by our injected DLLs. The
+#                minimal 1.14d data set is baked in at /game, so the image runs with no
+#                volume; mount your own install over /game to replace it.
+#   gs-native  — the same 1.14d server without wine, its data baked in the same way.
 #   d2host     — headless PRE-1.14 server: our host driving the engine's D2Game.dll as a
 #                library, rather than injecting into Game.exe. Built for ONE engine version
 #                and tagged for it, the way a base image is tagged for its distro:
@@ -89,13 +84,6 @@ ARG D2_MINIMAL_WINDOWS_URL=https://files.typeguru.nl/diablo/minimal/114d/windows
 RUN apk add --no-cache curl && mkdir /gamedata && \
     curl -fsSL "$D2_MINIMAL_WINDOWS_URL" | tar -xz -C /gamedata
 
-# gamedata: the windows minimal set alone, for the chart's load-gamedata initContainer
-# The data at /gamedata is the point, but the image cannot be `scratch`: it runs as the
-# initContainer that copies itself into the gs pod's game volume, so it has to bring the shell
-# and the `cp` that do it. busybox is the smallest thing that does, at about a megabyte.
-FROM busybox:musl AS gamedata
-COPY --from=gamedata-windows /gamedata /gamedata
-
 # gs-native: the same server without wine
 # One statically linked file against the wine image's debian + wine32 + wine + Xvfb.
 # Labelled amd64, not 386, even though the binary inside is a 32-bit ELF. containerd matches the
@@ -104,9 +92,8 @@ COPY --from=gamedata-windows /gamedata /gamedata
 # without help. The label is metadata; the ELF is what runs.
 FROM --platform=linux/amd64 scratch AS gs-native
 COPY --from=build-native /src/zig-out/bin/d2gs-native /d2gs-native
-# Baked in directly rather than via an initContainer (unlike gs/gamedata above): nothing
-# public wires up a native-GS deployment yet, so there's no chart step to copy it in.
-# A bind mount at /game (below) still overrides this with a different install if you need one.
+# The mac minimal set, since this target loads the Mac image rather than Game.exe. A bind mount
+# at /game still overrides it with a different install if you need one.
 COPY --from=gamedata-mac /gamedata /game
 WORKDIR /game
 ENV D2MAC_BIN=/game/DiabloII_macho
@@ -184,13 +171,20 @@ RUN dpkg --add-architecture i386 && apt-get update && \
     rm -rf /var/lib/apt/lists/*
 # The GS needs only these two DLLs (dbghelp proxy + payload) — not realmd's checkrev.
 COPY --from=build-dlls /src/zig-out/bin/dbghelp.dll /src/zig-out/bin/d2gs.dll /opt/d2gs/
+# The minimal 1.14d install, baked in. It used to arrive at runtime from a separate
+# `d2-gamedata` image via an initContainer — one more package to publish, keep public and keep in
+# step with this one, for 16 MB that never changes independently of the server that reads it. The
+# entrypoint symlinks /game into a writable /work/game, so a read-only copy here is enough, and a
+# mount over /game still replaces it (a full install, another era, a mod).
+COPY --from=gamedata-windows /gamedata /game
 COPY deploy/gs-entrypoint.sh /opt/d2gs/entrypoint.sh
 RUN chmod +x /opt/d2gs/entrypoint.sh
 ENV WINEPREFIX=/wine WINEDEBUG=-all
-# /game = mounted D2 install (RO), /wine = wine prefix, /work = scratch (assembled game
-# dir + logs), /mods = optional server-mod DLLs (each --loaddll'd after d2gs.dll),
-# /moddata = optional extra data files (MPQs / loose data/ tree) overlaid on the game dir.
-VOLUME ["/game", "/wine", "/work", "/mods", "/moddata"]
+# /game holds the baked install and is NOT declared a volume — an anonymous volume over it would
+# hide the very data this image ships. /wine = wine prefix, /work = scratch (assembled game dir +
+# logs), /mods = optional server-mod DLLs (each --loaddll'd after d2gs.dll), /moddata = optional
+# extra data files (MPQs / loose data/ tree) overlaid on the game dir.
+VOLUME ["/wine", "/work", "/mods", "/moddata"]
 EXPOSE 4000
 ENTRYPOINT ["/opt/d2gs/entrypoint.sh"]
 
@@ -213,7 +207,7 @@ ENTRYPOINT ["/d2ingress"]
 # e2e-runner: tools/stress-e2e, built to run AS A CONTAINER on the compose network
 # (see deploy/compose.e2e.yaml) rather than against published host ports — no exposed ports,
 # no wait-for-host-port shell loop, it dials realmd/gs-native by their compose service names.
-# Not part of the realmd/gs/gs-native/gamedata deploy set; CI-only (and useful for local dev
+# Not part of the realmd / d2gs / d2ingress deploy set; CI-only (and useful for local dev
 # without wine — see run-stress.sh for the bash equivalent this ports).
 FROM zig AS e2e-runner
 COPY tools/stress-e2e ./tools/stress-e2e

@@ -156,12 +156,15 @@ More: [`REALMD.md`](REALMD.md) (configuration, trust model) and
 
 ### d2gs: the headless game server
 
-It comes in 3 variants -
-- `d2gs:1.14d-latest` - Running game.exe, with the entire game's exe and a d2gs patched into it
-- `d2gs:1.14d-native-latest` - Running the macos modified to a posix linux binary, with d2gs patched into it
+It comes in 3 variants. The engine version is the tag, the way it is for `postgres` — a bare
+`d2gs:1.10f` is the newest build of that engine, and `d2gs:1.10f-0.0.1` pins one. There is no
+separate package per mechanism: which of the three below serves a tag is our problem, not yours.
+
+- `d2gs:1.14d` - Running game.exe, with the entire game's exe and a d2gs patched into it
+- `d2gs:1.14d-native` - Running the macos modified to a posix linux binary, with d2gs patched into it
   More: [`apps/d2gs-native/README.md`](apps/d2gs-native/README.md).
 
-- `d2gs:[1.06b|1.07|1.08|1.09b|1.09d|1.10f|1.13c]-latest` - a own written zig exe that uses the version's dll's to host a game server
+- `d2gs:[1.06b|1.07|1.08|1.09b|1.09d|1.10f|1.13c]` - a own written zig exe that uses the version's dll's to host a game server
 
   The engine is compiled in, not selected at runtime: an image tagged for one version refuses to be
   told to serve another, and a version whose ABI is not fully measured fails the *build* rather than
