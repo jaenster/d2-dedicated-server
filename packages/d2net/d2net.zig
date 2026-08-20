@@ -322,11 +322,13 @@ export fn SERVER_Initialize(a: u32, b: u32) callconv(.winapi) u32 {
 }
 
 export fn SERVER_SetMaxClientsPerGame(n: u32) callconv(.winapi) u32 {
+    sayFmt("d2net-trace: SetMaxClientsPerGame", .{});
     max_clients_per_game = n;
     return 0;
 }
 
 export fn SERVER_SetHackListEnabled(n: u32) callconv(.winapi) u32 {
+    sayFmt("d2net-trace: SetHackListEnabled", .{});
     hack_list_enabled = n;
     return 0;
 }
@@ -349,6 +351,22 @@ export fn SERVER_Send(kind: u32, client: u32, data: ?[*]const u8, len: u32) call
         sent += @intCast(n);
     }
     sayFmt("d2net: -> client {d}, {d} bytes (kind {d})", .{ client, len, kind });
+    // The first bytes of a reply are what say whether the engine accepted a join or refused it, and
+    // a refusal on the system list looks identical to a world update from the outside.
+    {
+        var hex: [3 * 24]u8 = undefined;
+        var n: usize = 0;
+        const show = @min(len, 24);
+        for (0..show) |i| {
+            const b = (p + i)[0];
+            const d = "0123456789abcdef";
+            hex[n] = d[b >> 4];
+            hex[n + 1] = d[b & 15];
+            hex[n + 2] = ' ';
+            n += 3;
+        }
+        sayFmt("d2net:    head: {s}", .{hex[0..n]});
+    }
     return 1;
 }
 
@@ -386,6 +404,7 @@ export fn SERVER_GetIpAddressStringFromClientId(client: u32, buf: ?[*]u8, len: u
 
 /// `@10016 (clientId)` — called straight after the engine sends a rejection, so it is the kick.
 export fn SERVER_DisconnectClient(client: u32) callconv(.winapi) u32 {
+    sayFmt("d2net-trace: DisconnectClient", .{});
     if (client >= clients.len or !clients[client].active()) return 0;
     sayFmt("d2net: disconnecting client {d}", .{client});
     _ = closesocket(clients[client].sock);
@@ -394,6 +413,7 @@ export fn SERVER_DisconnectClient(client: u32) callconv(.winapi) u32 {
 }
 
 export fn D2NET_10015(a: u32, b: u32, c: u32) callconv(.winapi) u32 {
+    sayFmt("d2net-trace: D2NET_10015", .{});
     _ = a;
     _ = b;
     _ = c;
@@ -401,6 +421,7 @@ export fn D2NET_10015(a: u32, b: u32, c: u32) callconv(.winapi) u32 {
 }
 
 export fn D2NET_10019(a: u32) callconv(.winapi) u32 {
+    sayFmt("d2net-trace: D2NET_10019", .{});
     _ = a;
     return 0;
 }
@@ -411,6 +432,7 @@ export fn D2NET_10019(a: u32) callconv(.winapi) u32 {
 /// character delivery fails with `*** Failed SrvLockGame for client N ***`. It is the engine's
 /// state, but we are the ones holding it.
 export fn SERVER_SetClientGameGUID(client: u32, guid: u32) callconv(.winapi) u32 {
+    sayFmt("d2net-trace: SetClientGameGUID", .{});
     if (client >= clients.len) return 0;
     clients[client].game_guid = guid;
     sayFmt("d2net: client {d} joined game 0x{x}", .{ client, guid });
@@ -418,6 +440,7 @@ export fn SERVER_SetClientGameGUID(client: u32, guid: u32) callconv(.winapi) u32
 }
 
 export fn SERVER_GetClientGameGUID(client: u32) callconv(.winapi) u32 {
+    sayFmt("d2net-trace: GetClientGameGUID", .{});
     return if (client < clients.len) clients[client].game_guid else 0;
 }
 
