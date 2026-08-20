@@ -396,6 +396,30 @@ pub const v109d: StackArgs = .{
 /// Still not runnable: 1.06b is the classic Fog family, so its imports need rewriting through
 /// `fogrosetta` before it will load, and `hostapi.charNameSource` has no 1.06b entry yet — the
 /// probe run that would measure it is the next step.
+/// 1.09b, counted the same way against its own D2Game (table global 0x6fd242dc), and cross-checked
+/// against the assert strings Blizzard left in it — `ptEventCallbackTable->fpCloseGame` and friends
+/// each sit immediately before the slot the scan assigned, which confirms the whole map by name.
+///
+/// It is a hybrid rather than an early 1.09d: fpLeaveGame is 12, as on 1.06b through 1.08, where
+/// 1.09d is 13; it dispatches 0x20, which 1.09d never reaches; and it has no 0x3C site at all,
+/// which 1.09d added.
+pub const v109b: StackArgs = .{
+    .fpCloseGame = .{ .args = 0 }, // @0x6fc3937d
+    .fpLeaveGame = .{ .args = 12 }, // @0x6fc32bd5 and @0x6fc32c80 — 1.06b..1.08's count, not 1.09d's
+    .fpGetDatabaseCharacter = .{ .args = 2 }, // @0x6fc371b1
+    .fpSaveDatabaseCharacter = .{ .args = 4 }, // @0x6fc7ddc7
+    .fpEnterGame = .{ .args = 3 }, // @0x6fc38841
+    .fpFindPlayerToken = .{ .args = 3 }, // @0x6fc36d93
+    .fpSaveDatabaseGuild = .no_site_found,
+    .fpUnlockDatabaseCharacter = .{ .args = 1 }, // @0x6fc37029 — 1.09d has no site for this
+    .fpReserved0x24 = .no_site_found,
+    .fpUpdateCharacterLadder = .{ .args = 5 }, // three sites, all 5
+    .fpUpdateGameInformation = .{ .args = 2 }, // @0x6fc722c3
+    .fpHandlePacket = .{ .args = 0 }, // @0x6fc37fc2
+    .fpSetGameData = .{ .args = 0 }, // @0x6fc3263b
+    .fpRelockDatabaseCharacter = .{ .args = 1 }, // @0x6fc7dcc5
+};
+
 pub const v106b: StackArgs = .{
     .fpCloseGame = .{ .args = 0 }, // @0x6fcb8a4d
     .fpLeaveGame = .{ .args = 12 }, // two sites @0x6fcb2787 and @0x6fcb2832, both 12

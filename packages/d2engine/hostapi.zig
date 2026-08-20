@@ -83,7 +83,7 @@ pub const SendDatabaseCharacterFn7 = fn (
 /// How many arguments @10007 takes on `v`. Null means unmeasured.
 pub fn sendDatabaseCharacterArgs(v: version.Version) ?u8 {
     return switch (v) {
-        .v106b, .v107, .v108, .v109d => 7,
+        .v106b, .v107, .v108, .v109b, .v109d => 7,
         .v110f, .v113c, .v114d => 8,
         else => null,
     };
@@ -152,7 +152,7 @@ pub fn charNameSource(v: version.Version) ?CharNameSource {
         // `GetDatabaseCharacter(LPGAMEDATA, LPCSTR lpCharName, ...)` is __fastcall, so ECX is the
         // game and EDX is the name — the same shape 1.07 was measured to have, not the
         // realm-relative one this file first assumed.
-        .v109d, .v108, .v107 => .edx_pointer,
+        .v109d, .v109b, .v108, .v107 => .edx_pointer,
         // 1.06b too, measured in its own binary rather than assumed from the LoD builds: both 0x08
         // sites load ECX with `lea ecx,[esi+0x20]` where esi is the GAME (game id at +0x08, name at
         // +0x0A) and pass the name in EDX. The same EDX value is what CLIENTS_Alloc strncpy's into
@@ -189,7 +189,7 @@ pub fn clientFields(v: version.Version) ?ClientFieldOffsets {
 /// better than a plausible-looking address that is really another version's.
 pub fn createGame(v: version.Version) ?Location {
     return switch (v) {
-        .v100, .v106b, .v107, .v108, .v109d, .v110f, .v113c => .{ .ordinal = 10047 },
+        .v100, .v106b, .v107, .v108, .v109b, .v109d, .v110f, .v113c => .{ .ordinal = 10047 },
         .v114d => null, // not needed: the injected server is already inside the engine's own path
     };
 }
@@ -197,7 +197,7 @@ pub fn createGame(v: version.Version) ?Location {
 pub fn sendDatabaseCharacter(v: version.Version) ?Location {
     return switch (v) {
         // RET 0x20 for eight stdcall args, and its body calls CLIENTS_AttachSaveFile.
-        .v100, .v106b, .v107, .v108, .v109d, .v110f, .v113c => .{ .ordinal = 10007 },
+        .v100, .v106b, .v107, .v108, .v109b, .v109d, .v110f, .v113c => .{ .ordinal = 10007 },
         // CLIENT_OnDatabaseCharacterReceived, in daily use by apps/d2gs.
         .v114d => .{ .address = 0x005306e0 },
     };

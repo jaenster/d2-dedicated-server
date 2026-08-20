@@ -20,6 +20,7 @@ pub const Version = enum {
     v106b,
     v107,
     v108,
+    v109b,
     v109d,
     v110f,
     v113c,
@@ -113,6 +114,9 @@ pub fn spec(comptime v: Version) Spec {
             .common = .{ .load_all_txts = 10554, .set_compile_tables = null },
             .stack_args = callbacks.v106b,
         },
+        // 1.09b is a hybrid, not an early 1.09d: it keeps 1.06b-through-1.08's 12-argument
+        // fpLeaveGame and dispatches 0x20, which 1.09d never reaches, while 1.09d added 0x3C.
+        .v109b => .{ .name = "1.09b", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v109b },
         .v107 => .{ .name = "1.07", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v107 },
         .v108 => .{ .name = "1.08", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v108 },
         .v109d => .{ .name = "1.09d", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v109d },
