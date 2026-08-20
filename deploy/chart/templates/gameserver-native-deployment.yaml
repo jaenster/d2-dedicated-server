@@ -35,7 +35,7 @@ spec:
             # The only link to the realm, exactly as the wine GS: publish here, take work from the
             # queue here, read and write characters here.
             - name: D2GS_REDIS_ADDR
-              value: "realmd-redis:6379"
+              value: {{ include "realm.redisAddr" . | quote }}
             # POD_IP must precede D2GS_GS_ADDR for the $(POD_IP) substitution to resolve.
             - name: POD_IP
               valueFrom:

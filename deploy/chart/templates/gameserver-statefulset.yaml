@@ -50,7 +50,7 @@ spec:
             # itself here, takes create/join from its queue here, and reads and writes characters
             # here. There is no realmd address to point it at.
             - name: D2GS_REDIS_ADDR
-              value: "realmd-redis:6379"
+              value: {{ include "realm.redisAddr" . | quote }}
             # The GS registers its in-cluster POD IP — d2ingress (also in-cluster) dials
             # this to splice client game traffic through. No public exposure. POD_IP must
             # precede D2GS_GS_ADDR for the $(POD_IP) substitution to resolve.

@@ -48,7 +48,7 @@ spec:
             - name: REALMD_GAME_ADDR
               value: {{ required "gameAddr is required: the d2ingress address clients dial for game traffic (defaults to the first floatingIP when set)" $gameAddr | quote }}
             - name: REALMD_REDIS_ADDR
-              value: "realmd-redis:6379"
+              value: {{ include "realm.redisAddr" . | quote }}
             {{- $pgSecret := "realmd-pg" }}
             {{- $pgKey := "DSN" }}
             {{- if not .Values.postgres.enabled }}

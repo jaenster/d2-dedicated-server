@@ -17,6 +17,19 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{/*
+Where everything dials redis. The chart's own redis, or an external one when that is disabled —
+realmd, d2ingress and both kinds of game server all resolve it through here so they cannot end up
+pointed at different stores.
+*/}}
+{{- define "realm.redisAddr" -}}
+{{- if .Values.redis.enabled -}}
+realmd-redis:6379
+{{- else -}}
+{{ required "redis.external.addr is required when redis.enabled is false: every component dials redis and none of them has a default" .Values.redis.external.addr }}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Per-component selector labels. Call with a dict {root, component}.
 */}}
 {{- define "realm.selectorLabels" -}}
