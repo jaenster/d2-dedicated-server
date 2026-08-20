@@ -67,11 +67,19 @@ for engine in $ENGINES; do
   # prints nothing, and "cached" would then be indistinguishable from "no tree".
   tree="" tree_arg=""
   if [ "$target" = d2host ]; then
-    tree_arg="--build-arg D2_MINIMAL_ENGINE_BASE=$D2_MINIMAL_ENGINE_BASE"
-  fi
-  if [ "$target" = d2host ] && \
-     ! curl -fsI "${D2_MINIMAL_ENGINE_BASE}/${engine}/d2-${engine}-minimal.tgz" >/dev/null 2>&1; then
-    tree=" (no game tree — needs an install mounted at /game)"
+    # One HEAD answers both questions: whether a tree exists, and which version of it. The ETag
+    # goes into the image build so that republishing a tree invalidates the layer that carries it —
+    # keyed on the URL alone, a corrected tree would never reach an image built on a warm cache.
+    hdr=$(curl -fsI "${D2_MINIMAL_ENGINE_BASE}/${engine}/d2-${engine}-minimal.tgz" 2>/dev/null || true)
+    if [ -z "$hdr" ]; then
+      tree=" (no game tree — needs an install mounted at /game)"
+      etag="none"
+    else
+      etag=$(printf '%s' "$hdr" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' | tr -d '"')
+      [ -n "$etag" ] || etag=$(printf '%s' "$hdr" | tr -d '\r' | sed -n 's/^[Ll]ast-[Mm]odified: *//p')
+      [ -n "$etag" ] || etag="unknown"
+    fi
+    tree_arg="--build-arg D2_MINIMAL_ENGINE_BASE=$D2_MINIMAL_ENGINE_BASE --build-arg D2_TREE_ETAG=$etag"
   fi
   printf '==> %s:%s-%s (%s) ... ' "$REPO" "$engine" "$APP_VERSION" "$target"
   # Both streams to the same file, and NOT -q. The compiler's refusal goes to stdout; with -q that

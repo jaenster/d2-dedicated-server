@@ -101,11 +101,18 @@ RUN apk add --no-cache curl && mkdir /gamedata && \
 FROM alpine:3.20 AS gamedata-engine
 ARG D2_VERSION=1.10f
 ARG D2_MINIMAL_ENGINE_BASE=https://files.typeguru.nl/diablo/minimal
+# The tree's ETag, passed in by build-d2host.sh, for ONE reason: to be part of this layer's cache
+# key. Without it the fetch is keyed on the URL alone, so republishing a corrected tree to the same
+# address leaves every existing builder happily reusing the old one — an image that looks freshly
+# built and ships stale data. Verifying the content inside this stage cannot catch that, because a
+# cached layer does not re-run its own checks. The key itself has to move.
+ARG D2_TREE_ETAG=unknown
 # "No tree published" and "the download broke" are different answers and must not share an exit
 # path. A 404 is a statement -- this engine has no tree yet -- and the build carries on without one.
 # Anything else is infrastructure: retried, and then fatal with a message, because a flaky mirror
 # silently becoming an engine that ships no data is the failure this whole stage exists to prevent.
 RUN apk add --no-cache curl && mkdir -p /gamedata && \
+    echo "tree etag: ${D2_TREE_ETAG}" && \
     url="${D2_MINIMAL_ENGINE_BASE}/${D2_VERSION}/d2-${D2_VERSION}-minimal.tgz" && \
     code=$(curl -sSL --retry 5 --retry-all-errors --retry-delay 2 \
              -o /tmp/tree.tgz -w '%{http_code}' "$url" || echo 000) && \
