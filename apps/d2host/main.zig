@@ -22,6 +22,7 @@ const build_options = @import("build_options");
 
 const HMODULE = *anyopaque;
 extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?HMODULE;
+extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
 extern "kernel32" fn InitializeCriticalSection(cs: *anyopaque) callconv(.winapi) void;
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
@@ -377,7 +378,20 @@ fn Binding(comptime version: d2version.Version) type {
         /// reads the slot and branches on it, so a null cannot be called by accident — whereas a
         /// stub for a call that never comes needs a stack-cleanup count nothing can check.
         inline fn stubFor(comptime which: cb.Slot, comptime name: []const u8) ?*const anyopaque {
-            if (comptime !cb.dispatches(spec.stack_args, which)) return null;
+            // A slot the sweep found no call site for still gets a POINTER, just not a returning
+            // one. Leaving it null means the engine calls address zero, and the process dies as
+            // "Illegal instruction at address 0x0" — which names neither the slot nor the fact
+            // that a callback was involved at all.
+            //
+            // `no_site_found` is not proof there is no site: dispatch is often
+            // `lea reg,[table+slot]; call [reg]`, which a displacement scan never sees. So this is
+            // the case where a version's table is INCOMPLETE, and the useful thing is to say which
+            // slot to go and measure.
+            //
+            // It cannot simply return: with the arity unknown there is no way to balance the
+            // stack, and guessing corrupts the caller instead of the process. So it reports and
+            // stops, which is what was going to happen anyway — just legibly.
+            if (comptime !cb.dispatches(spec.stack_args, which)) return Unmeasured(name).ptr;
             return Stub(name, cb.stackArgs(spec.stack_args, which)).ptr;
         }
 
@@ -701,6 +715,25 @@ fn assertReads(
 
 /// Build a reporting stub for one slot. `n_stack` is the arg count past ECX/EDX, which is also what
 /// the shim must pop — get it wrong and the engine's stack is corrupt on return.
+/// A slot this version has no measured arity for. Reached only if the engine really does dispatch
+/// it — which is itself the finding, because the table said it never would.
+fn Unmeasured(comptime name: []const u8) type {
+    return struct {
+        fn impl(ecx: usize, edx: usize, ...) callconv(.c) usize {
+            _ = ecx;
+            _ = edx;
+            say("d2host: FATAL — the engine called " ++ name ++ ", which this version has no measured");
+            say("d2host:   stack-arg count for. It is listed as no_site_found, so the sweep missed a");
+            say("d2host:   dispatch (typically `lea reg,[table+slot]; call [reg]`). Count the pushes at");
+            say("d2host:   that site and give " ++ name ++ " its arity in packages/d2engine/callbacks.zig.");
+            say("d2host:   Returning is not possible without it: the stack cannot be balanced.");
+            ExitProcess(3);
+            return 0;
+        }
+        const ptr: *const anyopaque = @ptrCast(&fastcall.Callback2(0, impl).shim);
+    };
+}
+
 fn Stub(comptime name: []const u8, comptime n_stack: usize) type {
     return struct {
         fn impl(ecx: usize, edx: usize, ...) callconv(.c) usize {
