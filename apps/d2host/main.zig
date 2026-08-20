@@ -322,11 +322,18 @@ fn Binding(comptime version: d2version.Version) type {
         /// The slot cannot be left null: the engine runs `IsBadCodePtr` on it first and a bad
         /// pointer is an assert and `exit(-1)`, not a skipped call.
         ///
-        /// Accepting unconditionally is what the injected 1.14d server does in production today:
-        /// realmd has already authorised this join before the client is told where to connect, so
-        /// the token is a second check rather than the only one. Enforcing it here needs the same
-        /// join-context bookkeeping `apps/d2gs` keeps, which is realm-side state this host does
-        /// not hold yet.
+        /// This is an authorisation decision, so it is made rather than assumed. The realm stages
+        /// (account, character) here before it tells the client where to connect, and BOTH halves
+        /// are checked: the character the engine reports must have been staged, and the account
+        /// claimed alongside it must be the one the realm staged it under.
+        ///
+        /// Matching the character alone is not enough, which is the trap worth naming. Both fields
+        /// arrive from the client's own join packet, so a client that knows a character currently
+        /// staged on this server could otherwise name it and be handed that character's save.
+        /// Requiring the pair means impersonation also needs the victim's account name.
+        ///
+        /// With no realm there is nothing to check against, and refusing would break the standalone
+        /// smoke path that creates its own game — so enforcement follows the realm.
         /// Only the first two stack arguments are named: 1.10f pushes five and 1.09d three, but
         /// both push the game id first and the account second, and the shim cleans up whatever
         /// that version's count is.
@@ -339,6 +346,21 @@ fn Binding(comptime version: d2version.Version) type {
                 game_id,
                 edx,
             });
+            if (!realmConfigured()) return 1;
+            const want = std.mem.sliceTo(char_name, 0);
+            const staged = accountFor(want) orelse {
+                sayFmt("d2host: REFUSED join — the realm staged no context for '{s}'", .{want});
+                return 0;
+            };
+            // The account is only checked where the build actually supplies one. Not every version
+            // passes it here — 1.06b keeps it in a BSS global the create path leaves empty, and the
+            // stack layout differs besides (1.10f pushes five arguments, 1.09d three) — so an empty
+            // string means "this build did not tell us", not "the client claimed nothing".
+            const claimed = std.mem.sliceTo(acct_name, 0);
+            if (claimed.len != 0 and !std.mem.eql(u8, staged, claimed)) {
+                sayFmt("d2host: REFUSED join — '{s}' is staged for '{s}', not '{s}'", .{ want, staged, claimed });
+                return 0;
+            }
             return 1;
         }
 
