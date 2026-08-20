@@ -1,7 +1,8 @@
 #!/bin/bash
 # make-minimal-engine.sh — build the game tree for the pre-1.14 engines, in two layers.
 #
-#   tools/make-minimal-engine.sh base   <out>            the archives, ONCE, shared by every engine
+#   tools/make-minimal-engine.sh base         <out>      the expansion archives, shared by 1.07+
+#   tools/make-minimal-engine.sh base-classic <out>      the classic archive, for 1.00/1.06b
 #   tools/make-minimal-engine.sh engine <ver> <out>      that engine's DLLs and tables
 #
 # The split is the point. mpqmin keeps by EXTENSION, not by version, so the minimised archives come
@@ -15,6 +16,15 @@
 #   D2_BASE      a directory holding d2data.mpq and d2exp.mpq
 #   D2_PATCHES   the directory of LODPatch_*/D2Patch_* installers
 #   D2_LOD_BASE  the 1.07 expansion PE files, which every later DLL is a delta against
+#
+# A CLASSIC engine needs its own base, built with `base-classic`, and two more inputs:
+#   D2_CLASSIC_ARCHIVE   a classic d2data.mpq (retail v1.00 does)
+#   D2_CLASSIC_LISTFILE  its (listfile); the v1.00 archive ships one alongside
+#
+# Classic gets d2data.mpq and NOTHING ELSE. The engine opens d2exp.mpq FIRST when it is present
+# and reads expansion-format tables out of it for everything it has no loose override for, which
+# is not a licence question but a correctness one -- it was the whole reason 1.06b asserted in
+# ItemTbls.cpp.
 #
 # This ships the RECIPE, not Blizzard's bytes.
 set -euo pipefail
@@ -51,6 +61,17 @@ base)
         "$MPQMIN" $LF "$BASE/$a" "$OUT/$a"
     done
     du -sh "$OUT" | sed 's/^/==> shared base: /'
+    ;;
+base-classic)
+    OUT="${1:?usage: make-minimal-engine.sh base-classic <out>}"
+    ARC="${D2_CLASSIC_ARCHIVE:?set D2_CLASSIC_ARCHIVE to a classic d2data.mpq (retail v1.00 has one)}"
+    mkdir -p "$OUT"
+    LF=""
+    [ -n "${D2_CLASSIC_LISTFILE:-}" ] && LF="--listfile $D2_CLASSIC_LISTFILE"
+    echo "==> minimising the classic d2data.mpq"
+    "$MPQMIN" $LF "$ARC" "$OUT/d2data.mpq"
+    # Deliberately no d2exp.mpq. See the header.
+    du -sh "$OUT" | sed 's/^/==> classic base: /'
     ;;
 engine)
     VER="${1:?usage: make-minimal-engine.sh engine <ver> <out>}"
@@ -120,6 +141,26 @@ engine)
                 [ -f "$OUT/$m" ] || continue
                 "$ROOT/zig-out/bin/fogrewrite" "$OUT/$m" "$OUT/$m.rw" --accept-inferred >/dev/null
                 mv "$OUT/$m.rw" "$OUT/$m"
+            done
+            ;;
+    esac
+
+    # Classic ships its string tables in the patch too, and they are not excel — they belong under
+    # data/local/lng/ENG. Without them a classic engine dies on `miss: patchstring.tbl` the moment
+    # d2exp.mpq is (correctly) absent, because that is where it had been reading them from. They are
+    # whole files rather than deltas (Ptc kind 0x0104), so applying them needs no base.
+    case "$VER" in
+        1.00|1.06b)
+            echo "==> recovering $VER string tables"
+            mkdir -p "$OUT/data/local/lng/ENG"
+            : > "$WORK/empty"
+            for t in string.tbl patchstring.tbl; do
+                "$MPQCAT" "$WORK/patch.mpq" "$t" "$WORK/$t.rec" >/dev/null 2>&1 || { echo "   $t: absent"; continue; }
+                if "$D2PATCH" apply "$WORK/$t.rec" "$WORK/empty" "$OUT/data/local/lng/ENG/$t" >/dev/null 2>&1; then
+                    echo "   $t ok"
+                else
+                    echo "   $t FAILED"; exit 1
+                fi
             done
             ;;
     esac

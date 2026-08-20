@@ -28,8 +28,8 @@
         // already a second, from-scratch implementation of the realm half of this). Lazy because
         // nothing else here needs it — a plain `zig build` for the deploy images shouldn't fetch it.
         .clientless = .{
-            .url = "git+https://github.com/jaenster/d2-clientless#da649efcdc90e0de918677e09160cf998a31cc71",
-            .hash = "clientless-0.1.0-lyHu8n-vAwCz11rnzsk08LeQMUtkFh9sB2tbJ7E-olHz",
+            .url = "git+https://github.com/jaenster/d2-clientless#e721572031226380f100622c85c6d69ee4b41024",
+            .hash = "clientless-0.1.0-lyHu8s3BAwBGYBVCZ5xxJfjwOF7jU-LsQdMM2mn3o1L7",
             .lazy = true,
         },
     },
