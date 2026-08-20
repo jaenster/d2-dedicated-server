@@ -2,9 +2,9 @@
 //!
 //! Every member of a `D2Patch_*.exe` / `LODPatch_*.exe` archive is a 24-byte record plus payload,
 //! and before 1.11b the payload is a binary delta against the retail install rather than the file
-//! itself. This reverses `Ptc.cpp` out of BNUpdate.exe (applier @0x404fee, stream-A @0x4051e9,
-//! stream-B @0x4053a3, varints @0x40532a signed / @0x40545d unsigned) so a version can be
-//! reconstructed offline instead of by running the installer.
+//! itself. This reverses `Ptc.cpp` out of LODPatch_109d's BNUpdate.exe (applier @0x406f00,
+//! stream-A @0x407140, stream-B @0x407300, the shared unsigned varint reader @0x407610) so a
+//! version can be reconstructed offline instead of by running the installer.
 //!
 //!   d2patch carve <installer.exe> <out.mpq>       find the MPQ appended after the stub
 //!   d2patch info  <record>                        print a record header
@@ -90,7 +90,8 @@ pub const Record = struct {
 };
 
 /// The 1/2/3/4-byte varint both streams are coded with. `signed` sign-extends to the width the
-/// length actually carries, which is what separates the stream-A reader from the stream-B one.
+/// payload actually carries; the encoder picks the width from the signed value, so a wide form can
+/// still hold a small negative number.
 const Varint = struct {
     value: i32,
     next: usize,
@@ -206,10 +207,15 @@ pub fn apply(gpa: std.mem.Allocator, rec: Record, src: []const u8) ![]u8 {
 
     // Stream B re-applies the absolute-address fixups: groups of (accumulated value, then a
     // delta-coded list of offsets to add it at). A zero ends a list; a zero value ends the stream.
+    // The values are one ascending run, so only the opening one can be negative and only it is
+    // sign-extended; every later value is a positive step. Missing that costs a whole 2^bits, which
+    // is invisible on the 3-byte form the DLL deltas use but wrecks the 1- and 2-byte ones.
     var pb: usize = 0;
     var acc: i64 = 0;
+    var opening = true;
     while (pb < size_b) {
-        const dv = try Varint.read(b, pb, false);
+        const dv = try Varint.read(b, pb, opening);
+        opening = false;
         pb = dv.next;
         if (dv.value == 0) break;
         acc += dv.value;
@@ -323,6 +329,31 @@ test "apply: every stream-A opcode against a known source" {
     const out = try apply(gpa, try Record.parse(&rec), &src);
     defer gpa.free(out);
     try std.testing.expectEqualSlices(u8, &src, out);
+}
+
+test "apply: stream B opens on a signed value and steps unsigned" {
+    const gpa = std.testing.allocator;
+    const src = [_]u8{ 0, 0, 0, 0 };
+
+    // zero-fill 4 bytes, then one fixup group: value 0x7b (-5 over 7 bits) added at offset 0.
+    const a = [_]u8{ 0x04, 0xC0 };
+    const b = [_]u8{ 0x7b, 0x00, 0x00, 0x00 };
+    var payload: [8 + a.len + b.len]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], a.len, .little);
+    std.mem.writeInt(u32, payload[4..8], b.len, .little);
+    @memcpy(payload[8..][0..a.len], &a);
+    @memcpy(payload[8 + a.len ..], &b);
+
+    var rec: [0x18 + payload.len]u8 = @splat(0);
+    std.mem.writeInt(u16, rec[0..2], 0x18, .little);
+    std.mem.writeInt(u16, rec[2..4], 0x0004, .little);
+    std.mem.writeInt(u32, rec[8..12], src.len, .little);
+    std.mem.writeInt(u32, rec[12..16], 4, .little);
+    @memcpy(rec[0x18..], &payload);
+
+    const out = try apply(gpa, try Record.parse(&rec), &src);
+    defer gpa.free(out);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xFB, 0xFF, 0x00, 0x00 }, out);
 }
 
 test "apply: refuses a source of the wrong size" {
