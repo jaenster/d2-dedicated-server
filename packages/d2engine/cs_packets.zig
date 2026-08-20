@@ -113,7 +113,8 @@ pub fn packetSizes(v: version.Version) ?[]const i32 {
         .v106b => &packet_size_106b,
         .v107 => &packet_size_107,
         .v108 => &packet_size_108,
-        .v109d, .v110f => &packet_size_110f,
+        .v109b, .v109d => &packet_size_107, // 1.09 is 1.07-shaped; 1.10 is where it moved
+        .v110f => &packet_size_110f,
         else => null,
     };
 }
@@ -125,8 +126,8 @@ pub fn packetSizes(v: version.Version) ?[]const i32 {
 pub fn systemRange(v: version.Version) ?struct { lo: u8, hi: u8 } {
     return switch (v) {
         .v106b => .{ .lo = 0x60, .hi = 0x69 },
-        .v107, .v108 => .{ .lo = 0x64, .hi = 0x6d },
-        .v109d, .v110f => .{ .lo = 0x66, .hi = 0x6f },
+        .v107, .v108, .v109b, .v109d => .{ .lo = 0x64, .hi = 0x6d },
+        .v110f => .{ .lo = 0x66, .hi = 0x6f },
         else => null,
     };
 }
@@ -139,6 +140,11 @@ test "the system-message block shifts with the join" {
     try std.testing.expectEqual(b.lo - a.lo, b.hi - a.hi); // the same two-opcode shift
 
     // Classic sits six below 1.10f, and its join is the shorter 28-byte one.
+    // 1.09 sits with 1.07/1.08, not with 1.10f — the shift is a 1.10 change.
+    try std.testing.expectEqual(@as(u8, 0x65), joinPacket(.v109d).?.op);
+    try std.testing.expectEqual(@as(u8, 0x65), joinPacket(.v109b).?.op);
+    try std.testing.expectEqual(@as(u8, 0x64), systemRange(.v109d).?.lo);
+
     const c = systemRange(.v106b).?;
     try std.testing.expect(joinPacket(.v106b).?.op >= c.lo and joinPacket(.v106b).?.op <= c.hi);
     try std.testing.expectEqual(@as(u8, 6), b.lo - c.lo);
@@ -150,8 +156,12 @@ test "the system-message block shifts with the join" {
 pub fn joinPacket(v: version.Version) ?struct { op: u8, len: usize } {
     return switch (v) {
         .v106b => .{ .op = 0x61, .len = 28 },
-        .v107, .v108 => .{ .op = 0x65, .len = 29 },
-        .v109d, .v110f => .{ .op = join_110f, .len = join_110f_len },
+        // Read from each build's own table rather than grouped by era: the 46/29 pair sits at
+        // 0x64/0x65 on 1.07, 1.08, 1.09b AND 1.09d, and only moves to 0x66/0x67 at 1.10. Grouping
+        // 1.09d with 1.10f sent it a join it does not recognise, and the engine answered with an
+        // unrelated 0xAA packet on the system list instead of ever binding the client to a game.
+        .v107, .v108, .v109b, .v109d => .{ .op = 0x65, .len = 29 },
+        .v110f => .{ .op = join_110f, .len = join_110f_len },
         .v114d => .{ .op = join_114d, .len = join_114d_len },
         else => null,
     };
