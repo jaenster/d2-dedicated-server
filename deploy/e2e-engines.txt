@@ -4,11 +4,7 @@
 # than something someone notices three weeks later. This file exists because the failure mode here
 # is never "the build breaks" — it is that a fix for one version quietly stops another serving, and
 # every one of those looks identical from the client: the join is accepted and nothing arrives.
-#
-# 1.07 is deliberately NOT a row here: it is not a target. It is still REQUIRED, though, and by the
-# build rather than by this file — every expansion DLL from 1.08 on is a delta against 1.07's PE
-# files (`D2_LOD_BASE` in tools/make-minimal-engine.sh), so the tree recipe cannot lose it. What is
-# dropped is serving it, not having it.
+
 #
 #   world   a real client must reach a NON-EMPTY world. Anything less fails the run.
 #   boot    the server must start, publish itself into the store, and keep a clean log. Not yet
@@ -25,98 +21,20 @@
 # built to an older recipe fails as an engine assert with nothing pointing at the tree, so when a
 # row that used to hold starts failing, check the tarball's age against the recipe's before the code.
 
-1.08   boot    # driven now: creates a game, handshakes and TAKES THE CHARACTER (its record is
-               # 1.07's shape with its own number, 0x59, out of its own writer). Then the same null
-               # jump as 1.06b.
-1.09b  boot    # driven too, and takes the character. Its record is NOT 1.08's shape: it keeps the
-               # modern layout and only the version differs (0x5c), so rewriting the header the
-               # 1.08 way would break a save it would otherwise accept. Then the same null jump.
-               # Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it during boot
-1.09d  boot    # boots from the PUBLISHED tree, which carries 1.09d-era compiled tables. It was
-               # recorded as broken off a locally assembled tree whose data/ held the recovered
-               # tables instead: loose files win over MPQ members, so the wrong-era ones are what
-               # the engine reads, and it asserts "nLoadedValue < MAX_SKILL_RESTRICTED_STATES"
-               # (DataTbls.cpp:0x231). The engine was never the problem; the tree was.
-1.10f  world   # verified: stock 1.14d client in the Rogue Encampment, 145 packets. Needs Patch_D2
-1.13c  world   # verified: same, plus 179 packets / 53 units via the clientless. Needs Patch_D2
-1.06b  boot    # classic lineage: d2data only, no d2exp, and its own Fog rewrite. Now creates a
-               # game, takes a character and completes the handshake with a client framing it as
-               # classic (GameFlags is SIX bytes here). It refuses the character with Error:9,
-               # which is the save-version gate: 1.06b requires EXACTLY 0x47 (@0x6fcf7827) and the
-               # realm hands every engine 0x60. Same root as 1.07 — see the note there.
-               #
-               # What it wants is not the modern .d2s at all but a 130-byte record: magic, version,
-               # name[16] at 0x08 (strcmp'd against the client's), status at 0x18, a content
-               # revision at 0x1c (0xdd here, 0x13f on 1.07), 0x10 at 0x1e and the size 0x82 at
-               # 0x20. Writer @0x6fcf6a10, parser @0x6fcf77c0.
-               #
-               # The parser has SEVEN return-9 paths, not three — a scan stopping at 0x6fcf7c00
-               # sees only the first three, and the rest are counter-bumping blocks that conditions
-               # further up jump into. Relative to the record: word[0x20]==0x82, dword[0x04]==0x47,
-               # strcmp(client, 0x08), word[0x1c]<=0xdd, word[0x1e]<=0x10, word[0x22]<5, and
-               # byte[0x58] nibbles <4 and <3. A record satisfying all seven STILL returns 9, so
-               # the next move is to dump the record as DELIVERED from d2host rather than infer it
-               # from the database row.
-               #
-               # Of those, two are provably satisfied once
-               # that record is delivered: word[rec+0x20]==0x82 (@0x6fcf77f3) and
-               # dword[rec+0x04]==0x47 (@0x6fcf7827, and the host logs ver=0x47 going out). What is
-               # left is the third: `strcmp(clientName, rec+0x08)` @0x6fcf787a, the record's name
-               # against the name the engine holds for the client. The record's half is confirmed
-               # good — the host logs "declared=1668572506", which is the name read as a dword at
-               # offset 8 — so the disagreement is on the CLIENT side of that compare, which is
-               # where d2host translates the 1.14d join. That is the next thing to look at, and it
-               # is one comparison rather than a format.
-               #
-               # RESOLVED. It was the checksum: the modern save keeps one at 0x0C, and 0x0C is
-               # inside name[16] at 0x08 in this record, so writing one left the name without its
-               # terminator and the strcmp failed — reported as the same number a bad version gets.
-               # d2host now converts the save into the era's record (packages/d2engine/charrecord.zig)
-               # and 1.06b takes the character. What stops it now is a call through a null pointer
-               # (EIP=0) shortly after BITMANIP_Initialize @10126 — the same wall 1.07 hits. It is
-               # NOT the callback table (every tail slot is a reporting stub now and none fired),
-               # NOT the game-data vtable (filling past its four methods changed nothing), and NOT
-               # BITMANIP_Initialize's own arity (the real one is `ret 0xc`, three stdcall args,
-               # and ours is the same — 1.10f's is instruction-identical besides).
-               #
-               # The fault is very likely a JUMP through a null pointer rather than a call: the
-               # stack at the fault holds a heap value where a call's return address would be. Fog
-               # now logs BITMANIP_Initialize's engine-side caller for exactly this; on 1.06b those
-               # are 0x6fceb7ee and 0x6fcbc85a.
-               #
-               # The crash reporter walks the stack for engine addresses now, which pins it: the
-               # innermost frame is 0x6fcb1f94, the return address of `call 0x6fcedf20` at
-               # 0x6fcb1f8f (__fastcall, the unit in ECX and 1 pushed). So the null transfer is
-               # inside 0x6fcedf20 or below it. Its direct calls are all resolved — two are Fog
-               # thunks (#10023 DisplayAssert, #10128 BITMANIP_Write) and neither fired, so this is
-               # not a missing import — EVERY import of every module resolves, checked at load.
-               #
-               # Traced to the instruction. The life/mana packet builds completely: eight
-               # BITMANIP_Write calls (0x6fcbc86b..0x6fcbc906), then BITMANIP_GetSize returns the
-               # right 13 bytes, then `call 0x6fcbb970` at 0x6fcbc917 with the client in ECX — and
-               # that call is where it dies. Its two helpers (0x6fcb3f10, 0x6fcb3e70) are trivial
-               # accessors with no indirect transfer, and its allocator ordinal (classic 10140 ->
-               # LoD 10045) is byte-identical, fastcall on both sides. So the null transfer is
-               # inside 0x6fcbb970 itself, on the client's packet-buffer list.
-               #
-               # STRONGEST LEAD: the real 1.09d server does two things this host does not. It
-               # LoadLibraryA's D2Client.dll — which D2Game does not import, so a headless server
-               # has no other reason to — and it BINARY-PATCHES the loaded modules. One patch is
-               # mandatory, applied even when its config disables patching: tag 'INIT',
-               # d2client.dll+0x81e1. A runtime lookup into a D2Client nobody loaded returns NULL,
-               # and calling it jumps to address zero; a static import check cannot see that, which
-               # is why ours came back clean. 1.10f and 1.13c need none of this, which is exactly
-               # the line these failures fall on.
-               #
-               # That INIT entry is not a byte patch — decoded, it READS four bytes out of the
-               # module. d2client.dll+0x81e1 is the imm32 of `mov ecx, 0x6fbb0a88`, so the real
-               # server pulls a pointer to a D2Client data structure out of an instruction operand
-               # and hands it to the engine during bring-up. Loading D2Client alone changes nothing
-               # here (tested), which fits: the load is only what makes that pointer reachable.
-               #
-               # NOT the join translation either, which was the obvious suspect and is ruled out. Classic
-               # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two
-               # ways: a 10-byte preamble with a 16-byte name, or an 11-byte one with a 15-byte
-               # name. cs_packets picks the first. Forcing the second makes the engine answer the
-               # join with NOTHING AT ALL rather than with GameFlags, so the first is right and the
-               # name does arrive where this build reads it.
+1.07   world   # 194 packets / 34 units. Was dropped as a target while it was broken; it costs
+               # nothing now that it works, and a working engine left out of this list is one that
+               # can break again unnoticed. Still required by the BUILD regardless: every expansion
+               # DLL from 1.08 on is a delta against 1.07's PE files (D2_LOD_BASE).
+1.08   world   # 196 packets / 34 units. Its character record is 1.07's shape with its own version,
+               # 0x59, out of its own writer.
+1.09b  world   # 195 packets / 34 units. Its record is NOT 1.08's shape: it keeps the modern layout
+               # and only the version differs (0x5c), so rewriting the header the 1.08 way would
+               # break a save it would otherwise accept.
+1.09d  world   # 195 packets / 34 units, same record shape as 1.09b. Needs the era-matched tables:
+               # a tree carrying the RECOVERED ones asserts in DataTbls.cpp instead, because loose
+               # files win over MPQ members.
+1.10f  world   # 179 packets / 34 units. Needs Patch_D2
+1.13c  world   # 179 packets / 34 units. Needs Patch_D2
+1.06b  world   # 200 packets / 34 units. Classic lineage: d2data only, no d2exp, its own Fog
+               # numbering (retargeted through fogrosetta), a SIX-byte GameFlags, and a client that
+               # must fire JOINGAME off GameFlags because no 0x00 StateCommand follows it.

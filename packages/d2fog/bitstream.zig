@@ -35,7 +35,19 @@ const low_mask = [9]u32{ 0, 1, 3, 7, 0xf, 0x1f, 0x3f, 0x7f, 0xff };
 const high_mask = [8]u8{ 0xff, 0xfe, 0xfc, 0xf8, 0xf0, 0xe0, 0xc0, 0x80 };
 
 pub fn init(st: *BitStream, buf: ?[*]u8, n_bytes: u32) void {
-    st.* = .{ .cur = buf, .cap_bits = @bitCast(n_bytes << 3) };
+    // FOUR fields, never five. The real @10126 writes +0x00, +0x04, +0x08 and +0x0c and stops;
+    // `overflow` at +0x10 is only ever written by @10128, and only on the path where a write does
+    // not fit — which for a correctly sized buffer never runs.
+    //
+    // That distinction is not cosmetic. Callers put this struct on the stack and reserve only what
+    // Initialize touches: D2Common 1.09d @10881 opens `sub esp, 0x10`, sixteen bytes, and the whole
+    // struct assignment this used to be wrote twenty — four bytes straight through the bottom of
+    // the caller's frame, on every packet it built. Nothing fails at the write; the damage lands on
+    // whatever that frame held, which is why it surfaced as a jump to a garbage address much later.
+    st.cur = buf;
+    st.cap_bits = @bitCast(n_bytes << 3);
+    st.bytes = 0;
+    st.bit = 0;
 }
 
 /// Bytes produced, rounded up: a byte with bits still in flight counts as one.
