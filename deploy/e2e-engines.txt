@@ -99,6 +99,15 @@
                # LoD 10045) is byte-identical, fastcall on both sides. So the null transfer is
                # inside 0x6fcbb970 itself, on the client's packet-buffer list.
                #
+               # STRONGEST LEAD: the real 1.09d server does two things this host does not. It
+               # LoadLibraryA's D2Client.dll — which D2Game does not import, so a headless server
+               # has no other reason to — and it BINARY-PATCHES the loaded modules. One patch is
+               # mandatory, applied even when its config disables patching: tag 'INIT',
+               # d2client.dll+0x81e1. A runtime lookup into a D2Client nobody loaded returns NULL,
+               # and calling it jumps to address zero; a static import check cannot see that, which
+               # is why ours came back clean. 1.10f and 1.13c need none of this, which is exactly
+               # the line these failures fall on.
+               #
                # NOT the join translation either, which was the obvious suspect and is ruled out. Classic
                # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two
                # ways: a 10-byte preamble with a 16-byte name, or an 11-byte one with a 15-byte
