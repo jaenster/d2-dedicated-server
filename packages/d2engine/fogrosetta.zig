@@ -59,6 +59,8 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10023, .lod = 10025, .how = .corroborated },
     .{ .classic = 10024, .lod = 10026, .how = .inferred },
     .{ .classic = 10026, .lod = 10029, .how = .measured }, // LogManager.cpp on both sides
+    // Published ordinal lists for 1.09d name these AllocClientMemory/FreeClientMemory at the same
+    // slots we ship them at, which corroborates the LoD side from outside our own disassembly.
     .{ .classic = 10033, .lod = 10042, .how = .corroborated },
     .{ .classic = 10034, .lod = 10043, .how = .corroborated },
     .{ .classic = 10036, .lod = 10055, .how = .corroborated },
@@ -81,7 +83,12 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10089, .lod = 10120, .how = .corroborated },
     .{ .classic = 10095, .lod = 10126, .how = .measured }, // BitManip.cpp on both sides
     .{ .classic = 10096, .lod = 10127, .how = .corroborated },
-    .{ .classic = 10097, .lod = 10128, .how = .inferred },
+    // Bodies compared instruction for instruction, because neither side asserts and so neither
+    // carries a __FILE__ tag to match on: both read the stream's +0x04/+0x08/+0x0c, both compute
+    // the bit cursor as `lea edx,[ecx+edx*8]` then add the width. Same function, different register
+    // allocation. Worth doing rather than leaving inferred — it is called eight times in the one
+    // function the pre-1.10 builds fault in, so it was the obvious suspect and is now excluded.
+    .{ .classic = 10097, .lod = 10128, .how = .measured },
     .{ .classic = 10098, .lod = 10129, .how = .inferred },
     .{ .classic = 10099, .lod = 10130, .how = .measured },
     .{ .classic = 10102, .lod = 10134, .how = .measured }, // NOT file I/O — String, margin 2.78
@@ -173,7 +180,7 @@ test "an unconfirmed row is refused rather than guessed" {
 
 test "how much of the set is actually established" {
     try std.testing.expectEqual(@as(usize, 47), classic_to_lod.len);
-    try std.testing.expectEqual(@as(usize, 21), countBy(.measured));
+    try std.testing.expectEqual(@as(usize, 22), countBy(.measured));
     try std.testing.expectEqual(@as(usize, 17), countBy(.corroborated));
-    try std.testing.expectEqual(@as(usize, 9), countBy(.inferred));
+    try std.testing.expectEqual(@as(usize, 8), countBy(.inferred));
 }
