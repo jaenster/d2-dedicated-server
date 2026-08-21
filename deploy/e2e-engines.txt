@@ -33,8 +33,18 @@
 1.09d  world   # 195 packets / 34 units, same record shape as 1.09b. Needs the era-matched tables:
                # a tree carrying the RECOVERED ones asserts in DataTbls.cpp instead, because loose
                # files win over MPQ members.
-1.10f  world   # 179 packets / 34 units. Needs Patch_D2
-1.13c  world   # 179 packets / 34 units. Needs Patch_D2
+1.10f  world   # 179 packets / 34 units. Needs Patch_D2 — the published tree carries it as of
+               # 2026-08-21; before that it halted at boot and never reached a world in CI while
+               # passing locally, because the local tree had been given the file by hand.
+               #
+               # Reaches the world and then asserts on the way out: "Character has too many items",
+               # PlrSave.cpp:0x713, from D2Game+0x59d52. That is the character SAVE path, and
+               # fpSaveDatabaseCharacter is still a reporting stub — the engine is being told
+               # nothing about the save it asked for. Pre-existing and identical on a hand-built
+               # tree, so it is not the tarball. It does fail the log check, so these two are the
+               # last rows CI cannot pass.
+1.13c  world   # 179 packets / 34 units. Needs Patch_D2, published 2026-08-21. Same save-path
+               # assert as 1.10f.
 1.06b  world   # 200 packets / 34 units. Classic lineage: d2data only, no d2exp, its own Fog
                # numbering (retargeted through fogrosetta), a SIX-byte GameFlags, and a client that
                # must fire JOINGAME off GameFlags because no 0x00 StateCommand follows it.
