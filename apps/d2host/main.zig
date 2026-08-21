@@ -1115,6 +1115,38 @@ const Module = struct { name: [*:0]const u8, handle: ?HMODULE = null };
 /// This order is the cheapest arrangement, measured: D2Game keeps `0x6FC30000` and only D2Common
 /// moves. Loading D2Common first instead costs two relocations (D2CMP *and* D2Game). Either way,
 /// resolve everything by ordinal — RVAs hold across relocation, absolute addresses do not.
+/// Where each module landed, so a crash can name an address instead of printing a bare number.
+///
+/// This exists because the first version of the stack walk filtered on the engine's own address
+/// range and silently dropped every frame in OUR modules — Fog and D2Net load far away from the
+/// Blizzard DLLs — which is exactly the half you need when the question is whose code faulted.
+const LoadedModule = struct { name: []const u8 = "", base: usize = 0, end: usize = 0 };
+var loaded_modules: [16]LoadedModule = @splat(.{});
+var loaded_module_count: usize = 0;
+
+fn noteModule(name: []const u8, base: usize) void {
+    if (loaded_module_count == loaded_modules.len) return;
+    // The real image size, out of the PE header at the base we were just handed. A fixed guess does
+    // not work: the engine's modules sit close enough together that a generous window swallows its
+    // neighbours, and the first match wins — which mislabels every frame after the lowest module.
+    var end = base + 0x1000;
+    const lfanew: u32 = @as(*const u32, @ptrFromInt(base + 0x3c)).*;
+    const nt = base + lfanew;
+    if (@as(*const u32, @ptrFromInt(nt)).* == 0x0000_4550) { // "PE\0\0"
+        end = base + @as(*const u32, @ptrFromInt(nt + 24 + 56)).*; // OptionalHeader.SizeOfImage
+    }
+    loaded_modules[loaded_module_count] = .{ .name = name, .base = base, .end = end };
+    loaded_module_count += 1;
+}
+
+/// Which module `addr` is in, or null when it is not in any of them.
+fn moduleOf(addr: usize) ?[]const u8 {
+    for (loaded_modules[0..loaded_module_count]) |m| {
+        if (addr >= m.base and addr < m.end) return m.name;
+    }
+    return null;
+}
+
 fn loadModules(comptime module_names: []const [:0]const u8) ![module_names.len]Module {
     var modules: [module_names.len]Module = undefined;
     inline for (module_names, 0..) |name, i| {
@@ -1126,6 +1158,7 @@ fn loadModules(comptime module_names: []const [:0]const u8) ![module_names.len]M
             return error.LoadLibraryFailed;
         }
         sayHex("d2host: loaded " ++ name ++ ", base=", @intFromPtr(modules[i].handle.?));
+        noteModule(name, @intFromPtr(modules[i].handle.?));
     }
     return modules;
 }
@@ -1259,17 +1292,17 @@ fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
             stack[0],
             if (stack[0] >= 0x6f00_0000 and stack[0] < 0x7000_0000) "a return address" else "not code, so this was a JMP not a CALL",
         });
-        say("d2host:   stack, engine addresses only (innermost first):");
+        say("d2host:   stack, addresses inside a loaded module (innermost first):");
         var found: usize = 0;
         var off: usize = 0;
-        while (off < 0x400 and found < 12) : (off += 4) {
+        while (off < 0x400 and found < 14) : (off += 4) {
             const v = stack[off / 4];
-            if (v >= 0x6f00_0000 and v < 0x7000_0000) {
-                sayFmt("d2host:     [esp+0x{x:0>3}] = 0x{x}", .{ off, v });
+            if (moduleOf(v)) |m| {
+                sayFmt("d2host:     [esp+0x{x:0>3}] = 0x{x}  {s}", .{ off, v, m });
                 found += 1;
             }
         }
-        if (found == 0) say("d2host:     none — the stack holds no engine addresses at all");
+        if (found == 0) say("d2host:     none — no frame on the stack is in any module we loaded");
     }
     return 0;
 }
