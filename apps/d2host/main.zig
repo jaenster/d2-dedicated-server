@@ -149,11 +149,22 @@ const Pending = struct {
     save: [8192]u8 = undefined,
 };
 
-/// A zeroed FILETIME and the {FILETIME*, unk0x194} pair pointing at it. The engine copies both
-/// dwords into pClient+0x190/+0x194 rather than reading them, so placeholders are fine — but the
-/// pointer itself has to be valid.
+/// The seventh argument of D2GSSendDatabaseCharacter, which does NOT mean the same thing on both
+/// sides of 1.10.
+///
+/// From 1.10 on it is the {FILETIME*, unk0x194} pair: the engine copies both dwords into
+/// pClient+0x190/+0x194 rather than reading them, so placeholders do — but the pointer has to be
+/// valid.
+///
+/// Before that it is `LPPLAYERINFO`, `{ PLAYERMARK PlayerMark; DWORD dwReserved; }`, an opaque host
+/// token the engine carries with the player and hands back in SaveDatabaseCharacter. pvpgn's real
+/// 1.09 server sets it to these two constants, and matching a working host costs nothing where
+/// guessing might cost an afternoon.
 var load_filetime: [2]u32 = .{ 0, 0 };
 var load_filetimes: [2]u32 = undefined;
+
+/// What pvpgn's d2gs109 puts in PLAYERINFO before every character it sends.
+const player_info_pre110: [2]u32 = .{ 0xabcdef, 0xfedcba };
 
 var pending: [8]Pending = @splat(.{});
 
@@ -489,7 +500,7 @@ fn pumpCharacterLoads() void {
         const lock: u32 = if (refused) 1 else 0;
         if (send_character7) |send| {
             // No container argument before 1.10: the engine had not started cross-checking it.
-            _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetimes);
+            _ = send(p.client_id, &p.save, size, size, lock, 0, &player_info_pre110);
         } else if (send_character) |send| {
             _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetimes, p.container);
         } else return;
