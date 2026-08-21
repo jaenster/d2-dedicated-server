@@ -18,9 +18,12 @@
 1.08   boot    # as 1.07
 1.09b  boot    # as 1.07. Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it during boot
 1.09d  broken  # assert "nLoadedValue < MAX_SKILL_RESTRICTED_STATES" DataTbls.cpp:0x231 during
-               # DATATBLS_LoadAllTxts. Its base archives are 1.14d-era and carry more skill states
-               # than this build's MAX allows. Era-matched table data, not a code fix. Unchanged
-               # with or without Patch_D2.mpq, so that is not the cause.
+               # DATATBLS_LoadAllTxts. It is the RECOVERED TABLES in data/, not the archives:
+               # loose files win over MPQ members, and rebuilding the tree on era-matched 1.00 +
+               # 1.07 archives changes nothing, while removing data/ changes the assert to
+               # "ptItemStats != NULL" (ItemTbls.cpp:0x918). So it wants 1.09d-era compiled
+               # tables and tools/re/patchdata.py is not producing them. Unaffected by
+               # Patch_D2.mpq either way.
 1.10f  world   # verified: stock 1.14d client in the Rogue Encampment, 145 packets. Needs Patch_D2
 1.13c  world   # verified: same, plus 179 packets / 53 units via the clientless. Needs Patch_D2
 1.06b  boot    # classic lineage: d2data only, no d2exp, and its own Fog rewrite
