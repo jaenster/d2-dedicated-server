@@ -295,68 +295,65 @@ jobs:
   # The matrix comes from deploy/e2e-engines.txt so there is ONE list of engines and one statement
   # of what each is expected to manage. Adding an engine, or promoting one from `boot` to `world`,
   # is a line in that file and nothing here.
-  engine-plan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: plan
-        run: |
-          rows=$(awk '!/^[[:space:]]*#/ && NF>=2 {printf "%s{\"engine\":\"%s\",\"expect\":\"%s\"}", sep, $1, $2; sep=","}' \
-                 deploy/e2e-engines.txt)
-          echo "matrix={\"include\":[$rows]}" >> "$GITHUB_OUTPUT"
-          echo "$rows"
-
-  # Every engine, end to end, every time — because the regression this catches is a fix for one
-  # version quietly stopping another from serving, and that is invisible in any single engine's run.
+  # Every pre-1.14 engine, driven to a real world by the clientless — on the runner, not in
+  # containers.
   #
-  # Only on a push: the images live in ghcr by then. A pull request gets the unit tests and the
-  # 1.14d e2e, which is what its own images can support without pulling a gigabyte per engine.
+  # It used to build nine engine images and run one compose stack per engine, which meant it could
+  # only run AFTER those images were pushed, so it never guarded a pull request — the one place a
+  # regression is cheap to fix. The runner is already a Linux VM: the only things that genuinely
+  # want a container here are postgres and redis, and the harness starts those itself.
+  #
+  # No matrix. The engines run one at a time on purpose — they are wine processes and two racing
+  # for a port fail in ways that read as protocol bugs — so a matrix would buy parallelism the test
+  # cannot use, at the price of nine wine installs.
   engine-e2e:
-    needs: [build, engines, engine-plan]
-    if: github.event_name == 'push' || github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      # Every engine reports. Stopping at the first failure would hide whether one version broke or
-      # all of them did, and that difference is the whole diagnosis.
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.engine-plan.outputs.matrix) }}
+    timeout-minutes: 45
+    env:
+      ZIG_VERSION: "0.16.0"
+      D2_MINIMAL_ENGINE_BASE: https://files.typeguru.nl/diablo/minimal
+      CLIENTLESS: ${{ github.workspace }}/d2-clientless/zig-out/bin/clientless
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: take realmd from the build job
-        uses: actions/download-artifact@v4
-        with:
-          pattern: image-realmd
-          merge-multiple: true
-          path: /tmp/images
-      - run: docker load -i /tmp/images/realmd.tar
-      - name: run ${{ matrix.engine }}
-        env:
-          D2GS_IMAGE: ghcr.io/jaenster/d2gs:${{ matrix.engine }}-${{ github.sha }}
-          # Actions expressions have no arithmetic, so the octet is worked out in the shell. A /24
-          # of its own per leg, so engines running at the same time cannot share a bridge.
-          JOB_INDEX: ${{ strategy.job-index }}
+      - name: install zig
         run: |
-          export SUBNET_OCTET=$((30 + JOB_INDEX))
-          docker pull "$D2GS_IMAGE"
-          deploy/engine-e2e-ci.sh "${{ matrix.engine }}" "${{ matrix.expect }}"
+          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            | tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      # Same recipe the engine image uses. i386 first: the engines are 32-bit and wine32 is what
+      # actually runs them.
+      - name: install wine
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends wine wine32 \
+            || sudo apt-get install -y --no-install-recommends wine wine32:i386
+          wine --version
+      - name: build the clientless
+        run: |
+          git clone --depth 1 https://github.com/jaenster/d2-clientless.git
+          cd d2-clientless && zig build -Doptimize=ReleaseSafe
+      # The published tree per engine, named by the rows in deploy/e2e-engines.txt so this cannot
+      # drift from what the run actually tests.
+      - name: fetch the engine trees
+        run: |
+          mkdir -p .stack
+          while read -r eng _; do
+            case "$eng" in ''|\#*) continue ;; esac
+            tag="${eng//./}"
+            url="$D2_MINIMAL_ENGINE_BASE/$eng/d2-$eng-minimal.tgz"
+            echo "==> $eng <- $url"
+            mkdir -p ".stack/gs$tag"
+            curl -fsSL "$url" | tar -xz -C ".stack/gs$tag" || { echo "no published tree for $eng"; exit 1; }
+          done < deploy/e2e-engines.txt
+      - name: bring up the realm
+        run: ./run-stack.sh --realm-only
+      - name: every engine to a world
+        run: tools/e2e-engines.sh
+      - name: server logs
+        if: always()
+        run: for f in .stack/*.log; do echo "===== $f ====="; tail -60 "$f"; done
 
-  # Moves the floating tags to the sha the build jobs just pushed — a manifest copy, no rebuild.
-  # Only after e2e passes, and only on a real push to main (never a PR: there's nothing to promote).
-  #
-  # For the engines that is d2gs:<engine>, from the list the engines job actually built — an engine
-  # that was refused has no sha tag to copy and is silently absent here, which is the same
-  # compiler-decides rule the build follows. d2gs:latest points at 1.14d: an unqualified `d2gs`
-  # should be the newest engine the game ever shipped, not the newest one we happened to add.
   promote:
     needs: [build, engines, test, e2e, engine-e2e]
     timeout-minutes: 10

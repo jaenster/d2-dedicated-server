@@ -40,11 +40,16 @@ WINE="${WINE:-wine}"
 CLIENTLESS="${CLIENTLESS:-$ROOT/../clientless/zig-out/bin/clientless}"
 mkdir -p "$LOG_DIR"
 
-TRACE=0; MODE=up
+TRACE=0; MODE=up; REALM_ONLY=0
 for a in "$@"; do case "$a" in
   --trace) TRACE=1 ;;
   --status) MODE=status ;;
   --down) MODE=down ;;
+  # redis, postgres, realmd and d2ingress, and nothing else. What tools/e2e-engines.sh wants: it
+  # brings up its OWN game server per engine and refuses to run beside another, because two servers
+  # in one realm means a create can land on either and the result reads as a defect in whichever
+  # engine was being tested.
+  --realm-only) REALM_ONLY=1 ;;
   *) echo "unknown flag $a" >&2; exit 2 ;;
 esac; done
 
@@ -178,6 +183,13 @@ else
   await "127.0.0.1:$INGRESS_PORT" 15 "d2ingress" || die "see $LOG_DIR/d2ingress.log"
 fi
 [ "$TRACE" = 1 ] && ok "d2ingress tracing both directions -> $LOG_DIR/d2ingress.log"
+
+if [ "$REALM_ONLY" = 1 ]; then
+  say "realm only"
+  ok "redis, postgres, realmd and d2ingress are up; no game server started"
+  ok "run one with tools/e2e-engines.sh, which brings up its own per engine"
+  exit 0
+fi
 
 say "game server"
 [ -f "$TESTDIR/Game.exe" ] || die "no Game.exe in $TESTDIR — run ./run.sh once to assemble it"
