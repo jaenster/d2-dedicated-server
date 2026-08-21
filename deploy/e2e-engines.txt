@@ -72,3 +72,10 @@
                # offset 8 — so the disagreement is on the CLIENT side of that compare, which is
                # where d2host translates the 1.14d join. That is the next thing to look at, and it
                # is one comparison rather than a format.
+               #
+               # NOT the join translation, which was the obvious suspect and is ruled out. Classic
+               # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two
+               # ways: a 10-byte preamble with a 16-byte name, or an 11-byte one with a 15-byte
+               # name. cs_packets picks the first. Forcing the second makes the engine answer the
+               # join with NOTHING AT ALL rather than with GameFlags, so the first is right and the
+               # name does arrive where this build reads it.
