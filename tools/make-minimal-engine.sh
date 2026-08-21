@@ -60,6 +60,18 @@ base)
         echo "==> minimising $a"
         "$MPQMIN" $LF "$BASE/$a" "$OUT/$a"
     done
+    # Patch_D2.mpq too, and it is not optional in practice. It overlays the base archives, and a
+    # tree without it boots and loads its tables and then halts inside level generation --
+    # "..\Source\D2Common\DRLG\DrlgLogic.cpp:876", a lookup in a table that came back empty.
+    # 1.13c dies there the moment a client enters a game; with the patch archive present the same
+    # build runs a client into the world. Nothing about the failure points at a missing archive.
+    if [ -f "$BASE/Patch_D2.mpq" ]; then
+        echo "==> minimising Patch_D2.mpq"
+        "$MPQMIN" $LF "$BASE/Patch_D2.mpq" "$OUT/Patch_D2.mpq"
+    else
+        echo "!!  no Patch_D2.mpq in $BASE. The engine will boot and then halt in DRLG the first"
+        echo "!!  time a client enters a game. See DrlgLogic.cpp:876."
+    fi
     du -sh "$OUT" | sed 's/^/==> shared base: /'
     ;;
 base-classic)

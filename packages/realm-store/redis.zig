@@ -1498,6 +1498,42 @@ pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
     };
 }
 
+/// Renew the lease on every character this game holds. Returns how many were still ours.
+///
+/// The claim is a LEASE, not a permanent lock: `lockChar` takes it with a TTL so a game server
+/// that dies without releasing cannot strand a character forever. That only works if something
+/// renews it while the game is genuinely alive — otherwise the opposite failure appears, and it is
+/// worse than the one the TTL prevents: the lease lapses under a running game, another game takes
+/// the character, and two games hold one character with neither able to release the other's.
+///
+/// Owner-checked per member for that same reason, and done in one script so a character cannot be
+/// taken between the check and the PEXPIRE.
+pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32) usize {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return 0;
+    const script =
+        \\local n = 0
+        \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+        \\  local lk = ARGV[3] .. m
+        \\  if redis.call('GET', lk) == ARGV[1] then
+        \\    redis.call('PEXPIRE', lk, ARGV[2])
+        \\    n = n + 1
+        \\  end
+        \\end
+        \\return n
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, px, prefix ++ "charlock:" }) orelse return 0;
+    return switch (rep) {
+        .int => |v| @intCast(@max(v, 0)),
+        else => 0,
+    };
+}
+
 /// Free one character this game holds, matched by name because that is all a departure carries.
 pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u8) bool {
     var kb: [64]u8 = undefined;

@@ -53,7 +53,8 @@ EXPORTS
     FOG_IsExpansion @10227 NONAME
     FOG_ComputeChecksum @10229 NONAME
     FOG_PopCount @10230 NONAME
-    FOG_LeadingZeroesCount @10252 NONAME
+    FOG_FindFirstSetBit @10252 NONAME
+    FOG_CallerReturnAddress @10265 NONAME
     DATATBLS_CalcEvaluateExpression @10253 NONAME
     DATATBLS_CompileExpression @10254 NONAME
     FOG_10255 @10255 NONAME

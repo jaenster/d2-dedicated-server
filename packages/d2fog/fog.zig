@@ -357,19 +357,82 @@ export fn FOG_GetMemoryUsage(sys: ?*anyopaque) callconv(.c) u32 {
 // DisplayAssert *returns* — the caller executes `exit(-1)` itself — so a non-fatal stub only
 // changes what gets logged, not whether the engine dies.
 
-export fn FOG_DisplayAssert(msg: ?[*:0]const u8, file: ?[*:0]const u8, line: u32) callconv(.c) void {
+const MemoryBasicInformation = extern struct {
+    base: usize,
+    alloc_base: usize,
+    alloc_protect: u32,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
+};
+extern "kernel32" fn VirtualQuery(addr: ?*const anyopaque, buf: *MemoryBasicInformation, len: usize) callconv(.winapi) usize;
+
+/// How many bytes are readable starting at `v`, capped at `max`. Zero when the address is not
+/// committed readable memory.
+///
+/// `VirtualQuery` and not `IsBadStringPtr`: the latter is deprecated precisely because it can fault
+/// on the pointer it was asked to vet, and it did — the first version of this crashed inside the
+/// halt reporter on the argument `0x36c`, which turned an engine halt into a segfault in the code
+/// meant to explain it.
+fn readableRun(v: usize, max: usize) usize {
+    if (v < 0x10000) return 0;
+    var mbi: MemoryBasicInformation = undefined;
+    if (VirtualQuery(@ptrFromInt(v), &mbi, @sizeOf(MemoryBasicInformation)) == 0) return 0;
+    if (mbi.state != 0x1000) return 0; // MEM_COMMIT
+    if (mbi.protect & 0x101 != 0) return 0; // PAGE_NOACCESS | PAGE_GUARD
+    const end = mbi.base +% mbi.region_size;
+    if (end <= v) return 0;
+    return @min(max, end - v);
+}
+
+/// Render one assert argument as whatever it actually is.
+///
+/// These three do NOT carry the same arguments on every build. 1.10f's forwards (msg, file, line);
+/// 1.13c's ignores the first, treats the second as an error code (its own text for it is
+/// "Unrecoverable internal error %08x") and keeps the third. So printing every argument as a string
+/// produces garbage exactly when the message matters most — which is what `halt "" at Ph(\xa7\xddo...`
+/// was, an engine halt whose reason was unreadable.
+///
+/// A readable NUL-terminated run of printable bytes prints as text; anything else prints as the
+/// number it is. Neither guess can corrupt anything, and both are legible.
+fn assertArg(buf: []u8, v: usize) []const u8 {
+    if (v == 0) return "(null)";
+    const n = readableRun(v, 256);
+    if (n != 0) {
+        const p: [*]const u8 = @ptrFromInt(v);
+        var i: usize = 0;
+        while (i < n and p[i] >= 0x20 and p[i] <= 0x7e) : (i += 1) {}
+        if (i != 0 and i < n and p[i] == 0)
+            return std.fmt.bufPrint(buf, "\"{s}\"", .{p[0..i]}) catch "(long)";
+    }
+    return std.fmt.bufPrint(buf, "0x{x}", .{v}) catch "(?)";
+}
+
+/// `from` is the engine's call site. It is the one field that means the same thing on every build,
+/// so it is what to map back to a disassembly when the arguments themselves are version-shaped.
+fn reportEngineStop(kind: []const u8, from: usize, a: usize, b: usize, c: usize) void {
+    var ba: [288]u8 = undefined;
+    var bb: [288]u8 = undefined;
+    var bc: [288]u8 = undefined;
+    sayFmt("  {s} from 0x{x}: {s} / {s} / {s}", .{
+        kind, from, assertArg(&ba, a), assertArg(&bb, b), assertArg(&bc, c),
+    });
+}
+
+export fn FOG_DisplayAssert(a: usize, b: usize, c: usize) callconv(.c) void {
     trace("FOG_DisplayAssert @10023  *** ENGINE ASSERT ***");
-    sayFmt("  assert \"{s}\" at {s}:{d}", .{ cstr(msg), cstr(file), line });
+    reportEngineStop("assert", @returnAddress(), a, b, c);
 }
 
-export fn FOG_DisplayHalt(msg: ?[*:0]const u8, file: ?[*:0]const u8, line: u32) callconv(.c) void {
+export fn FOG_DisplayHalt(a: usize, b: usize, c: usize) callconv(.c) void {
     trace("FOG_DisplayHalt @10024  *** ENGINE HALT ***");
-    sayFmt("  halt \"{s}\" at {s}:{d}", .{ cstr(msg), cstr(file), line });
+    reportEngineStop("halt", @returnAddress(), a, b, c);
 }
 
-export fn FOG_DisplayWarning(msg: ?[*:0]const u8, file: ?[*:0]const u8, line: u32) callconv(.c) void {
+export fn FOG_DisplayWarning(a: usize, b: usize, c: usize) callconv(.c) void {
     trace("FOG_DisplayWarning @10025");
-    sayFmt("  warning \"{s}\" at {s}:{d}", .{ cstr(msg), cstr(file), line });
+    reportEngineStop("warning", @returnAddress(), a, b, c);
 }
 
 /// Note the leading category: `FOG_DisplayError(int nCategory, szMsg, szFile, nLine)`.
@@ -542,8 +605,32 @@ export fn FOG_PopCount(p: ?[*]const u8, n: u32) callconv(.winapi) u32 {
     return bits;
 }
 
-export fn FOG_LeadingZeroesCount(v: u32) callconv(.winapi) u32 {
-    return @clz(v);
+/// @10265 — 1.13c only: 1.10f's Fog ends at ordinal 10264 and 1.13c added three more.
+///
+/// `mov (%esp),%eax; ret` — it hands back its own caller's return address, the `_ReturnAddress()`
+/// helper Blizzard threads through the allocator and assert paths so a report can name the call
+/// site. D2Game, D2Common, D2Lang and D2CMP all import it on 1.13c, and wine ABORTS the process on
+/// a call to an unimplemented ordinal — which presents as the server going silent at 0% CPU, not as
+/// a missing export. It is exported unconditionally because no earlier LoD build has a 10265 at
+/// all, so there is nothing for it to collide with.
+export fn FOG_CallerReturnAddress() callconv(.c) usize {
+    return @returnAddress();
+}
+
+/// @10252 — the index of the LOWEST set bit, or **-1** when there is none. Not a leading-zero
+/// count, which is what this used to be: the wrong end of the word, and 32 rather than -1 for zero.
+///
+/// The -1 is the whole contract. `D2GAME_STATES_SendUnitStates` @0x6fcc58e0 walks a unit's state
+/// bitfield with `while (bit >= 0) { clear bit; write the state; bit = this(word); }`, so a zero
+/// word answered with 32 is a loop that never ends and a bit that clearing cannot reach. It spun
+/// 91.9 billion times through `BITMANIP_Write` on an already-overflowed stream — every state packet
+/// on every pre-1.14 engine, which is why no client ever received a world.
+///
+/// The real Fog (1.10f 0x6ff539a0) walks the four bytes low to high and indexes a 256-entry table;
+/// that table is `ctz` for all 1..255, checked entry by entry against the image.
+export fn FOG_FindFirstSetBit(v: u32) callconv(.winapi) i32 {
+    if (v == 0) return -1;
+    return @ctz(v);
 }
 
 /// One argument: the string. Returns a 16-bit CRC.
@@ -870,8 +957,8 @@ export fn BITMANIP_Write(s: ?*bitstream.BitStream, v: u32, nbits: i32) callconv(
     const st = s orelse return;
     writes_since_init +%= 1;
     if (writes_since_init % (1 << 20) == 0) sayFmt(
-        "fog: BITMANIP_Write x{d} since the last Initialize — stream bytes={d} bit={d} cap_bits={d} overflow={d}, nbits={d}",
-        .{ writes_since_init, st.bytes, st.bit, st.cap_bits, st.overflow, nbits },
+        "fog: BITMANIP_Write x{d} since the last Initialize — caller=0x{x} stream bytes={d} bit={d} cap_bits={d} overflow={d}, nbits={d}",
+        .{ writes_since_init, @returnAddress(), st.bytes, st.bit, st.cap_bits, st.overflow, nbits },
     );
     bitstream.write(st, v, nbits);
 }

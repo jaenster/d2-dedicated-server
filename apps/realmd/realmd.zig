@@ -263,6 +263,10 @@ pub fn run(init: std.process.Init.Minimal) !void {
     // Game servers report what happens on them into the shared store rather than down a socket
     // to whichever instance they connected to. Every instance drains that stream; each event is
     // taken by exactly one of them.
+    // A character's claim is a lease; without something renewing it, a game longer than the TTL
+    // loses its own claim mid-session. See fleet.renewCharLeases.
+    _ = std.Thread.spawn(.{}, fleet.renewCharLeases, .{}) catch |e|
+        log.line("realmd", "could not start the character-lease renewer: {s}", .{@errorName(e)});
     _ = std.Thread.spawn(.{}, fleet.consumeEvents, .{}) catch |e|
         log.line("realmd", "WARNING game-server event consumer did not start: {s} — the join list will not update", .{@errorName(e)});
 

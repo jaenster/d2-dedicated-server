@@ -386,7 +386,12 @@ fn Binding(comptime version: d2version.Version) type {
         // reuse of another version's number under a different engine.
         pub fn buildCallbackTable() CallbackTable {
             return .{
-                .close_game = stubFor(.fpCloseGame, "pfCloseGame"),
+                // Not a report. It is the only moment the realm learns a game ended, and until it
+                // did the realm went on believing every character in that game was still in it.
+                .close_game = @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpCloseGame),
+                    closeGame,
+                ).shim),
                 .leave_game = stubFor(.fpLeaveGame, "pfLeaveGame"),
                 // The one slot that is a real implementation rather than a report: it drives every join.
                 .get_database_character = if (probing) @ptrCast(&fastcall.Callback2(
@@ -799,6 +804,35 @@ fn cformat(buf: []u8, fmt: [*:0]const u8, ap: anytype) []const u8 {
 fn loadComplete(a: i32) callconv(.winapi) i32 {
     _ = a;
     say("d2host: engine called pfLoadComplete");
+    return 0;
+}
+
+/// How long a realm event lives, and how many may queue. Same figures the 1.14d server publishes
+/// with, because both feed the one drain loop in realmd.
+const event_cap: u32 = 4096;
+const event_ttl_s: u32 = 3600;
+
+/// Slot 0x00, the end of a game. Every measured version passes the game id in ECX — 1.09's
+/// `CloseGame(wGameId)` takes nothing else at all, and the builds that push two more stack
+/// arguments still lead with it — so the handler names no stack argument and the shim cleans up
+/// whatever that version's count is.
+///
+/// This has to reach the realm. `removeGameById` and `releaseGameChars` both sit on realmd's side
+/// of a CLOSEGAME, so while this only reported, a finished game stayed in the join list forever and
+/// every character in it stayed claimed. That surfaces three moves later and reads as three
+/// separate bugs: `create game '<name>' -> name already exists`, `character '<name>' is held by
+/// game:N`, and a join refused 0x2b "game is full" with nobody in it.
+fn closeGame(ecx: usize, edx: usize) callconv(.c) usize {
+    _ = edx;
+    const gid: u32 = @truncate(ecx);
+    sayFmt("d2host: pfCloseGame — game {d} ended", .{gid});
+    if (live_games > 0) live_games -= 1;
+    if (realmConfigured() and gid != 0) {
+        var c = std.mem.zeroes(proto.CloseGame);
+        c.h = proto.header(.closegame, @sizeOf(proto.CloseGame), 0);
+        c.gameid = gid;
+        _ = store.pushEvent(std.mem.asBytes(&c), event_cap, event_ttl_s);
+    }
     return 0;
 }
 
