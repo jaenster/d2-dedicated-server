@@ -25,9 +25,13 @@
 # built to an older recipe fails as an engine assert with nothing pointing at the tree, so when a
 # row that used to hold starts failing, check the tarball's age against the recipe's before the code.
 
-1.08   boot    # its S->C table is measured now, so a client can frame it. Not yet driven.
-1.09b  boot    # measured too. Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it during
-               # boot
+1.08   boot    # driven now: creates a game, handshakes and TAKES THE CHARACTER (its record is
+               # 1.07's shape with its own number, 0x59, out of its own writer). Then the same null
+               # jump as 1.06b.
+1.09b  boot    # driven too, and takes the character. Its record is NOT 1.08's shape: it keeps the
+               # modern layout and only the version differs (0x5c), so rewriting the header the
+               # 1.08 way would break a save it would otherwise accept. Then the same null jump.
+               # Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it during boot
 1.09d  boot    # boots from the PUBLISHED tree, which carries 1.09d-era compiled tables. It was
                # recorded as broken off a locally assembled tree whose data/ held the recovered
                # tables instead: loose files win over MPQ members, so the wrong-era ones are what

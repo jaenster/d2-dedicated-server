@@ -28,21 +28,54 @@ pub const size: usize = 0x82;
 const modern_name = 0x14;
 const modern_status = 0x24;
 
+/// Not every build that refuses the modern save wants the same thing.
+///
+/// 1.06b through 1.08 want the record above, fields moved. 1.09 does not: its writer stamps a
+/// version and nothing else of this shape — no size at 0x20, no revision at 0x1c — so it reads the
+/// modern layout and only disagrees about the number in the version field. Rewriting its header
+/// the 1.08 way would break a save it would otherwise have taken.
+pub const Shape = enum {
+    /// Name at 0x08, status at 0x18, revision, size. No checksum — 0x0C is inside the name.
+    record,
+    /// The modern layout, with a different number in the version field. The checksum still applies
+    /// and must be recomputed, because here 0x0C really is the checksum.
+    version_only,
+};
+
 pub const Layout = struct {
     /// The engine compares this exactly; it is not a minimum.
     version: u32,
-    /// Bounded by the engine against its own value, so it must not exceed it.
-    revision: u16,
+    /// Bounded by the engine against its own value, so it must not exceed it. Unused by
+    /// `version_only`.
+    revision: u16 = 0,
+    shape: Shape = .record,
 };
 
 /// What `v` wants handed to it, or null when it takes the realm's save unchanged.
+///
+/// Every number here is out of that build's own writer, not its neighbour's: 1.08 writes 0x59 where
+/// 1.07 writes 0x57, and 1.09 writes 0x5c in a different shape entirely.
 pub fn layout(v: version.Version) ?Layout {
     return switch (v) {
         .v106b => .{ .version = 0x47, .revision = 0xdd },
         .v107 => .{ .version = 0x57, .revision = 0x13f },
+        .v108 => .{ .version = 0x59, .revision = 0x13f },
+        .v109b, .v109d => .{ .version = 0x5c, .shape = .version_only },
         // 1.10f and later read the modern save as it is stored.
         else => null,
     };
+}
+
+/// The save checksum, over the whole buffer with its own field zeroed. Only `version_only` needs
+/// it: the `record` shape has no checksum field, because 0x0C is inside the name there.
+fn checksum(buf: []u8) u32 {
+    @memset(buf[0x0c..0x10], 0);
+    var sum: u32 = 0;
+    for (buf) |b| {
+        const carry: u32 = @intFromBool(sum & 0x8000_0000 != 0);
+        sum = @as(u32, b) +% carry +% (sum *% 2);
+    }
+    return sum;
 }
 
 /// Rewrite the realm's `.d2s` into `l`'s record, in place, returning the length to send.
@@ -51,6 +84,12 @@ pub fn layout(v: version.Version) ?Layout {
 /// record out of the front.
 pub fn fromModern(buf: []u8, l: Layout) usize {
     if (buf.len < size) return buf.len;
+    if (l.shape == .version_only) {
+        std.mem.writeInt(u32, buf[4..8], l.version, .little);
+        const c = checksum(buf);
+        std.mem.writeInt(u32, buf[0x0c..0x10], c, .little);
+        return buf.len;
+    }
     const status = buf[modern_status];
     var name: [16]u8 = undefined;
     @memcpy(&name, buf[modern_name..][0..16]);
@@ -107,4 +146,22 @@ test "1.10f and later are handed the save unchanged" {
     try std.testing.expect(layout(.v110f) == null);
     try std.testing.expect(layout(.v113c) == null);
     try std.testing.expect(layout(.v114d) == null);
+}
+
+test "1.08 is 1.07's shape with its own number, read from its own writer" {
+    var b = sample("Zeta", 0x21);
+    _ = fromModern(&b, layout(.v108).?);
+    try std.testing.expectEqual(@as(u32, 0x59), std.mem.readInt(u32, b[4..8], .little));
+    try std.testing.expectEqualStrings("Zeta", std.mem.sliceTo(b[8..24], 0));
+}
+
+test "1.09 keeps the modern layout and only its version differs" {
+    var b = sample("Zeta", 0x21);
+    const before_name = b[modern_name..][0..16].*;
+    _ = fromModern(&b, layout(.v109d).?);
+    try std.testing.expectEqual(@as(u32, 0x5c), std.mem.readInt(u32, b[4..8], .little));
+    // The name stays where the modern save keeps it — moving it would break a save it would take.
+    try std.testing.expectEqualSlices(u8, &before_name, b[modern_name..][0..16]);
+    // And its checksum is real here, because 0x0C is the checksum in this shape.
+    try std.testing.expect(std.mem.readInt(u32, b[0x0c..0x10], .little) != 0xdeadbeef);
 }
