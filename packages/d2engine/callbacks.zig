@@ -473,7 +473,7 @@ pub const v106b: StackArgs = .{
 
 /// 1.14d grew the table past 0x40. fpGetDatabaseFileTime is the only appended slot known to be
 /// called — CalculateGetFlags @0x569d80 calls it with no IsBadCodePtr guard, so null is a
-/// call-to-zero during the character load. Pre-1.14 has no equivalent.
+/// call-to-zero during the character load. 1.13c shares the layout; see `Ext113c`.
 pub const Ext114d = extern struct {
     reserved_0x40: [5]?*const anyopaque = @splat(null),
     fpGetDatabaseFileTime: ?*const anyopaque = null, // 0x54 — char save timestamp for conflict checks
@@ -481,6 +481,17 @@ pub const Ext114d = extern struct {
 };
 
 pub const Table114d = Extended(Ext114d);
+
+/// 1.13c's tail is the same shape and the same slot. `SrvVerifyJoinGame` @0x6fd0baf0 loads the
+/// table and calls 0x54 with nothing but the "callbacks installed" flag in front of it — no null
+/// test, no `IsBadCodePtr` — then feeds the eight bytes it filled to `CompareFileTime` against the
+/// delivered save's own stamp at +0x190. So a host that hands 1.13c a 0x40-byte table is read
+/// 0x14 bytes past the end of it, and the engine calls whatever follows.
+///
+/// Found by joining a 1.13c server with a stock 1.14d client: the fault is EIP=0 with the caller
+/// at D2Game+0xebb38, one instruction past that call.
+pub const Ext113c = Ext114d;
+pub const Table113c = Extended(Ext113c);
 
 comptime {
     const file_time = @offsetOf(Table114d, "ext") + @offsetOf(Ext114d, "fpGetDatabaseFileTime");

@@ -417,6 +417,16 @@ fn Binding(comptime version: d2version.Version) type {
                 .load_complete = @ptrCast(&loadComplete),
             };
         }
+
+        /// The tail past 0x40. Filled only where the build is known to index it — but the storage
+        /// carries it either way, because "this build does not index it" is a claim about a sweep
+        /// and the cost of the sweep being wrong is a call through whatever follows the table.
+        pub fn buildCallbackTail() cb.Ext113c {
+            if (!spec.callback_tail) return .{};
+            return .{
+                .fpGetDatabaseFileTime = @ptrCast(&fastcall.Callback2(0, getDatabaseFileTime).shim),
+            };
+        }
     };
 }
 
@@ -671,9 +681,19 @@ const CallbackTable = extern struct {
     load_complete: ?*const anyopaque
 };
 
+/// What the engine is actually handed. 1.13c and 1.14d index past the shared sixteen, and the one
+/// appended slot they call — 0x54 — is dispatched with no null guard, so the table has to physically
+/// extend that far even on a build that never reads it. The tail costs 0x18 bytes; getting it wrong
+/// costs a call through whatever follows a 0x40-byte struct in BSS.
+const EngineTable = extern struct {
+    base: CallbackTable,
+    ext: cb.Ext113c = .{},
+};
+
 comptime {
     // The engine indexes this table by fixed offset; a layout change silently corrupts dispatch.
     std.debug.assert(@sizeOf(CallbackTable) == 0x40);
+    std.debug.assert(@offsetOf(EngineTable, "ext") == 0x40);
     std.debug.assert(@offsetOf(CallbackTable, "get_database_character") == 0x08);
     std.debug.assert(@offsetOf(CallbackTable, "save_database_character") == 0x0C);
     std.debug.assert(@offsetOf(CallbackTable, "enter_game") == 0x14);
@@ -782,9 +802,26 @@ fn loadComplete(a: i32) callconv(.winapi) i32 {
     return 0;
 }
 
+/// Slot 0x54, `__fastcall(FILETIME *out)` — the one appended slot 1.13c and 1.14d call, and neither
+/// guards it: the only thing in front of the dispatch is the "callbacks installed" flag.
+///
+/// The engine asks the realm for the timestamp of the character's stored save and compares it with
+/// the stamp inside the save the client just uploaded (`SrvVerifyJoinGame` @0x6fd0baf0, then
+/// `CompareFileTime` against the delivered data at +0x190) — so a client cannot hand back an older
+/// copy of its own character. The realm keeps no per-save timestamp, so the honest answer is a zero
+/// FILETIME: nothing on record, and every delivered save is at least as new as that.
+fn getDatabaseFileTime(ecx: usize, edx: usize) callconv(.c) usize {
+    _ = edx;
+    if (ecx != 0) {
+        const out: *[2]u32 = @ptrFromInt(ecx);
+        out.* = .{ 0, 0 };
+    }
+    return 0;
+}
+
 /// MUST outlive every call into D2Game: SetServerCallbackFunctions stores this pointer rather than
 /// copying the struct (verified at 1.10f 0x6FC358E0), so a stack temporary would dangle.
-var callbacks: CallbackTable = undefined;
+var callbacks: EngineTable = undefined;
 
 /// The game-data table is not an opaque buffer — it is a host-owned object D2Game reaches into by
 /// fixed offset, and Blizzard's own host built it with a C++ constructor. In 1.00's `D2Server.dll`
@@ -1075,7 +1112,11 @@ fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
     for (0..6) |i| sayFmt("d2host:   [esp+0x{x}] = 0x{x}", .{ i * 4, stack[i] });
     // What is actually executing. When EIP lands inside the stack the bytes are not code at all,
     // and seeing them says which data got jumped into — the register dump alone cannot.
-    {
+    //
+    // Not for a null EIP: reading around address 0 faults inside the handler and takes the rest of
+    // the report with it — which is how the one fault that says most about its cause (a CALL through
+    // a null slot) used to be the one that reported least.
+    if (c.eip >= 0x10000) {
         const code: [*]const u8 = @ptrFromInt(c.eip -% 8);
         var buf: [96]u8 = undefined;
         var n: usize = 0;
@@ -1088,6 +1129,8 @@ fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
             n += 3;
         }
         sayFmt("d2host:   bytes at eip-8: {s}", .{buf[0..n]});
+    } else {
+        sayFmt("d2host:   EIP is not code — a CALL through a null pointer. The caller is [esp+0x0].", .{});
     }
     return 0;
 }
@@ -1236,7 +1279,10 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     // Everything version-specific about the table — every slot's arity, and the two real
     // implementations' internals — lives in `Binding(version)`. `run` is generic, so this line is
     // the same regardless of which version the current instantiation is for.
-    callbacks = Binding(version).buildCallbackTable();
+    callbacks = .{
+        .base = Binding(version).buildCallbackTable(),
+        .ext = Binding(version).buildCallbackTail(),
+    };
     say("d2host: callback table built");
 
     // Blizzard's own host (`D2Server.dll`, WinMain @0x10009EA0) defines the minimal init, and this
