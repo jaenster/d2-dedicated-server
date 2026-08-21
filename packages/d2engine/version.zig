@@ -130,6 +130,15 @@ pub const Spec = struct {
 const classic_modules = [_][:0]const u8{ "Storm.dll", "Fog.dll", "D2Lang.dll", "D2CMP.dll", "D2Common.dll", "D2Net.dll", "D2Game.dll" };
 const lod_modules = classic_modules;
 
+/// Loading the CLIENT dll was tried here and did nothing.
+///
+/// The real pre-1.10 servers do it — Onlyer's 1.09d D2Server.dll LoadLibraryA's D2Client.dll from a
+/// one-entry list, and its one unconditional patch targets `d2client.dll+0x81e1`, so it loads the
+/// client in order to patch it. Loading it here (plus D2gfx, D2Win, D2Sound, D2MCPClient and
+/// ijl11) boots fine and changes nothing about the fault those builds hit, so the load is not the
+/// missing half on its own. Left out rather than left in: it costs five modules the minimal tree
+/// does not ship, and buys nothing measured.
+
 pub fn spec(comptime v: Version) Spec {
     return switch (v) {
         .v100 => .{

@@ -1475,7 +1475,13 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
         } else say("d2host: Fog has no FOG_SetEngineVersion — using its built-in ABI");
     }
 
-    const d2game = modules[modules.len - 1].handle.?;
+    // By NAME. This used to take the last entry, which held for as long as D2Game happened to be
+    // last in every version's list — and silently handed back the wrong module the moment one of
+    // them loaded anything after it.
+    const d2game = moduleHandle(&modules, "D2Game.dll") orelse {
+        say("d2host: D2Game.dll is not in this version's module list");
+        return error.MissingOrdinal;
+    };
     const d2common = moduleHandle(&modules, "D2Common.dll").?;
     const d2lang = moduleHandle(&modules, "D2Lang.dll").?;
     const d2net = moduleHandle(&modules, "D2Net.dll").?;
