@@ -82,7 +82,15 @@
                # The fault is very likely a JUMP through a null pointer rather than a call: the
                # stack at the fault holds a heap value where a call's return address would be. Fog
                # now logs BITMANIP_Initialize's engine-side caller for exactly this; on 1.06b those
-               # are 0x6fceb7ee and 0x6fcbc85a, which is where to disassemble forward from.
+               # are 0x6fceb7ee and 0x6fcbc85a.
+               #
+               # The crash reporter walks the stack for engine addresses now, which pins it: the
+               # innermost frame is 0x6fcb1f94, the return address of `call 0x6fcedf20` at
+               # 0x6fcb1f8f (__fastcall, the unit in ECX and 1 pushed). So the null transfer is
+               # inside 0x6fcedf20 or below it. Its direct calls are all resolved — two are Fog
+               # thunks (#10023 DisplayAssert, #10128 BITMANIP_Write) and neither fired, so this is
+               # not a missing import: an unfilled entry in a dispatch table the engine builds at
+               # runtime fits the evidence (`[esp]` and EDI both point into the heap).
                #
                # NOT the join translation either, which was the obvious suspect and is ruled out. Classic
                # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two

@@ -1238,7 +1238,27 @@ fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
         }
         sayFmt("d2host:   bytes at eip-8: {s}", .{buf[0..n]});
     } else {
-        sayFmt("d2host:   EIP is not code — a CALL through a null pointer. The caller is [esp+0x0].", .{});
+        // Not necessarily a CALL. A call leaves its return address at [esp]; when what is there is
+        // heap rather than code, the transfer was a JMP through a null pointer — a thunk or a
+        // dispatch table entry that was never filled — and there is no return address to read.
+        // Either way the stack still holds the frames that led here, so walk it for anything inside
+        // the engine's address range and print those. That is the difference between "it died" and
+        // "it died in this function".
+        sayFmt("d2host:   EIP is not code — a null transfer. [esp]=0x{x} is {s}.", .{
+            stack[0],
+            if (stack[0] >= 0x6f00_0000 and stack[0] < 0x7000_0000) "a return address" else "not code, so this was a JMP not a CALL",
+        });
+        say("d2host:   stack, engine addresses only (innermost first):");
+        var found: usize = 0;
+        var off: usize = 0;
+        while (off < 0x400 and found < 12) : (off += 4) {
+            const v = stack[off / 4];
+            if (v >= 0x6f00_0000 and v < 0x7000_0000) {
+                sayFmt("d2host:     [esp+0x{x:0>3}] = 0x{x}", .{ off, v });
+                found += 1;
+            }
+        }
+        if (found == 0) say("d2host:     none — the stack holds no engine addresses at all");
     }
     return 0;
 }
