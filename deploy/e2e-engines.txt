@@ -22,10 +22,19 @@
 
 1.07   boot    # frames and handshakes correctly now that the client uses 1.07's own S->C table
                # (GameFlags is 7 bytes here, not 8): GameFlags -> Nop -> JOINGAME -> LoadSuccess
-               # all land. It dies after that, on two separate things. The character is refused
-               # with SYSERROR_EXPANSIONGAME, so the game is not being created as expansion the
-               # way this build wants; and the engine then CALLs through a null pointer (eip=0)
-               # right after BITMANIP_Initialize @10126.
+               # all land, none of which happened before. It then refuses the character with
+               # SYSERROR_EXPANSIONGAME and CALLs through a null pointer (eip=0) right after
+               # BITMANIP_Initialize @10126.
+               #
+               # The refusal is at 0x6fc621a3: `mov ax,[esi+0x0a]` (the CLIENT record's flag word)
+               # / `mov ecx,[ebx+0x50]` (the game's expansion field, +0x70 on 1.10f) / `test al,
+               # 0x20`. The message means client-classic against game-expansion, so the game is
+               # right and the client record never gets the bit. Two things it is NOT, both tested
+               # rather than assumed: not the save version (1.07 parses 0x47-0x49 and 0x50-0x57
+               # through one case at 0x6fcac520 and rejects 0x4a-0x4f; delivering 0x57 instead of
+               # our usual 0x60 changes nothing), and not the old pre-1.09 header layout with the
+               # status at 0x18 instead of 0x24 (names putting 0x78 and 0x00 at that offset fail
+               # identically). So what fills [esi+0x0a] on this build is the open question.
 1.08   boot    # never driven: nobody has read its S->C table out of its D2Net yet, and the client
                # refuses to frame a build with a neighbour's table rather than hang on it
 1.09b  boot    # as 1.08, unmeasured. Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it
