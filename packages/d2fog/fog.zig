@@ -970,7 +970,11 @@ export fn BITMANIP_MaskBitstate(p: ?[*]u8, bit: i32) callconv(.winapi) void {
     bitstream.clearBit(p orelse return, bit);
 }
 export fn BITMANIP_Initialize(s: ?*bitstream.BitStream, stream: ?[*]u8, n: u32) callconv(.winapi) void {
-    trace("BITMANIP_Initialize @10126");
+    // With the caller, because this is the last thing traced before the pre-1.10 builds fault, and
+    // the fault itself carries no usable return address — it looks like a jump through a null
+    // pointer rather than a call, so the stack holds an argument where a return address would be.
+    // The engine-side address is the only handle on where that jump is.
+    sayFmt("BITMANIP_Initialize @10126 from 0x{x}", .{@returnAddress()});
     writes_since_init = 0;
     bitstream.init(s orelse return, stream, n);
 }

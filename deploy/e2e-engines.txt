@@ -5,6 +5,11 @@
 # is never "the build breaks" — it is that a fix for one version quietly stops another serving, and
 # every one of those looks identical from the client: the join is accepted and nothing arrives.
 #
+# 1.07 is deliberately NOT a row here: it is not a target. It is still REQUIRED, though, and by the
+# build rather than by this file — every expansion DLL from 1.08 on is a delta against 1.07's PE
+# files (`D2_LOD_BASE` in tools/make-minimal-engine.sh), so the tree recipe cannot lose it. What is
+# dropped is serving it, not having it.
+#
 #   world   a real client must reach a NON-EMPTY world. Anything less fails the run.
 #   boot    the server must start, publish itself into the store, and keep a clean log. Not yet
 #           expected to hand out a world; the reason is in the note.
@@ -20,31 +25,9 @@
 # built to an older recipe fails as an engine assert with nothing pointing at the tree, so when a
 # row that used to hold starts failing, check the tarball's age against the recipe's before the code.
 
-1.07   boot    # frames and handshakes correctly now that the client uses 1.07's own S->C table
-               # (GameFlags is 7 bytes here, not 8): GameFlags -> Nop -> JOINGAME -> LoadSuccess
-               # all land, none of which happened before. It then refuses the character with
-               # SYSERROR_EXPANSIONGAME and CALLs through a null pointer (eip=0) right after
-               # BITMANIP_Initialize @10126.
-               #
-               # The refusal is at 0x6fc621a3: `mov ax,[esi+0x0a]` (the CLIENT record's flag word)
-               # / `mov ecx,[ebx+0x50]` (the game's expansion field, +0x70 on 1.10f) / `test al,
-               # 0x20`. The message means client-classic against game-expansion, so the game is
-               # right and the client record never gets the bit. Two things it is NOT, both tested
-               # rather than assumed: not the save version (1.07 parses 0x47-0x49 and 0x50-0x57
-               # through one case at 0x6fcac520 and rejects 0x4a-0x4f; delivering 0x57 instead of
-               # our usual 0x60 changes nothing), and not the old pre-1.09 header layout with the
-               # status at 0x18 instead of 0x24 (names putting 0x78 and 0x00 at that offset fail
-               # identically). So what fills [esi+0x0a] on this build is the open question.
-               #
-               # It is very likely the same root as 1.06b's Error:9 seen from a build that does not
-               # reject outright: the realm writes ONE save version, 0x60, and hands it to every
-               # engine. 1.06b writes 0x47; 1.07 accepts 0x47-0x49 and 0x50-0x57 and writes 0x57;
-               # only 1.10f and later accept 0x60. A per-era .d2s is the same shape of fix as the
-               # per-build packet tables, and it is what both of these are waiting on.
-1.08   boot    # never driven: nobody has read its S->C table out of its D2Net yet, and the client
-               # refuses to frame a build with a neighbour's table rather than hang on it
-1.09b  boot    # as 1.08, unmeasured. Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it
-               # during boot
+1.08   boot    # its S->C table is measured now, so a client can frame it. Not yet driven.
+1.09b  boot    # measured too. Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it during
+               # boot
 1.09d  boot    # boots from the PUBLISHED tree, which carries 1.09d-era compiled tables. It was
                # recorded as broken off a locally assembled tree whose data/ held the recovered
                # tables instead: loose files win over MPQ members, so the wrong-era ones are what
@@ -90,7 +73,12 @@
                # NOT the callback table (every tail slot is a reporting stub now and none fired),
                # NOT the game-data vtable (filling past its four methods changed nothing), and NOT
                # BITMANIP_Initialize's own arity (the real one is `ret 0xc`, three stdcall args,
-               # and ours is the same — 1.07's and 1.10f's are instruction-identical besides).
+               # and ours is the same — 1.10f's is instruction-identical besides).
+               #
+               # The fault is very likely a JUMP through a null pointer rather than a call: the
+               # stack at the fault holds a heap value where a call's return address would be. Fog
+               # now logs BITMANIP_Initialize's engine-side caller for exactly this; on 1.06b those
+               # are 0x6fceb7ee and 0x6fcbc85a, which is where to disassemble forward from.
                #
                # NOT the join translation either, which was the obvious suspect and is ruled out. Classic
                # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two
