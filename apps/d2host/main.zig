@@ -1630,8 +1630,28 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
 
     // GAME_InitGameDataTable(ptGameDataTbl, phGameList) — stdcall, both asserted non-null.
     buildGameDataTable();
+    // Which object the engine is given. From 1.10 on it takes the one built above; before that the
+    // real servers hand it a C++ global that lives in D2Client and is constructed by that module's
+    // static initialisers, whose address they read out of a `mov ecx, <addr>` operand because it is
+    // not exported. The value is verified first, exactly as they verify it: a mismatch means the
+    // offset was measured on a different build, and reading on would hand the engine a wild pointer.
+    var gdt_ptr: *anyopaque = @ptrCast(&game_data_table);
+    if (comptime d2version.spec(version).client_game_data) |cgd| {
+        const client = moduleHandle(&modules, "D2Client.dll") orelse {
+            say("d2host: this build wants D2Client's game-data object but D2Client.dll is not loaded");
+            return error.MissingModule;
+        };
+        const at = @intFromPtr(client) + cgd.offset;
+        const found = @as(*align(1) const u32, @ptrFromInt(at)).*;
+        if (found != cgd.expect) {
+            sayFmt("d2host: D2Client+0x{x} holds 0x{x}, expected 0x{x} — refusing to use it", .{ cgd.offset, found, cgd.expect });
+            return error.MissingModule;
+        }
+        sayFmt("d2host: game-data object from D2Client+0x{x} = 0x{x}", .{ cgd.offset, found });
+        gdt_ptr = @ptrFromInt(found);
+    }
     say("d2host: calling GAME_InitGameDataTable");
-    @as(InitFn, @ptrCast(@alignCast(init_table)))(@ptrCast(&game_data_table), @ptrCast(&game_list));
+    @as(InitFn, @ptrCast(@alignCast(init_table)))(gdt_ptr, @ptrCast(&game_list));
     say("d2host: GAME_InitGameDataTable returned");
     sayHex("d2host: esp after InitGameDataTable = ", espNow());
 
