@@ -1159,8 +1159,53 @@ fn loadModules(comptime module_names: []const [:0]const u8) ![module_names.len]M
         }
         sayHex("d2host: loaded " ++ name ++ ", base=", @intFromPtr(modules[i].handle.?));
         noteModule(name, @intFromPtr(modules[i].handle.?));
+        reportNullImports(name, @intFromPtr(modules[i].handle.?));
     }
     return modules;
+}
+
+/// Report any import in `base`'s table that resolved to a null address.
+///
+/// The fault that stops the pre-1.10 builds is a JMP through a null pointer, and an import thunk is
+/// `jmp dword ptr [IAT slot]` — so a slot the loader left at zero produces exactly that, with no
+/// return address pushed and nothing on the stack to say where it came from. Normally a failed
+/// import fails the whole load, but we SUPPLY Fog and D2Net: an ordinal our .def names but does not
+/// really export can resolve to zero without the load failing, and then the first call to it jumps
+/// to address zero from a thunk that names nothing.
+///
+/// Cheap to check from in-process and it either finds the fault or removes the hypothesis.
+fn reportNullImports(name: []const u8, base: usize) void {
+    const lfanew: u32 = @as(*const u32, @ptrFromInt(base + 0x3c)).*;
+    const nt = base + lfanew;
+    if (@as(*const u32, @ptrFromInt(nt)).* != 0x0000_4550) return;
+    const dir = nt + 24 + 104; // OptionalHeader.DataDirectory[1] = imports
+    const irva: u32 = @as(*const u32, @ptrFromInt(dir)).*;
+    if (irva == 0) return;
+    var desc = base + irva;
+    var nulls: usize = 0;
+    while (true) : (desc += 20) {
+        const olt: u32 = @as(*const u32, @ptrFromInt(desc)).*;
+        const name_rva: u32 = @as(*const u32, @ptrFromInt(desc + 12)).*;
+        const first: u32 = @as(*const u32, @ptrFromInt(desc + 16)).*;
+        if (name_rva == 0 and first == 0) break;
+        const dll: [*:0]const u8 = @ptrFromInt(base + name_rva);
+        // Walk the ORIGINAL thunk list for the length. The IAT itself cannot supply it: after the
+        // loader has written addresses into it, a zero is indistinguishable from the terminator,
+        // and reading past it walks straight into the next descriptor's array — which is what the
+        // first version of this did, reporting every array boundary in Storm as a null import.
+        const names_at = if (olt != 0) base + olt else base + first;
+        var i: usize = 0;
+        while (@as(*const u32, @ptrFromInt(names_at + i * 4)).* != 0) : (i += 1) {
+            const v: usize = @as(*const usize, @ptrFromInt(base + first + i * 4)).*;
+            if (v == 0) {
+                sayFmt("d2host: NULL IMPORT — {s} imports entry {d} of {s} and it resolved to zero", .{
+                    name, i, std.mem.sliceTo(dll, 0),
+                });
+                nulls += 1;
+            }
+        }
+    }
+    if (nulls != 0) sayFmt("d2host: {s} has {d} null import(s); a call to one jumps to address zero", .{ name, nulls });
 }
 
 fn moduleHandle(modules: []const Module, name: []const u8) ?HMODULE {
