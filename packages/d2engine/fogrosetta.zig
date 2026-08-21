@@ -82,7 +82,12 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10088, .lod = 10119, .how = .corroborated },
     .{ .classic = 10089, .lod = 10120, .how = .corroborated },
     .{ .classic = 10095, .lod = 10126, .how = .measured }, // BitManip.cpp on both sides
-    .{ .classic = 10096, .lod = 10127, .how = .corroborated },
+    // Byte-for-byte identical bodies: both read the stream's +0x08 and +0x0c and return
+    // `bytes + (bit != 0)`, `ret 4`. Verified because this one's return value is the LENGTH the
+    // engine then copies into a fixed 0x208 packet buffer, so a wrong mapping here would not
+    // misbehave locally — it would overrun and corrupt, and surface much later as a jump to a
+    // garbage address.
+    .{ .classic = 10096, .lod = 10127, .how = .measured },
     // Bodies compared instruction for instruction, because neither side asserts and so neither
     // carries a __FILE__ tag to match on: both read the stream's +0x04/+0x08/+0x0c, both compute
     // the bit cursor as `lea edx,[ecx+edx*8]` then add the width. Same function, different register
@@ -183,7 +188,7 @@ test "an unconfirmed row is refused rather than guessed" {
 
 test "how much of the set is actually established" {
     try std.testing.expectEqual(@as(usize, 47), classic_to_lod.len);
-    try std.testing.expectEqual(@as(usize, 22), countBy(.measured));
-    try std.testing.expectEqual(@as(usize, 17), countBy(.corroborated));
+    try std.testing.expectEqual(@as(usize, 23), countBy(.measured));
+    try std.testing.expectEqual(@as(usize, 16), countBy(.corroborated));
     try std.testing.expectEqual(@as(usize, 8), countBy(.inferred));
 }
