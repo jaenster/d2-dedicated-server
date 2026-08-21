@@ -342,9 +342,11 @@ jobs:
       - name: run ${{ matrix.engine }}
         env:
           D2GS_IMAGE: ghcr.io/jaenster/d2gs:${{ matrix.engine }}-${{ github.sha }}
-          # A /24 of its own per leg, so engines running at the same time cannot share a bridge.
-          SUBNET_OCTET: ${{ 30 + strategy.job-index }}
+          # Actions expressions have no arithmetic, so the octet is worked out in the shell. A /24
+          # of its own per leg, so engines running at the same time cannot share a bridge.
+          JOB_INDEX: ${{ strategy.job-index }}
         run: |
+          export SUBNET_OCTET=$((30 + JOB_INDEX))
           docker pull "$D2GS_IMAGE"
           deploy/engine-e2e-ci.sh "${{ matrix.engine }}" "${{ matrix.expect }}"
 
