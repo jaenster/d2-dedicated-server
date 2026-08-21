@@ -55,5 +55,12 @@
 1.06b  boot    # classic lineage: d2data only, no d2exp, and its own Fog rewrite. Now creates a
                # game, takes a character and completes the handshake with a client framing it as
                # classic (GameFlags is SIX bytes here). It refuses the character with Error:9,
-               # which is the save-version gate: 1.06b writes 0x47 (@0x6fcf6a1a) and the realm
-               # hands every engine 0x60. Same root as 1.07 — see the note there.
+               # which is the save-version gate: 1.06b requires EXACTLY 0x47 (@0x6fcf7827) and the
+               # realm hands every engine 0x60. Same root as 1.07 — see the note there.
+               #
+               # What it wants is not the modern .d2s at all but a 130-byte record: magic, version,
+               # name[16] at 0x08 (strcmp'd against the client's), status at 0x18, a content
+               # revision at 0x1c (0xdd here, 0x13f on 1.07), 0x10 at 0x1e and the size 0x82 at
+               # 0x20. Writer @0x6fcf6a10, parser @0x6fcf77c0. Delivering all of that still returns
+               # Error:9, so a gate remains unmapped — walk every return-9 path out of the parser
+               # rather than patching fields one at a time.
