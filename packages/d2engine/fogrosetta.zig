@@ -173,9 +173,12 @@ test "a shared ordinal number is not a shared function" {
 }
 
 test "an unconfirmed row is refused rather than guessed" {
-    try std.testing.expect(lodFor(10097, false) == null); // inferred only
-    try std.testing.expectEqual(@as(u16, 10128), lodFor(10097, true).?);
+    try std.testing.expect(lodFor(10098, false) == null); // inferred only
+    try std.testing.expectEqual(@as(u16, 10129), lodFor(10098, true).?);
     try std.testing.expect(lodFor(9999, true) == null); // not imported at all
+    // 10097 used to be this test's example and is not any more: its bodies were compared against
+    // 10128's and matched, so it is measured and answers without being asked to accept inferences.
+    try std.testing.expectEqual(@as(u16, 10128), lodFor(10097, false).?);
 }
 
 test "how much of the set is actually established" {
