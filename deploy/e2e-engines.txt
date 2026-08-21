@@ -87,8 +87,10 @@
                # d2host now converts the save into the era's record (packages/d2engine/charrecord.zig)
                # and 1.06b takes the character. What stops it now is a call through a null pointer
                # (EIP=0) shortly after BITMANIP_Initialize @10126 — the same wall 1.07 hits. It is
-               # NOT the callback table (every tail slot is a reporting stub now and none fired) and
-               # NOT the game-data vtable (filling past its four methods changed nothing).
+               # NOT the callback table (every tail slot is a reporting stub now and none fired),
+               # NOT the game-data vtable (filling past its four methods changed nothing), and NOT
+               # BITMANIP_Initialize's own arity (the real one is `ret 0xc`, three stdcall args,
+               # and ours is the same — 1.07's and 1.10f's are instruction-identical besides).
                #
                # NOT the join translation either, which was the obvious suspect and is ruled out. Classic
                # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two
