@@ -63,7 +63,15 @@
                # revision at 0x1c (0xdd here, 0x13f on 1.07), 0x10 at 0x1e and the size 0x82 at
                # 0x20. Writer @0x6fcf6a10, parser @0x6fcf77c0.
                #
-               # The parser has exactly THREE return-9 paths and two are provably satisfied once
+               # The parser has SEVEN return-9 paths, not three — a scan stopping at 0x6fcf7c00
+               # sees only the first three, and the rest are counter-bumping blocks that conditions
+               # further up jump into. Relative to the record: word[0x20]==0x82, dword[0x04]==0x47,
+               # strcmp(client, 0x08), word[0x1c]<=0xdd, word[0x1e]<=0x10, word[0x22]<5, and
+               # byte[0x58] nibbles <4 and <3. A record satisfying all seven STILL returns 9, so
+               # the next move is to dump the record as DELIVERED from d2host rather than infer it
+               # from the database row.
+               #
+               # Of those, two are provably satisfied once
                # that record is delivered: word[rec+0x20]==0x82 (@0x6fcf77f3) and
                # dword[rec+0x04]==0x47 (@0x6fcf7827, and the host logs ver=0x47 going out). What is
                # left is the third: `strcmp(clientName, rec+0x08)` @0x6fcf787a, the record's name
