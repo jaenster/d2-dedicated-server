@@ -60,18 +60,6 @@ base)
         echo "==> minimising $a"
         "$MPQMIN" $LF "$BASE/$a" "$OUT/$a"
     done
-    # Patch_D2.mpq too, and it is not optional in practice. It overlays the base archives, and a
-    # tree without it boots and loads its tables and then halts inside level generation --
-    # "..\Source\D2Common\DRLG\DrlgLogic.cpp:876", a lookup in a table that came back empty.
-    # 1.13c dies there the moment a client enters a game; with the patch archive present the same
-    # build runs a client into the world. Nothing about the failure points at a missing archive.
-    if [ -f "$BASE/Patch_D2.mpq" ]; then
-        echo "==> minimising Patch_D2.mpq"
-        "$MPQMIN" $LF "$BASE/Patch_D2.mpq" "$OUT/Patch_D2.mpq"
-    else
-        echo "!!  no Patch_D2.mpq in $BASE. The engine will boot and then halt in DRLG the first"
-        echo "!!  time a client enters a game. See DrlgLogic.cpp:876."
-    fi
     du -sh "$OUT" | sed 's/^/==> shared base: /'
     ;;
 base-classic)
@@ -174,6 +162,32 @@ engine)
                     echo "   $t FAILED"; exit 1
                 fi
             done
+            ;;
+    esac
+
+    # Patch_D2.mpq is ERA-SPECIFIC and belongs to the engine, not to the shared base. The one we
+    # have is 1.14d's, and each side of the 1.10 line reacts to it in the opposite way -- measured,
+    # not assumed:
+    #
+    #   1.10f  without it: assert "pbData" DataTbls.cpp:0x8b3
+    #   1.13c  without it: halts in level generation, DrlgLogic.cpp:876, the moment a client enters
+    #   1.09b  WITH it:    ACCESS VIOLATION during boot; without it, it reaches the tick loop
+    #
+    # So it is required from 1.10 on and must be kept away from anything older. Putting it in the
+    # shared base layer instead fixes 1.13c and breaks 1.09b, which is a trade nobody would choose
+    # on purpose -- and one that presents as "the older engines regressed", not as a data problem.
+    case "$VER" in
+        1.10*|1.11*|1.12*|1.13*|1.14*)
+            if [ -f "$BASE/Patch_D2.mpq" ]; then
+                echo "==> minimising Patch_D2.mpq (required from 1.10 on)"
+                "$MPQMIN" ${D2_LISTFILE:+--listfile $D2_LISTFILE} "$BASE/Patch_D2.mpq" "$OUT/Patch_D2.mpq"
+            else
+                echo "!!  no Patch_D2.mpq in $BASE, and $VER needs one: it will assert in DataTbls"
+                echo "!!  or halt in DRLG the first time a client enters a game."
+            fi
+            ;;
+        *)
+            echo "==> no Patch_D2.mpq for $VER (pre-1.10; the 1.14d-era one faults it during boot)"
             ;;
     esac
 

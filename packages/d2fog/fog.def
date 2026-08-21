@@ -63,3 +63,19 @@ EXPORTS
     ; Not called. See FOG_ordinal_ceiling in fog.zig — pins where mingw's auto-exported
     ; decorated aliases start, clear of every ordinal the real Fog uses (max 10264).
     FOG_ordinal_ceiling @10900 NONAME
+
+    ; Exported as reporting stubs, not implementations: wine aborts namelessly on a call to
+    ; an ordinal we do not export, so these turn that into a message. See unimplemented.zig.
+    FOG_Unimplemented10022 @10022 NONAME
+    FOG_Unimplemented10091 @10091 NONAME
+    FOG_Unimplemented10092 @10092 NONAME
+    FOG_Unimplemented10093 @10093 NONAME
+    FOG_Unimplemented10094 @10094 NONAME
+    FOG_Unimplemented10095 @10095 NONAME
+    FOG_Unimplemented10097 @10097 NONAME
+    FOG_Unimplemented10106 @10106 NONAME
+    FOG_Unimplemented10134 @10134 NONAME
+    FOG_Unimplemented10135 @10135 NONAME
+    FOG_Unimplemented10136 @10136 NONAME
+    FOG_Unimplemented10144 @10144 NONAME
+    FOG_Unimplemented10202 @10202 NONAME

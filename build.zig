@@ -400,6 +400,9 @@ pub fn build(b: *std.Build) void {
         // Fog's bit stream. It is the codec the engine serialises the world with, and it is pure
         // logic, so it is asserted here rather than only inside the Windows DLL that exports it.
         .{ "packages/d2fog/bitstream.zig", false, false },
+        // Does our Fog export everything the engines import? Checked against a committed manifest
+        // rather than the DLLs, so it runs on a machine with no game files.
+        .{ "packages/d2fog/ordinals.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{

@@ -605,6 +605,34 @@ export fn FOG_PopCount(p: ?[*]const u8, n: u32) callconv(.winapi) u32 {
     return bits;
 }
 
+// ── ordinals we do not implement ─────────────────────────────────────────────
+
+extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
+
+/// One stub per unimplemented ordinal. It names itself and stops rather than returning — see
+/// `unimplemented.zig` for why not returning is the correct choice for every arity.
+fn Unimplemented(comptime ord: u32) type {
+    return struct {
+        fn call() callconv(.winapi) noreturn {
+            sayFmt(
+                "fog: THE ENGINE CALLED UNIMPLEMENTED Fog @{d}, from 0x{x}. It is listed in " ++
+                    "packages/d2fog/unimplemented.zig; implement it there rather than guessing here.",
+                .{ ord, @returnAddress() },
+            );
+            ExitProcess(3);
+        }
+    };
+}
+
+comptime {
+    for (unimplemented.ordinals) |ord| {
+        @export(&Unimplemented(ord).call, .{
+            .name = std.fmt.comptimePrint("FOG_Unimplemented{d}", .{ord}),
+            .linkage = .strong,
+        });
+    }
+}
+
 /// @10265 — 1.13c only: 1.10f's Fog ends at ordinal 10264 and 1.13c added three more.
 ///
 /// `mov (%esp),%eax; ret` — it hands back its own caller's return address, the `_ReturnAddress()`
@@ -930,6 +958,7 @@ comptime {
 // in every packet, and tracing that wrote 2.8 GB in five minutes.
 
 const bitstream = @import("bitstream.zig");
+const unimplemented = @import("unimplemented.zig");
 
 export fn BITMANIP_SetBitState(p: ?[*]u8, bit: i32) callconv(.winapi) void {
     bitstream.setBit(p orelse return, bit);
