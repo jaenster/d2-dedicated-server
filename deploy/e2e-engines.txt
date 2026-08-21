@@ -35,6 +35,12 @@
                # our usual 0x60 changes nothing), and not the old pre-1.09 header layout with the
                # status at 0x18 instead of 0x24 (names putting 0x78 and 0x00 at that offset fail
                # identically). So what fills [esi+0x0a] on this build is the open question.
+               #
+               # It is very likely the same root as 1.06b's Error:9 seen from a build that does not
+               # reject outright: the realm writes ONE save version, 0x60, and hands it to every
+               # engine. 1.06b writes 0x47; 1.07 accepts 0x47-0x49 and 0x50-0x57 and writes 0x57;
+               # only 1.10f and later accept 0x60. A per-era .d2s is the same shape of fix as the
+               # per-build packet tables, and it is what both of these are waiting on.
 1.08   boot    # never driven: nobody has read its S->C table out of its D2Net yet, and the client
                # refuses to frame a build with a neighbour's table rather than hang on it
 1.09b  boot    # as 1.08, unmeasured. Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it
@@ -46,4 +52,8 @@
                # (DataTbls.cpp:0x231). The engine was never the problem; the tree was.
 1.10f  world   # verified: stock 1.14d client in the Rogue Encampment, 145 packets. Needs Patch_D2
 1.13c  world   # verified: same, plus 179 packets / 53 units via the clientless. Needs Patch_D2
-1.06b  boot    # classic lineage: d2data only, no d2exp, and its own Fog rewrite
+1.06b  boot    # classic lineage: d2data only, no d2exp, and its own Fog rewrite. Now creates a
+               # game, takes a character and completes the handshake with a client framing it as
+               # classic (GameFlags is SIX bytes here). It refuses the character with Error:9,
+               # which is the save-version gate: 1.06b writes 0x47 (@0x6fcf6a1a) and the realm
+               # hands every engine 0x60. Same root as 1.07 — see the note there.

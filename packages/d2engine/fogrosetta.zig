@@ -94,7 +94,14 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10141, .lod = 10046, .how = .measured },
     .{ .classic = 10142, .lod = 10047, .how = .measured },
     .{ .classic = 10152, .lod = 10200, .how = .inferred },
-    .{ .classic = 10175, .lod = 10202, .how = .inferred },
+    // Not 10202. Order put it there and order was wrong: 10202 on the LoD side is an IFF.cpp
+    // forwarder, while classic 10175 tags itself LogManager.cpp with a `format` string — a
+    // variadic trace, and 1.06b's D2Game calls it with five cdecl arguments. The LogManager
+    // exports line up on both sides with a constant +0x33 source-line offset (classic 10026 at
+    // 0xe5 -> LoD 10029 at 0x118, which is already measured; this one at 0xf6 -> 0x129; classic
+    // 10027 at 0x11c -> 0x14f), so this is 10030 FOG_TraceF. Reached the moment 1.06b first
+    // served a character, as an unimplemented-ordinal stop.
+    .{ .classic = 10175, .lod = 10030, .how = .measured },
     .{ .classic = 10200, .lod = 10207, .how = .measured }, // Excel.cpp, margin 5.12
     .{ .classic = 10201, .lod = 10208, .how = .measured }, // "*data == SYM_EOL"
     .{ .classic = 10202, .lod = 10209, .how = .corroborated },
@@ -130,7 +137,7 @@ test "every row satisfies the arity gate that refuted five of them" {
     try std.testing.expectEqual(@as(u16, 10047), lodFor(10142, false).?);
     try std.testing.expectEqual(@as(u16, 10130), lodFor(10099, false).?);
     try std.testing.expectEqual(@as(u16, 10200), lodFor(10152, true).?); // was 10175, ret 0 vs 16
-    try std.testing.expectEqual(@as(u16, 10202), lodFor(10175, true).?); // was 10180, ret 0 vs 4
+    try std.testing.expectEqual(@as(u16, 10030), lodFor(10175, true).?); // LogManager, not IFF
 }
 
 test "the map increases everywhere except the one block that was relocated" {
@@ -138,7 +145,7 @@ test "the map increases everywhere except the one block that was relocated" {
     // law, and comparing bodies found where it breaks. Classic 10140-10142 land on LoD 10045-10047:
     // a contiguous block moved contiguously, downward, past everything around it. Anything solved
     // from order alone in that neighbourhood was solved from a false premise.
-    const relocated = [_]u16{ 10140, 10141, 10142 };
+    const relocated = [_]u16{ 10140, 10141, 10142, 10175 };
     var prev_c: u16 = 0;
     var prev_l: u16 = 0;
     for (classic_to_lod) |row| {
@@ -166,7 +173,7 @@ test "an unconfirmed row is refused rather than guessed" {
 
 test "how much of the set is actually established" {
     try std.testing.expectEqual(@as(usize, 47), classic_to_lod.len);
-    try std.testing.expectEqual(@as(usize, 20), countBy(.measured));
+    try std.testing.expectEqual(@as(usize, 21), countBy(.measured));
     try std.testing.expectEqual(@as(usize, 17), countBy(.corroborated));
-    try std.testing.expectEqual(@as(usize, 10), countBy(.inferred));
+    try std.testing.expectEqual(@as(usize, 9), countBy(.inferred));
 }
