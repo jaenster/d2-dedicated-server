@@ -108,6 +108,12 @@
                # is why ours came back clean. 1.10f and 1.13c need none of this, which is exactly
                # the line these failures fall on.
                #
+               # That INIT entry is not a byte patch — decoded, it READS four bytes out of the
+               # module. d2client.dll+0x81e1 is the imm32 of `mov ecx, 0x6fbb0a88`, so the real
+               # server pulls a pointer to a D2Client data structure out of an instruction operand
+               # and hands it to the engine during bring-up. Loading D2Client alone changes nothing
+               # here (tested), which fits: the load is only what makes that pointer reachable.
+               #
                # NOT the join translation either, which was the obvious suspect and is ruled out. Classic
                # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two
                # ways: a 10-byte preamble with a 16-byte name, or an 11-byte one with a 15-byte
