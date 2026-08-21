@@ -20,9 +20,16 @@
 # built to an older recipe fails as an engine assert with nothing pointing at the tree, so when a
 # row that used to hold starts failing, check the tarball's age against the recipe's before the code.
 
-1.07   boot    # boots and ticks; not yet driven to a world by a client
-1.08   boot    # as 1.07
-1.09b  boot    # as 1.07. Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it during boot
+1.07   boot    # frames and handshakes correctly now that the client uses 1.07's own S->C table
+               # (GameFlags is 7 bytes here, not 8): GameFlags -> Nop -> JOINGAME -> LoadSuccess
+               # all land. It dies after that, on two separate things. The character is refused
+               # with SYSERROR_EXPANSIONGAME, so the game is not being created as expansion the
+               # way this build wants; and the engine then CALLs through a null pointer (eip=0)
+               # right after BITMANIP_Initialize @10126.
+1.08   boot    # never driven: nobody has read its S->C table out of its D2Net yet, and the client
+               # refuses to frame a build with a neighbour's table rather than hang on it
+1.09b  boot    # as 1.08, unmeasured. Must NOT be given Patch_D2.mpq — the 1.14d-era one faults it
+               # during boot
 1.09d  boot    # boots from the PUBLISHED tree, which carries 1.09d-era compiled tables. It was
                # recorded as broken off a locally assembled tree whose data/ held the recovered
                # tables instead: loose files win over MPQ members, so the wrong-era ones are what

@@ -200,7 +200,10 @@ for i in "${!ENGINES[@]}"; do
 
     verdict=PASS; note=""
     if [ "$want" = world ]; then
-        out="$(timeout 120 "$CLIENTLESS" 127.0.0.1 D2XP 1.14.3.71 \
+        # --engine is not cosmetic: the S->C size table is per build, and framing a pre-1.10f
+        # server with 1.14d's eats the LoadSuccess behind GameFlags and hangs. A build whose table
+        # nobody has read makes the client say so rather than hang.
+        out="$(timeout 120 "$CLIENTLESS" 127.0.0.1 D2XP 1.14.3.71 --engine "$eng" \
                 --create "$acct:pw" --new-char "$char" --game "e2e$tag" 2>&1 | tail -30)"
         if printf '%s' "$out" | grep -q 'IN GAME'; then
             units=$(printf '%s' "$out" | sed -n 's/.*units=\([0-9]*\).*/\1/p' | tail -1)
