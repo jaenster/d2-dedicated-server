@@ -835,56 +835,54 @@ comptime {
 
 // ── bit streams (BITMANIP_) ──────────────────────────────────────────────────
 //
-// All stdcall. The three bit-poking entries take (pBitStream, nBit) — two args, not three.
+// All stdcall. The logic lives in `bitstream.zig`, where it can be tested on the host; these are
+// only the ABI. The three bit-poking entries take (pBuffer, nBit) — two args, not three — and
+// address a plain byte array; the rest take the engine-owned `BitStream`.
+//
+// Deliberately untraced apart from Initialize: the engine calls Write once per field of every unit
+// in every packet, and tracing that wrote 2.8 GB in five minutes.
+
+const bitstream = @import("bitstream.zig");
 
 export fn BITMANIP_SetBitState(p: ?[*]u8, bit: i32) callconv(.winapi) void {
-    _ = p;
-    _ = bit;
-    trace("BITMANIP_SetBitState @10118");
+    bitstream.setBit(p orelse return, bit);
 }
 export fn BITMANIP_GetBitState(p: ?[*]const u8, bit: i32) callconv(.winapi) i32 {
-    _ = p;
-    _ = bit;
-    trace("BITMANIP_GetBitState @10119");
-    return 0;
+    return bitstream.getBit(p orelse return 0, bit);
 }
 export fn BITMANIP_MaskBitstate(p: ?[*]u8, bit: i32) callconv(.winapi) void {
-    _ = p;
-    _ = bit;
-    trace("BITMANIP_MaskBitstate @10120");
+    bitstream.clearBit(p orelse return, bit);
 }
-export fn BITMANIP_Initialize(s: ?*anyopaque, stream: ?[*]u8, n: u32) callconv(.winapi) void {
-    _ = s;
-    _ = stream;
-    _ = n;
+export fn BITMANIP_Initialize(s: ?*bitstream.BitStream, stream: ?[*]u8, n: u32) callconv(.winapi) void {
     trace("BITMANIP_Initialize @10126");
+    writes_since_init = 0;
+    bitstream.init(s orelse return, stream, n);
 }
-export fn BITMANIP_GetSize(s: ?*anyopaque) callconv(.winapi) u32 {
-    _ = s;
-    trace("BITMANIP_GetSize @10127");
-    return 0;
+export fn BITMANIP_GetSize(s: ?*bitstream.BitStream) callconv(.winapi) u32 {
+    return bitstream.size(s orelse return 0);
 }
-export fn BITMANIP_Write(s: ?*anyopaque, v: u32, bits: u32) callconv(.winapi) void {
-    _ = s;
-    _ = v;
-    _ = bits;
-    trace("BITMANIP_Write @10128");
+/// Untraced per call — the engine writes once per field of every unit in every packet. But a
+/// million writes into one stream is not a busy frame, it is a loop that is not terminating, so
+/// that case reports itself with enough state to say whether the stream is even advancing.
+var writes_since_init: u64 = 0;
+
+export fn BITMANIP_Write(s: ?*bitstream.BitStream, v: u32, nbits: i32) callconv(.winapi) void {
+    const st = s orelse return;
+    writes_since_init +%= 1;
+    if (writes_since_init % (1 << 20) == 0) sayFmt(
+        "fog: BITMANIP_Write x{d} since the last Initialize — stream bytes={d} bit={d} cap_bits={d} overflow={d}, nbits={d}",
+        .{ writes_since_init, st.bytes, st.bit, st.cap_bits, st.overflow, nbits },
+    );
+    bitstream.write(st, v, nbits);
 }
-export fn BITMANIP_ReadSigned(s: ?*anyopaque, bits: i32) callconv(.winapi) i32 {
-    _ = s;
-    _ = bits;
-    trace("BITMANIP_ReadSigned @10129");
-    return 0;
+export fn BITMANIP_ReadSigned(s: ?*bitstream.BitStream, nbits: i32) callconv(.winapi) i32 {
+    return bitstream.readSigned(s orelse return 0, nbits);
 }
-export fn BITMANIP_Read(s: ?*anyopaque, bits: i32) callconv(.winapi) u32 {
-    _ = s;
-    _ = bits;
-    trace("BITMANIP_Read @10130");
-    return 0;
+export fn BITMANIP_Read(s: ?*bitstream.BitStream, nbits: i32) callconv(.winapi) u32 {
+    return bitstream.read(s orelse return 0, nbits);
 }
-export fn BITMANIP_GoToNextByte(s: ?*anyopaque) callconv(.winapi) void {
-    _ = s;
-    trace("BITMANIP_GoToNextByte @10131");
+export fn BITMANIP_GoToNextByte(s: ?*bitstream.BitStream) callconv(.winapi) void {
+    bitstream.goToNextByte(s orelse return);
 }
 
 // ── .bin / .txt data tables ──────────────────────────────────────────────────
