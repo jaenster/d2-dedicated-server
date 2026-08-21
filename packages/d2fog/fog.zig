@@ -976,17 +976,33 @@ export fn BITMANIP_Initialize(s: ?*bitstream.BitStream, stream: ?[*]u8, n: u32) 
     // The engine-side address is the only handle on where that jump is.
     sayFmt("BITMANIP_Initialize @10126 from 0x{x}", .{@returnAddress()});
     writes_since_init = 0;
+    traced_writes = 0;
     bitstream.init(s orelse return, stream, n);
 }
 export fn BITMANIP_GetSize(s: ?*bitstream.BitStream) callconv(.winapi) u32 {
-    return bitstream.size(s orelse return 0);
+    const n = bitstream.size(s orelse return 0);
+    // Traced under the same budget as the writes: it is the call that closes a packet, so a trace
+    // that stops at the last write and never reaches here says the packet was built and something
+    // between the two went wrong — which is a different bug from one in the writing.
+    if (traced_writes != 0 and traced_writes < 64) sayFmt("BITMANIP_GetSize from 0x{x} -> {d} bytes", .{ @returnAddress(), n });
+    return n;
 }
 /// Untraced per call — the engine writes once per field of every unit in every packet. But a
 /// million writes into one stream is not a busy frame, it is a loop that is not terminating, so
 /// that case reports itself with enough state to say whether the stream is even advancing.
 var writes_since_init: u64 = 0;
 
+/// Traced for the first writes after each Initialize, and only those. Per-call tracing of every
+/// field of every unit is unusable noise, but the FIRST few after a stream is opened are exactly
+/// what says how far a packet got before something went wrong — and the caller address makes that
+/// a line of the engine rather than a guess.
+var traced_writes: u32 = 0;
+
 export fn BITMANIP_Write(s: ?*bitstream.BitStream, v: u32, nbits: i32) callconv(.winapi) void {
+    if (traced_writes < 64) {
+        traced_writes += 1;
+        sayFmt("BITMANIP_Write #{d} from 0x{x}  value=0x{x} nbits={d}", .{ traced_writes, @returnAddress(), v, nbits });
+    }
     const st = s orelse return;
     writes_since_init +%= 1;
     if (writes_since_init % (1 << 20) == 0) sayFmt(

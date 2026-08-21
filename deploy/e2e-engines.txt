@@ -89,8 +89,15 @@
                # 0x6fcb1f8f (__fastcall, the unit in ECX and 1 pushed). So the null transfer is
                # inside 0x6fcedf20 or below it. Its direct calls are all resolved — two are Fog
                # thunks (#10023 DisplayAssert, #10128 BITMANIP_Write) and neither fired, so this is
-               # not a missing import: an unfilled entry in a dispatch table the engine builds at
-               # runtime fits the evidence (`[esp]` and EDI both point into the heap).
+               # not a missing import — EVERY import of every module resolves, checked at load.
+               #
+               # Traced to the instruction. The life/mana packet builds completely: eight
+               # BITMANIP_Write calls (0x6fcbc86b..0x6fcbc906), then BITMANIP_GetSize returns the
+               # right 13 bytes, then `call 0x6fcbb970` at 0x6fcbc917 with the client in ECX — and
+               # that call is where it dies. Its two helpers (0x6fcb3f10, 0x6fcb3e70) are trivial
+               # accessors with no indirect transfer, and its allocator ordinal (classic 10140 ->
+               # LoD 10045) is byte-identical, fastcall on both sides. So the null transfer is
+               # inside 0x6fcbb970 itself, on the client's packet-buffer list.
                #
                # NOT the join translation either, which was the obvious suspect and is ruled out. Classic
                # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two
