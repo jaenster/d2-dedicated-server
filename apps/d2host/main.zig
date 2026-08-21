@@ -544,6 +544,7 @@ fn connectedClients() u32 {
     return f();
 }
 
+var stack_drift_reports: u32 = 0;
 var flush_logged = false;
 var flushes: usize = 0;
 var alloc_logged = false;
@@ -885,7 +886,13 @@ fn cformat(buf: []u8, fmt: [*:0]const u8, ap: anytype) []const u8 {
     return buf[0..n];
 }
 
-/// stdcall, one arg.
+/// stdcall, ONE arg — measured, not assumed.
+///
+/// pvpgn's d2gelib header declares `D2GSLoadComplete(WORD wGameId, LPCSTR lpCharName, BOOL
+/// bExpansion)`, three arguments, and that was tried here: popping twelve where the engine pushes
+/// four tears eight bytes off the caller's frame and the process dies immediately, before the
+/// client is even greeted. So that header describes the D2GE layer's own API to its host, not the
+/// engine's callback slot, and this slot really is one argument.
 fn loadComplete(a: i32) callconv(.winapi) i32 {
     _ = a;
     say("d2host: engine called pfLoadComplete");
@@ -1785,7 +1792,20 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
                 _ = store.putHeartbeat(gsid, public_ip, public_port, max_games, live_games, live_games >= max_games, 90, gs_labels);
             }
         }
+        // The stack pointer across the network pump. A callback whose declared arity does not match
+        // what the engine pushes leaves ESP skewed by the difference, and nothing fails at the call
+        // — the damage lands on whatever runs next, which is how it surfaces as a jump to a garbage
+        // address. Measuring it here turns "something is corrupting the stack" into a number, and
+        // names the frame it first moved on.
+        const esp_before = espNow();
         if (netmsgs) |p| @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();
+        const esp_after = espNow();
+        if (esp_after != esp_before and stack_drift_reports < 8) {
+            stack_drift_reports += 1;
+            sayFmt("d2host: STACK DRIFT across the network pump: esp 0x{x} -> 0x{x} ({d} bytes)", .{
+                esp_before, esp_after, @as(isize, @bitCast(esp_after -% esp_before)),
+            });
+        }
 
         // Immediately after the network pump and BEFORE the game tasks run, because a join is
         // processed in the call above and the fetch it queues has to reach the engine within the
