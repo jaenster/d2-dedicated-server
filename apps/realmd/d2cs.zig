@@ -603,7 +603,17 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "create game '{s}' (account={s}) -> name already claimed", .{ name, c.accountName() });
         return fail(c, &w, CREATE_NAME_TAKEN);
     }
-    const routed = fleet.createGameRouted(name, pass, desc, ladder, expansion, difficulty, hardcore);
+    const routed = fleet.createGameRouted(.{
+        .name = name,
+        .pass = pass,
+        .desc = desc,
+        .ladder = ladder,
+        .expansion = expansion,
+        .difficulty = difficulty,
+        .hardcore = hardcore,
+        .account = c.accountName(),
+        .charname = c.charName(),
+    });
     // A create that did not produce a game must not keep the name.
     if (routed == null) store.releaseGameName(name);
     if (routed == null) {
@@ -818,7 +828,14 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     const n = state.snapshotGames(&games);
     log.line(tag, "game list (reqid={d}) -> {d} game(s)", .{ reqid, n });
 
+    const acct = c.accountName();
     for (games[0..n]) |g| {
+        // An extension decides what this player is shown — a private league's games, a staging
+        // game, a lobby scoped to a channel. Hiding is cosmetic: a player who knows the name can
+        // still attempt the join, and gameJoin is where that is actually refused.
+        if (hook.gameVisible(acct, g.name_slice(), g.gameid)) |visible| {
+            if (!visible) continue;
+        }
         var buf: [128]u8 = undefined; // 12B header + name + description, both bounded
         var w = startPacket(&buf, MCP_GAMELIST);
         w.putU16(reqid); // +1 echo request id

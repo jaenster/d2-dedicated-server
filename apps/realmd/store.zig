@@ -133,6 +133,60 @@ pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
     return pg.deleteCharD2s(account, charname);
 }
 
+// the extension keyspace
+
+pub const ExtKey = types.ExtKey;
+
+/// One extension's private corner of the realm's storage. Every operation is scoped to `name`, so
+/// an extension can never read or overwrite the realm's own rows or another extension's — which is
+/// the compatibility promise: nothing we change to this schema can break what an extension keeps.
+///
+/// The two halves are the same two the realm itself uses and mean the same things. `get`/`put`/
+/// `del`/`keys` are DURABLE — the store of record, where a ladder's standings or a season's state
+/// belongs. `cacheGet`/`cachePut`/`cacheDel`/`incr` are IN FLIGHT and shared across instances —
+/// rate limits, a computed leaderboard, anything the extension is willing to lose on a restart.
+pub const Ext = struct {
+    name: []const u8,
+
+    pub fn get(e: Ext, key: []const u8, out: []u8) usize {
+        return pg.getExt(e.name, key, out);
+    }
+    pub fn put(e: Ext, key: []const u8, value: []const u8) bool {
+        return pg.setExt(e.name, key, value);
+    }
+    pub fn del(e: Ext, key: []const u8) bool {
+        return pg.delExt(e.name, key);
+    }
+    /// Durable keys starting with `prefix` (empty = all), into a caller-owned array. A full array
+    /// is a truncated answer: ask for more room rather than assuming you saw everything.
+    pub fn keys(e: Ext, prefix: []const u8, out: []ExtKey) usize {
+        return pg.listExtKeys(e.name, prefix, out);
+    }
+
+    pub fn cacheGet(e: Ext, key: []const u8, out: []u8) usize {
+        return redis.getExtCache(e.name, key, out);
+    }
+    /// `ttl_s` 0 = no expiry.
+    pub fn cachePut(e: Ext, key: []const u8, value: []const u8, ttl_s: u32) bool {
+        return redis.setExtCache(e.name, key, value, ttl_s);
+    }
+    pub fn cacheDel(e: Ext, key: []const u8) void {
+        redis.delExtCache(e.name, key);
+    }
+    /// Add to a shared counter and read back the new total. The TTL arms only on the increment
+    /// that creates the key, so a rate-limit window ends rather than sliding forever.
+    pub fn incr(e: Ext, key: []const u8, by: i64, ttl_s: u32) ?i64 {
+        return redis.incrExtCache(e.name, key, by, ttl_s);
+    }
+};
+
+/// The storage an extension addresses everything through: `store.ext("ladder").put("season", ...)`.
+/// `name` must be letters, digits, `_` or `-` — it is the namespace, and a name the backend cannot
+/// sanitise makes every operation on it fail rather than land somewhere unexpected.
+pub fn ext(name: []const u8) Ext {
+    return .{ .name = name };
+}
+
 // per-account userdata (BNCS profile: SID_READ/WRITEUSERDATA 0x26/0x27)
 // Key-path addressed ("profile\\sex").
 pub fn getUserData(account: []const u8, key: []const u8, out: []u8) usize {
@@ -367,6 +421,12 @@ pub fn takeGsReply(seq: u32, out: []u8) ?usize {
 /// Null when every server is full, which the caller reports differently from an empty fleet.
 pub fn pickAndReserveGs() ?u32 {
     return redis.pickAndReserveGs();
+}
+
+/// Reserve a slot on one named server, for a caller that chose it rather than asking us to.
+/// False when that server is gone or has no room — the choice still has to survive the race.
+pub fn reserveGs(gsid: u32) bool {
+    return redis.reserveGs(gsid);
 }
 
 /// Give back a slot whose create did not happen.

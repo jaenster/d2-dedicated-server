@@ -11,6 +11,25 @@ pub const Name = struct {
     }
 };
 
+/// Longest key an extension may address its own keyspace with. Generous next to `Name` because
+/// nothing here is a D2 name — an extension keys by whatever it likes ("season:3:leader").
+pub const ext_key_max = 96;
+
+/// One key in an extension's keyspace, as returned by a listing. Fixed-size for the same reason
+/// `Name` is: the store hands these back into a caller-owned array and allocates nothing.
+pub const ExtKey = struct {
+    buf: [ext_key_max]u8 = [_]u8{0} ** ext_key_max,
+    len: u8 = 0,
+    pub fn slice(k: *const ExtKey) []const u8 {
+        return k.buf[0..k.len];
+    }
+    pub fn set(k: *ExtKey, s: []const u8) void {
+        const n = @min(s.len, ext_key_max);
+        @memcpy(k.buf[0..n], s[0..n]);
+        k.len = @intCast(n);
+    }
+};
+
 /// A hosted game as resolved from the store: engine gameid, the address clients dial,
 /// and which GS in the fleet hosts it.
 pub const GameRec = struct {

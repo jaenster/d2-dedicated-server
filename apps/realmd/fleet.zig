@@ -14,6 +14,7 @@ const std = @import("std");
 const log = @import("realm_infra").log;
 const state = @import("state.zig");
 const store = @import("store.zig");
+const hook = @import("hook.zig");
 const p = @import("realm_proto").protocol;
 
 extern "c" fn usleep(usec: c_uint) c_int;
@@ -25,8 +26,10 @@ pub var gs_ip_override: ?[4]u8 = null;
 /// Bound on one fleet snapshot.
 const max_gs = 64;
 
-/// Read-only view of one game server, for the admin API.
-pub const GsInfo = struct { gsid: u32, ip: [4]u8, port: u16, maxgame: u32, live: u32 };
+/// Read-only view of one game server, for the admin API and for an extension choosing where a
+/// game goes. Declared in hook.zig so an extension needs only that module; one type, so the two
+/// cannot drift into disagreeing about what a server looks like.
+pub const GsInfo = hook.GsInfo;
 
 fn addrOf(rec: store.GsRec) [4]u8 {
     return gs_ip_override orelse rec.gs_ip;
@@ -137,19 +140,66 @@ pub const CreateFailure = enum { no_gs, name_taken, refused, all_full };
 /// Set by createGameRouted when it returns null. Read it immediately.
 pub threadlocal var last_create_failure: CreateFailure = .no_gs;
 
-/// Route a game create to the least-loaded server with room. Null if none could host it.
-pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, ladder: u8, expansion: bool, difficulty: u8, hardcore: bool) ?CreateResult {
+/// A game to place on the fleet. A struct rather than nine positional parameters: the last three
+/// are only here so an extension choosing the server knows who is asking for what, and as
+/// arguments they would be three more booleans and names to line up correctly at the call.
+pub const CreateRequest = struct {
+    name: []const u8,
+    pass: []const u8,
+    desc: []const u8,
+    ladder: u8,
+    expansion: bool,
+    difficulty: u8,
+    hardcore: bool,
+    /// Who is creating it. Not sent to the game server — it is what `hook.pickGs` decides on.
+    account: []const u8 = "",
+    charname: []const u8 = "",
+};
+
+/// Ask an extension where this game should go, and reserve the server it names. Null when no
+/// extension has an opinion, or when the one it named cannot take the game after all — in which
+/// case the caller falls back to the stock pick rather than failing the create. An extension
+/// expressing a preference must not be able to leave a realm unable to host anything.
+fn extPickGs(req: CreateRequest) ?u32 {
+    var servers: [max_gs]GsInfo = undefined;
+    const n = snapshot(&servers);
+    const chosen = hook.pickGs(.{
+        .account = req.account,
+        .charname = req.charname,
+        .gamename = req.name,
+        .difficulty = req.difficulty,
+        .ladder = req.ladder,
+        .expansion = req.expansion,
+        .hardcore = req.hardcore,
+        .servers = servers[0..n],
+    }) orelse return null;
+    // The reserve is the same atomic increment the stock pick does, so a chosen server still
+    // loses the race when two instances place a game on its last free slot at once.
+    if (!store.reserveGs(chosen)) {
+        log.line("fleet", "extension picked gs {x} but it could not take the game; falling back", .{chosen});
+        return null;
+    }
+    return chosen;
+}
+
+/// Route a game create to a server that can host it: whichever one an extension names, else the
+/// least-loaded with room. Null if none could.
+pub fn createGameRouted(req: CreateRequest) ?CreateResult {
     last_create_failure = .no_gs;
     // Retry across servers: "I am full" is a fact about one server, not about the request, so a
     // refusal there should not fail a create while the rest of the fleet is idle.
     var attempts: usize = 0;
+    // Only the FIRST attempt is the extension's to place. Once a server has refused the game, the
+    // retry is the realm working around that refusal, and asking again would get the same answer.
+    var ext_pick: ?u32 = extPickGs(req);
     while (attempts < max_gs) : (attempts += 1) {
-        const gsid = store.pickAndReserveGs() orelse {
+        const gsid = ext_pick orelse store.pickAndReserveGs() orelse {
             // Nothing has room. Which of the two answers that is depends on whether there is a
             // fleet at all, and the player is told something different for each.
             last_create_failure = if (registeredCount() > 0) .all_full else .no_gs;
             return null;
         };
+        ext_pick = null;
         const rec = find(gsid) orelse {
             store.releaseGsSlot(gsid);
             continue; // expired between the pick and the lookup
@@ -157,14 +207,14 @@ pub fn createGameRouted(name: []const u8, pass: []const u8, desc: []const u8, la
 
         var buf: [512]u8 = undefined;
         var pos: usize = p.HEADER_LEN;
-        buf[pos] = ladder;
-        buf[pos + 1] = @intFromBool(expansion);
-        buf[pos + 2] = difficulty;
-        buf[pos + 3] = @intFromBool(hardcore);
+        buf[pos] = req.ladder;
+        buf[pos + 1] = @intFromBool(req.expansion);
+        buf[pos + 2] = req.difficulty;
+        buf[pos + 3] = @intFromBool(req.hardcore);
         pos += 4;
-        pos = putCStr(&buf, pos, name);
-        pos = putCStr(&buf, pos, pass);
-        pos = putCStr(&buf, pos, desc);
+        pos = putCStr(&buf, pos, req.name);
+        pos = putCStr(&buf, pos, req.pass);
+        pos = putCStr(&buf, pos, req.desc);
         const seq = nextSeq();
         writeHeader(buf[0..p.HEADER_LEN], @intCast(pos), .creategame, seq);
 

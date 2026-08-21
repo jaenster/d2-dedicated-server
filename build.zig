@@ -314,6 +314,25 @@ pub fn build(b: *std.Build) void {
     const realmd_bin_step = b.step("realmd-bin", "Build only the realmd binary");
     realmd_bin_step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
 
+    // The worked example of a realm with extensions, built exactly as a downstream builds one:
+    // its own root file naming its own modules, against the same `realmd` package. It declares
+    // EVERY hook, which is what makes it a drift guard — the stock binary above compiles the hook
+    // fan-out away (empty registry), so without something that actually instantiates them, a hook
+    // whose signature changed would break nobody's build here and everybody's downstream.
+    // `zig build test` depends on this, so that breakage lands on us instead.
+    const realm_example = b.addExecutable(.{
+        .name = "realm-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/realm-extension/main.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    realm_example.root_module.addImport("realmd", realmd_mod);
+    const realm_example_step = b.step("realm-example", "Build the example realm (every extension hook, compiled)");
+    realm_example_step.dependOn(&b.addInstallArtifact(realm_example, .{}).step);
+
     // ── apps/d2ingress ────────────────────────────────────────────────────────────
     //
     // The cloud-native game-traffic gateway: a token-translating, fully non-blocking poll()
@@ -342,6 +361,9 @@ pub fn build(b: *std.Build) void {
     // is tested only by an artifact rooted at its own barrel — importing it from somewhere else
     // runs none of its tests. Hence one artifact per package rather than one big root.
     const test_step = b.step("test", "Run the unit tests");
+    // The extension surface is only type-checked where something declares the hooks; see the
+    // realm-example comment above.
+    test_step.dependOn(&realm_example.step);
 
     const realm_tests = b.addTest(.{
         .root_module = b.createModule(.{

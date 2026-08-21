@@ -111,11 +111,89 @@ pub const Config = struct {
     /// when the admin port is reachable solely through that trusted proxy, since the
     /// header is trusted verbatim (a direct client could otherwise spoof it).
     trusted_auth_header: []const u8 = "",
+
+    /// This extension's own options. On `Config` as well as at module scope because `startup` is
+    /// handed a config and that is where an extension reads its settings.
+    pub fn ext(_: Config, name: []const u8) ExtConfig {
+        return .{ .name = name };
+    }
 };
 
 fn env(name: [*:0]const u8) ?[]const u8 {
     const v = getenv(name) orelse return null;
     return std.mem.span(v);
+}
+
+/// An extension's own configuration, read from `REALMD_EXT_<NAME>_<KEY>`.
+///
+/// Extensions get a namespace here for the same reason they get one in the store: an option an
+/// extension invents must not need a field in `Config`, or adding one would mean editing this
+/// repo — which is the thing the extension mechanism exists to avoid. Nothing is parsed at
+/// startup; each lookup reads the environment, so an extension names its own options and this
+/// file never learns them.
+pub const ExtConfig = struct {
+    name: []const u8,
+
+    /// The value of `REALMD_EXT_<NAME>_<KEY>`, upper-cased with `-` folded to `_`, so
+    /// `cfg.ext("my-ladder").get("season_end")` reads `REALMD_EXT_MY_LADDER_SEASON_END`.
+    pub fn get(e: ExtConfig, key: []const u8) ?[]const u8 {
+        var buf: [128]u8 = undefined;
+        const n = e.varName(&buf, key) orelse return null;
+        return env(@ptrCast(n.ptr));
+    }
+
+    pub fn getOr(e: ExtConfig, key: []const u8, default: []const u8) []const u8 {
+        return e.get(key) orelse default;
+    }
+
+    pub fn int(e: ExtConfig, comptime T: type, key: []const u8, default: T) T {
+        const v = e.get(key) orelse return default;
+        return std.fmt.parseInt(T, v, 10) catch default;
+    }
+
+    /// Present and not one of the words that mean "off". Set-means-on is how the realm's own
+    /// switches already read (`REALMD_TRACE`), and an explicit `=0` still turns one off.
+    pub fn flag(e: ExtConfig, key: []const u8) bool {
+        const v = e.get(key) orelse return false;
+        return !(std.ascii.eqlIgnoreCase(v, "0") or std.ascii.eqlIgnoreCase(v, "false") or
+            std.ascii.eqlIgnoreCase(v, "no") or v.len == 0);
+    }
+
+    /// Build the sentinel-terminated env var name. Null if it would not fit, which is a name or
+    /// key long enough to be a mistake rather than something to truncate into a different var.
+    fn varName(e: ExtConfig, buf: []u8, key: []const u8) ?[:0]const u8 {
+        const lead = "REALMD_EXT_";
+        const total = lead.len + e.name.len + 1 + key.len;
+        if (total + 1 > buf.len) return null;
+        @memcpy(buf[0..lead.len], lead);
+        var i = lead.len;
+        for (e.name) |c| {
+            buf[i] = if (c == '-') '_' else std.ascii.toUpper(c);
+            i += 1;
+        }
+        buf[i] = '_';
+        i += 1;
+        for (key) |c| {
+            buf[i] = if (c == '-') '_' else std.ascii.toUpper(c);
+            i += 1;
+        }
+        buf[i] = 0;
+        return buf[0..i :0];
+    }
+};
+
+/// Configuration for one extension: `cfg.ext("ladder").int(u32, "season", 1)`.
+pub fn ext(name: []const u8) ExtConfig {
+    return .{ .name = name };
+}
+
+test "ExtConfig builds the namespaced env var name" {
+    var buf: [128]u8 = undefined;
+    const e = ExtConfig{ .name = "my-ladder" };
+    try std.testing.expectEqualStrings("REALMD_EXT_MY_LADDER_SEASON_END", e.varName(&buf, "season_end").?);
+    // A name that cannot fit is refused rather than truncated into some other extension's var.
+    var small: [8]u8 = undefined;
+    try std.testing.expect(e.varName(&small, "season_end") == null);
 }
 
 fn envPort(name: [*:0]const u8, current: u16) u16 {

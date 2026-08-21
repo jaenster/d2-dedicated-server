@@ -14,8 +14,11 @@
 const std = @import("std");
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const config = @import("realm_infra").config;
-const net = @import("realm_infra").net;
-const log = @import("realm_infra").log;
+/// Public because an extension that binds a listener needs both: it writes a `net.Handler` exactly
+/// as bncs.zig and health.zig do, and its lines belong in the realm's log rather than on stderr
+/// where nothing collects them.
+pub const net = @import("realm_infra").net;
+pub const log = @import("realm_infra").log;
 const obs = @import("realm_infra").obs;
 
 extern "c" fn time(t: ?*c_long) c_long; // unix seconds — portable (Linux + macOS), no struct-layout traps
@@ -288,6 +291,26 @@ pub fn run(init: std.process.Init.Minimal) !void {
         const game_fd = try net.listenTcp(cfg.bind, cfg.game_port);
         log.line("realmd", "embedded game edge on {d} (in-process splice; no standalone d2ingress needed)", .{cfg.game_port});
         t_game = try std.Thread.spawn(.{}, net.serve, .{ "game", game_fd, gameedge.handle });
+    }
+
+    // Listeners an extension asked for, bound alongside the realm's own — a launcher auth
+    // endpoint, a REST hook a website calls, whatever this realm needs that the D2 client never
+    // knew how to ask for. A port that will not bind is fatal for the same reason ours are: a
+    // realm that comes up healthy with half of itself missing is worse than one that refuses to.
+    // Bound after hook.startup, so an extension's port can come from its own configuration rather
+    // than being fixed at compile time — a realm that runs more than one instance cannot have
+    // every extension hardcoding a port.
+    var ext_listeners: [16]hook.Listener = undefined;
+    for (ext_listeners[0..hook.listeners(&ext_listeners)]) |l| {
+        const fd = net.listenTcp(cfg.bind, l.port) catch |e| {
+            log.line("realmd", "FATAL extension listener '{s}' could not bind {d}: {s}", .{ l.name, l.port, @errorName(e) });
+            return e;
+        };
+        log.line("realmd", "extension listener '{s}' on {d}", .{ l.name, l.port });
+        _ = std.Thread.spawn(.{}, net.serve, .{ l.name, fd, l.handler }) catch |e| {
+            log.line("realmd", "FATAL extension listener '{s}' did not start: {s}", .{ l.name, @errorName(e) });
+            return e;
+        };
     }
 
     health.markStarted(); // all listeners bound → probes may go green

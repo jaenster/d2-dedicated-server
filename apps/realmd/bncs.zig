@@ -192,6 +192,29 @@ pub const Conn = struct {
     fn statSlice(c: *Conn) []const u8 {
         return c.stat[0..c.stat_len];
     }
+
+    // What an extension is allowed to do with a connection. Everything above is this file's own
+    // business; these four are the surface a hook is handed a `*Conn` FOR. An extension that can
+    // claim a `/command` but cannot answer it is not much of an extension, and without a public
+    // way to say something back the only alternative is reaching into fields it should not know.
+
+    /// Who this connection is logged in as. Empty before the logon packet.
+    pub fn account_name(c: *Conn) []const u8 {
+        return c.accountName();
+    }
+    /// The channel this connection is in, empty when it is in none.
+    pub fn channel_name(c: *Conn) []const u8 {
+        return c.channelName();
+    }
+    /// Say something to this client only, as the realm — an EID_INFO line in its chat window.
+    pub fn tell(c: *Conn, text: []const u8) void {
+        sendEvent(c, EID_INFO, 0, "", text);
+    }
+    /// Same, but the client renders it as an error. For refusals, so a player can tell being told
+    /// "no" from being told something.
+    pub fn warn(c: *Conn, text: []const u8) void {
+        sendEvent(c, EID_ERROR, 0, c.accountName(), text);
+    }
 };
 
 fn startPacket(buf: []u8, id: u8) proto.Writer {
@@ -478,8 +501,31 @@ pub var permissive_auth: bool = false;
 fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
     const acct = c.accountName();
     var stored: [20]u8 = undefined;
+    // An extension answers first if it wants to: a realm behind an existing account database, a
+    // launcher token or a ban list decides this instead of the password check, and returning null
+    // leaves the account to the stock path below. `accept` also registers an account the realm has
+    // not seen — the extension is the authority saying the player is real.
+    if (hook.authenticate(.{
+        .account = acct,
+        .client_token = c.client_token,
+        .server_token = server_token,
+        .hash = got,
+    })) |decision| return switch (decision) {
+        .accept => blk: {
+            if (store.accountPwHash(acct, &stored) == null) {
+                if (!hook.accountCreate(acct)) break :blk LOGON_NO_ACCOUNT;
+                _ = store.createAccount(acct, null);
+            }
+            break :blk LOGON_OK;
+        },
+        .reject_password => LOGON_BAD_PASSWORD,
+        .reject_no_account => LOGON_NO_ACCOUNT,
+    };
     const has_pw = store.accountPwHash(acct, &stored) orelse {
         if (permissive_auth) {
+            // Auto-registration is still a creation, so an extension gating who may exist gets
+            // asked here too — otherwise a permissive realm is a hole straight past it.
+            if (!hook.accountCreate(acct)) return LOGON_NO_ACCOUNT;
             _ = store.createAccount(acct, null); // legacy: auto-register password-less
             return LOGON_OK;
         }
@@ -497,8 +543,11 @@ fn onCreateAccount(c: *Conn, tag: []const u8, body: []const u8) void {
     const acct = r.getStr();
     c.setAccount(acct);
 
-    const created = store.createAccount(acct, pwhash);
-    log.line(tag, "create account={s} -> {s}", .{ acct, if (created) "ok" else "exists" });
+    // An extension gets to refuse the name before it exists — reserved names, an invite-only
+    // realm, an external registry that has to be the one issuing accounts. Refusal is reported as
+    // "name taken", the only failure SID_CREATEACCOUNT2 can express.
+    const created = hook.accountCreate(acct) and store.createAccount(acct, pwhash);
+    log.line(tag, "create account={s} -> {s}", .{ acct, if (created) "ok" else "refused/exists" });
 
     var buf: [64]u8 = undefined;
     var w = startPacket(&buf, SID_CREATEACCOUNT2);
@@ -851,6 +900,13 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         // it out loud. It used to answer with an empty INFO line, which looks to the
         // player exactly like the command silently working.
         sendEvent(c, EID_ERROR, 0, acct, "That is not a valid command. Type /help for a list.");
+        return;
+    }
+
+    // Last say on whether this line reaches the channel: mutes, flood control, word filters. It
+    // runs after the command handlers so an extension moderating talk is never handed a `/command`.
+    if (!hook.chatSay(c, acct, c.channelName(), text)) {
+        log.line(tag, "{s} talk dropped by an extension", .{acct});
         return;
     }
 

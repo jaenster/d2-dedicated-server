@@ -689,6 +689,96 @@ pub fn listChars(account: []const u8, names: []Name) usize {
 
 // sessions (ephemeral, PX TTL)
 
+// extension cache
+//
+// The in-flight half of an extension's namespace, keyed `realmd:ext:<name>:<key>` so it sits
+// beside the realm's own keys without ever being one of them. Durable extension state belongs in
+// pg's ext_kv; this is for what an extension is willing to lose — rate limits, a cached leaderboard,
+// a per-session scratch value.
+
+/// Longest `realmd:ext:<name>:<key>` we will build. Bounded by ExtKey (96) plus the name and the
+/// fixed prefix, rounded up.
+const ext_key_buf = 192;
+
+fn extKey(buf: []u8, ext: []const u8, key: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "ext:{s}:{s}", .{ ext, key }) catch null;
+}
+
+pub fn getExtCache(ext: []const u8, key: []const u8, out: []u8) usize {
+    var kb: [ext_key_buf]u8 = undefined;
+    const k = extKey(&kb, ext, key) orelse return 0;
+
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", k }) orelse return 0;
+    const bulk = switch (rep) {
+        .bulk => |b| b orelse return 0, // nil → missing or expired
+        else => return 0,
+    };
+    const n = @min(bulk.len, out.len);
+    @memcpy(out[0..n], bulk[0..n]);
+    return n;
+}
+
+/// `ttl_s` 0 means no expiry — an extension that wants a value to outlive its own uptime should
+/// still be writing it durably, not leaning on this.
+pub fn setExtCache(ext: []const u8, key: []const u8, value: []const u8, ttl_s: u32) bool {
+    var kb: [ext_key_buf]u8 = undefined;
+    const k = extKey(&kb, ext, key) orelse return false;
+
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = if (ttl_s > 0) blk: {
+        var pb: [16]u8 = undefined;
+        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        break :blk command(s, &r, &.{ "SET", k, value, "PX", px });
+    } else command(s, &r, &.{ "SET", k, value });
+    return switch (rep orelse return false) {
+        .status, .bulk, .int => true,
+        .array_len, .err => false,
+    };
+}
+
+pub fn delExtCache(ext: []const u8, key: []const u8) void {
+    var kb: [ext_key_buf]u8 = undefined;
+    const k = extKey(&kb, ext, key) orelse return;
+
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    _ = command(s, &r, &.{ "DEL", k });
+}
+
+/// Add to a counter in the extension's namespace and return the new value, setting the TTL only
+/// when the key is created. The one operation a rate limit or a "kills this season" counter needs
+/// and cannot build out of get+set without losing increments between instances.
+pub fn incrExtCache(ext: []const u8, key: []const u8, by: i64, ttl_s: u32) ?i64 {
+    var kb: [ext_key_buf]u8 = undefined;
+    const k = extKey(&kb, ext, key) orelse return null;
+    var bb: [24]u8 = undefined;
+    const byv = std.fmt.bufPrint(&bb, "{d}", .{by}) catch return null;
+
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "INCRBY", k, byv }) orelse return null;
+    const v = switch (rep) {
+        .int => |i| i,
+        else => return null,
+    };
+    // Only a first increment gets the expiry: re-arming it on every hit would make a one-minute
+    // rate-limit window slide forever for anyone who keeps hitting it.
+    if (ttl_s > 0 and v == by) {
+        var pb: [16]u8 = undefined;
+        const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return v;
+        var r2: Reader = undefined;
+        _ = command(s, &r2, &.{ "EXPIRE", k, secs });
+    }
+    return v;
+}
+
 pub fn saveSession(id: u64, account: []const u8, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, prefix ++ "session:{x}", .{id}) catch return false;
@@ -1900,6 +1990,44 @@ pub fn pickAndReserveGs() ?u32 {
             break :blk std.fmt.parseInt(u32, v, 16) catch null;
         },
         else => null,
+    };
+}
+
+/// Reserve a slot on ONE named server, the way `pickAndReserveGs` reserves on the one it chose.
+/// False when that server is gone, is flagged full, or has no room — which is the whole point: a
+/// caller that picked its own server still has to lose the same races the stock pick loses, or the
+/// choice would be a way to overfill a server rather than a way to place a game.
+///
+/// This exists so an extension can decide WHICH server hosts a game (fleet.pickGs) without giving
+/// up the atomic reserve; returning a gsid from a snapshot and reserving it in a second round trip
+/// would let two instances both place a game on the last free slot.
+pub fn reserveGs(gsid: u32) bool {
+    const script =
+        \\local rec = redis.call('GET', KEYS[1])
+        \\if not rec or #rec < 15 then return 0 end
+        \\local function u32(o)
+        \\  return string.byte(rec,o) + string.byte(rec,o+1)*256
+        \\       + string.byte(rec,o+2)*65536 + string.byte(rec,o+3)*16777216
+        \\end
+        \\local maxgame, live, full = u32(7), u32(11), string.byte(rec,15)
+        \\if full ~= 0 then return 0 end
+        \\if maxgame ~= 0 and live >= maxgame then return 0 end
+        \\live = live + 1
+        \\local b = string.char(live % 256, math.floor(live/256) % 256,
+        \\                      math.floor(live/65536) % 256, math.floor(live/16777216) % 256)
+        \\redis.call('SET', KEYS[1], string.sub(rec,1,10) .. b .. string.sub(rec,15), 'KEEPTTL')
+        \\return 1
+    ;
+    var kb: [64]u8 = undefined;
+    const key = gsKey(&kb, gsid);
+    if (key.len == 0) return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key }) orelse return false;
+    return switch (rep) {
+        .int => |i| i == 1,
+        else => false,
     };
 }
 

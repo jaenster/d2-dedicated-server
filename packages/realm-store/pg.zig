@@ -2,7 +2,7 @@
 //! `pg.zig` client (no libpq, so the static-musl scratch image is preserved).
 //!
 //! Schema: chars(account, name, d2s), accounts(name, pwhash, is_admin), userdata(account, key,
-//! value), guilds(name, data). Nothing short-lived is here — sessions, games, routes and the
+//! value), guilds(name, data), ext_kv(ext, key, value). Nothing short-lived is here — sessions, games, routes and the
 //! fleet are in flight and belong to Redis; a Postgres copy would be a second answer to a
 //! question that must have one.
 //!
@@ -15,6 +15,7 @@ const Lock = @import("realm_infra").lock.Lock;
 const types = @import("realm_infra").types;
 
 const Name = types.Name;
+const ExtKey = types.ExtKey;
 
 // accounts, profiles and guilds (durable)
 //
@@ -134,6 +135,70 @@ pub fn setUserData(account: []const u8, key_: []const u8, value: []const u8) boo
         \\on conflict (account, key) do update set value = excluded.value
     , .{ a, key_, value }) catch return false;
     return true;
+}
+
+// extension keyspace (durable)
+//
+// Every operation is scoped by `ext`, and the name is sanitised the same way an account is, so an
+// extension cannot address another's rows even by asking for them. Keys are opaque to us and go
+// through the parameter binder; only their LENGTH is checked, since a listing has to hand them
+// back through a fixed-size `ExtKey`.
+
+pub fn getExt(ext: []const u8, key: []const u8, out: []u8) usize {
+    var nb: [64]u8 = undefined;
+    const e = sanitize(ext, &nb) orelse return 0;
+    if (key.len == 0 or key.len > types.ext_key_max) return 0;
+    const p = ensurePool() orelse return 0;
+    var row = (p.row("select value from ext_kv where ext = $1 and key = $2", .{ e, key }) catch return 0) orelse return 0;
+    defer row.deinit() catch {};
+    const v = row.get([]const u8, 0) catch return 0;
+    const n = @min(v.len, out.len);
+    @memcpy(out[0..n], v[0..n]);
+    return n;
+}
+
+pub fn setExt(ext: []const u8, key: []const u8, value: []const u8) bool {
+    var nb: [64]u8 = undefined;
+    const e = sanitize(ext, &nb) orelse return false;
+    if (key.len == 0 or key.len > types.ext_key_max) return false;
+    const p = ensurePool() orelse return false;
+    _ = p.exec(
+        \\insert into ext_kv(ext, key, value) values ($1, $2, $3)
+        \\on conflict (ext, key) do update set value = excluded.value, updated = now()
+    , .{ e, key, value }) catch return false;
+    return true;
+}
+
+pub fn delExt(ext: []const u8, key: []const u8) bool {
+    var nb: [64]u8 = undefined;
+    const e = sanitize(ext, &nb) orelse return false;
+    const p = ensurePool() orelse return false;
+    _ = p.exec("delete from ext_kv where ext = $1 and key = $2", .{ e, key }) catch return false;
+    return true;
+}
+
+/// Keys in this extension's namespace that start with `prefix` (empty = all), into a caller-owned
+/// array. Returns how many were written; a full array is a truncated answer, not an error.
+pub fn listExtKeys(ext: []const u8, prefix: []const u8, out: []ExtKey) usize {
+    if (out.len == 0) return 0;
+    var nb: [64]u8 = undefined;
+    const e = sanitize(ext, &nb) orelse return 0;
+    if (prefix.len > types.ext_key_max) return 0;
+    const p = ensurePool() orelse return 0;
+    // `like` would need the prefix escaped into a second buffer; `starts_with` takes it as a plain
+    // parameter, so a key containing `%` still means itself.
+    var result = p.query(
+        \\select key from ext_kv where ext = $1 and starts_with(key, $2) order by key
+    , .{ e, prefix }) catch return 0;
+    defer result.deinit();
+    var count: usize = 0;
+    while (result.next() catch null) |row| {
+        if (count >= out.len) continue; // drain the rest, as listAccounts does
+        const k = row.get([]const u8, 0) catch continue;
+        out[count].set(k);
+        count += 1;
+    }
+    return count;
 }
 
 pub fn saveGuild(name: []const u8, bytes: []const u8) bool {
@@ -261,6 +326,19 @@ fn createSchema(p: *pg.Pool) !void {
         \\create table if not exists guilds(
         \\  name text primary key,
         \\  data bytea not null
+        \\)
+    , .{});
+    // The extension keyspace. One table for every extension, partitioned by the `ext` column
+    // rather than a table per extension: an extension gets a namespace without getting DDL
+    // rights, so nothing it stores can collide with the realm's own schema or with another
+    // extension's. `value` is bytea because JSON is only one of the things people will keep here.
+    _ = try p.exec(
+        \\create table if not exists ext_kv(
+        \\  ext text not null,
+        \\  key text not null,
+        \\  value bytea not null,
+        \\  updated timestamptz not null default now(),
+        \\  primary key(ext, key)
         \\)
     , .{});
 }
