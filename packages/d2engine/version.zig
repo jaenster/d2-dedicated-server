@@ -121,6 +121,10 @@ pub const Spec = struct {
     /// Stack args per callback slot. Counted at the call sites in that version's D2Game; asking
     /// for an uncounted slot is a compile error rather than a guess.
     stack_args: callbacks.StackArgs,
+    /// Whether this build indexes the callback table past the shared sixteen (`callbacks.Ext113c`).
+    /// It is not cosmetic: the one appended slot anyone calls, 0x54, is dispatched with no null
+    /// guard, so a host that leaves the tail off hands the engine a table it reads past the end of.
+    callback_tail: bool = false,
 };
 
 const classic_modules = [_][:0]const u8{ "Storm.dll", "Fog.dll", "D2Lang.dll", "D2CMP.dll", "D2Common.dll", "D2Net.dll", "D2Game.dll" };
@@ -195,9 +199,17 @@ pub fn spec(comptime v: Version) Spec {
             .lang = .{ .strtable_init = 10008 },
             .net = .{ .initialize = 10005, .set_max_clients = 10022, .set_hacklist = 10012 },
             .stack_args = callbacks.v113c,
+            .callback_tail = true,
         },
         // 1.14d is the monolith: no DLLs to load, and it grew the callback table past 0x40.
-        .v114d => .{ .name = "1.14d", .fog = .lod, .expansion = true, .modules = &.{}, .stack_args = callbacks.v114d },
+        .v114d => .{
+            .name = "1.14d",
+            .fog = .lod,
+            .expansion = true,
+            .modules = &.{},
+            .stack_args = callbacks.v114d,
+            .callback_tail = true,
+        },
     };
 }
 

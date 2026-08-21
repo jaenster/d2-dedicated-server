@@ -464,6 +464,13 @@ pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool 
     return redis.addGameChar(gameid, account, charname);
 }
 
+/// Renew the leases on every character a live game holds. The realm calls this on a timer for
+/// every game still in the index — see `fleet.renewCharLeases`.
+pub fn renewGameCharLeases(gameid: u32) usize {
+    var ob: [32]u8 = undefined;
+    return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s);
+}
+
 pub fn releaseGameChars(gameid: u32) usize {
     var ob: [32]u8 = undefined;
     const owner = gameOwnerId(&ob, gameid);

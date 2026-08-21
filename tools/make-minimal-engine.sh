@@ -165,6 +165,32 @@ engine)
             ;;
     esac
 
+    # Patch_D2.mpq is ERA-SPECIFIC and belongs to the engine, not to the shared base. The one we
+    # have is 1.14d's, and each side of the 1.10 line reacts to it in the opposite way -- measured,
+    # not assumed:
+    #
+    #   1.10f  without it: assert "pbData" DataTbls.cpp:0x8b3
+    #   1.13c  without it: halts in level generation, DrlgLogic.cpp:876, the moment a client enters
+    #   1.09b  WITH it:    ACCESS VIOLATION during boot; without it, it reaches the tick loop
+    #
+    # So it is required from 1.10 on and must be kept away from anything older. Putting it in the
+    # shared base layer instead fixes 1.13c and breaks 1.09b, which is a trade nobody would choose
+    # on purpose -- and one that presents as "the older engines regressed", not as a data problem.
+    case "$VER" in
+        1.10*|1.11*|1.12*|1.13*|1.14*)
+            if [ -f "$BASE/Patch_D2.mpq" ]; then
+                echo "==> minimising Patch_D2.mpq (required from 1.10 on)"
+                "$MPQMIN" ${D2_LISTFILE:+--listfile $D2_LISTFILE} "$BASE/Patch_D2.mpq" "$OUT/Patch_D2.mpq"
+            else
+                echo "!!  no Patch_D2.mpq in $BASE, and $VER needs one: it will assert in DataTbls"
+                echo "!!  or halt in DRLG the first time a client enters a game."
+            fi
+            ;;
+        *)
+            echo "==> no Patch_D2.mpq for $VER (pre-1.10; the 1.14d-era one faults it during boot)"
+            ;;
+    esac
+
     echo "==> recovering $VER tables"
     MPQCAT="$MPQCAT" D2PATCH="$D2PATCH" python3 tools/re/patchdata.py "$INST" \
         "$BASE/d2exp.mpq,$BASE/d2data.mpq" "$OUT/data/global/excel"

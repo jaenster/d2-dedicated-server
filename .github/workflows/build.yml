@@ -292,6 +292,64 @@ jobs:
         if: always()
         run: $COMPOSE down -v
 
+  # The matrix comes from deploy/e2e-engines.txt so there is ONE list of engines and one statement
+  # of what each is expected to manage. Adding an engine, or promoting one from `boot` to `world`,
+  # is a line in that file and nothing here.
+  engine-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        run: |
+          rows=$(awk '!/^[[:space:]]*#/ && NF>=2 {printf "%s{\"engine\":\"%s\",\"expect\":\"%s\"}", sep, $1, $2; sep=","}' \
+                 deploy/e2e-engines.txt)
+          echo "matrix={\"include\":[$rows]}" >> "$GITHUB_OUTPUT"
+          echo "$rows"
+
+  # Every engine, end to end, every time — because the regression this catches is a fix for one
+  # version quietly stopping another from serving, and that is invisible in any single engine's run.
+  #
+  # Only on a push: the images live in ghcr by then. A pull request gets the unit tests and the
+  # 1.14d e2e, which is what its own images can support without pulling a gigabyte per engine.
+  engine-e2e:
+    needs: [build, engines, engine-plan]
+    if: github.event_name == 'push' || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Every engine reports. Stopping at the first failure would hide whether one version broke or
+      # all of them did, and that difference is the whole diagnosis.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.engine-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: take realmd from the build job
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-realmd
+          merge-multiple: true
+          path: /tmp/images
+      - run: docker load -i /tmp/images/realmd.tar
+      - name: run ${{ matrix.engine }}
+        env:
+          D2GS_IMAGE: ghcr.io/jaenster/d2gs:${{ matrix.engine }}-${{ github.sha }}
+          # Actions expressions have no arithmetic, so the octet is worked out in the shell. A /24
+          # of its own per leg, so engines running at the same time cannot share a bridge.
+          JOB_INDEX: ${{ strategy.job-index }}
+        run: |
+          export SUBNET_OCTET=$((30 + JOB_INDEX))
+          docker pull "$D2GS_IMAGE"
+          deploy/engine-e2e-ci.sh "${{ matrix.engine }}" "${{ matrix.expect }}"
+
   # Moves the floating tags to the sha the build jobs just pushed — a manifest copy, no rebuild.
   # Only after e2e passes, and only on a real push to main (never a PR: there's nothing to promote).
   #
@@ -300,7 +358,7 @@ jobs:
   # compiler-decides rule the build follows. d2gs:latest points at 1.14d: an unqualified `d2gs`
   # should be the newest engine the game ever shipped, not the newest one we happened to add.
   promote:
-    needs: [build, engines, test, e2e]
+    needs: [build, engines, test, e2e, engine-e2e]
     timeout-minutes: 10
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest

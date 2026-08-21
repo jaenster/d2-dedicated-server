@@ -400,7 +400,12 @@ fn Binding(comptime version: d2version.Version) type {
         // reuse of another version's number under a different engine.
         pub fn buildCallbackTable() CallbackTable {
             return .{
-                .close_game = stubFor(.fpCloseGame, "pfCloseGame"),
+                // Not a report. It is the only moment the realm learns a game ended, and until it
+                // did the realm went on believing every character in that game was still in it.
+                .close_game = @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpCloseGame),
+                    closeGame,
+                ).shim),
                 .leave_game = stubFor(.fpLeaveGame, "pfLeaveGame"),
                 // The one slot that is a real implementation rather than a report: it drives every join.
                 .get_database_character = if (probing) @ptrCast(&fastcall.Callback2(
@@ -429,6 +434,16 @@ fn Binding(comptime version: d2version.Version) type {
                 .set_game_data = stubFor(.fpSetGameData, "pfSetGameData"),
                 .relock_database_character = stubFor(.fpRelockDatabaseCharacter, "pfRelockDatabaseCharacter"),
                 .load_complete = @ptrCast(&loadComplete),
+            };
+        }
+
+        /// The tail past 0x40. Filled only where the build is known to index it — but the storage
+        /// carries it either way, because "this build does not index it" is a claim about a sweep
+        /// and the cost of the sweep being wrong is a call through whatever follows the table.
+        pub fn buildCallbackTail() cb.Ext113c {
+            if (!spec.callback_tail) return .{};
+            return .{
+                .fpGetDatabaseFileTime = @ptrCast(&fastcall.Callback2(0, getDatabaseFileTime).shim),
             };
         }
     };
@@ -685,9 +700,19 @@ const CallbackTable = extern struct {
     load_complete: ?*const anyopaque
 };
 
+/// What the engine is actually handed. 1.13c and 1.14d index past the shared sixteen, and the one
+/// appended slot they call — 0x54 — is dispatched with no null guard, so the table has to physically
+/// extend that far even on a build that never reads it. The tail costs 0x18 bytes; getting it wrong
+/// costs a call through whatever follows a 0x40-byte struct in BSS.
+const EngineTable = extern struct {
+    base: CallbackTable,
+    ext: cb.Ext113c = .{},
+};
+
 comptime {
     // The engine indexes this table by fixed offset; a layout change silently corrupts dispatch.
     std.debug.assert(@sizeOf(CallbackTable) == 0x40);
+    std.debug.assert(@offsetOf(EngineTable, "ext") == 0x40);
     std.debug.assert(@offsetOf(CallbackTable, "get_database_character") == 0x08);
     std.debug.assert(@offsetOf(CallbackTable, "save_database_character") == 0x0C);
     std.debug.assert(@offsetOf(CallbackTable, "enter_game") == 0x14);
@@ -815,9 +840,55 @@ fn loadComplete(a: i32) callconv(.winapi) i32 {
     return 0;
 }
 
+/// How long a realm event lives, and how many may queue. Same figures the 1.14d server publishes
+/// with, because both feed the one drain loop in realmd.
+const event_cap: u32 = 4096;
+const event_ttl_s: u32 = 3600;
+
+/// Slot 0x00, the end of a game. Every measured version passes the game id in ECX — 1.09's
+/// `CloseGame(wGameId)` takes nothing else at all, and the builds that push two more stack
+/// arguments still lead with it — so the handler names no stack argument and the shim cleans up
+/// whatever that version's count is.
+///
+/// This has to reach the realm. `removeGameById` and `releaseGameChars` both sit on realmd's side
+/// of a CLOSEGAME, so while this only reported, a finished game stayed in the join list forever and
+/// every character in it stayed claimed. That surfaces three moves later and reads as three
+/// separate bugs: `create game '<name>' -> name already exists`, `character '<name>' is held by
+/// game:N`, and a join refused 0x2b "game is full" with nobody in it.
+fn closeGame(ecx: usize, edx: usize) callconv(.c) usize {
+    _ = edx;
+    const gid: u32 = @truncate(ecx);
+    sayFmt("d2host: pfCloseGame — game {d} ended", .{gid});
+    if (live_games > 0) live_games -= 1;
+    if (realmConfigured() and gid != 0) {
+        var c = std.mem.zeroes(proto.CloseGame);
+        c.h = proto.header(.closegame, @sizeOf(proto.CloseGame), 0);
+        c.gameid = gid;
+        _ = store.pushEvent(std.mem.asBytes(&c), event_cap, event_ttl_s);
+    }
+    return 0;
+}
+
+/// Slot 0x54, `__fastcall(FILETIME *out)` — the one appended slot 1.13c and 1.14d call, and neither
+/// guards it: the only thing in front of the dispatch is the "callbacks installed" flag.
+///
+/// The engine asks the realm for the timestamp of the character's stored save and compares it with
+/// the stamp inside the save the client just uploaded (`SrvVerifyJoinGame` @0x6fd0baf0, then
+/// `CompareFileTime` against the delivered data at +0x190) — so a client cannot hand back an older
+/// copy of its own character. The realm keeps no per-save timestamp, so the honest answer is a zero
+/// FILETIME: nothing on record, and every delivered save is at least as new as that.
+fn getDatabaseFileTime(ecx: usize, edx: usize) callconv(.c) usize {
+    _ = edx;
+    if (ecx != 0) {
+        const out: *[2]u32 = @ptrFromInt(ecx);
+        out.* = .{ 0, 0 };
+    }
+    return 0;
+}
+
 /// MUST outlive every call into D2Game: SetServerCallbackFunctions stores this pointer rather than
 /// copying the struct (verified at 1.10f 0x6FC358E0), so a stack temporary would dangle.
-var callbacks: CallbackTable = undefined;
+var callbacks: EngineTable = undefined;
 
 /// The game-data table is not an opaque buffer — it is a host-owned object D2Game reaches into by
 /// fixed offset, and Blizzard's own host built it with a C++ constructor. In 1.00's `D2Server.dll`
@@ -1108,7 +1179,11 @@ fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
     for (0..6) |i| sayFmt("d2host:   [esp+0x{x}] = 0x{x}", .{ i * 4, stack[i] });
     // What is actually executing. When EIP lands inside the stack the bytes are not code at all,
     // and seeing them says which data got jumped into — the register dump alone cannot.
-    {
+    //
+    // Not for a null EIP: reading around address 0 faults inside the handler and takes the rest of
+    // the report with it — which is how the one fault that says most about its cause (a CALL through
+    // a null slot) used to be the one that reported least.
+    if (c.eip >= 0x10000) {
         const code: [*]const u8 = @ptrFromInt(c.eip -% 8);
         var buf: [96]u8 = undefined;
         var n: usize = 0;
@@ -1121,6 +1196,8 @@ fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
             n += 3;
         }
         sayFmt("d2host:   bytes at eip-8: {s}", .{buf[0..n]});
+    } else {
+        sayFmt("d2host:   EIP is not code — a CALL through a null pointer. The caller is [esp+0x0].", .{});
     }
     return 0;
 }
@@ -1269,7 +1346,10 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     // Everything version-specific about the table — every slot's arity, and the two real
     // implementations' internals — lives in `Binding(version)`. `run` is generic, so this line is
     // the same regardless of which version the current instantiation is for.
-    callbacks = Binding(version).buildCallbackTable();
+    callbacks = .{
+        .base = Binding(version).buildCallbackTable(),
+        .ext = Binding(version).buildCallbackTail(),
+    };
     say("d2host: callback table built");
 
     // Blizzard's own host (`D2Server.dll`, WinMain @0x10009EA0) defines the minimal init, and this
