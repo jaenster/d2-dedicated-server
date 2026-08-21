@@ -80,6 +80,23 @@ await() { # await <host:port> <seconds> <what>
   bad "$3 never came up on $1"; return 1
 }
 
+# Postgres needs more than an open port. The container publishes 5432 before the database can serve,
+# so a connection in that window is accepted and then dropped — realmd reports `error.EndOfStream`
+# and exits, which reads as "postgres is missing" when it is merely still starting. Only ever seen
+# on a cold start, which is why it survived locally and failed the first time CI ran this from
+# scratch. Ask the database itself, not the socket.
+await_pg() { # await_pg <seconds>
+  local t=0
+  while [ "$t" -lt "$1" ]; do
+    if docker compose -f deploy/compose.dev.yaml exec -T postgres pg_isready -q >/dev/null 2>&1; then
+      ok "postgres accepting connections"
+      return 0
+    fi
+    sleep 1; t=$((t+1))
+  done
+  bad "postgres opened its port but never accepted a connection"; return 1
+}
+
 # The GS is the one piece whose readiness is NOT a port of its own: it publishes itself into redis
 # and takes work from there. Until that lands, realmd has no server to hand out and every join
 # fails somewhere that looks like a client problem. So wait for the registration, not the process.
@@ -155,6 +172,7 @@ if ! listening "$REDIS_ADDR" || ! listening "$PG_ADDR"; then
 fi
 await "$REDIS_ADDR" 20 "redis"    || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
 await "$PG_ADDR"    30 "postgres" || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
+await_pg 60                       || die "postgres is up but not serving; see docker compose -f deploy/compose.dev.yaml logs postgres"
 
 say "realmd"
 if listening "127.0.0.1:$BNET_PORT"; then
