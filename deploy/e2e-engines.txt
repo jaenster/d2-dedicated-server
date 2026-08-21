@@ -81,7 +81,16 @@
                # where d2host translates the 1.14d join. That is the next thing to look at, and it
                # is one comparison rather than a format.
                #
-               # NOT the join translation, which was the obvious suspect and is ruled out. Classic
+               # RESOLVED. It was the checksum: the modern save keeps one at 0x0C, and 0x0C is
+               # inside name[16] at 0x08 in this record, so writing one left the name without its
+               # terminator and the strcmp failed — reported as the same number a bad version gets.
+               # d2host now converts the save into the era's record (packages/d2engine/charrecord.zig)
+               # and 1.06b takes the character. What stops it now is a call through a null pointer
+               # (EIP=0) shortly after BITMANIP_Initialize @10126 — the same wall 1.07 hits. It is
+               # NOT the callback table (every tail slot is a reporting stub now and none fired) and
+               # NOT the game-data vtable (filling past its four methods changed nothing).
+               #
+               # NOT the join translation either, which was the obvious suspect and is ruled out. Classic
                # takes 0x61 at 28 bytes — 1.06b's own C->S table says so — and 28 is reachable two
                # ways: a 10-byte preamble with a 16-byte name, or an 11-byte one with a 15-byte
                # name. cs_packets picks the first. Forcing the second makes the engine answer the

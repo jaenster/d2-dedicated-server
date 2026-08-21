@@ -18,6 +18,7 @@ const cb = @import("d2engine").callbacks;
 const hostapi = @import("d2engine").hostapi;
 const gameflags = @import("d2engine").gameflags;
 const d2version = @import("d2engine").version;
+const charrecord = @import("d2engine").charrecord;
 const build_options = @import("build_options");
 
 const HMODULE = *anyopaque;
@@ -437,26 +438,53 @@ fn Binding(comptime version: d2version.Version) type {
             };
         }
 
-        /// The tail past 0x40. Filled only where the build is known to index it — but the storage
-        /// carries it either way, because "this build does not index it" is a claim about a sweep
-        /// and the cost of the sweep being wrong is a call through whatever follows the table.
+        /// The tail past 0x40. Every slot is filled on every build, including the builds believed
+        /// not to index it — because that belief is a claim about a sweep, and a wrong sweep costs
+        /// a call through a null pointer.
+        ///
+        /// A null tail slot is the worst possible failure here: the engine indexes it with no null
+        /// test, so the process dies at EIP=0 with a return address one instruction past a call
+        /// site, naming neither the slot nor the fact that a callback was involved. That is exactly
+        /// how 1.13c's 0x54 was found, and it cost a day. A reporting stub turns the same fault
+        /// into a line that says which slot was called, so the next one costs a minute.
         pub fn buildCallbackTail() cb.Ext113c {
-            if (!spec.callback_tail) return .{};
-            return .{
-                .fpGetDatabaseFileTime = @ptrCast(&fastcall.Callback2(0, getDatabaseFileTime).shim),
-            };
+            var t = cb.Ext113c{};
+            inline for (&t.reserved_0x40, 0..) |*slot, i| {
+                slot.* = Unmeasured(std.fmt.comptimePrint("callback slot 0x{x}", .{0x40 + i * 4})).ptr;
+            }
+            inline for (&t.reserved_0x58, 0..) |*slot, i| {
+                slot.* = Unmeasured(std.fmt.comptimePrint("callback slot 0x{x}", .{0x58 + i * 4})).ptr;
+            }
+            t.fpGetDatabaseFileTime = if (spec.callback_tail)
+                @ptrCast(&fastcall.Callback2(0, getDatabaseFileTime).shim)
+            else
+                Unmeasured("callback slot 0x54 (fpGetDatabaseFileTime)").ptr;
+            return t;
         }
     };
 }
 
 /// Hand every fetched save to the engine, outside the join call stack. A zero-length fetch is a
 /// refusal, not a silence: bLock nonzero tells the engine the load failed and it disconnects.
+/// What this build wants a character handed to it as, or null for the builds that take the realm's
+/// save unchanged. Set once, from `run`, where the version is known.
+var char_record: ?charrecord.Layout = null;
+
 fn pumpCharacterLoads() void {
     for (&pending) |*p| {
         if (!p.used) continue;
         p.used = false;
         const refused = p.len == 0;
         if (refused) say("d2host: character fetch failed — refusing the join");
+        // A pre-1.10 engine does not read the save the realm stores. It reads a 130-byte record
+        // with its own field offsets and refuses the character otherwise — reporting the same
+        // number whichever field it disliked, which is why this is a conversion and not a guess.
+        if (!refused) {
+            if (char_record) |l| {
+                p.len = @intCast(charrecord.fromModern(p.save[0..p.len], l));
+                sayFmt("d2host: converted the save into this build's character record (version 0x{x})", .{l.version});
+            }
+        }
         const size: u32 = if (refused) 0 else p.len;
         const lock: u32 = if (refused) 1 else 0;
         if (send_character7) |send| {
@@ -479,6 +507,19 @@ fn pumpCharacterLoads() void {
                     sig, ver, declared, p.len, status,
                     if (status & 1 != 0) "yes" else "NO — the engine will want a full save body",
                 });
+                // The header AS DELIVERED. A pre-1.10 engine reads a 96-byte record out of the
+                // front of this and refuses the character on any of seven field checks, all of
+                // which report the same opaque number — so the only way to tell which one is to
+                // see the bytes it actually got. Reading them back out of the database instead has
+                // already sent one search the wrong way: the row is not necessarily what arrives.
+                const dump_len = @min(p.len, 0x60);
+                var hex: [0x60 * 3]u8 = undefined;
+                var w: usize = 0;
+                for (p.save[0..dump_len]) |b| {
+                    _ = std.fmt.bufPrint(hex[w..][0..3], "{x:0>2} ", .{b}) catch break;
+                    w += 3;
+                }
+                sayFmt("d2host: record head {s}", .{hex[0..w]});
             }
         }
     }
@@ -1278,6 +1319,9 @@ pub fn main() !void {
 /// data it was handed.
 fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     const spec = comptime d2version.spec(version);
+    // The delivery path runs outside this template, so the one version-shaped fact it needs is
+    // handed to it here rather than plumbed through every call.
+    char_record = comptime charrecord.layout(version);
 
     if (install_dir) |dir| {
         if (SetCurrentDirectoryA(dir) == 0) {

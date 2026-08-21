@@ -10,6 +10,7 @@ pub const gameflags = @import("gameflags.zig");
 pub const cs_packets = @import("cs_packets.zig");
 pub const fogabi = @import("fogabi.zig");
 pub const fogrosetta = @import("fogrosetta.zig");
+pub const charrecord = @import("charrecord.zig");
 
 // A test artifact rooted here only runs the tests of files it actually analyses.
 test {
@@ -20,4 +21,5 @@ test {
     _ = cs_packets;
     _ = fogabi;
     _ = fogrosetta;
+    _ = charrecord;
 }
