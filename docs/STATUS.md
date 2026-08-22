@@ -33,6 +33,13 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   take create/join from a queue there, and report back on an event stream any instance drains.
   Everything durable is shared too -- an account created and flagged admin on one instance,
   read back from another that shares nothing but Postgres. See [`docs/redis.md`](redis.md).
+- **Every pre-1.14 engine serves a world.** A second kind of game server, `apps/d2host`, drives the
+  game's own `D2Game`/`D2Common` against our `Fog.dll` and `D2Net.dll` -- no injection, no
+  `Game.exe`. All seven of 1.06b, 1.07, 1.08, 1.09b, 1.09d, 1.10f and 1.13c take a real client's
+  join, load its character and stream it a world. A stock 1.14d client stands in the Rogue
+  Encampment on 1.10f and on 1.13c. The gate is `deploy/e2e-engines.txt` + `tools/e2e-engines.sh`,
+  run in CI on every engine, so an engine that stops serving is a hard failure rather than something
+  noticed weeks later. See [`docs/dll-host.md`](dll-host.md).
 - **A game server with no wine at all.** 1.14d's macOS i386 build, mapped and run directly on
   i386 Linux, serving real clients through the same realm and gateway: one process in a 4.4 MB
   image, and on real amd64 hardware as fast as the wine server. It meets the realm through redis
@@ -56,14 +63,11 @@ says otherwise, it is tested under wine on the unmodified retail `Game.exe`.
   crashes, no evictions, and the games that run are correct. The shortfall is not yet
   understood, so the default keeps every game landing.
 - Replace the fixed init delay with a proper engine-init hook.
-- **A second kind of game server, on the pre-1.14 DLLs, is in bring-up.** `apps/d2host` drives real
-  1.10f `D2Game`/`D2Common` against our own `Fog.dll` and `D2Net.dll`: 2,636 files served straight
-  out of the archives, the data tables and tilesets loaded, a game created, and a TCP client
-  round-tripping through the engine -- it answers a packet with 357 bytes and calls our
-  `pfHandlePacket`. No assert, crash or hang anywhere in that path. What it cannot do yet is mean
-  anything: the stream is delivered in `recv`-sized chunks rather than split into packets, and the
-  callbacks are reporting stubs rather than realm calls, so no character can join.
-  See [`docs/dll-host.md`](dll-host.md).
+- **A pre-1.14 game does not write the character back yet.** `close_game` / `leave_game` are
+  reporting stubs in `apps/d2host`, so a character that played on one of those engines is not saved
+  to the realm the way the 1.14d server saves it.
+- 1.13c sends opcode `0xB4`, which the 1.14d client world-model does not carry, so the clientless
+  parses 2 of 3 packets on that engine. A model gap on the client side, not a server one.
 
 ## Related
 

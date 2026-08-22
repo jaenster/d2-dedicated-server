@@ -225,7 +225,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: install zig
         run: |
-          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+          # Retried for the same reason deploy/Dockerfile retries it: one dropped connection to
+          # ziglang.org is not a broken build. --fail keeps an error page out of tar.
+          curl -sSL --fail --retry 5 --retry-delay 3 --retry-all-errors \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
             | tar -xJ -C /opt
           echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - name: unit tests
@@ -339,7 +342,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: install zig
         run: |
-          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+          # Retried for the same reason deploy/Dockerfile retries it: one dropped connection to
+          # ziglang.org is not a broken build. --fail keeps an error page out of tar.
+          curl -sSL --fail --retry 5 --retry-delay 3 --retry-all-errors \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
             | tar -xJ -C /opt
           echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       # Same recipe the engine image uses. i386 first: the engines are 32-bit and wine32 is what

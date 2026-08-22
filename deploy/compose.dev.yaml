@@ -35,7 +35,9 @@ services:
     ports:
       - "55432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U realmd"]
+      # Over TCP, not the unix socket: the image's first boot serves initdb on the socket alone
+      # while refusing TCP, so a socket probe calls it healthy before anything can connect.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U realmd -d realmd"]
       interval: 3s
       retries: 10
 

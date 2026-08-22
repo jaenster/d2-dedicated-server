@@ -36,8 +36,13 @@
 FROM --platform=$BUILDPLATFORM alpine:3.20 AS zig
 RUN apk add --no-cache curl xz
 ARG ZIG_VERSION=0.16.0
+# --retry, because ziglang.org is one small server and this matrix asks it for 55 MB several times
+# at once: a dropped connection failed a whole image build in 14 seconds while the identical
+# download in the job beside it succeeded. --fail so an error page is reported as one instead of
+# being piped into tar, which fails several layers later as a corrupt archive.
 RUN ZA="$(uname -m)" && \
-    curl -sSL https://ziglang.org/download/${ZIG_VERSION}/zig-${ZA}-linux-${ZIG_VERSION}.tar.xz \
+    curl -sSL --fail --retry 5 --retry-delay 3 --retry-all-errors \
+      https://ziglang.org/download/${ZIG_VERSION}/zig-${ZA}-linux-${ZIG_VERSION}.tar.xz \
       | tar -xJ -C /opt && ln -s /opt/zig-${ZA}-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 WORKDIR /src
 COPY build.zig build.zig.zon ./

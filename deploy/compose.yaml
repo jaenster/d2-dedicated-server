@@ -21,7 +21,8 @@ services:
       POSTGRES_PASSWORD: realmd
       POSTGRES_DB: realmd
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "realmd"]
+      # -h forces TCP. On the socket, initdb's temporary server answers while TCP is still refused.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "realmd", "-d", "realmd"]
       interval: 3s
       retries: 10
 

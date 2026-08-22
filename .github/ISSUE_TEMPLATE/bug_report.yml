@@ -1,0 +1,74 @@
+name: Bug report
+description: Something the server does wrong, or does not do at all
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Almost every bug here presents the same way from the client: the join is accepted and
+        nothing arrives. So the interesting part is rarely "it doesn't work" — it's which
+        component, which engine, and what the server's own log said at the moment it went quiet.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component
+      multiple: true
+      options:
+        - realmd (login, chat, characters, game list)
+        - d2gs 1.14d (wine)
+        - d2gs 1.14d-native (no wine)
+        - d2host (1.06b … 1.13c, the game's own DLLs)
+        - d2ingress
+        - build / tests
+        - docs
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Engine and client version
+      description: e.g. server `d2gs:1.10f`, client 1.14d retail. Say if the client is modded.
+      placeholder: server 1.10f, client 1.14d
+  - type: input
+    id: version
+    attributes:
+      label: Which build of this project
+      description: Image tag, release tag, or `git rev-parse HEAD`.
+      placeholder: ghcr.io/jaenster/d2gs:1.10f, or commit abc1234
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How it is running
+      options:
+        - Docker Compose
+        - Kubernetes / Helm
+        - run-stack.sh on one host
+        - built and run by hand
+        - other
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server log around the failure
+      description: >
+        The server's own output, not just the client's message. Include the lines before the point
+        where it went quiet — that is usually where the cause is. Engine asserts (file and line)
+        matter a lot; paste them verbatim.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: The game tree/data this ran against is the one the docs describe (a stale tree fails as an engine assert with nothing pointing at the tree).
+        - label: No Blizzard game files are attached to this issue.
+          required: true
