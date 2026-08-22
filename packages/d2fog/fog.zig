@@ -204,7 +204,16 @@ export fn FOG_SetEngineVersion(v: u32) callconv(.c) i32 {
                 return 0;
             };
             d2fog_alloc_linker_pop = @as(u32, abi.alloc_linker) * 4;
-            sayFmt("fog: ABI set for {s} (AllocLinker pops {d})", .{ f.name, d2fog_alloc_linker_pop });
+            // Unmeasured leaves the port's own shape rather than guessing from the neighbours; the
+            // AllocLinker pop above already refused this version outright, so this cannot be
+            // reached with a null.
+            bitstream.has_overflow = fogabi.bitstreamHasOverflow(@enumFromInt(f.value)) orelse
+                fogabi.default_bitstream_has_overflow;
+            sayFmt("fog: ABI set for {s} (AllocLinker pops {d}, BitStream {d} bytes)", .{
+                f.name,
+                d2fog_alloc_linker_pop,
+                @as(u32, if (bitstream.has_overflow) 20 else 16),
+            });
             return 1;
         }
     }
@@ -1006,8 +1015,10 @@ export fn BITMANIP_Write(s: ?*bitstream.BitStream, v: u32, nbits: i32) callconv(
     const st = s orelse return;
     writes_since_init +%= 1;
     if (writes_since_init % (1 << 20) == 0) sayFmt(
+        // `overflow` is only read where the caller reserved it. Pre-1.10 that word belongs to the
+        // caller's frame, and a diagnostic has no business reading four bytes past a stream.
         "fog: BITMANIP_Write x{d} since the last Initialize — caller=0x{x} stream bytes={d} bit={d} cap_bits={d} overflow={d}, nbits={d}",
-        .{ writes_since_init, @returnAddress(), st.bytes, st.bit, st.cap_bits, st.overflow, nbits },
+        .{ writes_since_init, @returnAddress(), st.bytes, st.bit, st.cap_bits, if (bitstream.has_overflow) st.overflow else -1, nbits },
     );
     bitstream.write(st, v, nbits);
 }

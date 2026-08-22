@@ -13,9 +13,12 @@
 
 const std = @import("std");
 
-/// 20 bytes, laid out by the engine's callers — it is a local in the caller's frame, so this is a
-/// contract rather than our choice. Bits pack LSB-first within each byte, low bits of the value
-/// first. Verified against 1.10f @10126 (0x6ff53650).
+/// Laid out by the engine's callers — it is a local in the caller's frame, so this is a contract
+/// rather than our choice. Bits pack LSB-first within each byte, low bits of the value first.
+/// Verified against 1.10f @10126 (0x6ff53650).
+///
+/// SIXTEEN bytes before 1.10 and twenty from 1.10 on: `overflow` is the field that was added, and
+/// `has_overflow` below decides whether this build's caller reserved room for it.
 pub const BitStream = extern struct {
     /// The byte being filled or drained — advanced past, never indexed from the start.
     cur: ?[*]u8 = null,
@@ -25,7 +28,9 @@ pub const BitStream = extern struct {
     bytes: i32 = 0,
     /// Bit position inside `cur`, 0..7.
     bit: i32 = 0,
-    /// Latched once a read or a write ran past `cap_bits`. Nothing clears it but `init`.
+    /// Latched once a read or a write ran past `cap_bits`. Nothing clears it but `init`, and it
+    /// only exists from 1.10 on — before that an over-long write is a Fog assert that exits, so
+    /// there is no flag for anyone to read. See `has_overflow`.
     overflow: i32 = 0,
 };
 
@@ -34,20 +39,24 @@ const low_mask = [9]u32{ 0, 1, 3, 7, 0xf, 0x1f, 0x3f, 0x7f, 0xff };
 /// `0xff << b` for b in 0..7 — the engine's own table at 1.10f 0x6ff7142c.
 const high_mask = [8]u8{ 0xff, 0xfe, 0xfc, 0xf8, 0xf0, 0xe0, 0xc0, 0x80 };
 
+/// Whether the caller's stream has the `overflow` field at +0x10. The host sets this from the
+/// engine version through `FOG_SetEngineVersion`, before any engine module is loaded; the default
+/// is 1.10f's shape, which is what this file was ported from.
+///
+/// This is the one thing in here that cannot be decided from the arguments, and both ways of being
+/// wrong cost a day. Writing +0x10 when the caller reserved sixteen bytes puts a zero on its return
+/// address; leaving it alone when the caller reserved twenty leaves the engine testing uninitialised
+/// stack. `fogabi.bitstreamHasOverflow` carries the measurement and the addresses it came from.
+pub var has_overflow: bool = true;
+
 pub fn init(st: *BitStream, buf: ?[*]u8, n_bytes: u32) void {
-    // FOUR fields, never five. The real @10126 writes +0x00, +0x04, +0x08 and +0x0c and stops;
-    // `overflow` at +0x10 is only ever written by @10128, and only on the path where a write does
-    // not fit — which for a correctly sized buffer never runs.
-    //
-    // That distinction is not cosmetic. Callers put this struct on the stack and reserve only what
-    // Initialize touches: D2Common 1.09d @10881 opens `sub esp, 0x10`, sixteen bytes, and the whole
-    // struct assignment this used to be wrote twenty — four bytes straight through the bottom of
-    // the caller's frame, on every packet it built. Nothing fails at the write; the damage lands on
-    // whatever that frame held, which is why it surfaced as a jump to a garbage address much later.
     st.cur = buf;
     st.cap_bits = @bitCast(n_bytes << 3);
     st.bytes = 0;
     st.bit = 0;
+    // The fifth field, on the builds that have one. 1.10f's @10126 ends `mov [eax+0x10], ecx` with
+    // ECX still zero; 1.09d's and 1.06b's end one instruction earlier.
+    if (has_overflow) st.overflow = 0;
 }
 
 /// Bytes produced, rounded up: a byte with bits still in flight counts as one.
@@ -61,7 +70,9 @@ pub fn size(st: *const BitStream) u32 {
 /// value and then stop, it writes nothing at all and latches the flag.
 pub fn write(st: *BitStream, value: u32, nbits: i32) void {
     if (st.cap_bits < st.bit + st.bytes * 8 + nbits) {
-        st.overflow = 1;
+        // Pre-1.10 there is nowhere to put this: that Fog asserts and exits instead (1.09d @10128
+        // 0x6ff520fe, BitManip.cpp:0x165), so the caller never reserved a flag to be told about it.
+        if (has_overflow) st.overflow = 1;
         st.bit = 0;
         st.bytes = @divTrunc(st.cap_bits, 8);
         return;
@@ -94,7 +105,7 @@ pub fn write(st: *BitStream, value: u32, nbits: i32) void {
 pub fn read(st: *BitStream, nbits: i32) u32 {
     var over = st.bytes * 8 - st.cap_bits + nbits + st.bit;
     if (over < 0) over = 0;
-    if (over != 0) st.overflow = 1;
+    if (over != 0 and has_overflow) st.overflow = 1;
     var n = nbits - over;
     var result: u32 = 0;
     var shift: i32 = 0;
@@ -151,6 +162,32 @@ pub fn getBit(p: [*]const u8, bit: i32) i32 {
 /// Clears the bit, despite Fog's name for it (`BITMANIP_MaskBitstate`).
 pub fn clearBit(p: [*]u8, bit: i32) void {
     p[@intCast(bit >> 3)] &= ~(@as(u8, 1) << @intCast(bit & 7));
+}
+
+test "a pre-1.10 stream leaves the overflow field completely alone" {
+    // On 1.09d that field is not the stream's to write: `sub esp, 0x10` puts a SIXTEEN-byte stream
+    // at the bottom of the caller's frame, so the word our struct calls `overflow` is the caller's
+    // own return address. So the property is simply that nothing here writes it — a sentinel that
+    // survives says that, and it survives on any host, which a frame modelled in raw bytes would not
+    // (`cur` is eight bytes off i386 and every offset after it moves).
+    const sentinel: i32 = @bitCast(@as(u32, 0xC0FFEE));
+    var buf = [_]u8{0} ** 4;
+    var st: BitStream = .{ .overflow = sentinel };
+
+    has_overflow = false;
+    defer has_overflow = true;
+    init(&st, &buf, buf.len);
+    try std.testing.expectEqual(sentinel, st.overflow);
+    write(&st, 0, 33 * 8); // far past four bytes: the latching path
+    try std.testing.expectEqual(sentinel, st.overflow);
+    _ = read(&st, 32); // and the reader, which latches it too
+    try std.testing.expectEqual(sentinel, st.overflow);
+
+    // From 1.10 on `init` MUST clear it, or the engine's own overflow test reads whatever the frame
+    // happened to hold — which is how a save that fit got reported as "too many items".
+    has_overflow = true;
+    init(&st, &buf, buf.len);
+    try std.testing.expectEqual(@as(i32, 0), st.overflow);
 }
 
 test "bits land LSB-first, in the bytes the engine puts them in" {

@@ -21,11 +21,13 @@
 # built to an older recipe fails as an engine assert with nothing pointing at the tree, so when a
 # row that used to hold starts failing, check the tarball's age against the recipe's before the code.
 
-1.07   world   # 194 packets / 34 units. Was dropped as a target while it was broken; it costs
-               # nothing now that it works, and a working engine left out of this list is one that
-               # can break again unnoticed. Still required by the BUILD regardless: every expansion
-               # DLL from 1.08 on is a delta against 1.07's PE files (D2_LOD_BASE).
-1.08   world   # 196 packets / 34 units. Its character record is 1.07's shape with its own version,
+1.07   world   # ~197 packets / 34 units. Counts in this file wobble by a few between runs — they
+               # are a scale check, not a value anything asserts. Was dropped as a target while it
+               # was broken; it costs nothing now that it works, and a working engine left out of
+               # this list is one that can break again unnoticed. Still required by the BUILD
+               # regardless: every expansion DLL from 1.08 on is a delta against 1.07's PE files
+               # (D2_LOD_BASE).
+1.08   world   # ~195 packets / 34 units. Its character record is 1.07's shape with its own version,
                # 0x59, out of its own writer.
 1.09b  world   # 195 packets / 34 units. Its record is NOT 1.08's shape: it keeps the modern layout
                # and only the version differs (0x5c), so rewriting the header the 1.08 way would
@@ -37,14 +39,13 @@
                # 2026-08-21; before that it halted at boot and never reached a world in CI while
                # passing locally, because the local tree had been given the file by hand.
                #
-               # Reaches the world and then asserts on the way out: "Character has too many items",
-               # PlrSave.cpp:0x713, from D2Game+0x59d52. That is the character SAVE path, and
-               # fpSaveDatabaseCharacter is still a reporting stub — the engine is being told
-               # nothing about the save it asked for. Pre-existing and identical on a hand-built
-               # tree, so it is not the tarball. It does fail the log check, so these two are the
-               # last rows CI cannot pass.
-1.13c  world   # 179 packets / 34 units. Needs Patch_D2, published 2026-08-21. Same save-path
-               # assert as 1.10f.
+               # From 1.10 on the Fog BitStream carries an overflow flag at +0x10 that Initialize
+               # has to clear, and the pre-1.10 builds have no such field. Leaving it alone on this
+               # side of the line made the engine read stack garbage and refuse a save that fit —
+               # "Character has too many items", PlrSave.cpp:0x713 — which is the engine reporting
+               # a flag nobody set. fogabi.bitstreamHasOverflow holds the measurement.
+1.13c  world   # 179 packets / 34 units. Needs Patch_D2, published 2026-08-21. Same BitStream
+               # generation as 1.10f, measured from its callers because no 1.13c Fog.dll is on disk.
 1.06b  world   # 200 packets / 34 units. Classic lineage: d2data only, no d2exp, its own Fog
                # numbering (retargeted through fogrosetta), a SIX-byte GameFlags, and a client that
                # must fire JOINGAME off GameFlags because no 0x00 StateCommand follows it.
