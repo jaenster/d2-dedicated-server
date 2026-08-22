@@ -75,7 +75,7 @@ jobs:
           - target: d2ingress
             image: d2ingress
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         # A PR doesn't push, so a fork PR (read-only GITHUB_TOKEN, no packages:write) still builds.
@@ -171,7 +171,7 @@ jobs:
     outputs:
       built: ${{ steps.build.outputs.built }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
@@ -222,7 +222,7 @@ jobs:
     env:
       ZIG_VERSION: "0.16.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: install zig
         run: |
           # Retried for the same reason deploy/Dockerfile retries it: one dropped connection to
@@ -259,7 +259,7 @@ jobs:
     env:
       COMPOSE: docker compose -f deploy/compose.yaml -f deploy/compose.e2e.yaml --profile native
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - name: take the images the build jobs made
         uses: actions/download-artifact@v4
@@ -339,7 +339,7 @@ jobs:
       D2_MINIMAL_ENGINE_BASE: https://files.typeguru.nl/diablo/minimal
       CLIENTLESS: ${{ github.workspace }}/d2-clientless/zig-out/bin/clientless
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: install zig
         run: |
           # Retried for the same reason deploy/Dockerfile retries it: one dropped connection to
