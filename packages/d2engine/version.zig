@@ -125,10 +125,40 @@ pub const Spec = struct {
     /// It is not cosmetic: the one appended slot anyone calls, 0x54, is dispatched with no null
     /// guard, so a host that leaves the tail off hands the engine a table it reads past the end of.
     callback_tail: bool = false,
+    /// Non-null when this build's game-data object must be taken from D2Client rather than built.
+    client_game_data: ?ClientGameData = null,
 };
 
 const classic_modules = [_][:0]const u8{ "Storm.dll", "Fog.dll", "D2Lang.dll", "D2CMP.dll", "D2Common.dll", "D2Net.dll", "D2Game.dll" };
 const lod_modules = classic_modules;
+
+/// The engine DLLs plus the CLIENT stack, which the pre-1.10 servers load.
+///
+/// Onlyer's 1.09d D2Server loads fog, d2win, d2sound, d2gfx, d2game, d2common, d2net, d2lang and
+/// D2Client. The client ones are not decoration: its one mandatory table entry reads four bytes out
+/// of `d2client.dll+0x81e1` — the imm32 of `mov ecx, <addr>` in a C++ static initialiser — and
+/// hands that address to `GAME_InitGameDataTable`. The game-data object those builds want is a C++
+/// global living in D2Client, constructed when its DllMain runs.
+const lod_modules_with_client = classic_modules ++ [_][:0]const u8{
+    "D2gfx.dll", "D2Win.dll", "D2Sound.dll", "D2MCPClient.dll", "D2Client.dll",
+};
+
+/// Where a build's game-data object is, when it is not ours to build.
+///
+/// `offset` is into D2Client.dll and points at the imm32 of the `mov ecx, <addr>` that its static
+/// initialiser uses, so the dword there IS the object's address. `expect` is that dword's known
+/// value, checked before use exactly as the real host checks it — a mismatch means this is not the
+/// build the offset was measured on, and reading on regardless would hand the engine a wild pointer.
+pub const ClientGameData = struct { offset: u32, expect: u32 };
+
+
+///
+/// The real pre-1.10 servers do it — Onlyer's 1.09d D2Server.dll LoadLibraryA's D2Client.dll from a
+/// one-entry list, and its one unconditional patch targets `d2client.dll+0x81e1`, so it loads the
+/// client in order to patch it. Loading it here (plus D2gfx, D2Win, D2Sound, D2MCPClient and
+/// ijl11) boots fine and changes nothing about the fault those builds hit, so the load is not the
+/// missing half on its own. Left out rather than left in: it costs five modules the minimal tree
+/// does not ship, and buys nothing measured.
 
 pub fn spec(comptime v: Version) Spec {
     return switch (v) {
@@ -158,7 +188,18 @@ pub fn spec(comptime v: Version) Spec {
         .v109b => .{ .name = "1.09b", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v109b },
         .v107 => .{ .name = "1.07", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v107 },
         .v108 => .{ .name = "1.08", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v108 },
-        .v109d => .{ .name = "1.09d", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v109d },
+        .v109d => .{
+            .name = "1.09d",
+            .fog = .lod,
+            .expansion = true,
+            .modules = &lod_modules,
+            .stack_args = callbacks.v109d,
+            // Verified to work and deliberately OFF: passing D2Client's object instead of ours
+            // changes nothing about the fault this build hits, and switching it on costs the
+            // minimal tree five modules it does not ship. Turn both lines on together.
+            // .modules = &lod_modules_with_client,
+            // .client_game_data = .{ .offset = 0x81e1, .expect = 0x6fbb0a88 },
+        },
         .v110f => .{ .name = "1.10f", .fog = .lod, .expansion = true, .modules = &lod_modules, .stack_args = callbacks.v110f },
         // 1.13c renumbered its whole export table — every entry point we call moved, in D2Game and
         // D2Common alike, and 10023 there is a bare `ret 4` rather than the callback setter. Each

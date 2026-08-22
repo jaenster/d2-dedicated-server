@@ -40,11 +40,16 @@ WINE="${WINE:-wine}"
 CLIENTLESS="${CLIENTLESS:-$ROOT/../clientless/zig-out/bin/clientless}"
 mkdir -p "$LOG_DIR"
 
-TRACE=0; MODE=up
+TRACE=0; MODE=up; REALM_ONLY=0
 for a in "$@"; do case "$a" in
   --trace) TRACE=1 ;;
   --status) MODE=status ;;
   --down) MODE=down ;;
+  # redis, postgres, realmd and d2ingress, and nothing else. What tools/e2e-engines.sh wants: it
+  # brings up its OWN game server per engine and refuses to run beside another, because two servers
+  # in one realm means a create can land on either and the result reads as a defect in whichever
+  # engine was being tested.
+  --realm-only) REALM_ONLY=1 ;;
   *) echo "unknown flag $a" >&2; exit 2 ;;
 esac; done
 
@@ -73,6 +78,23 @@ await() { # await <host:port> <seconds> <what>
   local t=0
   while [ "$t" -lt "$2" ]; do listening "$1" && { ok "$3 on $1"; return 0; }; sleep 1; t=$((t+1)); done
   bad "$3 never came up on $1"; return 1
+}
+
+# Postgres needs more than an open port. The container publishes 5432 before the database can serve,
+# so a connection in that window is accepted and then dropped — realmd reports `error.EndOfStream`
+# and exits, which reads as "postgres is missing" when it is merely still starting. Only ever seen
+# on a cold start, which is why it survived locally and failed the first time CI ran this from
+# scratch. Ask the database itself, not the socket.
+await_pg() { # await_pg <seconds>
+  local t=0
+  while [ "$t" -lt "$1" ]; do
+    if docker compose -f deploy/compose.dev.yaml exec -T postgres pg_isready -q >/dev/null 2>&1; then
+      ok "postgres accepting connections"
+      return 0
+    fi
+    sleep 1; t=$((t+1))
+  done
+  bad "postgres opened its port but never accepted a connection"; return 1
 }
 
 # The GS is the one piece whose readiness is NOT a port of its own: it publishes itself into redis
@@ -150,6 +172,7 @@ if ! listening "$REDIS_ADDR" || ! listening "$PG_ADDR"; then
 fi
 await "$REDIS_ADDR" 20 "redis"    || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
 await "$PG_ADDR"    30 "postgres" || die "start it with: docker compose -f deploy/compose.dev.yaml up -d"
+await_pg 60                       || die "postgres is up but not serving; see docker compose -f deploy/compose.dev.yaml logs postgres"
 
 say "realmd"
 if listening "127.0.0.1:$BNET_PORT"; then
@@ -178,6 +201,13 @@ else
   await "127.0.0.1:$INGRESS_PORT" 15 "d2ingress" || die "see $LOG_DIR/d2ingress.log"
 fi
 [ "$TRACE" = 1 ] && ok "d2ingress tracing both directions -> $LOG_DIR/d2ingress.log"
+
+if [ "$REALM_ONLY" = 1 ]; then
+  say "realm only"
+  ok "redis, postgres, realmd and d2ingress are up; no game server started"
+  ok "run one with tools/e2e-engines.sh, which brings up its own per engine"
+  exit 0
+fi
 
 say "game server"
 [ -f "$TESTDIR/Game.exe" ] || die "no Game.exe in $TESTDIR — run ./run.sh once to assemble it"

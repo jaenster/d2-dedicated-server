@@ -59,6 +59,8 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10023, .lod = 10025, .how = .corroborated },
     .{ .classic = 10024, .lod = 10026, .how = .inferred },
     .{ .classic = 10026, .lod = 10029, .how = .measured }, // LogManager.cpp on both sides
+    // Published ordinal lists for 1.09d name these AllocClientMemory/FreeClientMemory at the same
+    // slots we ship them at, which corroborates the LoD side from outside our own disassembly.
     .{ .classic = 10033, .lod = 10042, .how = .corroborated },
     .{ .classic = 10034, .lod = 10043, .how = .corroborated },
     .{ .classic = 10036, .lod = 10055, .how = .corroborated },
@@ -80,8 +82,18 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10088, .lod = 10119, .how = .corroborated },
     .{ .classic = 10089, .lod = 10120, .how = .corroborated },
     .{ .classic = 10095, .lod = 10126, .how = .measured }, // BitManip.cpp on both sides
-    .{ .classic = 10096, .lod = 10127, .how = .corroborated },
-    .{ .classic = 10097, .lod = 10128, .how = .inferred },
+    // Byte-for-byte identical bodies: both read the stream's +0x08 and +0x0c and return
+    // `bytes + (bit != 0)`, `ret 4`. Verified because this one's return value is the LENGTH the
+    // engine then copies into a fixed 0x208 packet buffer, so a wrong mapping here would not
+    // misbehave locally — it would overrun and corrupt, and surface much later as a jump to a
+    // garbage address.
+    .{ .classic = 10096, .lod = 10127, .how = .measured },
+    // Bodies compared instruction for instruction, because neither side asserts and so neither
+    // carries a __FILE__ tag to match on: both read the stream's +0x04/+0x08/+0x0c, both compute
+    // the bit cursor as `lea edx,[ecx+edx*8]` then add the width. Same function, different register
+    // allocation. Worth doing rather than leaving inferred — it is called eight times in the one
+    // function the pre-1.10 builds fault in, so it was the obvious suspect and is now excluded.
+    .{ .classic = 10097, .lod = 10128, .how = .measured },
     .{ .classic = 10098, .lod = 10129, .how = .inferred },
     .{ .classic = 10099, .lod = 10130, .how = .measured },
     .{ .classic = 10102, .lod = 10134, .how = .measured }, // NOT file I/O — String, margin 2.78
@@ -94,7 +106,14 @@ pub const classic_to_lod = [_]Row{
     .{ .classic = 10141, .lod = 10046, .how = .measured },
     .{ .classic = 10142, .lod = 10047, .how = .measured },
     .{ .classic = 10152, .lod = 10200, .how = .inferred },
-    .{ .classic = 10175, .lod = 10202, .how = .inferred },
+    // Not 10202. Order put it there and order was wrong: 10202 on the LoD side is an IFF.cpp
+    // forwarder, while classic 10175 tags itself LogManager.cpp with a `format` string — a
+    // variadic trace, and 1.06b's D2Game calls it with five cdecl arguments. The LogManager
+    // exports line up on both sides with a constant +0x33 source-line offset (classic 10026 at
+    // 0xe5 -> LoD 10029 at 0x118, which is already measured; this one at 0xf6 -> 0x129; classic
+    // 10027 at 0x11c -> 0x14f), so this is 10030 FOG_TraceF. Reached the moment 1.06b first
+    // served a character, as an unimplemented-ordinal stop.
+    .{ .classic = 10175, .lod = 10030, .how = .measured },
     .{ .classic = 10200, .lod = 10207, .how = .measured }, // Excel.cpp, margin 5.12
     .{ .classic = 10201, .lod = 10208, .how = .measured }, // "*data == SYM_EOL"
     .{ .classic = 10202, .lod = 10209, .how = .corroborated },
@@ -130,7 +149,7 @@ test "every row satisfies the arity gate that refuted five of them" {
     try std.testing.expectEqual(@as(u16, 10047), lodFor(10142, false).?);
     try std.testing.expectEqual(@as(u16, 10130), lodFor(10099, false).?);
     try std.testing.expectEqual(@as(u16, 10200), lodFor(10152, true).?); // was 10175, ret 0 vs 16
-    try std.testing.expectEqual(@as(u16, 10202), lodFor(10175, true).?); // was 10180, ret 0 vs 4
+    try std.testing.expectEqual(@as(u16, 10030), lodFor(10175, true).?); // LogManager, not IFF
 }
 
 test "the map increases everywhere except the one block that was relocated" {
@@ -138,7 +157,7 @@ test "the map increases everywhere except the one block that was relocated" {
     // law, and comparing bodies found where it breaks. Classic 10140-10142 land on LoD 10045-10047:
     // a contiguous block moved contiguously, downward, past everything around it. Anything solved
     // from order alone in that neighbourhood was solved from a false premise.
-    const relocated = [_]u16{ 10140, 10141, 10142 };
+    const relocated = [_]u16{ 10140, 10141, 10142, 10175 };
     var prev_c: u16 = 0;
     var prev_l: u16 = 0;
     for (classic_to_lod) |row| {
@@ -159,14 +178,17 @@ test "a shared ordinal number is not a shared function" {
 }
 
 test "an unconfirmed row is refused rather than guessed" {
-    try std.testing.expect(lodFor(10097, false) == null); // inferred only
-    try std.testing.expectEqual(@as(u16, 10128), lodFor(10097, true).?);
+    try std.testing.expect(lodFor(10098, false) == null); // inferred only
+    try std.testing.expectEqual(@as(u16, 10129), lodFor(10098, true).?);
     try std.testing.expect(lodFor(9999, true) == null); // not imported at all
+    // 10097 used to be this test's example and is not any more: its bodies were compared against
+    // 10128's and matched, so it is measured and answers without being asked to accept inferences.
+    try std.testing.expectEqual(@as(u16, 10128), lodFor(10097, false).?);
 }
 
 test "how much of the set is actually established" {
     try std.testing.expectEqual(@as(usize, 47), classic_to_lod.len);
-    try std.testing.expectEqual(@as(usize, 20), countBy(.measured));
-    try std.testing.expectEqual(@as(usize, 17), countBy(.corroborated));
-    try std.testing.expectEqual(@as(usize, 10), countBy(.inferred));
+    try std.testing.expectEqual(@as(usize, 23), countBy(.measured));
+    try std.testing.expectEqual(@as(usize, 16), countBy(.corroborated));
+    try std.testing.expectEqual(@as(usize, 8), countBy(.inferred));
 }

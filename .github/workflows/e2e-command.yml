@@ -1,0 +1,45 @@
+# `/e2e` on a pull request runs the seven-engine gate.
+#
+# It does that by ADDING THE `run-e2e` LABEL rather than running anything itself, and that
+# indirection is the whole point. An `issue_comment` event fires against the DEFAULT BRANCH and
+# carries no head SHA, so a workflow that did the work here would run the wrong code and report its
+# result against the wrong commit — where branch protection cannot see it. Labelling instead raises
+# a `labeled` event that carries the pull request, so build.yml runs on the actual head commit and
+# its check run lands where the required check is looking.
+#
+# Which also means this file cannot break the gate. The worst it can do is fail to label.
+name: e2e command
+on:
+  issue_comment:
+    types: [created]
+
+# Labels and comments on a pull request go through the ISSUES api, so both are needed. Nothing
+# else is — this workflow never checks out code and never touches a package.
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  label:
+    # A pull request comment, from someone who can already push here, whose first word is /e2e.
+    # The association check matters on a public repo: anyone can comment, and without it anyone
+    # could spend the runner minutes this whole arrangement exists to save.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/e2e') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: add the run-e2e label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Removed first when it is already there: re-adding a label the PR already carries raises
+          # no `labeled` event, so `/e2e` twice in a row would silently do nothing the second time.
+          gh api -X DELETE "repos/$REPO/issues/$PR/labels/run-e2e" >/dev/null 2>&1 || true
+          gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=run-e2e"
+          gh api -X POST "repos/$REPO/issues/$PR/comments" \
+            -f body="Labelled \`run-e2e\` — the seven-engine gate is running on this commit."

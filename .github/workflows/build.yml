@@ -46,6 +46,9 @@ on:
       - .github/workflows/build.yml
   pull_request:
     branches: [main]
+    # `labeled` is NOT one of the default types, and without it adding the label below raises no
+    # event at all — which is the entire mechanism.
+    types: [opened, reopened, synchronize, labeled]
     paths: *image-paths
   workflow_dispatch: {}
 
@@ -150,6 +153,19 @@ jobs:
   # version strings in this file would be a second source of truth that goes stale the day a
   # version becomes ready.
   engines:
+    # On a pull request, only when it carries the `run-e2e` label. Building every engine image is
+    # the single most expensive thing here (7-10 minutes) and on a PR it cannot even push what it
+    # built, so per commit it buys a compile check that `test` already gives in under a minute.
+    #
+    # A label rather than a `/e2e` comment, and the difference is not ergonomics. A `labeled` event
+    # carries the pull request, so the run happens on the HEAD COMMIT and reports a real check run
+    # against it — which is what lets `engine-e2e` be a required check at all. `issue_comment`
+    # fires against the default branch with no head SHA attached, so that route has to check out
+    # the PR by hand and POST a commit status to make the gate notice it.
+    #
+    # (A merge queue would be better still — one run, on the commit about to land. It is org-only,
+    # and this repo is user-owned, so the API refuses the rule outright.)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-e2e')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -295,70 +311,73 @@ jobs:
   # The matrix comes from deploy/e2e-engines.txt so there is ONE list of engines and one statement
   # of what each is expected to manage. Adding an engine, or promoting one from `boot` to `world`,
   # is a line in that file and nothing here.
-  engine-plan:
+  # Every pre-1.14 engine, driven to a real world by the clientless — on the runner, not in
+  # containers.
+  #
+  # It used to build nine engine images and run one compose stack per engine, which meant it could
+  # only run AFTER those images were pushed, so it never guarded a pull request — the one place a
+  # regression is cheap to fix. The runner is already a Linux VM: the only things that genuinely
+  # want a container here are postgres and redis, and the harness starts those itself.
+  #
+  # No matrix. The engines run one at a time on purpose — they are wine processes and two racing
+  # for a port fail in ways that read as protocol bugs — so a matrix would buy parallelism the test
+  # cannot use, at the price of nine wine installs.
+  engine-e2e-run:
+    # Seven wine engines, one at a time, six minutes. Label-gated exactly like `engines` above —
+    # add `run-e2e` when the branch is ready and it runs on that commit.
+    #
+    # The REQUIRED check is `engine-e2e` at the bottom of this file, not this job. Skipping is why:
+    # see the comment there.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-e2e')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
+    timeout-minutes: 45
+    env:
+      ZIG_VERSION: "0.16.0"
+      D2_MINIMAL_ENGINE_BASE: https://files.typeguru.nl/diablo/minimal
+      CLIENTLESS: ${{ github.workspace }}/d2-clientless/zig-out/bin/clientless
     steps:
       - uses: actions/checkout@v4
-      - id: plan
+      - name: install zig
         run: |
-          rows=$(awk '!/^[[:space:]]*#/ && NF>=2 {printf "%s{\"engine\":\"%s\",\"expect\":\"%s\"}", sep, $1, $2; sep=","}' \
-                 deploy/e2e-engines.txt)
-          echo "matrix={\"include\":[$rows]}" >> "$GITHUB_OUTPUT"
-          echo "$rows"
-
-  # Every engine, end to end, every time — because the regression this catches is a fix for one
-  # version quietly stopping another from serving, and that is invisible in any single engine's run.
-  #
-  # Only on a push: the images live in ghcr by then. A pull request gets the unit tests and the
-  # 1.14d e2e, which is what its own images can support without pulling a gigabyte per engine.
-  engine-e2e:
-    needs: [build, engines, engine-plan]
-    if: github.event_name == 'push' || github.ref_type == 'tag'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      # Every engine reports. Stopping at the first failure would hide whether one version broke or
-      # all of them did, and that difference is the whole diagnosis.
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.engine-plan.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: take realmd from the build job
-        uses: actions/download-artifact@v4
-        with:
-          pattern: image-realmd
-          merge-multiple: true
-          path: /tmp/images
-      - run: docker load -i /tmp/images/realmd.tar
-      - name: run ${{ matrix.engine }}
-        env:
-          D2GS_IMAGE: ghcr.io/jaenster/d2gs:${{ matrix.engine }}-${{ github.sha }}
-          # Actions expressions have no arithmetic, so the octet is worked out in the shell. A /24
-          # of its own per leg, so engines running at the same time cannot share a bridge.
-          JOB_INDEX: ${{ strategy.job-index }}
+          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            | tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      # Same recipe the engine image uses. i386 first: the engines are 32-bit and wine32 is what
+      # actually runs them.
+      - name: install wine
         run: |
-          export SUBNET_OCTET=$((30 + JOB_INDEX))
-          docker pull "$D2GS_IMAGE"
-          deploy/engine-e2e-ci.sh "${{ matrix.engine }}" "${{ matrix.expect }}"
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends wine wine32 \
+            || sudo apt-get install -y --no-install-recommends wine wine32:i386
+          wine --version
+      - name: build the clientless
+        run: |
+          git clone --depth 1 https://github.com/jaenster/d2-clientless.git
+          cd d2-clientless && zig build -Doptimize=ReleaseSafe
+      # The published tree per engine, named by the rows in deploy/e2e-engines.txt so this cannot
+      # drift from what the run actually tests.
+      - name: fetch the engine trees
+        run: |
+          mkdir -p .stack
+          while read -r eng _; do
+            case "$eng" in ''|\#*) continue ;; esac
+            tag="${eng//./}"
+            url="$D2_MINIMAL_ENGINE_BASE/$eng/d2-$eng-minimal.tgz"
+            echo "==> $eng <- $url"
+            mkdir -p ".stack/gs$tag"
+            curl -fsSL "$url" | tar -xz -C ".stack/gs$tag" || { echo "no published tree for $eng"; exit 1; }
+          done < deploy/e2e-engines.txt
+      - name: bring up the realm
+        run: ./run-stack.sh --realm-only
+      - name: every engine to a world
+        run: tools/e2e-engines.sh
+      - name: server logs
+        if: always()
+        run: for f in .stack/*.log; do echo "===== $f ====="; tail -60 "$f"; done
 
-  # Moves the floating tags to the sha the build jobs just pushed — a manifest copy, no rebuild.
-  # Only after e2e passes, and only on a real push to main (never a PR: there's nothing to promote).
-  #
-  # For the engines that is d2gs:<engine>, from the list the engines job actually built — an engine
-  # that was refused has no sha tag to copy and is silently absent here, which is the same
-  # compiler-decides rule the build follows. d2gs:latest points at 1.14d: an unqualified `d2gs`
-  # should be the newest engine the game ever shipped, not the newest one we happened to add.
   promote:
-    needs: [build, engines, test, e2e, engine-e2e]
+    needs: [build, engines, test, e2e, engine-e2e-run]
     timeout-minutes: 10
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -386,3 +405,35 @@ jobs:
           docker buildx imagetools create \
             -t ghcr.io/jaenster/d2gs:latest \
             "ghcr.io/jaenster/d2gs:1.14d-${{ github.sha }}"
+
+  # The required status check, and the only one that speaks for the whole expensive half of this
+  # workflow. Seconds to run.
+  #
+  # It exists because a SKIPPED required check counts as PASSING on GitHub. Gating the real jobs
+  # with `if:` alone therefore saves the minutes AND quietly removes the gate: the pull request
+  # goes green with `engine-e2e: SKIPPED`, `mergeStateStatus: CLEAN`, and nothing having run.
+  # Measured on this repo, not assumed. So the check that main requires has to be a job that
+  # always runs and reads the others' results.
+  engine-e2e:
+    needs: [engines, e2e, engine-e2e-run]
+    if: always()
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - name: the seven-engine gate must have run, and passed
+        env:
+          ENGINES: ${{ needs.engines.result }}
+          E2E: ${{ needs.e2e.result }}
+          ENGINE_E2E: ${{ needs.engine-e2e-run.result }}
+        run: |
+          echo "engines=$ENGINES  e2e=$E2E  engine-e2e-run=$ENGINE_E2E"
+          if [ "$ENGINES" = success ] && [ "$E2E" = success ] && [ "$ENGINE_E2E" = success ]; then
+            echo "the full gate ran on this commit and passed"
+            exit 0
+          fi
+          if [ "$ENGINE_E2E" = skipped ]; then
+            echo "::error::the seven-engine gate has not run on this commit. Add the 'run-e2e' label to the pull request to run it."
+          else
+            echo "::error::the seven-engine gate did not pass — engines=$ENGINES e2e=$E2E engine-e2e-run=$ENGINE_E2E"
+          fi
+          exit 1

@@ -18,6 +18,7 @@ const cb = @import("d2engine").callbacks;
 const hostapi = @import("d2engine").hostapi;
 const gameflags = @import("d2engine").gameflags;
 const d2version = @import("d2engine").version;
+const charrecord = @import("d2engine").charrecord;
 const build_options = @import("build_options");
 
 const HMODULE = *anyopaque;
@@ -148,11 +149,22 @@ const Pending = struct {
     save: [8192]u8 = undefined,
 };
 
-/// A zeroed FILETIME and the {FILETIME*, unk0x194} pair pointing at it. The engine copies both
-/// dwords into pClient+0x190/+0x194 rather than reading them, so placeholders are fine — but the
-/// pointer itself has to be valid.
+/// The seventh argument of D2GSSendDatabaseCharacter, which does NOT mean the same thing on both
+/// sides of 1.10.
+///
+/// From 1.10 on it is the {FILETIME*, unk0x194} pair: the engine copies both dwords into
+/// pClient+0x190/+0x194 rather than reading them, so placeholders do — but the pointer has to be
+/// valid.
+///
+/// Before that it is `LPPLAYERINFO`, `{ PLAYERMARK PlayerMark; DWORD dwReserved; }`, an opaque host
+/// token the engine carries with the player and hands back in SaveDatabaseCharacter. pvpgn's real
+/// 1.09 server sets it to these two constants, and matching a working host costs nothing where
+/// guessing might cost an afternoon.
 var load_filetime: [2]u32 = .{ 0, 0 };
 var load_filetimes: [2]u32 = undefined;
+
+/// What pvpgn's d2gs109 puts in PLAYERINFO before every character it sends.
+const player_info_pre110: [2]u32 = .{ 0xabcdef, 0xfedcba };
 
 var pending: [8]Pending = @splat(.{});
 
@@ -437,31 +449,58 @@ fn Binding(comptime version: d2version.Version) type {
             };
         }
 
-        /// The tail past 0x40. Filled only where the build is known to index it — but the storage
-        /// carries it either way, because "this build does not index it" is a claim about a sweep
-        /// and the cost of the sweep being wrong is a call through whatever follows the table.
+        /// The tail past 0x40. Every slot is filled on every build, including the builds believed
+        /// not to index it — because that belief is a claim about a sweep, and a wrong sweep costs
+        /// a call through a null pointer.
+        ///
+        /// A null tail slot is the worst possible failure here: the engine indexes it with no null
+        /// test, so the process dies at EIP=0 with a return address one instruction past a call
+        /// site, naming neither the slot nor the fact that a callback was involved. That is exactly
+        /// how 1.13c's 0x54 was found, and it cost a day. A reporting stub turns the same fault
+        /// into a line that says which slot was called, so the next one costs a minute.
         pub fn buildCallbackTail() cb.Ext113c {
-            if (!spec.callback_tail) return .{};
-            return .{
-                .fpGetDatabaseFileTime = @ptrCast(&fastcall.Callback2(0, getDatabaseFileTime).shim),
-            };
+            var t = cb.Ext113c{};
+            inline for (&t.reserved_0x40, 0..) |*slot, i| {
+                slot.* = Unmeasured(std.fmt.comptimePrint("callback slot 0x{x}", .{0x40 + i * 4})).ptr;
+            }
+            inline for (&t.reserved_0x58, 0..) |*slot, i| {
+                slot.* = Unmeasured(std.fmt.comptimePrint("callback slot 0x{x}", .{0x58 + i * 4})).ptr;
+            }
+            t.fpGetDatabaseFileTime = if (spec.callback_tail)
+                @ptrCast(&fastcall.Callback2(0, getDatabaseFileTime).shim)
+            else
+                Unmeasured("callback slot 0x54 (fpGetDatabaseFileTime)").ptr;
+            return t;
         }
     };
 }
 
 /// Hand every fetched save to the engine, outside the join call stack. A zero-length fetch is a
 /// refusal, not a silence: bLock nonzero tells the engine the load failed and it disconnects.
+/// What this build wants a character handed to it as, or null for the builds that take the realm's
+/// save unchanged. Set once, from `run`, where the version is known.
+var char_record: ?charrecord.Layout = null;
+
 fn pumpCharacterLoads() void {
     for (&pending) |*p| {
         if (!p.used) continue;
         p.used = false;
         const refused = p.len == 0;
         if (refused) say("d2host: character fetch failed — refusing the join");
+        // A pre-1.10 engine does not read the save the realm stores. It reads a 130-byte record
+        // with its own field offsets and refuses the character otherwise — reporting the same
+        // number whichever field it disliked, which is why this is a conversion and not a guess.
+        if (!refused) {
+            if (char_record) |l| {
+                p.len = @intCast(charrecord.fromModern(p.save[0..p.len], l));
+                sayFmt("d2host: converted the save into this build's character record (version 0x{x})", .{l.version});
+            }
+        }
         const size: u32 = if (refused) 0 else p.len;
         const lock: u32 = if (refused) 1 else 0;
         if (send_character7) |send| {
             // No container argument before 1.10: the engine had not started cross-checking it.
-            _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetimes);
+            _ = send(p.client_id, &p.save, size, size, lock, 0, &player_info_pre110);
         } else if (send_character) |send| {
             _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetimes, p.container);
         } else return;
@@ -479,6 +518,19 @@ fn pumpCharacterLoads() void {
                     sig, ver, declared, p.len, status,
                     if (status & 1 != 0) "yes" else "NO — the engine will want a full save body",
                 });
+                // The header AS DELIVERED. A pre-1.10 engine reads a 96-byte record out of the
+                // front of this and refuses the character on any of seven field checks, all of
+                // which report the same opaque number — so the only way to tell which one is to
+                // see the bytes it actually got. Reading them back out of the database instead has
+                // already sent one search the wrong way: the row is not necessarily what arrives.
+                const dump_len = @min(p.len, 0x60);
+                var hex: [0x60 * 3]u8 = undefined;
+                var w: usize = 0;
+                for (p.save[0..dump_len]) |b| {
+                    _ = std.fmt.bufPrint(hex[w..][0..3], "{x:0>2} ", .{b}) catch break;
+                    w += 3;
+                }
+                sayFmt("d2host: record head {s}", .{hex[0..w]});
             }
         }
     }
@@ -492,6 +544,7 @@ fn connectedClients() u32 {
     return f();
 }
 
+var stack_drift_reports: u32 = 0;
 var flush_logged = false;
 var flushes: usize = 0;
 var alloc_logged = false;
@@ -833,7 +886,13 @@ fn cformat(buf: []u8, fmt: [*:0]const u8, ap: anytype) []const u8 {
     return buf[0..n];
 }
 
-/// stdcall, one arg.
+/// stdcall, ONE arg — measured, not assumed.
+///
+/// pvpgn's d2gelib header declares `D2GSLoadComplete(WORD wGameId, LPCSTR lpCharName, BOOL
+/// bExpansion)`, three arguments, and that was tried here: popping twelve where the engine pushes
+/// four tears eight bytes off the caller's frame and the process dies immediately, before the
+/// client is even greeted. So that header describes the D2GE layer's own API to its host, not the
+/// engine's callback slot, and this slot really is one argument.
 fn loadComplete(a: i32) callconv(.winapi) i32 {
     _ = a;
     say("d2host: engine called pfLoadComplete");
@@ -1063,6 +1122,38 @@ const Module = struct { name: [*:0]const u8, handle: ?HMODULE = null };
 /// This order is the cheapest arrangement, measured: D2Game keeps `0x6FC30000` and only D2Common
 /// moves. Loading D2Common first instead costs two relocations (D2CMP *and* D2Game). Either way,
 /// resolve everything by ordinal — RVAs hold across relocation, absolute addresses do not.
+/// Where each module landed, so a crash can name an address instead of printing a bare number.
+///
+/// This exists because the first version of the stack walk filtered on the engine's own address
+/// range and silently dropped every frame in OUR modules — Fog and D2Net load far away from the
+/// Blizzard DLLs — which is exactly the half you need when the question is whose code faulted.
+const LoadedModule = struct { name: []const u8 = "", base: usize = 0, end: usize = 0 };
+var loaded_modules: [16]LoadedModule = @splat(.{});
+var loaded_module_count: usize = 0;
+
+fn noteModule(name: []const u8, base: usize) void {
+    if (loaded_module_count == loaded_modules.len) return;
+    // The real image size, out of the PE header at the base we were just handed. A fixed guess does
+    // not work: the engine's modules sit close enough together that a generous window swallows its
+    // neighbours, and the first match wins — which mislabels every frame after the lowest module.
+    var end = base + 0x1000;
+    const lfanew: u32 = @as(*const u32, @ptrFromInt(base + 0x3c)).*;
+    const nt = base + lfanew;
+    if (@as(*const u32, @ptrFromInt(nt)).* == 0x0000_4550) { // "PE\0\0"
+        end = base + @as(*const u32, @ptrFromInt(nt + 24 + 56)).*; // OptionalHeader.SizeOfImage
+    }
+    loaded_modules[loaded_module_count] = .{ .name = name, .base = base, .end = end };
+    loaded_module_count += 1;
+}
+
+/// Which module `addr` is in, or null when it is not in any of them.
+fn moduleOf(addr: usize) ?[]const u8 {
+    for (loaded_modules[0..loaded_module_count]) |m| {
+        if (addr >= m.base and addr < m.end) return m.name;
+    }
+    return null;
+}
+
 fn loadModules(comptime module_names: []const [:0]const u8) ![module_names.len]Module {
     var modules: [module_names.len]Module = undefined;
     inline for (module_names, 0..) |name, i| {
@@ -1074,8 +1165,54 @@ fn loadModules(comptime module_names: []const [:0]const u8) ![module_names.len]M
             return error.LoadLibraryFailed;
         }
         sayHex("d2host: loaded " ++ name ++ ", base=", @intFromPtr(modules[i].handle.?));
+        noteModule(name, @intFromPtr(modules[i].handle.?));
+        reportNullImports(name, @intFromPtr(modules[i].handle.?));
     }
     return modules;
+}
+
+/// Report any import in `base`'s table that resolved to a null address.
+///
+/// The fault that stops the pre-1.10 builds is a JMP through a null pointer, and an import thunk is
+/// `jmp dword ptr [IAT slot]` — so a slot the loader left at zero produces exactly that, with no
+/// return address pushed and nothing on the stack to say where it came from. Normally a failed
+/// import fails the whole load, but we SUPPLY Fog and D2Net: an ordinal our .def names but does not
+/// really export can resolve to zero without the load failing, and then the first call to it jumps
+/// to address zero from a thunk that names nothing.
+///
+/// Cheap to check from in-process and it either finds the fault or removes the hypothesis.
+fn reportNullImports(name: []const u8, base: usize) void {
+    const lfanew: u32 = @as(*const u32, @ptrFromInt(base + 0x3c)).*;
+    const nt = base + lfanew;
+    if (@as(*const u32, @ptrFromInt(nt)).* != 0x0000_4550) return;
+    const dir = nt + 24 + 104; // OptionalHeader.DataDirectory[1] = imports
+    const irva: u32 = @as(*const u32, @ptrFromInt(dir)).*;
+    if (irva == 0) return;
+    var desc = base + irva;
+    var nulls: usize = 0;
+    while (true) : (desc += 20) {
+        const olt: u32 = @as(*const u32, @ptrFromInt(desc)).*;
+        const name_rva: u32 = @as(*const u32, @ptrFromInt(desc + 12)).*;
+        const first: u32 = @as(*const u32, @ptrFromInt(desc + 16)).*;
+        if (name_rva == 0 and first == 0) break;
+        const dll: [*:0]const u8 = @ptrFromInt(base + name_rva);
+        // Walk the ORIGINAL thunk list for the length. The IAT itself cannot supply it: after the
+        // loader has written addresses into it, a zero is indistinguishable from the terminator,
+        // and reading past it walks straight into the next descriptor's array — which is what the
+        // first version of this did, reporting every array boundary in Storm as a null import.
+        const names_at = if (olt != 0) base + olt else base + first;
+        var i: usize = 0;
+        while (@as(*const u32, @ptrFromInt(names_at + i * 4)).* != 0) : (i += 1) {
+            const v: usize = @as(*const usize, @ptrFromInt(base + first + i * 4)).*;
+            if (v == 0) {
+                sayFmt("d2host: NULL IMPORT — {s} imports entry {d} of {s} and it resolved to zero", .{
+                    name, i, std.mem.sliceTo(dll, 0),
+                });
+                nulls += 1;
+            }
+        }
+    }
+    if (nulls != 0) sayFmt("d2host: {s} has {d} null import(s); a call to one jumps to address zero", .{ name, nulls });
 }
 
 fn moduleHandle(modules: []const Module, name: []const u8) ?HMODULE {
@@ -1197,7 +1334,27 @@ fn onException(info: *ExceptionPointers) callconv(.winapi) i32 {
         }
         sayFmt("d2host:   bytes at eip-8: {s}", .{buf[0..n]});
     } else {
-        sayFmt("d2host:   EIP is not code — a CALL through a null pointer. The caller is [esp+0x0].", .{});
+        // Not necessarily a CALL. A call leaves its return address at [esp]; when what is there is
+        // heap rather than code, the transfer was a JMP through a null pointer — a thunk or a
+        // dispatch table entry that was never filled — and there is no return address to read.
+        // Either way the stack still holds the frames that led here, so walk it for anything inside
+        // the engine's address range and print those. That is the difference between "it died" and
+        // "it died in this function".
+        sayFmt("d2host:   EIP is not code — a null transfer. [esp]=0x{x} is {s}.", .{
+            stack[0],
+            if (stack[0] >= 0x6f00_0000 and stack[0] < 0x7000_0000) "a return address" else "not code, so this was a JMP not a CALL",
+        });
+        say("d2host:   stack, addresses inside a loaded module (innermost first):");
+        var found: usize = 0;
+        var off: usize = 0;
+        while (off < 0x400 and found < 14) : (off += 4) {
+            const v = stack[off / 4];
+            if (moduleOf(v)) |m| {
+                sayFmt("d2host:     [esp+0x{x:0>3}] = 0x{x}  {s}", .{ off, v, m });
+                found += 1;
+            }
+        }
+        if (found == 0) say("d2host:     none — no frame on the stack is in any module we loaded");
     }
     return 0;
 }
@@ -1278,6 +1435,9 @@ pub fn main() !void {
 /// data it was handed.
 fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     const spec = comptime d2version.spec(version);
+    // The delivery path runs outside this template, so the one version-shaped fact it needs is
+    // handed to it here rather than plumbed through every call.
+    char_record = comptime charrecord.layout(version);
 
     if (install_dir) |dir| {
         if (SetCurrentDirectoryA(dir) == 0) {
@@ -1322,7 +1482,13 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
         } else say("d2host: Fog has no FOG_SetEngineVersion — using its built-in ABI");
     }
 
-    const d2game = modules[modules.len - 1].handle.?;
+    // By NAME. This used to take the last entry, which held for as long as D2Game happened to be
+    // last in every version's list — and silently handed back the wrong module the moment one of
+    // them loaded anything after it.
+    const d2game = moduleHandle(&modules, "D2Game.dll") orelse {
+        say("d2host: D2Game.dll is not in this version's module list");
+        return error.MissingOrdinal;
+    };
     const d2common = moduleHandle(&modules, "D2Common.dll").?;
     const d2lang = moduleHandle(&modules, "D2Lang.dll").?;
     const d2net = moduleHandle(&modules, "D2Net.dll").?;
@@ -1471,8 +1637,28 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
 
     // GAME_InitGameDataTable(ptGameDataTbl, phGameList) — stdcall, both asserted non-null.
     buildGameDataTable();
+    // Which object the engine is given. From 1.10 on it takes the one built above; before that the
+    // real servers hand it a C++ global that lives in D2Client and is constructed by that module's
+    // static initialisers, whose address they read out of a `mov ecx, <addr>` operand because it is
+    // not exported. The value is verified first, exactly as they verify it: a mismatch means the
+    // offset was measured on a different build, and reading on would hand the engine a wild pointer.
+    var gdt_ptr: *anyopaque = @ptrCast(&game_data_table);
+    if (comptime d2version.spec(version).client_game_data) |cgd| {
+        const client = moduleHandle(&modules, "D2Client.dll") orelse {
+            say("d2host: this build wants D2Client's game-data object but D2Client.dll is not loaded");
+            return error.MissingModule;
+        };
+        const at = @intFromPtr(client) + cgd.offset;
+        const found = @as(*align(1) const u32, @ptrFromInt(at)).*;
+        if (found != cgd.expect) {
+            sayFmt("d2host: D2Client+0x{x} holds 0x{x}, expected 0x{x} — refusing to use it", .{ cgd.offset, found, cgd.expect });
+            return error.MissingModule;
+        }
+        sayFmt("d2host: game-data object from D2Client+0x{x} = 0x{x}", .{ cgd.offset, found });
+        gdt_ptr = @ptrFromInt(found);
+    }
     say("d2host: calling GAME_InitGameDataTable");
-    @as(InitFn, @ptrCast(@alignCast(init_table)))(@ptrCast(&game_data_table), @ptrCast(&game_list));
+    @as(InitFn, @ptrCast(@alignCast(init_table)))(gdt_ptr, @ptrCast(&game_list));
     say("d2host: GAME_InitGameDataTable returned");
     sayHex("d2host: esp after InitGameDataTable = ", espNow());
 
@@ -1606,7 +1792,20 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
                 _ = store.putHeartbeat(gsid, public_ip, public_port, max_games, live_games, live_games >= max_games, 90, gs_labels);
             }
         }
+        // The stack pointer across the network pump. A callback whose declared arity does not match
+        // what the engine pushes leaves ESP skewed by the difference, and nothing fails at the call
+        // — the damage lands on whatever runs next, which is how it surfaces as a jump to a garbage
+        // address. Measuring it here turns "something is corrupting the stack" into a number, and
+        // names the frame it first moved on.
+        const esp_before = espNow();
         if (netmsgs) |p| @as(*const fn () callconv(.c) void, @ptrCast(@alignCast(p)))();
+        const esp_after = espNow();
+        if (esp_after != esp_before and stack_drift_reports < 8) {
+            stack_drift_reports += 1;
+            sayFmt("d2host: STACK DRIFT across the network pump: esp 0x{x} -> 0x{x} ({d} bytes)", .{
+                esp_before, esp_after, @as(isize, @bitCast(esp_after -% esp_before)),
+            });
+        }
 
         // Immediately after the network pump and BEFORE the game tasks run, because a join is
         // processed in the call above and the fetch it queues has to reach the engine within the

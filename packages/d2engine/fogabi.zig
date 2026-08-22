@@ -51,10 +51,42 @@ pub fn ordinalArgs(v: version.Version) ?OrdinalArgs {
     };
 }
 
+/// Whether this build's `BitStream` carries the overflow flag at +0x10, and so whether
+/// `BITMANIP_Initialize` @10126 clears four fields or five.
+///
+/// The struct grew at the 1.10 boundary and the callers grew with it. Measured from the real
+/// `Fog.dll` where one is on disk and from the callers where one is not:
+///
+///   1.06b @10095, 1.07 @10126, 1.09d @10126   write +0x00/+0x04/+0x08/+0x0c and stop.
+///   1.10f @10126 (0x6ff53650)                 writes those four AND `mov [eax+0x10], ecx`.
+///
+/// The callers say the same thing from the other side. D2Common's item serialiser opens
+/// `sub esp, 0x10` on 1.07 through 1.09d and `sub esp, 0x14` on 1.10f and 1.13c — and on those two
+/// it goes on to read the stream back at +0x10 to decide whether the item fit, byte for byte the
+/// same code in both (1.10f @10881 0x6fda2bd3, 1.13c 0x6fd79d33).
+///
+/// Both halves of that matter, in opposite directions. Writing +0x10 on a pre-1.10 caller lands on
+/// its own return address, because the struct sits at the bottom of a frame that reserved exactly
+/// sixteen bytes. NOT writing it on 1.10f leaves the overflow test reading stack garbage, and the
+/// engine reports a save that fit as one that did not — `"Character has too many items"`,
+/// PlrSave.cpp:0x713, which is the engine faithfully relaying a flag we never cleared.
+///
+/// Null means unmeasured, which is not the same as "the same as 1.10f".
+pub fn bitstreamHasOverflow(v: version.Version) ?bool {
+    return switch (v) {
+        .v110f, .v113c, .v114d => true,
+        .v106b, .v107, .v108, .v109b, .v109d => false,
+        else => null,
+    };
+}
+
 /// What a host should use when it has no measurement: 1.10f's shape, which is also what
 /// `packages/d2fog` is written against. A wrong guess here is a slow stack leak, so a host that
 /// knows its version should always pass one.
 pub const default: OrdinalArgs = .{ .alloc_linker = 2 };
+
+/// The BitStream shape to match `default`: 1.10f's, the one this file's port was written against.
+pub const default_bitstream_has_overflow = true;
 
 test "the LoD family shares ordinals but not arities" {
     try std.testing.expectEqual(@as(u8, 2), ordinalArgs(.v110f).?.alloc_linker);
@@ -63,4 +95,23 @@ test "the LoD family shares ordinals but not arities" {
     // 1.06b is a different Fog numbering entirely, and measuring it found no arity moved at all.
     try std.testing.expectEqual(@as(u8, 0), ordinalArgs(.v106b).?.alloc_linker);
     try std.testing.expect(ordinalArgs(.v100) == null); // still genuinely unmeasured
+}
+
+test "the BitStream grew its overflow flag at the 1.10 boundary" {
+    try std.testing.expectEqual(false, bitstreamHasOverflow(.v109d).?);
+    try std.testing.expectEqual(false, bitstreamHasOverflow(.v106b).?);
+    try std.testing.expectEqual(true, bitstreamHasOverflow(.v110f).?);
+    try std.testing.expectEqual(true, bitstreamHasOverflow(.v113c).?);
+    // A build whose Fog nobody has read must not answer by resembling its neighbours.
+    try std.testing.expect(bitstreamHasOverflow(.v100) == null);
+}
+
+test "a build measured in one table is measured in both" {
+    // The hole this closes is a half-measurement: someone reads a new build's AllocLinker call
+    // sites, does not read its Initialize, and the BitStream question silently falls back to
+    // 1.10f's shape. Both tables answer for a build or neither does.
+    inline for (@typeInfo(version.Version).@"enum".fields) |f| {
+        const v: version.Version = @enumFromInt(f.value);
+        try std.testing.expectEqual(ordinalArgs(v) == null, bitstreamHasOverflow(v) == null);
+    }
 }

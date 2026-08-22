@@ -39,7 +39,10 @@ panic:'
 rc=0
 for log in "$@"; do
     [ -f "$log" ] || { echo "  no such log: $log"; rc=1; continue; }
-    hits=$(grep -a -n -E "$(printf '%s' "$PATTERNS" | paste -sd'|' -)" "$log" 2>/dev/null | head -40)
+    # With trailing context: the marker line names nothing on its own — the reason ("assert from
+    # 0x...: <msg> / <file> / <line>") is the line the reporter prints after it, and a failure whose
+    # cause is one line out of reach is a CI run someone has to reproduce by hand to learn anything.
+    hits=$(grep -a -n -A2 -E "$(printf '%s' "$PATTERNS" | paste -sd'|' -)" "$log" 2>/dev/null | head -60)
     if [ -n "$hits" ]; then
         echo "  $log — the server reported a failure about itself:"
         printf '%s\n' "$hits" | sed 's/^/      /'

@@ -204,7 +204,16 @@ export fn FOG_SetEngineVersion(v: u32) callconv(.c) i32 {
                 return 0;
             };
             d2fog_alloc_linker_pop = @as(u32, abi.alloc_linker) * 4;
-            sayFmt("fog: ABI set for {s} (AllocLinker pops {d})", .{ f.name, d2fog_alloc_linker_pop });
+            // Unmeasured leaves the port's own shape rather than guessing from the neighbours; the
+            // AllocLinker pop above already refused this version outright, so this cannot be
+            // reached with a null.
+            bitstream.has_overflow = fogabi.bitstreamHasOverflow(@enumFromInt(f.value)) orelse
+                fogabi.default_bitstream_has_overflow;
+            sayFmt("fog: ABI set for {s} (AllocLinker pops {d}, BitStream {d} bytes)", .{
+                f.name,
+                d2fog_alloc_linker_pop,
+                @as(u32, if (bitstream.has_overflow) 20 else 16),
+            });
             return 1;
         }
     }
@@ -970,24 +979,46 @@ export fn BITMANIP_MaskBitstate(p: ?[*]u8, bit: i32) callconv(.winapi) void {
     bitstream.clearBit(p orelse return, bit);
 }
 export fn BITMANIP_Initialize(s: ?*bitstream.BitStream, stream: ?[*]u8, n: u32) callconv(.winapi) void {
-    trace("BITMANIP_Initialize @10126");
+    // With the caller, because this is the last thing traced before the pre-1.10 builds fault, and
+    // the fault itself carries no usable return address — it looks like a jump through a null
+    // pointer rather than a call, so the stack holds an argument where a return address would be.
+    // The engine-side address is the only handle on where that jump is.
+    sayFmt("BITMANIP_Initialize @10126 from 0x{x}", .{@returnAddress()});
     writes_since_init = 0;
+    traced_writes = 0;
     bitstream.init(s orelse return, stream, n);
 }
 export fn BITMANIP_GetSize(s: ?*bitstream.BitStream) callconv(.winapi) u32 {
-    return bitstream.size(s orelse return 0);
+    const n = bitstream.size(s orelse return 0);
+    // Traced under the same budget as the writes: it is the call that closes a packet, so a trace
+    // that stops at the last write and never reaches here says the packet was built and something
+    // between the two went wrong — which is a different bug from one in the writing.
+    if (traced_writes != 0 and traced_writes < 64) sayFmt("BITMANIP_GetSize from 0x{x} -> {d} bytes", .{ @returnAddress(), n });
+    return n;
 }
 /// Untraced per call — the engine writes once per field of every unit in every packet. But a
 /// million writes into one stream is not a busy frame, it is a loop that is not terminating, so
 /// that case reports itself with enough state to say whether the stream is even advancing.
 var writes_since_init: u64 = 0;
 
+/// Traced for the first writes after each Initialize, and only those. Per-call tracing of every
+/// field of every unit is unusable noise, but the FIRST few after a stream is opened are exactly
+/// what says how far a packet got before something went wrong — and the caller address makes that
+/// a line of the engine rather than a guess.
+var traced_writes: u32 = 0;
+
 export fn BITMANIP_Write(s: ?*bitstream.BitStream, v: u32, nbits: i32) callconv(.winapi) void {
+    if (traced_writes < 64) {
+        traced_writes += 1;
+        sayFmt("BITMANIP_Write #{d} from 0x{x}  value=0x{x} nbits={d}", .{ traced_writes, @returnAddress(), v, nbits });
+    }
     const st = s orelse return;
     writes_since_init +%= 1;
     if (writes_since_init % (1 << 20) == 0) sayFmt(
+        // `overflow` is only read where the caller reserved it. Pre-1.10 that word belongs to the
+        // caller's frame, and a diagnostic has no business reading four bytes past a stream.
         "fog: BITMANIP_Write x{d} since the last Initialize — caller=0x{x} stream bytes={d} bit={d} cap_bits={d} overflow={d}, nbits={d}",
-        .{ writes_since_init, @returnAddress(), st.bytes, st.bit, st.cap_bits, st.overflow, nbits },
+        .{ writes_since_init, @returnAddress(), st.bytes, st.bit, st.cap_bits, if (bitstream.has_overflow) st.overflow else -1, nbits },
     );
     bitstream.write(st, v, nbits);
 }
