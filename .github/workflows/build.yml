@@ -46,6 +46,9 @@ on:
       - .github/workflows/build.yml
   pull_request:
     branches: [main]
+    # `labeled` is NOT one of the default types, and without it adding the label below raises no
+    # event at all — which is the entire mechanism.
+    types: [opened, reopened, synchronize, labeled]
     paths: *image-paths
   workflow_dispatch: {}
 
@@ -150,6 +153,19 @@ jobs:
   # version strings in this file would be a second source of truth that goes stale the day a
   # version becomes ready.
   engines:
+    # On a pull request, only when it carries the `run-e2e` label. Building every engine image is
+    # the single most expensive thing here (7-10 minutes) and on a PR it cannot even push what it
+    # built, so per commit it buys a compile check that `test` already gives in under a minute.
+    #
+    # A label rather than a `/e2e` comment, and the difference is not ergonomics. A `labeled` event
+    # carries the pull request, so the run happens on the HEAD COMMIT and reports a real check run
+    # against it — which is what lets `engine-e2e` be a required check at all. `issue_comment`
+    # fires against the default branch with no head SHA attached, so that route has to check out
+    # the PR by hand and POST a commit status to make the gate notice it.
+    #
+    # (A merge queue would be better still — one run, on the commit about to land. It is org-only,
+    # and this repo is user-owned, so the API refuses the rule outright.)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-e2e')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -306,7 +322,13 @@ jobs:
   # No matrix. The engines run one at a time on purpose — they are wine processes and two racing
   # for a port fail in ways that read as protocol bugs — so a matrix would buy parallelism the test
   # cannot use, at the price of nine wine installs.
-  engine-e2e:
+  engine-e2e-run:
+    # Seven wine engines, one at a time, six minutes. Label-gated exactly like `engines` above —
+    # add `run-e2e` when the branch is ready and it runs on that commit.
+    #
+    # The REQUIRED check is `engine-e2e` at the bottom of this file, not this job. Skipping is why:
+    # see the comment there.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-e2e')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -355,7 +377,7 @@ jobs:
         run: for f in .stack/*.log; do echo "===== $f ====="; tail -60 "$f"; done
 
   promote:
-    needs: [build, engines, test, e2e, engine-e2e]
+    needs: [build, engines, test, e2e, engine-e2e-run]
     timeout-minutes: 10
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -383,3 +405,35 @@ jobs:
           docker buildx imagetools create \
             -t ghcr.io/jaenster/d2gs:latest \
             "ghcr.io/jaenster/d2gs:1.14d-${{ github.sha }}"
+
+  # The required status check, and the only one that speaks for the whole expensive half of this
+  # workflow. Seconds to run.
+  #
+  # It exists because a SKIPPED required check counts as PASSING on GitHub. Gating the real jobs
+  # with `if:` alone therefore saves the minutes AND quietly removes the gate: the pull request
+  # goes green with `engine-e2e: SKIPPED`, `mergeStateStatus: CLEAN`, and nothing having run.
+  # Measured on this repo, not assumed. So the check that main requires has to be a job that
+  # always runs and reads the others' results.
+  engine-e2e:
+    needs: [engines, e2e, engine-e2e-run]
+    if: always()
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - name: the seven-engine gate must have run, and passed
+        env:
+          ENGINES: ${{ needs.engines.result }}
+          E2E: ${{ needs.e2e.result }}
+          ENGINE_E2E: ${{ needs.engine-e2e-run.result }}
+        run: |
+          echo "engines=$ENGINES  e2e=$E2E  engine-e2e-run=$ENGINE_E2E"
+          if [ "$ENGINES" = success ] && [ "$E2E" = success ] && [ "$ENGINE_E2E" = success ]; then
+            echo "the full gate ran on this commit and passed"
+            exit 0
+          fi
+          if [ "$ENGINE_E2E" = skipped ]; then
+            echo "::error::the seven-engine gate has not run on this commit. Add the 'run-e2e' label to the pull request to run it."
+          else
+            echo "::error::the seven-engine gate did not pass — engines=$ENGINES e2e=$E2E engine-e2e-run=$ENGINE_E2E"
+          fi
+          exit 1
