@@ -48,8 +48,25 @@ pub fn snapshot(buf: []GsInfo) usize {
             .maxgame = recs[i].maxgame,
             .live = recs[i].live_games,
         };
+        buf[i].setLabels(recs[i].labels[0..recs[i].labels_len]);
     }
     return n;
+}
+
+/// The fleet, narrowed to the servers running `version`. Empty `version` means no constraint and
+/// this is `snapshot`. Servers that publish no `v=` label are not in the result: an unlabelled
+/// server matching every version is how a game ends up on an engine that cannot host it.
+pub fn snapshotFor(buf: []GsInfo, version: []const u8) usize {
+    const n = snapshot(buf);
+    if (version.len == 0) return n;
+    var kept: usize = 0;
+    for (buf[0..n]) |g| {
+        const v = g.version() orelse continue;
+        if (!std.mem.eql(u8, v, version)) continue;
+        buf[kept] = g;
+        kept += 1;
+    }
+    return kept;
 }
 
 pub fn registeredCount() usize {
@@ -154,7 +171,21 @@ pub const CreateRequest = struct {
     /// Who is creating it. Not sent to the game server — it is what `hook.pickGs` decides on.
     account: []const u8 = "",
     charname: []const u8 = "",
+    /// The engine the creating character belongs to. Empty means unconstrained, and a fleet whose
+    /// servers publish no `v=` label behaves that way for every game — which is every realm that
+    /// runs one engine, i.e. the case this must not make more complicated.
+    version: []const u8 = "",
 };
+
+/// The realm's own choice: least-loaded server with room, among the ones that run this engine.
+///
+/// The version narrowing happens inside redis rather than here, because picking and reserving has
+/// to be one round trip — reserving a server chosen from a snapshot would let two instances place
+/// a game on the same last free slot.
+fn stockPick(version: []const u8) ?u32 {
+    if (version.len == 0) return store.pickAndReserveGs();
+    return store.pickAndReserveGsMatching("v", version);
+}
 
 /// Ask an extension where this game should go, and reserve the server it names. Null when no
 /// extension has an opinion, or when the one it named cannot take the game after all — in which
@@ -162,7 +193,10 @@ pub const CreateRequest = struct {
 /// expressing a preference must not be able to leave a realm unable to host anything.
 fn extPickGs(req: CreateRequest) ?u32 {
     var servers: [max_gs]GsInfo = undefined;
-    const n = snapshot(&servers);
+    // Narrowed to the servers that can actually host this character's engine, so an extension
+    // picking freely from what it is handed cannot mis-route by accident. An extension that wants
+    // the whole fleet can still have it — `fleet.snapshot` is public.
+    const n = snapshotFor(&servers, req.version);
     const chosen = hook.pickGs(.{
         .account = req.account,
         .charname = req.charname,
@@ -171,6 +205,7 @@ fn extPickGs(req: CreateRequest) ?u32 {
         .ladder = req.ladder,
         .expansion = req.expansion,
         .hardcore = req.hardcore,
+        .version = req.version,
         .servers = servers[0..n],
     }) orelse return null;
     // The reserve is the same atomic increment the stock pick does, so a chosen server still
@@ -193,7 +228,7 @@ pub fn createGameRouted(req: CreateRequest) ?CreateResult {
     // retry is the realm working around that refusal, and asking again would get the same answer.
     var ext_pick: ?u32 = extPickGs(req);
     while (attempts < max_gs) : (attempts += 1) {
-        const gsid = ext_pick orelse store.pickAndReserveGs() orelse {
+        const gsid = ext_pick orelse stockPick(req.version) orelse {
             // Nothing has room. Which of the two answers that is depends on whether there is a
             // fleet at all, and the player is told something different for each.
             last_create_failure = if (registeredCount() > 0) .all_full else .no_gs;

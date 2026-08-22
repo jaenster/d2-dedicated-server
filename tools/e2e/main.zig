@@ -394,6 +394,72 @@ fn charFlags(c: *rc.RealmClient, want: []const u8) ?u16 {
     return null;
 }
 
+/// A character belongs to the engine it was made on, and a client of another engine may not have
+/// it. The whole point of the gate: a 1.09d client handed a 1.13c save either refuses the load or
+/// writes the character back wrong, and neither is something the player can undo.
+///
+/// Three things have to hold together, so all three are asserted here: the version is recorded at
+/// creation from the connecting client, a matching client still gets in, and a mismatched one is
+/// refused with the code the client actually renders (0x46).
+fn scCharVersion() Result {
+    const name = "char_version";
+    const acct = "VersionAcct";
+    const old_char = "Antique";
+    const new_char = "Modern";
+    // The two builds the harness maps in REALMD_CLIENT_VERSIONS.
+    const ver_old: u32 = (1 << 24) | 7;
+    const ver_new: u32 = (1 << 24) | 8;
+
+    // Made on the old client.
+    var a = rc.RealmClient{ .exe_version = ver_old };
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    a.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    a.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    a.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((a.startup() catch 1) != 0) return fail(name, "d2cs startup failed on the old client", .{});
+    if ((a.charCreateFresh(1, 0x20, old_char) catch 1) != 0) return fail(name, "could not create '{s}'", .{old_char});
+    const same = a.charLogon(old_char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (same != 0) return fail(name, "the client that MADE '{s}' was refused it (0x{x})", .{ old_char, same });
+
+    // The same account from the new client. The old character must be refused and a new one made
+    // here must not be — otherwise the gate is just "nobody plays anything".
+    var b = rc.RealmClient{ .exe_version = ver_new };
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    b.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    b.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    b.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((b.startup() catch 1) != 0) return fail(name, "d2cs startup failed on the new client", .{});
+
+    const crossed = b.charLogon(old_char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (crossed != 0x46) return fail(name, "'{s}' on the wrong engine gave 0x{x}, want 0x46", .{ old_char, crossed });
+
+    if ((b.charCreateFresh(2, 0x20, new_char) catch 1) != 0) return fail(name, "could not create '{s}'", .{new_char});
+    const own = b.charLogon(new_char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (own != 0) return fail(name, "'{s}' was refused by the client that made it (0x{x})", .{ new_char, own });
+
+    // Both are still LISTED to both clients — the ruling is "show everything, refuse on load", so
+    // a player can see their whole account from any client and is told why one will not open.
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const cl = b.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var seen_old = false;
+    var seen_new = false;
+    for (entries[0..cl.count]) |e| {
+        if (std.mem.eql(u8, e.name, old_char)) seen_old = true;
+        if (std.mem.eql(u8, e.name, new_char)) seen_new = true;
+    }
+    if (!seen_old or !seen_new) return fail(name, "the new client lists old={} new={}, want both", .{ seen_old, seen_new });
+
+    return .{ .name = name, .status = .pass, .msg = msg(
+        "'{s}' made on e2e-old is refused (0x46) by an e2e-new client, that client's own char is not, and both still list",
+        .{old_char},
+    ) };
+}
+
 fn scCharCreate() Result {
     const name = "create_char";
     const acct = "CreateAcct";
@@ -1566,6 +1632,10 @@ fn maybeStartRealmd() !?c_int {
     _ = setenv("REALMD_GAME_ADDR", "127.0.0.1", 1);
     _ = setenv("REALMD_ADMIN_TOKEN", ADMIN_TOKEN, 1); // enable the admin API (admin_api scenario)
     _ = setenv("REALMD_PERMISSIVE_AUTH", "1", 1); // legacy auth (auto-register + verify) for the synthetic xsha1 client
+    // Two invented client builds, so the version scenario has two engines to disagree about. Real
+    // builds are not used deliberately: this asserts the MECHANISM, and it must not start failing
+    // the day someone corrects a real build number.
+    _ = setenv("REALMD_CLIENT_VERSIONS", "1.0.0.7=e2e-old,1.0.0.8=e2e-new", 1);
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
 
     const pid = fork();
@@ -2416,6 +2486,7 @@ pub fn main() !void {
         scEmbeddedGameEdge(),
         scCreateAccountRealAuth(),
         scCharCreate(),
+        scCharVersion(),
         scClassicChar(),
         scLadder(),
         scLadderExperience(),

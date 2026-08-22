@@ -45,6 +45,10 @@ const xsha1 = @import("libd2").bnet.xsha1;
 /// character through `store`, look at who is online in `state`, answer on the wire through `bncs`.
 /// `hook` is where an extension is called from; `config` is what it is configured by.
 pub const hook = @import("hook.zig");
+/// Logging in, as one surface: the primitives an extension answers `authenticate` with.
+pub const auth = @import("auth.zig");
+/// Which engine a client is running, and how that is configured.
+pub const version = @import("version.zig");
 pub const guilds = @import("guilds.zig");
 pub const friends = @import("friends.zig");
 pub const proto = @import("proto.zig");
@@ -215,6 +219,9 @@ pub fn run(init: std.process.Init.Minimal) !void {
         d2cs.trace_packets = true; // and the MCP client stream
     }
     if (getenv("REALMD_MODERN_CHALLENGE") != null) bncs.modern_challenge = true; // CheckRevision.mpq+base64 (clientless probe)
+    // Which engine each client build is. Only matters on a realm hosting more than one; an
+    // unmapped client resolves to no engine, which constrains nothing.
+    if (getenv("REALMD_CLIENT_VERSIONS")) |v| version.configure(std.mem.span(v));
     bncs.admin_accounts = cfg.admins;
     bncs.ad_file = cfg.ad_file;
     bncs.ad_url = cfg.ad_url;

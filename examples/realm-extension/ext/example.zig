@@ -22,12 +22,17 @@ const db = realmd.store.ext(name);
 /// Read once at startup rather than per call — `cfg.ext` reads the environment every time.
 var greeting: []const u8 = "Welcome.";
 
+/// Force every new character onto one engine, whatever client made it. Empty (the default) leaves
+/// the decision to the realm, which takes it from the client.
+var force_version: []const u8 = "";
+
 // startup
 
 /// The store is up, nothing is listening yet. Returning an error aborts startup, which is the
 /// right answer for configuration this extension cannot run without.
 pub fn startup(cfg: anytype) !void {
     greeting = cfg.ext(name).getOr("greeting", "Welcome.");
+    force_version = cfg.ext(name).getOr("force_version", "");
     const season = cfg.ext(name).int(u32, "season", 1);
 
     // Durable state, in our own keyspace. Absent on a realm's very first boot.
@@ -58,9 +63,27 @@ pub fn authenticate(req: realmd.hook.AuthRequest) ?realmd.hook.Auth {
     var buf: [8]u8 = undefined;
     var key: [128]u8 = undefined;
     const k = std.fmt.bufPrint(&key, "banned:{s}", .{req.account}) catch return null;
-    if (db.get(k, &buf) == 0) return null; // not banned: not our business
-    realmd.log.line(name, "refused banned account {s}", .{req.account});
-    return .reject_no_account;
+    if (db.get(k, &buf) != 0) {
+        realmd.log.line(name, "refused banned account {s} (client {s})", .{ req.account, req.client_version });
+        return .reject_no_account;
+    }
+    // A login the launcher already decided: something out of band called `issueTicket` and handed
+    // the result to the client as its password. Single-use and short-lived, so a realm can put its
+    // whole login flow behind a website without the game ever seeing a real password.
+    //
+    // Asked before the realm's own check, and only accepted — a wrong ticket falls through to the
+    // password, so an account can have both.
+    if (realmd.auth.redeemTicket(req)) {
+        realmd.log.line(name, "{s} logged in with a ticket", .{req.account});
+        return .accept;
+    }
+    // Our OWN password store, in our own keyspace, checked with the realm's primitive. This is the
+    // shape a realm behind an existing account database has: we keep the hash, the realm keeps the
+    // wire, and neither has to know the other's business.
+    var stored: [20]u8 = undefined;
+    const pk = std.fmt.bufPrint(&key, "pw:{s}", .{req.account}) catch return null;
+    if (db.get(pk, &stored) != stored.len) return null; // not ours: let the realm answer
+    return if (realmd.auth.verify(stored, req)) .accept else .reject_password;
 }
 
 /// VETO an account before it exists. Reserved names, an invite-only realm, an external registry
@@ -89,6 +112,30 @@ pub fn charCreate(account: []const u8, charname: []const u8, class: u8) ?u32 {
 
 pub fn charLogon(account: []const u8, charname: []const u8) void {
     realmd.log.line(name, "{s}/{s} entered", .{ account, charname });
+}
+
+/// OVERRIDE which engine a new character belongs to. The realm's own answer is the engine of the
+/// client that created it; return a tag to decide differently — an account pinned to an era, a
+/// launcher that said which one, a season that only runs one.
+///
+/// This one lets configuration force every character onto one engine, which is what a realm
+/// running a single old build wants regardless of what its players' clients report.
+pub fn charVersion(account: []const u8, charname: []const u8, client_version: []const u8) ?[]const u8 {
+    _ = account;
+    _ = charname;
+    _ = client_version;
+    return if (force_version.len > 0) force_version else null;
+}
+
+/// OVERRIDE whether a character may be played by the client asking for it. The realm refuses a
+/// genuine mismatch and allows anything it is unsure about; this one records the refusals so an
+/// operator can see whether their version map is right before players complain.
+pub fn charCompatible(account: []const u8, charname: []const u8, char_version: []const u8, client_version: []const u8) ?bool {
+    if (char_version.len == 0 or client_version.len == 0) return null;
+    if (std.mem.eql(u8, char_version, client_version)) return null;
+    realmd.log.line(name, "{s}/{s} is {s} but the client is {s}", .{ account, charname, char_version, client_version });
+    _ = db.incr("version:mismatch", 1, 0);
+    return null; // let the realm refuse it; we only wanted to count
 }
 
 /// The .d2s as the game server left it. Read it — a ladder counts levels here — but do not keep
@@ -133,8 +180,12 @@ pub fn gameVisible(account: []const u8, gamename: []const u8, gameid: u32) ?bool
 /// it as it would. The choice is reserved atomically and can still lose the race; if it does, the
 /// realm falls back to its own pick rather than failing the create.
 ///
-/// This is the hook that turns one fleet into several — hardcore on its own servers, a region kept
-/// local, or a game routed to a server that runs the engine version it needs.
+/// This is the hook that turns one fleet into several — hardcore on its own servers, or a region
+/// kept local.
+///
+/// `req.servers` has already been narrowed to the servers that run `req.version`, so anything
+/// picked from it can host the character. A realm that wants the unnarrowed fleet can take it from
+/// `realmd.fleet.snapshot` — and then owns the consequences of picking the wrong engine.
 pub fn pickGs(req: realmd.hook.GsPick) ?u32 {
     if (!req.hardcore) return null;
     // Hardcore goes to the emptiest server, so a death is never a server's fault.
@@ -214,10 +265,35 @@ fn serveApi(fd: realmd.net.Socket, tag: []const u8) void {
     const n = realmd.net.readSome(fd, &buf);
     if (n == 0) return;
     realmd.log.line(tag, "api request ({d} bytes)", .{n});
+
+    // `GET /ticket/<account>` — the other half of the launcher login in `authenticate`. Something
+    // that has already decided who the player is asks for a one-shot password and hands it to the
+    // client; the realm never sees a real one.
+    //
+    // Deliberately not authenticated, and deliberately not something to copy: an endpoint that
+    // mints logins for any name it is given is exactly as trustworthy as whatever can reach it.
+    // A real one checks a session cookie, an API key, or is not reachable from outside the cluster.
+    const ticket_path = "GET /ticket/";
+    if (std.mem.startsWith(u8, buf[0..n], ticket_path)) {
+        const rest = buf[ticket_path.len..n];
+        const end = std.mem.indexOfAny(u8, rest, " \r\n") orelse rest.len;
+        const account = rest[0..end];
+        var tb: [realmd.auth.ticket_max]u8 = undefined;
+        const ticket = realmd.auth.issueTicket(account, 300, &tb) orelse return;
+        realmd.log.line(tag, "issued a login ticket for {s}", .{account});
+        var tbody: [96]u8 = undefined;
+        const tpayload = std.fmt.bufPrint(&tbody, "{{\"ticket\":\"{s}\"}}", .{ticket}) catch return;
+        return respond(fd, tpayload);
+    }
+
     var seasonb: [32]u8 = undefined;
     const sn = db.get("season", &seasonb);
     var body: [64]u8 = undefined;
     const payload = std.fmt.bufPrint(&body, "{{\"season\":\"{s}\"}}", .{seasonb[0..sn]}) catch return;
+    respond(fd, payload);
+}
+
+fn respond(fd: realmd.net.Socket, payload: []const u8) void {
     var head: [160]u8 = undefined;
     const resp = std.fmt.bufPrint(&head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload }) catch return;
     _ = realmd.net.writeAll(fd, resp);

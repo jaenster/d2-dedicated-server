@@ -220,6 +220,9 @@ pub const RealmClient = struct {
     bnet_port: u16 = 0,
     d2cs_port: u16 = 0,
     realm_name: []const u8 = "TypeGuru",
+    /// The EXE version this client claims in SID_AUTH_CHECK — what the realm resolves an engine
+    /// from. Zero is what every scenario but the version one wants: unmapped, so unconstrained.
+    exe_version: u32 = 0,
     account: []const u8 = "",
     server_token: u32 = 0,
     cookie: u32 = 0,
@@ -261,7 +264,7 @@ pub const RealmClient = struct {
         var cbuf: [16]u8 = undefined;
         var cw = net.Writer.init(&cbuf);
         cw.u32v(1);
-        cw.u32v(0);
+        cw.u32v(self.exe_version);
         cw.u32v(0);
         cw.u32v(0);
         // followed by "\x00i\x00o\x00"

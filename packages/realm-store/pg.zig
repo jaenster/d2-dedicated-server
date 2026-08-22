@@ -1,7 +1,8 @@
 //! Postgres persistence backend — the durable store of record. Uses the vendored pure-Zig
 //! `pg.zig` client (no libpq, so the static-musl scratch image is preserved).
 //!
-//! Schema: chars(account, name, d2s), accounts(name, pwhash, is_admin), userdata(account, key,
+//! Schema: chars(account, name, d2s, version, metadata), accounts(name, pwhash, is_admin),
+//! userdata(account, key,
 //! value), guilds(name, data), ext_kv(ext, key, value). Nothing short-lived is here — sessions, games, routes and the
 //! fleet are in flight and belong to Redis; a Postgres copy would be a second answer to a
 //! question that must have one.
@@ -305,6 +306,14 @@ fn createSchema(p: *pg.Pool) !void {
         \\  primary key(account, name)
         \\)
     , .{});
+    // Which engine this character belongs to, and everything else anyone wants to remember about
+    // it. Two columns rather than one because they answer to different owners: the realm routes
+    // and gates on `version`, so it is typed, indexable and not something an extension can
+    // overwrite by writing the wrong key; `metadata` is free-form and belongs to whoever wrote it.
+    // Empty version means "no engine recorded", which reads as no constraint — that is what every
+    // character created before this column existed is.
+    _ = try p.exec("alter table chars add column if not exists version text not null default ''", .{});
+    _ = try p.exec("alter table chars add column if not exists metadata jsonb not null default '{}'::jsonb", .{});
     // join password, player count + description (added separately so an existing table
     // migrates in place).
     _ = try p.exec(
@@ -412,6 +421,135 @@ pub fn listChars(account: []const u8, names: []Name) usize {
         if (nm.len == 0 or nm.len > names[count].buf.len) continue;
         @memcpy(names[count].buf[0..nm.len], nm);
         names[count].len = @intCast(nm.len);
+        count += 1;
+    }
+    return count;
+}
+
+// character version + metadata (durable)
+//
+// Neither is written by `saveCharD2s`: a save carries the character's bytes and nothing about
+// which engine wrote them, so stamping the version there would make every save a chance to change
+// it. The version is set once, at creation.
+//
+// The writers upsert rather than update, and have to. A character's bytes land in redis first and
+// reach this table only when the flush worker moves them, so at creation there is no row yet — an
+// UPDATE would silently stamp nothing, and the character would come out of its first flush with
+// no engine recorded. Inserting the record row here with empty bytes is harmless: the flush's own
+// upsert fills the bytes in and leaves these columns alone.
+
+/// The engine a character belongs to, empty when nothing recorded one.
+pub fn charVersion(account: []const u8, charname: []const u8, out: []u8) usize {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return 0;
+    const c = sanitize(charname, &cb) orelse return 0;
+    const p = ensurePool() orelse return 0;
+    var row = (p.row("select version from chars where account = $1 and name = $2", .{ a, c }) catch return 0) orelse return 0;
+    defer row.deinit() catch {};
+    const v = row.get([]const u8, 0) catch return 0;
+    const n = @min(v.len, out.len);
+    @memcpy(out[0..n], v[0..n]);
+    return n;
+}
+
+pub fn setCharVersion(account: []const u8, charname: []const u8, version: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    const p = ensurePool() orelse return false;
+    _ = p.exec(
+        \\insert into chars(account, name, d2s, version) values ($1, $2, ''::bytea, $3)
+        \\on conflict (account, name) do update set version = excluded.version
+    , .{ a, c, version }) catch return false;
+    return true;
+}
+
+/// The whole metadata document, as JSON text.
+pub fn getCharMeta(account: []const u8, charname: []const u8, out: []u8) usize {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return 0;
+    const c = sanitize(charname, &cb) orelse return 0;
+    const p = ensurePool() orelse return 0;
+    var row = (p.row("select metadata::text from chars where account = $1 and name = $2", .{ a, c }) catch return 0) orelse return 0;
+    defer row.deinit() catch {};
+    const v = row.get([]const u8, 0) catch return 0;
+    const n = @min(v.len, out.len);
+    @memcpy(out[0..n], v[0..n]);
+    return n;
+}
+
+/// Shallow-merge a JSON object into the metadata, which is what two extensions writing different
+/// keys need: `set` would have each of them delete the other's work on every write.
+pub fn mergeCharMeta(account: []const u8, charname: []const u8, json: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    const p = ensurePool() orelse return false;
+    _ = p.exec(
+        \\insert into chars(account, name, d2s, metadata) values ($1, $2, ''::bytea, $3::jsonb)
+        \\on conflict (account, name) do update set metadata = chars.metadata || excluded.metadata
+    , .{ a, c, json }) catch return false;
+    return true;
+}
+
+/// One top-level key, as text. A JSON string comes back unquoted (`->>`), which is what a caller
+/// reading a version or a season number wants; an object or array comes back as its JSON.
+pub fn getCharMetaKey(account: []const u8, charname: []const u8, key: []const u8, out: []u8) usize {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return 0;
+    const c = sanitize(charname, &cb) orelse return 0;
+    const p = ensurePool() orelse return 0;
+    var row = (p.row(
+        "select metadata->>$3 from chars where account = $1 and name = $2",
+        .{ a, c, key },
+    ) catch return 0) orelse return 0;
+    defer row.deinit() catch {};
+    const v = (row.get(?[]const u8, 0) catch return 0) orelse return 0;
+    const n = @min(v.len, out.len);
+    @memcpy(out[0..n], v[0..n]);
+    return n;
+}
+
+/// Set one top-level key to a JSON string. `to_jsonb($4::text)` rather than a raw fragment: the
+/// value is data, so a caller storing `"} , "admin": true` stores that text and nothing else.
+pub fn setCharMetaKey(account: []const u8, charname: []const u8, key: []const u8, value: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    const p = ensurePool() orelse return false;
+    _ = p.exec(
+        \\insert into chars(account, name, d2s, metadata)
+        \\values ($1, $2, ''::bytea, jsonb_build_object($3::text, $4::text))
+        \\on conflict (account, name) do update
+        \\  set metadata = jsonb_set(chars.metadata, array[$3::text], to_jsonb($4::text), true)
+    , .{ a, c, key, value }) catch return false;
+    return true;
+}
+
+/// The account's characters with the engine each belongs to — one round trip, because the char
+/// list needs both for every row and asking per character would be a query per character.
+pub fn listCharsFull(account: []const u8, out: []types.CharRec) usize {
+    var ab: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return 0;
+    const p = ensurePool() orelse return 0;
+    var result = p.query("select name, version from chars where account = $1", .{a}) catch return 0;
+    defer result.deinit();
+    var count: usize = 0;
+    while (result.next() catch null) |row| {
+        if (count >= out.len) continue; // drain the rest
+        const nm = row.get([]const u8, 0) catch continue;
+        if (nm.len == 0 or nm.len > out[count].name.buf.len) continue;
+        const v = row.get([]const u8, 1) catch "";
+        out[count] = .{};
+        @memcpy(out[count].name.buf[0..nm.len], nm);
+        out[count].name.len = @intCast(nm.len);
+        out[count].version.set(v);
         count += 1;
     }
     return count;

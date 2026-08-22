@@ -26,6 +26,8 @@ const friends = @import("friends.zig");
 const store = @import("store.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
+const auth = @import("auth.zig");
+const version = @import("version.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds, for the banner-ad FILETIME
 const guild = @import("realm_proto").guild;
@@ -153,6 +155,23 @@ pub const Conn = struct {
     // The `clan*charname` the client asked to be known as in SID_ENTERCHAT.
     chat_name: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     chat_name_len: u8 = 0,
+    // What the client said it is, and what the realm made of it. Kept raw as well as resolved so
+    // an extension can decide for itself about a client this realm has no mapping for.
+    exe_version: u32 = 0,
+    verbyte: u8 = 0,
+    client_version: [state.max_version]u8 = [_]u8{0} ** state.max_version,
+    client_version_len: u8 = 0,
+
+    fn setClientVersion(c: *Conn, v: []const u8) void {
+        const n: u8 = @intCast(@min(v.len, state.max_version));
+        @memcpy(c.client_version[0..n], v[0..n]);
+        c.client_version_len = n;
+    }
+    /// The engine this client runs, empty when the realm could not name it — which every caller
+    /// reads as "no constraint" rather than as a mismatch.
+    pub fn clientVersion(c: *const Conn) []const u8 {
+        return c.client_version[0..c.client_version_len];
+    }
 
     fn setChannel(c: *Conn, name: []const u8) void {
         const n: u8 = @intCast(@min(name.len, chat.max_channel));
@@ -405,8 +424,9 @@ fn onAuthInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     _ = r.getU32(); // protocol id
     _ = r.getU32(); // platform ("IX86")
     const product = r.getU32(); // "D2DV" / "D2XP"
+    c.verbyte = @truncate(r.getU32()); // which patch family, as bnet numbers them
     var pc: [4]u8 = @bitCast(product);
-    log.line(tag, "auth_info product={s}", .{&pc});
+    log.line(tag, "auth_info product={s} verbyte={d}", .{ &pc, c.verbyte });
 
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_AUTH_INFO);
@@ -441,6 +461,14 @@ fn onAuthCheck(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const client_token = r.getU32();
     const exe_version = r.getU32();
+    c.exe_version = exe_version;
+    // The one place the realm learns which engine it is talking to. Everything downstream — which
+    // characters this client may load, which server its games land on — hangs off this string, and
+    // an unmapped client leaves it empty, which means "no constraint" everywhere it is read.
+    if (version.resolve(exe_version, c.verbyte)) |v| {
+        c.setClientVersion(v);
+        log.line(tag, "  client engine {s}", .{v});
+    } else version.noteUnknown(exe_version, c.verbyte);
     const exe_hash = r.getU32();
     const num_keys = r.getU32();
     const spawn = r.getU32();
@@ -505,12 +533,16 @@ fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
     // launcher token or a ban list decides this instead of the password check, and returning null
     // leaves the account to the stock path below. `accept` also registers an account the realm has
     // not seen — the extension is the authority saying the player is real.
-    if (hook.authenticate(.{
+    const req: hook.AuthRequest = .{
         .account = acct,
         .client_token = c.client_token,
         .server_token = server_token,
         .hash = got,
-    })) |decision| return switch (decision) {
+        .client_version = c.clientVersion(),
+        .exe_version = c.exe_version,
+        .verbyte = c.verbyte,
+    };
+    if (hook.authenticate(req)) |decision| return switch (decision) {
         .accept => blk: {
             if (store.accountPwHash(acct, &stored) == null) {
                 if (!hook.accountCreate(acct)) break :blk LOGON_NO_ACCOUNT;
@@ -532,8 +564,7 @@ fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
         return LOGON_NO_ACCOUNT; // strict: a brand-new name is rejected, not auto-created
     };
     if (!has_pw) return LOGON_OK; // password-less account: nothing to verify
-    const expect = xsha1.doubleHash(c.client_token, server_token, stored);
-    return if (std.mem.eql(u8, &expect, &got)) LOGON_OK else LOGON_BAD_PASSWORD;
+    return if (auth.verify(stored, req)) LOGON_OK else LOGON_BAD_PASSWORD;
 }
 
 fn onCreateAccount(c: *Conn, tag: []const u8, body: []const u8) void {
@@ -1148,7 +1179,7 @@ fn onLogonRealm(c: *Conn, tag: []const u8, body: []const u8) void {
     // Field-level detail for protocol work; the line below reports the same logon with the
     // session id.
     if (trace_packets) log.line(tag, "realm logon: parsed token=0x{x} title='{s}' acct='{s}' (minting session)", .{ c.client_token, title, acct });
-    const sid = state.global.mintSession(acct);
+    const sid = state.global.mintSession(acct, c.clientVersion());
     const cookie = nextToken();
     log.line(tag, "realm logon account={s} realm={s} session={d}", .{ acct, title, sid });
 

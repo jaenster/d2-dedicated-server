@@ -13,6 +13,8 @@ const store = @import("store.zig");
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds, for a game's elapsed-time line
 
 pub const max_name = 31;
+/// Longest engine tag a session carries — same bound the store puts on the column.
+pub const max_version = @import("realm_infra").types.version_max;
 
 /// Multi-instance mode: sessions/games go to the shared Store (a shared volume)
 /// instead of process memory, so any instance resolves what another created.
@@ -27,6 +29,11 @@ pub const Session = struct {
     id: u64 = 0,
     account: [max_name + 1]u8 = [_]u8{0} ** (max_name + 1),
     account_len: u8 = 0,
+    /// The engine the client that logged in is running. It is carried on the session because MCP
+    /// arrives on a DIFFERENT connection from the login that learned it, and the session token is
+    /// the only thing tying the two together.
+    version: [max_version]u8 = [_]u8{0} ** max_version,
+    version_len: u8 = 0,
     in_use: bool = false,
 
     pub fn name(s: *const Session) []const u8 {
@@ -96,11 +103,12 @@ pub const State = struct {
     games: [512]Game = [_]Game{.{}} ** 512,
     rosters: [256]Roster = [_]Roster{.{}} ** 256,
 
-    /// Mint a session for `account`, returning its id (0 on failure).
-    pub fn mintSession(st: *State, account: []const u8) u64 {
+    /// Mint a session for `account`, returning its id (0 on failure). `version` is the engine the
+    /// logging-in client runs, empty when the realm could not name it.
+    pub fn mintSession(st: *State, account: []const u8, version: []const u8) u64 {
         if (shared) {
             const id = (@as(u64, instance_hash) << 32) | shared_ctr.fetchAdd(1, .monotonic);
-            return if (store.saveSession(id, account)) id else 0;
+            return if (store.saveSession(id, account, version)) id else 0;
         }
         st.lock.lock();
         defer st.lock.unlock();
@@ -109,12 +117,30 @@ pub const State = struct {
             const n: u8 = @intCast(@min(account.len, max_name));
             @memcpy(s.account[0..n], account[0..n]);
             s.account_len = n;
+            const vn: u8 = @intCast(@min(version.len, max_version));
+            @memcpy(s.version[0..vn], version[0..vn]);
+            s.version_len = vn;
             s.id = st.next_id;
             s.in_use = true;
             st.next_id += 1;
             return s.id;
         }
         return 0;
+    }
+
+    /// The engine the client that owns this session runs, empty when unknown or no such session.
+    pub fn versionForSession(st: *State, id: u64, out: []u8) []const u8 {
+        if (shared) return store.versionForSession(id, out);
+        st.lock.lock();
+        defer st.lock.unlock();
+        for (&st.sessions) |*s| {
+            if (s.in_use and s.id == id) {
+                const n = @min(s.version_len, out.len);
+                @memcpy(out[0..n], s.version[0..n]);
+                return out[0..n];
+            }
+        }
+        return out[0..0];
     }
 
     /// Copy the session's account name for `id` into `out`; returns its slice,

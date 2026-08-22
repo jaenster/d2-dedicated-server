@@ -79,6 +79,10 @@ extensions behaves exactly as it does today.
 **Characters**
 
 - `charCreate(account, charname, class) ?u32` — VETO; return an MCP result code to refuse.
+- `charVersion(account, charname, client_version) ?[]const u8` — OVERRIDE which engine a new
+  character belongs to. See [Engine versions](#engine-versions).
+- `charCompatible(account, charname, char_version, client_version) ?bool` — OVERRIDE whether a
+  character may be played by the client asking for it.
 - `charLogon(account, charname) void` — OBSERVE.
 - `charSave(account, charname, bytes) void` — OBSERVE the `.d2s` on its way to the store. Read it;
   do not keep the slice.
@@ -92,9 +96,13 @@ extensions behaves exactly as it does today.
   that is actually refused.
 - `pickGs(req: hook.GsPick) ?u32` — OVERRIDE which game server hosts a game, given the live fleet
   snapshot. This is the decision that turns one fleet into several: hardcore on its own machines, a
-  region kept local, a guild pinned, or — with mixed engine versions in one fleet — a game routed
-  to a server that actually runs that version. Your choice is reserved atomically and can still
-  lose the race; if it does, the realm falls back to its own pick rather than failing the create.
+  region kept local, a guild pinned. Your choice is reserved atomically and can still lose the
+  race; if it does, the realm falls back to its own pick rather than failing the create.
+
+  `req.servers` is already narrowed to the servers that run `req.version`, so a pick made from it
+  cannot land a character on an engine that cannot host it. Each `GsInfo` also carries the server's
+  own labels — `s.version()` and `s.label("region")` — for finer routing. A realm that wants the
+  unnarrowed fleet can take it from `realmd.fleet.snapshot` and owns what follows.
 
 **Chat**
 
@@ -120,6 +128,78 @@ extensions behaves exactly as it does today.
   a fixed port makes the second instance of your realm fail to bind. A bind that fails is fatal,
   as the realm's own listeners are: a realm that comes up healthy with half of itself missing is
   worse than one that refuses to start.
+
+## Logging in
+
+`realmd.auth` is the whole login surface: what the client sent, and every primitive the realm
+decides with. The `authenticate` hook is the decision; this is what you decide with.
+
+```zig
+pub const Request = struct {
+    account: []const u8,
+    client_token: u32, server_token: u32,   // the nonces the hash is salted with
+    hash: [20]u8,                           // what the client sent
+    client_version: []const u8 = "",        // the engine it is running, empty if unknown
+    exe_version: u32 = 0, verbyte: u8 = 0,  // what it actually said it was
+    ip: [4]u8 = .{0,0,0,0},
+};
+
+realmd.auth.passwordHash(plaintext) [20]u8   // seed your own table with something verify accepts
+realmd.auth.verify(stored_hash, req) bool    // does this request prove that password?
+realmd.auth.verifyStored(req) ?bool          // the same against the realm's own table; null = no such account
+realmd.auth.issueTicket(account, ttl_s, &buf) ?[]const u8
+realmd.auth.redeemTicket(req) bool
+```
+
+There are two ways to own logins and most realms want both.
+
+**Own the passwords.** Keep accounts wherever you already keep them and answer `authenticate` with
+`verify(your_hash, req)`. The client's half of the exchange is a double hash over two
+per-connection nonces, so a stored hash on its own is never enough to log in with — which is also
+why you cannot do this check by hand without reimplementing Blizzard's broken SHA-1.
+
+**Skip the password.** Something outside the game already knows who the player is — a launcher, a
+website, a Discord bot. It calls `issueTicket` and hands the result to the client *as its
+password*; `authenticate` answers with `redeemTicket(req)`. Tickets are single-use and expire, and
+are consumed even on a wrong guess, so the issuer stays the authority instead of becoming a
+password vendor. Pair it with a `listeners()` endpoint and the whole login flow lives outside D2.
+
+Returning `.accept` for an account the realm has never seen also creates it: you saying yes *is*
+the authority that the player is real. Returning null leaves the login to the realm, so you can own
+only the accounts you know about.
+
+## Engine versions
+
+A realm hosting more than one game version has a problem a single-version realm does not: a 1.09d
+client cannot play a 1.13c character or join a 1.13c game. The save format and the wire framing
+both moved between them, so handing the wrong one over does not fail cleanly — the client either
+refuses the load or writes the character back wrong.
+
+So the realm tracks it, in one vocabulary shared with the fleet: the tag is the same string a game
+server publishes as its `v=` label (`1.09d`, `1.13c`, `1.14d`).
+
+| moment | what happens |
+|-|-|
+| a client logs in | the realm resolves its engine from what it reported, and carries it on the session |
+| a character is created | it is stamped with that engine, once, and never restamped — `charVersion` overrides |
+| a character is loaded | a genuine mismatch is refused; `charCompatible` overrides |
+| a game is created | it is routed to a server publishing that `v=` label |
+
+Unknown is never a mismatch. A character made before the realm recorded versions has none, a client
+the realm has no mapping for has none, and either one means "no constraint" — so this changes
+nothing at all on a realm running one engine.
+
+**The client map is configuration.** Blizzard's per-patch EXE version numbers are not derivable
+from anything in this repo, and a table of half-remembered build numbers would silently send
+players to the wrong engine, so only the 1.14d entry ships. Fill the rest in with:
+
+```
+REALMD_CLIENT_VERSIONS=1.13.0.60=1.13c,1.0.10.39=1.10f,vb:10=1.09d
+```
+
+Keys are a version quad, a raw dword (`0x01000e3f`), or a version byte (`vb:10`). An unmapped
+client is logged once with the exact line that would name it, so filling the map is copy-paste
+rather than research.
 
 ## Talking back to a player
 
@@ -152,6 +232,26 @@ db.incr("kills", 1, 3600);          // shared counter; the TTL arms only on crea
 
 Durable is where a ladder's standings belong. The cache is for what you are willing to lose on a
 restart — rate limits, a computed leaderboard, per-session scratch.
+
+### Per-character metadata
+
+Characters carry a free-form JSON document of their own, next to the save. Use it for anything that
+belongs to *that character* rather than to your extension as a whole — a ladder's per-character
+totals, a season stamp, an unlock.
+
+```zig
+realmd.store.setCharMetaKey(account, charname, "season", "7");
+realmd.store.charMetaKey(account, charname, "season", &buf);
+realmd.store.mergeCharMeta(account, charname, "{\"kills\":12,\"unlocked\":true}");
+realmd.store.charMeta(account, charname, &buf);   // the whole document
+```
+
+The writers **merge**, they do not replace, and that is not a convenience: the document is shared
+by every extension on the realm, so a write that replaced it would delete the others' work. The
+realm itself writes nothing into it.
+
+The character's engine is deliberately *not* in there — it is its own column, because the realm
+routes and gates on it and it must not be something an extension can overwrite by accident.
 
 The split is the same one the realm itself uses and means the same thing. Do not lean on the cache
 for anything that must survive.

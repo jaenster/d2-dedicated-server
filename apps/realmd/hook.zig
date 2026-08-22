@@ -39,6 +39,7 @@
 //! what makes an upstream upgrade safe for a realm that is carrying extensions.
 const std = @import("std");
 const root = @import("root");
+const auth = @import("auth.zig");
 
 /// What this realm was built with. Empty unless the root file says otherwise, so the stock binary
 /// carries no extension code at all rather than a disabled one.
@@ -101,18 +102,12 @@ pub fn chatCommand(c: anytype, tag: []const u8, text: []const u8) bool {
 /// What an extension answers `authenticate` with. `accept` also CREATES the account if the realm
 /// has never seen it, because an external source of truth saying "this is a valid login" is the
 /// realm learning about a player, not a login for a player it should refuse.
-pub const Auth = enum { accept, reject_password, reject_no_account };
-
-/// Everything the OLS password check is given, for an extension that wants to answer instead of
-/// it. Both tokens are here because the client's hash is a double hash over them, so an extension
-/// verifying a password itself needs them; one checking an external system ignores both.
-pub const AuthRequest = struct {
-    account: []const u8,
-    client_token: u32,
-    server_token: u32,
-    /// The 20-byte hash the client sent (Blizzard's broken SHA-1 double hash).
-    hash: [20]u8,
-};
+///
+/// Both of these are `auth.zig`'s, re-exported rather than restated: the request an extension is
+/// handed and the request the realm's own primitives take are the same value, so `verify`,
+/// `verifyStored` and `redeemTicket` can be called on it directly.
+pub const Auth = auth.Decision;
+pub const AuthRequest = auth.Request;
 
 /// OVERRIDE: decide a login, instead of the realm's own password check. Null means "not mine" and
 /// the stock check runs — so an extension can own only the accounts it knows about and leave the
@@ -160,6 +155,40 @@ pub fn charCreate(account: []const u8, charname: []const u8, class: u8) ?u32 {
     return null;
 }
 
+/// OVERRIDE: which engine a character being created belongs to.
+///
+/// The realm's own answer is the engine of the client creating it, which is right for a realm
+/// whose players run the client they mean to play on, and unhelpful for one that lets a launcher,
+/// a channel or an account decide. Return a tag to stamp it with — the same spelling a game server
+/// publishes as `v=`, e.g. "1.09d" — or null to take the client's.
+///
+/// `client_version` is what the realm made of the connection, empty when it could not name it.
+/// Whatever is stamped is what the character is thereafter: it is recorded once, at creation, and
+/// nothing later rewrites it.
+pub fn charVersion(account: []const u8, charname: []const u8, client_version: []const u8) ?[]const u8 {
+    inline for (registry) |ext| {
+        if (@hasDecl(ext, "charVersion")) {
+            if (ext.charVersion(account, charname, client_version)) |v| return v;
+        }
+    }
+    return null;
+}
+
+/// OVERRIDE: whether a character may be played by the client that is asking for it.
+///
+/// The realm refuses a genuine disagreement — a 1.09d character on a 1.13c client gets a save it
+/// cannot parse — and allows anything it is unsure about, which is every character created before
+/// the realm recorded versions. Return true to allow the pairing anyway, false to refuse one the
+/// realm would have allowed, null to leave it to the realm.
+pub fn charCompatible(account: []const u8, charname: []const u8, char_version: []const u8, client_version: []const u8) ?bool {
+    inline for (registry) |ext| {
+        if (@hasDecl(ext, "charCompatible")) {
+            if (ext.charCompatible(account, charname, char_version, client_version)) |v| return v;
+        }
+    }
+    return null;
+}
+
 /// A character just entered the realm (selected at character select).
 pub fn charLogon(account: []const u8, charname: []const u8) void {
     inline for (registry) |ext| {
@@ -198,6 +227,10 @@ pub const GsPick = struct {
     ladder: u8,
     expansion: bool,
     hardcore: bool,
+    /// The engine the creating character belongs to, empty when nothing recorded one. The realm
+    /// has already narrowed `servers` to the ones that publish it, so an extension picking freely
+    /// among them cannot mis-route by accident.
+    version: []const u8 = "",
     /// Zero-length when the fleet is empty, in which case there is nothing to pick and the realm
     /// will tell the player so.
     servers: []const GsInfo,
@@ -205,6 +238,8 @@ pub const GsPick = struct {
 
 /// A game server as an extension sees it. Mirrors fleet.GsInfo; declared here so an extension
 /// imports the hook module and nothing else.
+pub const labels_max = @import("realm_infra").types.labels_max;
+
 pub const GsInfo = struct {
     gsid: u32,
     ip: [4]u8,
@@ -212,6 +247,40 @@ pub const GsInfo = struct {
     /// 0 means the server publishes no limit.
     maxgame: u32,
     live: u32,
+    /// What the server says it IS: `k=v` pairs, newline-separated, as it published them. Held
+    /// inline rather than as a slice because the snapshot these are built from is a caller's
+    /// array — a slice into it would dangle the moment that caller returned.
+    labels: [labels_max]u8 = [_]u8{0} ** labels_max,
+    labels_len: u8 = 0,
+
+    /// The labels as text. Empty from a server that publishes none, which matches no requirement
+    /// rather than all of them.
+    pub fn labelText(g: *const GsInfo) []const u8 {
+        return g.labels[0..g.labels_len];
+    }
+
+    pub fn setLabels(g: *GsInfo, text: []const u8) void {
+        const n = @min(text.len, labels_max);
+        @memcpy(g.labels[0..n], text[0..n]);
+        g.labels_len = @intCast(n);
+    }
+
+    /// The value of one label, null when this server never published it.
+    pub fn label(g: *const GsInfo, key: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, g.labelText(), '\n');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+        }
+        return null;
+    }
+
+    /// Which engine this server runs ("1.09d"), null when it does not say. The label is `v`, and
+    /// the spelling is `d2engine.version.spec().name` — the same string a character's version is
+    /// recorded as, so routing is a string compare.
+    pub fn version(g: *const GsInfo) ?[]const u8 {
+        return g.label("v");
+    }
 };
 
 /// OVERRIDE: choose which game server hosts a game. Return a gsid to place it there, null to let

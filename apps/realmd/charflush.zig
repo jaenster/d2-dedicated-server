@@ -44,7 +44,7 @@ pub fn run() void {
 
             // Read the version BEFORE the bytes. The other order would let a save land in between
             // and be cleared by a version that already covers it.
-            const ver = store.charVersion(account, charname);
+            const ver = store.charSaveRevision(account, charname);
             if (ver == 0) continue;
             if (!store.flushCharToDurable(account, charname)) {
                 log.line(tag, "could not persist {s}/{s}; leaving it dirty", .{ account, charname });

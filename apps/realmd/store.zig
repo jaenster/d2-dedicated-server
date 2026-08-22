@@ -19,6 +19,8 @@ const pg = adapter.pg;
 const types = @import("realm_infra").types;
 
 pub const Name = types.Name;
+pub const CharRec = types.CharRec;
+pub const VersionTag = types.VersionTag;
 pub const GameRec = types.GameRec;
 pub const Route = types.Route;
 pub const TokenRoute = types.TokenRoute;
@@ -120,6 +122,66 @@ pub fn listChars(account: []const u8, names: []Name) usize {
         n += 1;
     }
     return n;
+}
+
+/// The same list, with the engine each character belongs to.
+///
+/// Characters the cache holds but the store of record has not seen yet come back with no version:
+/// the version is durable-only, and a character is in that state for as long as it takes the flush
+/// worker to move its first save. An unknown version is no constraint, so the effect is that a
+/// brand-new character is briefly unrestricted rather than briefly unusable.
+pub fn listCharsFull(account: []const u8, out: []CharRec) usize {
+    var n = pg.listCharsFull(account, out);
+    var cached: [max_chars]Name = undefined;
+    const m = redis.listChars(account, &cached);
+    for (cached[0..m]) |c| {
+        if (n >= out.len) break;
+        var seen = false;
+        for (out[0..n]) |have| {
+            if (caseEql(have.name.slice(), c.slice())) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        out[n] = .{ .name = c };
+        n += 1;
+    }
+    return n;
+}
+
+/// Which engine a character belongs to, empty when nothing recorded one — every character created
+/// before the realm started stamping them, and every character whose first save has not flushed.
+pub fn charVersion(account: []const u8, charname: []const u8) VersionTag {
+    var v: VersionTag = .{};
+    var buf: [types.version_max]u8 = undefined;
+    const n = pg.charVersion(account, charname, &buf);
+    v.set(buf[0..n]);
+    return v;
+}
+
+/// Record the engine a character belongs to. Called once, when it is created.
+pub fn setCharVersion(account: []const u8, charname: []const u8, version: []const u8) bool {
+    return pg.setCharVersion(account, charname, version);
+}
+
+/// A character's metadata document, as JSON text. Free-form and shared: the realm writes nothing
+/// into it, so an extension owns whatever keys it puts there — and so does every other extension,
+/// which is why the writers merge rather than replace.
+pub fn charMeta(account: []const u8, charname: []const u8, out: []u8) usize {
+    return pg.getCharMeta(account, charname, out);
+}
+
+pub fn mergeCharMeta(account: []const u8, charname: []const u8, json: []const u8) bool {
+    return pg.mergeCharMeta(account, charname, json);
+}
+
+pub fn charMetaKey(account: []const u8, charname: []const u8, key: []const u8, out: []u8) usize {
+    return pg.getCharMetaKey(account, charname, key, out);
+}
+
+pub fn setCharMetaKey(account: []const u8, charname: []const u8, key: []const u8, value: []const u8) bool {
+    return pg.setCharMetaKey(account, charname, key, value);
 }
 
 /// Delete a character's save. Idempotent — true even if it was already gone.
@@ -315,12 +377,26 @@ pub fn listGuilds(names: []Name) usize {
 
 // sessions (ephemeral)
 
-pub fn saveSession(id: u64, account: []const u8) bool {
-    return redis.saveSession(id, account, session_ttl_s);
+pub fn saveSession(id: u64, account: []const u8, version: []const u8) bool {
+    return redis.saveSession(id, account, version, session_ttl_s);
+}
+
+pub fn versionForSession(id: u64, out: []u8) []const u8 {
+    return redis.versionForSession(id, out);
 }
 
 pub fn accountForSession(id: u64, out: []u8) ?[]const u8 {
     return redis.accountForSession(id, out);
+}
+
+/// A single-use login password, issued out of band. In flight, so redis and nothing else — see
+/// `auth.zig` for what it is for.
+pub fn putLoginTicket(account: []const u8, ticket: []const u8, ttl_s: u32) bool {
+    return redis.putLoginTicket(account, ticket, ttl_s);
+}
+
+pub fn takeLoginTicket(account: []const u8, out: []u8) usize {
+    return redis.takeLoginTicket(account, out);
 }
 
 pub fn expireSession(id: u64) void {
@@ -423,6 +499,12 @@ pub fn pickAndReserveGs() ?u32 {
     return redis.pickAndReserveGs();
 }
 
+/// The same pick, restricted to servers publishing `key=value`. Null when none of the ones that
+/// match has room, which is a different answer from "the fleet is full".
+pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8) ?u32 {
+    return redis.pickAndReserveGsMatching(key, value);
+}
+
 /// Reserve a slot on one named server, for a caller that chose it rather than asking us to.
 /// False when that server is gone or has no room — the choice still has to survive the race.
 pub fn reserveGs(gsid: u32) bool {
@@ -465,7 +547,10 @@ pub fn dirtyChars(out: [][]u8, lens: []usize) usize {
     return redis.dirtyChars(out, lens);
 }
 
-pub fn charVersion(account: []const u8, charname: []const u8) u64 {
+/// Which revision of a character's cached save this is — the counter the flush worker uses to tell
+/// whether it flushed THIS save or an older one. Nothing to do with which ENGINE the character
+/// belongs to; that is `charVersion`.
+pub fn charSaveRevision(account: []const u8, charname: []const u8) u64 {
     return redis.charVersion(account, charname);
 }
 

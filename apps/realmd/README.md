@@ -58,7 +58,7 @@ fleet with no host ports — d2ingress splices to pod IPs):
 
 ## Testing it
 
-`zig build e2e` runs 34 clientless scenarios against a real realmd, starting its own redis and
+`zig build e2e` runs 35 clientless scenarios against a real realmd, starting its own redis and
 postgres containers. Two of them cover what this file is mostly about: `chat_across_instances`
 (two instances, one channel — talk and whispers cross, another channel does not) and
 `save_durability` (a save only redis had reaches postgres and survives losing the cache).
@@ -84,6 +84,11 @@ instances sharing one would collect each other's replies. In the chart it comes 
 
 Persistence — both required, neither selectable: `REALMD_REDIS_ADDR` (`host:port`) for everything
 in flight, `REALMD_PG_DSN` (`postgres://…`) for the store of record.
+
+Multi-version realms: `REALMD_CLIENT_VERSIONS` maps what a client reports to the engine tag the
+fleet publishes (`1.13.0.60=1.13c,vb:10=1.09d`). Only 1.14d is built in — see
+[`../../docs/realm-extensions.md`](../../docs/realm-extensions.md#engine-versions) for why, and for
+what the realm does with it. Unset means every client is unmapped, which constrains nothing.
 
 Health / lifecycle: `REALMD_HEALTH_PORT` (default 8080; `/healthz` liveness, `/readyz`
 readiness = stores reachable + a game server published + not draining), `REALMD_REQUIRE_GS` (gate

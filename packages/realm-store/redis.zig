@@ -779,9 +779,17 @@ pub fn incrExtCache(ext: []const u8, key: []const u8, by: i64, ttl_s: u32) ?i64 
     return v;
 }
 
-pub fn saveSession(id: u64, account: []const u8, ttl_s: u32) bool {
+/// The record is `<account>` or `<account>\n<engine>`. One key rather than two because both halves
+/// are established at the same moment and expire together; a reader that predates the engine half
+/// stops at the newline and is unaffected.
+pub fn saveSession(id: u64, account: []const u8, version: []const u8, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, prefix ++ "session:{x}", .{id}) catch return false;
+    var vb: [96]u8 = undefined;
+    const val = if (version.len == 0)
+        account
+    else
+        std.fmt.bufPrint(&vb, "{s}\n{s}", .{ account, version }) catch account;
 
     const s = acquire();
     defer release(s);
@@ -789,12 +797,32 @@ pub fn saveSession(id: u64, account: []const u8, ttl_s: u32) bool {
     const rep = if (ttl_s > 0) blk: {
         var pb: [16]u8 = undefined;
         const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
-        break :blk command(s, &r, &.{ "SET", key, account, "PX", px });
-    } else command(s, &r, &.{ "SET", key, account });
+        break :blk command(s, &r, &.{ "SET", key, val, "PX", px });
+    } else command(s, &r, &.{ "SET", key, val });
     return switch (rep orelse return false) {
         .status, .bulk, .int => true,
         .array_len, .err => false,
     };
+}
+
+/// The engine half of a session record, empty when it has none.
+pub fn versionForSession(id: u64, out: []u8) []const u8 {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "session:{x}", .{id}) catch return out[0..0];
+
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", key }) orelse return out[0..0];
+    const bulk = switch (rep) {
+        .bulk => |b| b orelse return out[0..0],
+        else => return out[0..0],
+    };
+    const nl = std.mem.indexOfScalar(u8, bulk, '\n') orelse return out[0..0];
+    const v = bulk[nl + 1 ..];
+    const n = @min(v.len, out.len);
+    @memcpy(out[0..n], v[0..n]);
+    return out[0..n];
 }
 
 pub fn accountForSession(id: u64, out: []u8) ?[]const u8 {
@@ -809,9 +837,61 @@ pub fn accountForSession(id: u64, out: []u8) ?[]const u8 {
         .bulk => |b| b orelse return null, // nil → missing or expired
         else => return null,
     };
+    const acct = bulk[0 .. std.mem.indexOfScalar(u8, bulk, '\n') orelse bulk.len];
+    const n = @min(acct.len, out.len);
+    @memcpy(out[0..n], acct[0..n]);
+    return out[0..n];
+}
+
+// login tickets
+//
+// A one-shot, short-lived password issued out of band — by a launcher, a website, or anything else
+// that has already decided who the player is. In flight by nature: a ticket that outlives a
+// restart is a ticket that outlived its reason, so this is redis and not the store of record.
+
+fn ticketKey(buf: []u8, account: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "ticket:{s}", .{account}) catch null;
+}
+
+pub fn putLoginTicket(account: []const u8, ticket: []const u8, ttl_s: u32) bool {
+    var kb: [128]u8 = undefined;
+    const key = ticketKey(&kb, account) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = if (ttl_s > 0) blk: {
+        var pb: [16]u8 = undefined;
+        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        break :blk command(s, &r, &.{ "SET", key, ticket, "PX", px });
+    } else command(s, &r, &.{ "SET", key, ticket });
+    return switch (rep orelse return false) {
+        .status, .bulk, .int => true,
+        .array_len, .err => false,
+    };
+}
+
+/// Read and consume a ticket in one round trip. One-shot on purpose: a ticket that can be redeemed
+/// twice is a password with a short expiry, and the point of it is that it is not one.
+pub fn takeLoginTicket(account: []const u8, out: []u8) usize {
+    var kb: [128]u8 = undefined;
+    const key = ticketKey(&kb, account) orelse return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    // GETDEL is 6.2+; on an older server the script is the portable form of the same thing.
+    const script =
+        \\local v = redis.call('GET', KEYS[1])
+        \\if v then redis.call('DEL', KEYS[1]) end
+        \\return v
+    ;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key }) orelse return 0;
+    const bulk = switch (rep) {
+        .bulk => |b| b orelse return 0,
+        else => return 0,
+    };
     const n = @min(bulk.len, out.len);
     @memcpy(out[0..n], bulk[0..n]);
-    return out[0..n];
+    return n;
 }
 
 pub fn expireSession(id: u64) void {
@@ -1984,6 +2064,59 @@ pub fn pickAndReserveGs() ?u32 {
     defer release(s);
     var r: Reader = undefined;
     const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:" }) orelse return null;
+    return switch (rep) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk null;
+            break :blk std.fmt.parseInt(u32, v, 16) catch null;
+        },
+        else => null,
+    };
+}
+
+/// `pickAndReserveGs`, restricted to servers that publish `key=value` among their labels.
+///
+/// This is how a fleet running several engines stays usable: a 1.09d character's game has to land
+/// on a 1.09d server or the client is handed a world it cannot parse, and "emptiest server" is the
+/// wrong answer to that question. Null means no server both matches and has room — a different
+/// thing from "the fleet is full", and the caller says so differently.
+///
+/// A server that does not publish the label at all does not match, deliberately: the alternative
+/// is that one unlabelled server answers every request, which is exactly the mis-routing this
+/// exists to prevent.
+pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8) ?u32 {
+    const script =
+        \\local want = '\n' .. ARGV[1] .. '=' .. ARGV[2] .. '\n'
+        \\local best, bestload
+        \\for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+        \\  local rec = redis.call('GET', KEYS[2] .. id)
+        \\  if rec and #rec >= 15 then
+        \\    local function u32(o)
+        \\      return string.byte(rec,o) + string.byte(rec,o+1)*256
+        \\           + string.byte(rec,o+2)*65536 + string.byte(rec,o+3)*16777216
+        \\    end
+        \\    local maxgame, live, full = u32(7), u32(11), string.byte(rec,15)
+        \\    local labels = '\n' .. string.sub(rec,16) .. '\n'
+        \\    if full == 0 and (maxgame == 0 or live < maxgame) and
+        \\       string.find(labels, want, 1, true) then
+        \\      if not bestload or live < bestload then best, bestload = id, live end
+        \\    end
+        \\  end
+        \\end
+        \\if not best then return false end
+        \\local k = KEYS[2] .. best
+        \\local rec = redis.call('GET', k)
+        \\local live = string.byte(rec,11) + string.byte(rec,12)*256
+        \\          + string.byte(rec,13)*65536 + string.byte(rec,14)*16777216
+        \\live = live + 1
+        \\local b = string.char(live % 256, math.floor(live/256) % 256,
+        \\                      math.floor(live/65536) % 256, math.floor(live/16777216) % 256)
+        \\redis.call('SET', k, string.sub(rec,1,10) .. b .. string.sub(rec,15), 'KEEPTTL')
+        \\return best
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:", key, value }) orelse return null;
     return switch (rep) {
         .bulk => |b| blk: {
             const v = b orelse break :blk null;

@@ -160,6 +160,15 @@ pub const DConn = struct {
     account_len: u8 = 0,
     char: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     char_len: u8 = 0,
+    // Which engine the client on the other end runs. MCP is a different connection from the login
+    // that learned it, so it comes back off the session at startup rather than off the wire.
+    client_version: [state.max_version]u8 = [_]u8{0} ** state.max_version,
+    client_version_len: u8 = 0,
+
+    /// Empty when the realm could not name the client's engine, which reads as no constraint.
+    pub fn clientVersion(c: *const DConn) []const u8 {
+        return c.client_version[0..c.client_version_len];
+    }
 
     fn setAccount(c: *DConn, name: []const u8) void {
         const n: u8 = @intCast(@min(name.len, state.max_name));
@@ -324,8 +333,12 @@ fn onStartup(c: *DConn, tag: []const u8, body: []const u8) void {
     if (state.global.accountForSession(sid, &namebuf)) |acct| {
         c.session = sid;
         c.setAccount(acct);
+        var vb: [state.max_version]u8 = undefined;
+        const v = state.global.versionForSession(sid, &vb);
+        c.client_version_len = @intCast(v.len);
+        @memcpy(c.client_version[0..v.len], v);
         result = 0x00;
-        log.line(tag, "startup session={d} -> account={s}", .{ sid, acct });
+        log.line(tag, "startup session={d} -> account={s} engine={s}", .{ sid, acct, v });
     } else {
         log.line(tag, "startup session={d} -> UNKNOWN (rejected)", .{sid});
     }
@@ -422,15 +435,48 @@ fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progressi
     // instead made it append " {ÿÿÿ}" garbage to the char name (looked like "no name").
 }
 
+// MCP_CHARLOGON (0x07) replies. The client stores the result dword as the D2GS join result and
+// SelectedCharBnetSingleTcpIp @0x434a00 reads it back: 0x46 puts up string 0x140d and returns to
+// character select, 0x7b puts up 0x2b89 (formatted with the character name) and tears the MCP
+// connection down with FreeMCP, and anything else proceeds into the game. So there are exactly two
+// ways to refuse, and 0x46 is the one that does not cost the player their MCP connection.
+const CHARLOGON_OK: u32 = 0;
+const CHARLOGON_REFUSED: u32 = 0x46;
+
 fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const name = r.getStr();
+    const acct = c.accountName();
+
+    // A character belongs to the engine it was made on, and handing it to a client of another one
+    // does not fail cleanly: the save format and the wire framing both moved between eras, so the
+    // client either refuses the load or takes a character it will write back wrong. Refusing here
+    // costs a popup; not refusing costs the character.
+    //
+    // Both sides being known and different is the only refusal. Everything created before the
+    // realm recorded versions has none, and a client the realm could not name has none either —
+    // neither is a disagreement, and treating it as one would lock players out of their own
+    // characters the day this shipped.
+    const char_version = store.charVersion(acct, name);
+    const client_version = c.clientVersion();
+    const compatible = hook.charCompatible(acct, name, char_version.slice(), client_version) orelse
+        char_version.compatible(client_version);
+    if (!compatible) {
+        log.line(tag, "char logon '{s}' (account={s}) -> REFUSED: character is {s}, client is {s}", .{
+            name, acct, char_version.slice(), client_version,
+        });
+        var rbuf: [12]u8 = undefined;
+        var rw = startPacket(&rbuf, MCP_CHARLOGON);
+        rw.putU32(CHARLOGON_REFUSED);
+        return finish(c, &rw);
+    }
+
     c.setChar(name); // remember the active char so a later join can name it to the GS
     hook.charLogon(c.accountName(), name);
     log.line(tag, "char logon '{s}' (account={s}) -> ok", .{ name, c.accountName() });
     var buf: [12]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARLOGON);
-    w.putU32(0); // success
+    w.putU32(CHARLOGON_OK);
     finish(c, &w);
 }
 
@@ -478,7 +524,12 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
         w.putU32(0x06);
         return finish(c, &w);
     }
-    log.line(tag, "char create '{s}' class={d} (account={s}) -> created", .{ name, class, acct });
+    // Which engine this character belongs to, decided once and never again. An extension may say
+    // otherwise; the realm's own answer is the engine of the client that made it, which is empty
+    // on a realm that has not mapped its clients and means the character is unconstrained.
+    const char_version = hook.charVersion(acct, name, c.clientVersion()) orelse c.clientVersion();
+    if (char_version.len != 0) _ = store.setCharVersion(acct, name, char_version);
+    log.line(tag, "char create '{s}' class={d} engine={s} (account={s}) -> created", .{ name, class, char_version, acct });
     w.putU32(0); // success
     finish(c, &w);
 }
@@ -603,6 +654,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "create game '{s}' (account={s}) -> name already claimed", .{ name, c.accountName() });
         return fail(c, &w, CREATE_NAME_TAKEN);
     }
+    const char_version = store.charVersion(c.accountName(), c.charName());
     const routed = fleet.createGameRouted(.{
         .name = name,
         .pass = pass,
@@ -613,6 +665,10 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         .hardcore = hardcore,
         .account = c.accountName(),
         .charname = c.charName(),
+        // Where this game has to be hosted. Taken from the CHARACTER, not from the connection: the
+        // two agree by the time a game is being created (charLogon refuses a pairing that does
+        // not), and the character is the one that outlives the session.
+        .version = char_version.slice(),
     });
     // A create that did not produce a game must not keep the name.
     if (routed == null) store.releaseGameName(name);

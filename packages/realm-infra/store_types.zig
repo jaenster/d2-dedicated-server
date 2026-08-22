@@ -11,6 +11,41 @@ pub const Name = struct {
     }
 };
 
+/// How an engine version is spelled everywhere it is compared: the same string a game server
+/// publishes as its `v=` label, which is the name in `d2engine.version.spec()` ("1.09d", "1.14d").
+/// Short and fixed because it is carried on records the store hands back by value.
+pub const version_max = 12;
+
+pub const VersionTag = struct {
+    buf: [version_max]u8 = [_]u8{0} ** version_max,
+    len: u8 = 0,
+    pub fn slice(v: *const VersionTag) []const u8 {
+        return v.buf[0..v.len];
+    }
+    pub fn set(v: *VersionTag, s: []const u8) void {
+        const n = @min(s.len, version_max);
+        @memcpy(v.buf[0..n], s[0..n]);
+        v.len = @intCast(n);
+    }
+    /// An empty tag is "no engine recorded", which every caller must read as "no constraint"
+    /// rather than as a mismatch — characters that predate the column have exactly this.
+    pub fn known(v: *const VersionTag) bool {
+        return v.len != 0;
+    }
+    /// Whether a character with this tag may be handed to something carrying `other`. Either side
+    /// being unknown allows it: the realm refuses on a genuine disagreement, not on missing data.
+    pub fn compatible(v: *const VersionTag, other: []const u8) bool {
+        if (v.len == 0 or other.len == 0) return true;
+        return std.mem.eql(u8, v.slice(), other);
+    }
+};
+
+/// One character as the realm lists it: the name the client shows, and the engine it belongs to.
+pub const CharRec = struct {
+    name: Name = .{},
+    version: VersionTag = .{},
+};
+
 /// Longest key an extension may address its own keyspace with. Generous next to `Name` because
 /// nothing here is a D2 name — an extension keys by whatever it likes ("season:3:leader").
 pub const ext_key_max = 96;
