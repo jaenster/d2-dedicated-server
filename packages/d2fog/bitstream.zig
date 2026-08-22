@@ -34,6 +34,23 @@ pub const BitStream = extern struct {
     overflow: i32 = 0,
 };
 
+// The layout belongs to the ENGINE — it puts this on its own stack and reads the fields back by
+// offset — so it is asserted where it is actually true rather than left to a test. No host test can
+// check it: `cur` is eight bytes on a 64-bit host and everything after it moves, which is how the
+// first attempt at a canary test for this ended up measuring `bit` and passing regardless.
+comptime {
+    if (@sizeOf(usize) == 4) {
+        std.debug.assert(@offsetOf(BitStream, "cur") == 0x00);
+        std.debug.assert(@offsetOf(BitStream, "cap_bits") == 0x04);
+        std.debug.assert(@offsetOf(BitStream, "bytes") == 0x08);
+        std.debug.assert(@offsetOf(BitStream, "bit") == 0x0c);
+        std.debug.assert(@offsetOf(BitStream, "overflow") == 0x10);
+        // Twenty from 1.10 on. Pre-1.10 callers reserve sixteen and `has_overflow` keeps us out of
+        // the fifth word; the type stays one shape so there is one layout to get right.
+        std.debug.assert(@sizeOf(BitStream) == 20);
+    }
+}
+
 /// `(1 << n) - 1` for n in 0..8 — the engine's own table at 1.10f 0x6ff71408.
 const low_mask = [9]u32{ 0, 1, 3, 7, 0xf, 0x1f, 0x3f, 0x7f, 0xff };
 /// `0xff << b` for b in 0..7 — the engine's own table at 1.10f 0x6ff7142c.

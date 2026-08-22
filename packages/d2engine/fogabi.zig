@@ -105,3 +105,13 @@ test "the BitStream grew its overflow flag at the 1.10 boundary" {
     // A build whose Fog nobody has read must not answer by resembling its neighbours.
     try std.testing.expect(bitstreamHasOverflow(.v100) == null);
 }
+
+test "a build measured in one table is measured in both" {
+    // The hole this closes is a half-measurement: someone reads a new build's AllocLinker call
+    // sites, does not read its Initialize, and the BitStream question silently falls back to
+    // 1.10f's shape. Both tables answer for a build or neither does.
+    inline for (@typeInfo(version.Version).@"enum".fields) |f| {
+        const v: version.Version = @enumFromInt(f.value);
+        try std.testing.expectEqual(ordinalArgs(v) == null, bitstreamHasOverflow(v) == null);
+    }
+}

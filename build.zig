@@ -403,6 +403,11 @@ pub fn build(b: *std.Build) void {
         // Does our Fog export everything the engines import? Checked against a committed manifest
         // rather than the DLLs, so it runs on a machine with no game files.
         .{ "packages/d2fog/ordinals.zig", false, false },
+        // Does every engine we claim to serve have the measurements that claim rests on? Reads
+        // deploy/e2e-engines.txt at compile time. A test root of its own on purpose: the claim is
+        // about our confidence, not about anything d2host does at runtime, and folding it into the
+        // d2engine module made a test-expectations file a compile input to every shipped image.
+        .{ "packages/d2engine/served.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -415,6 +420,7 @@ pub fn build(b: *std.Build) void {
         mod_tests.root_module.addImport("obs", obs);
         mod_tests.root_module.addImport("resp", resp);
         mod_tests.root_module.addImport("fastcall", fastcall_mod);
+        mod_tests.root_module.addAnonymousImport("served_engines", .{ .root_source_file = b.path("deploy/e2e-engines.txt") });
         if (spec[1]) mod_tests.root_module.addImport("realm_infra", realm_infra);
         if (spec[2]) {
             if (b.lazyDependency("pg", .{ .target = host, .optimize = optimize })) |pg_dep| {
