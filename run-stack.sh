@@ -84,11 +84,18 @@ await() { # await <host:port> <seconds> <what>
 # so a connection in that window is accepted and then dropped — realmd reports `error.EndOfStream`
 # and exits, which reads as "postgres is missing" when it is merely still starting. Only ever seen
 # on a cold start, which is why it survived locally and failed the first time CI ran this from
-# scratch. Ask the database itself, not the socket.
+# scratch.
+#
+# Ask over TCP, the way realmd connects, and not over the unix socket. The image's first boot runs
+# initdb and the init scripts against a temporary server with `listen_addresses` EMPTY: it answers
+# on the socket and refuses every TCP connection, so a socket probe reports a database that is ready
+# minutes before anything can reach it. That is what let a cold CI runner get past this check and
+# still hand realmd a connection that closed under it.
 await_pg() { # await_pg <seconds>
   local t=0
   while [ "$t" -lt "$1" ]; do
-    if docker compose -f deploy/compose.dev.yaml exec -T postgres pg_isready -q >/dev/null 2>&1; then
+    if docker compose -f deploy/compose.dev.yaml exec -T postgres \
+         pg_isready -h 127.0.0.1 -U realmd -d realmd -q >/dev/null 2>&1; then
       ok "postgres accepting connections"
       return 0
     fi

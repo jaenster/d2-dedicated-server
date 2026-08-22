@@ -53,7 +53,9 @@ spec:
           volumeMounts:
             - { name: data, mountPath: /var/lib/postgresql/data }
           readinessProbe:
-            exec: { command: ["pg_isready", "-U", "realmd"] }
+            # -h forces TCP. On the socket, initdb's temporary server answers while TCP is still
+            # refused, so the pod goes Ready and every client of it fails on a closed connection.
+            exec: { command: ["pg_isready", "-h", "127.0.0.1", "-U", "realmd", "-d", "realmd"] }
             periodSeconds: 5
   volumeClaimTemplates:
     - metadata: { name: data }
