@@ -546,7 +546,16 @@ fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
         .accept => blk: {
             if (store.accountPwHash(acct, &stored) == null) {
                 if (!hook.accountCreate(acct)) break :blk LOGON_NO_ACCOUNT;
-                _ = store.createAccount(acct, null);
+                // With an UNUSABLE password, not a null one. A password-less account is accepted
+                // by the stock check below whatever the client sends, so creating one here would
+                // mean an extension that authenticated a player once — a launcher ticket, an SSO
+                // callback — left behind an account anybody can then log into with any password.
+                // The extension said yes, so the extension owns this account from now on.
+                const unusable = auth.unusablePassword() orelse {
+                    log.line("bncs", "no entropy to close account {s}; refusing rather than creating it open", .{acct});
+                    break :blk LOGON_NO_ACCOUNT;
+                };
+                _ = store.createAccount(acct, unusable);
             }
             break :blk LOGON_OK;
         },

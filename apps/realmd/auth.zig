@@ -67,6 +67,22 @@ pub fn verifyStored(req: Request) ?bool {
     return verify(stored, req);
 }
 
+/// A stored hash no client can produce the answer to — what an account gets when something other
+/// than a password vouched for it.
+///
+/// The alternative, a null hash, means "no password set", and the realm's own check waves those
+/// through whatever the client sends. So an account created by an extension accepting a login once
+/// would be an account anybody could then log into. This closes it: the extension that vouched
+/// stays the only way in, which is what it asked for by vouching.
+///
+/// Null when the system has no entropy. The caller must then refuse the login — an account that
+/// cannot be created closed must not be created open.
+pub fn unusablePassword() ?[20]u8 {
+    var h: [20]u8 = undefined;
+    if (getentropy(&h, h.len) != 0) return null;
+    return h;
+}
+
 /// Longest ticket `issueTicket` produces, and the buffer `redeemTicket` needs.
 pub const ticket_max = 32;
 
