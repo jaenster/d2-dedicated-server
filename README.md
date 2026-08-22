@@ -1,5 +1,8 @@
-# d2-dedicated-server: headless, cloud-native Diablo II 1.14d dedicated game server + realm
+# d2-dedicated-server: headless, cloud-native Diablo II dedicated game server + realm
 
+[![build](https://github.com/jaenster/d2-dedicated-server/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/jaenster/d2-dedicated-server/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/tag/jaenster/d2-dedicated-server?label=release&sort=semver)](https://github.com/jaenster/d2-dedicated-server/releases)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/MHK2Dg9)
 
 This repo exists out of multiple components.
@@ -7,7 +10,8 @@ This repo exists out of multiple components.
 - **1.14d** d2gs via wine and **native** on linux (no wine)
 - **1.06b**, **1.07**, **1.08**, **1.09b**, **1.09d**, **1.10f**, **1.13c** d2gs
 - A cloud native realm server
-- D2Ingress, an ingress implementation for 
+- D2Ingress, an ingress implementation for game traffic: one public address in front of the whole
+  game-server fleet, routed per connection on the game's own protocol
 
 ## Different services (containers) in this repo
 
@@ -310,7 +314,9 @@ realm into Postgres, and `tools/symbolize.sh` turns a game-server panic back int
 | [`docs/native-vs-wine.md`](docs/native-vs-wine.md) | native vs wine game server, measured side by side |
 | [`docs/STATUS.md`](docs/STATUS.md) | what works, what doesn't yet |
 | [`REALMD.md`](REALMD.md) · [`REALM.md`](REALM.md) | the realm server; the engine-side realm bridge |
-| [`ARENA.md`](ARENA.md) · [`VERIFY.md`](VERIFY.md) · [`LEGAL.md`](LEGAL.md) | arena design; RE verification log; legal |
+| [`docs/dll-host.md`](docs/dll-host.md) | the pre-1.14 game server: the game's own DLLs, no injection |
+| [`VERIFY.md`](VERIFY.md) · [`LEGAL.md`](LEGAL.md) | RE verification log; legal |
+| [`CONTRIBUTING.md`](.github/CONTRIBUTING.md) · [`SECURITY.md`](.github/SECURITY.md) | how to build, test and land a change; reporting something exploitable |
 
 ## License & legal
 

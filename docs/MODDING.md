@@ -42,9 +42,8 @@ the registry, done.
 ## Shipped features
 
 See [`apps/d2gs/runtime/feature/`](../apps/d2gs/runtime/feature/): `expmod` (XP scaling), `ubers`
-(Pandemonium / Uber Tristram), `arena` (server-side PvP rounds -- design notes in
-[`ARENA.md`](../ARENA.md)), `ladder-items`, `guild-panel`, and client-side maphack
-(`omnivision`, `mapunits`, `mapreveal`) -- the same DLL injects into a real client too. Each is
+(Pandemonium / Uber Tristram), `arena` (server-side PvP rounds), `ladder-items`, `guild-panel`, and
+client-side maphack (`omnivision`, `mapunits`, `mapreveal`) -- the same DLL injects into a real client too. Each is
 toggled by its own `--<flag>`; see [`docs/FLAGS.md`](FLAGS.md).
 
 ## Native mods of your own
