@@ -2,7 +2,7 @@
     .name = .d2gs,
     // The project's own version, which is what a consumer of this manifest reads — not the Zig
     // version it happens to be built with. Kept in step with the release tags.
-    .version = "0.2.0",
+    .version = "0.3.0",
     .dependencies = .{
         .pg = .{
             .url = "git+https://github.com/karlseguin/pg.zig#4215baf19f7f61a94aab9f6c5893ea12aa9bce96",

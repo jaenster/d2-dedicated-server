@@ -1,0 +1,12 @@
+# Only the GitHub Actions this repo pins. Zig dependencies are pinned by commit + hash in
+# build.zig.zon and dependabot does not read that; bumping libd2 is a deliberate act here, not
+# something to automate.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
