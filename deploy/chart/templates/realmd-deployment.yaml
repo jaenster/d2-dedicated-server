@@ -28,6 +28,14 @@ spec:
           ports:
             - { containerPort: 6112, name: bnetd }
             - { containerPort: 8080, name: health }
+            {{- /* Extensions that listen bring their own ports; see realmd.extraPorts. */}}
+            {{- with .Values.realmd.extraPorts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.realmd.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           env:
             # Unique per pod (session-id high bits).
             - name: REALMD_INSTANCE
@@ -68,6 +76,10 @@ spec:
             # Presence is what enables it, so it is omitted entirely rather than set to 0.
             - name: REALMD_PERMISSIVE_AUTH
               value: "1"
+            {{- end }}
+            {{- /* Last, so a realm can override anything above it: later entries win in Kubernetes. */}}
+            {{- with .Values.realmd.extraEnv }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           readinessProbe:
             httpGet: { path: /readyz, port: 8080 }

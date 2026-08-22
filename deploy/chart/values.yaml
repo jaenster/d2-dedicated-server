@@ -87,6 +87,29 @@ realmd:
   # Drain window for the SIGTERM shutdown grace below.
   terminationGracePeriodSeconds: 30
   shutdownGraceMs: 10000
+  # Anything a realm's own extensions need. The chart cannot know what they are — an extension is
+  # compiled into a downstream binary and reads REALMD_EXT_<NAME>_<KEY> — so this is the seam that
+  # lets a realm configure one without the chart learning about it.
+  #
+  # extraEnv is appended AFTER the settings above, so a realm can override any of them.
+  #   extraEnv:
+  #     - name: REALMD_EXT_LOGIN_PORT
+  #       value: "7211"
+  #     - name: REALMD_EXT_LOGIN_SECRET
+  #       valueFrom:
+  #         secretKeyRef: { name: my-secret, key: login-secret }
+  extraEnv: []
+  # For pulling a whole Secret or ConfigMap in at once.
+  #   extraEnvFrom:
+  #     - secretRef: { name: my-secret }
+  extraEnvFrom: []
+  # Ports an extension listens on. These get containerPorts AND a `realmd-internal` ClusterIP
+  # Service — never the public `realmd` LoadBalancer, which is pinned to the realm's floating IPs.
+  # An extension port is internal by construction: the login extension mints a ticket for any
+  # account it is asked about, guarded by nothing but a bearer secret.
+  #   extraPorts:
+  #     - { containerPort: 7211, name: extlogin }
+  extraPorts: []
   logJson: true
   resources:
     requests: { cpu: 50m, memory: 32Mi }

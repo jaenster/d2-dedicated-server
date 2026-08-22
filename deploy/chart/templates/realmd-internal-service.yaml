@@ -1,0 +1,25 @@
+{{- if .Values.realmd.extraPorts }}
+# The ports realmd's extensions listen on, reachable only from inside the cluster.
+#
+# Deliberately NOT the `realmd` Service: that one is a LoadBalancer pinned to the realm's public
+# floating IPs, so a port added there is on the internet. An extension port is the opposite of
+# that — the ticket endpoint mints a login for any account it is asked about, and its only
+# protection is a bearer secret. It has no business being reachable from outside.
+apiVersion: v1
+kind: Service
+metadata:
+  name: realmd-internal
+  labels:
+    {{- include "realm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: realmd
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "realm.selectorLabels" (dict "root" . "component" "realmd") | nindent 4 }}
+  ports:
+    {{- range .Values.realmd.extraPorts }}
+    - port: {{ .containerPort }}
+      targetPort: {{ .containerPort }}
+      name: {{ .name }}
+    {{- end }}
+{{- end }}
