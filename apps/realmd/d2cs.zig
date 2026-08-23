@@ -382,10 +382,35 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
 
         w.putU32(0xFFFF_FFFF); // expiration — far future so it's NOT "expired"
         w.putStr(names[i].slice()); // character name
-        writeStatString(&w, class, level, status, progression, @intCast(total), app1, app2); // CharSel.cpp layout
+        const era = eraCode(store.charVersion(c.accountName(), names[i].slice()).slice());
+        writeStatString(&w, class, level, status, progression, @intCast(total), app1, app2, era); // CharSel.cpp layout
         w.putU8(0); // statstring C-string terminator
     }
     finish(c, &w);
+}
+
+/// The two characters that stand for an engine in a character's guild tag.
+///
+/// The tag is the only field of the statstring the game hands straight back to the player, so it
+/// is where a realm serving several engines can say which one a character is — and every client
+/// shows it, not only one that was built knowing about it. It renders as " {14}" after the name.
+///
+/// TWO characters and never three. `D2CharSelStrc.szGuildTag` is `char[3]` filled by a strncpy of
+/// three, so a three-character tag arrives with no terminator and the client's `" {%s}"` runs on
+/// into the difficulty byte at 0x32D. Two leaves the statstring's own terminator to land in the
+/// third.
+///
+/// Two is enough because that is exactly where the tags differ: "1.06b", "1.09d", "1.14d" all
+/// carry their era in the two characters after the dot. Anything shaped differently gets no tag
+/// rather than a wrong one.
+fn eraCode(version: []const u8) []const u8 {
+    if (version.len < 4) return "";
+    if (version[0] != '1' or version[1] != '.') return "";
+    const code = version[2..4];
+    for (code) |ch| {
+        if (ch < '0' or ch > '9') return "";
+    }
+    return code;
 }
 
 // 14-bit-encoded int: 7 bits/byte, high bit always set so the value never
@@ -413,7 +438,7 @@ fn putEquipSlot(w: *proto.Writer, app: []const u8) void {
     }
 }
 
-fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progression: u8, realm_count: u32, app1: []const u8, app2: []const u8) void {
+fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progression: u8, realm_count: u32, app1: []const u8, app2: []const u8, era: []const u8) void {
     enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
     putEquipSlot(w, app1); // equip slot 1: body-component graphic codes (.d2s pAppearance1)
     w.putU8(class + 1); // class (CharSel subtracts CLASS_SORCERESS=1)
@@ -430,9 +455,11 @@ fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progressi
     w.putU8(0xFF); // act      (0xFF -> 0)
     w.putU8(0xFF); // field_0x32f
     w.putU8(0xFF); // field_0x330
-    // No guild tag: the statstring's trailing NUL (added by the caller) lands on the
-    // guild-tag slot, so CharSel's strncpy reads an empty tag. Emitting 0xFF bytes here
-    // instead made it append " {ÿÿÿ}" garbage to the char name (looked like "no name").
+    // The guild tag, which on this realm is the character's engine. Two characters, so the
+    // caller's trailing NUL lands in the third and terminates it; a realm with nothing to say
+    // writes none and the NUL lands on the first, which is the empty tag the game expects.
+    // Emitting 0xFF bytes here instead made it append " {ÿÿÿ}" to the character's name.
+    for (era) |ch| w.putU8(ch);
 }
 
 // MCP_CHARLOGON (0x07) replies. The client stores the result dword as the D2GS join result and
