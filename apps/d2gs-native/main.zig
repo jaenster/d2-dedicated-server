@@ -215,6 +215,15 @@ fn applyPatches(loaded: *const macho.load.Loaded) void {
         // exactly the 7 bytes `mov dword [esp], 1` occupied, so nothing after it moves. EAX is dead
         // here — the call overwrites it and the test that follows reads the result.
         .{ .at = 0x001a7a2f, .bytes = &.{ 0x0f, 0xb7, 0x46, 0x09, 0x89, 0x04, 0x24 }, .why = "join the token the client asked for" },
+        // Then the version gate the same handler applies two instructions later: `cmp edi, 0xe;
+        // jne refuse`, where EDI is the version byte out of the packet at [esi+0xc]. 1.13c's
+        // server-to-client table is byte-for-byte 1.14d's (libd2 packages/net/src/sc_versions.zig
+        // records zero differing entries), so this engine can serve a 1.13c client and refuses it
+        // on the number alone. Widened to "0x0d or later" rather than removed: a 1.09d client
+        // frames GameFlags a byte shorter and would join to a silent hang, which is the one
+        // failure mode worth keeping a gate for. `JNE` -> `JB`, same target, same length.
+        .{ .at = 0x001a7a5a, .bytes = &.{ 0x83, 0xff, 0x0d }, .why = "accept 1.13c's version byte as well as 1.14d's" },
+        .{ .at = 0x001a7a5d, .bytes = &.{0x72}, .why = "refuse only what is older than 1.13c" },
         // ...and then translate it somewhere with room: SERVER_IsTokenValid's table has one usable
         // slot (index 0 aliases the server-running byte at 0x53756c, allocator clamps its counter to
         // 1) and indexes with an unchecked u16, so a realm token is unstorable/unsafe there.
