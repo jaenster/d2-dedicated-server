@@ -12,6 +12,7 @@ const std = @import("std");
 const macho = @import("macho");
 const chardb = @import("chardb.zig");
 const store = @import("store.zig");
+const health = @import("health.zig");
 const p = @import("realm_proto").protocol;
 
 extern "c" fn usleep(usec: c_uint) c_int;
@@ -416,6 +417,8 @@ pub fn start(loaded: *const macho.load.Loaded) void {
     chardb.configure(image);
     gsid = identity();
     readGameCap();
+    health.gsid = gsid;
+    health.games_max = game_cap;
     started = true;
     _ = std.Thread.spawn(.{}, thread, .{}) catch |e| {
         note("d2gs-native: realm thread: {s}\n", .{@errorName(e)});
@@ -713,7 +716,11 @@ fn publish() void {
     // Same ENGINE as the wine 1.14d server — the realm is choosing a game version, not a runtime.
     // Which of the two hosts it is is our business, and `d2gs:1.14d-native` already says it to a
     // human; a client only cares that it is 1.14d.
-    _ = store.putHeartbeat(gsid, public_ip, public_port, game_cap, liveGames(), liveGames() >= game_cap, heartbeat_ttl_s, "v=1.14d");
+    //
+    // The store's answer IS readiness: a server whose record the store did not take is one no game
+    // can be routed to, and reporting that is the whole difference between this and a TCP probe.
+    health.published = store.putHeartbeat(gsid, public_ip, public_port, game_cap, liveGames(), liveGames() >= game_cap, heartbeat_ttl_s, "v=1.14d");
+    health.games_live = liveGames();
 }
 
 /// A server that just started hosts nothing, so the realm must drop whatever still names it.

@@ -20,6 +20,7 @@ const gameflags = @import("d2engine").gameflags;
 const d2version = @import("d2engine").version;
 const charrecord = @import("d2engine").charrecord;
 const build_options = @import("build_options");
+const health = @import("health.zig");
 
 const HMODULE = *anyopaque;
 extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?HMODULE;
@@ -630,6 +631,7 @@ fn handleCreateGame(seq: u32, body: []const u8) void {
         reply.result = proto.CREATE_SERVER_FULL;
     } else {
         live_games += 1;
+        health.games_created +%= 1;
         reply.gameid = game_id;
         sayHex("d2host: CREATEGAME made game ", game_id);
     }
@@ -695,6 +697,7 @@ fn handleJoinGame(seq: u32, body: []const u8) void {
     const charname = proto.readCStr(body, &off);
     const account = proto.readCStr(body, &off);
     rememberJoin(charname, account);
+    health.players_joined +%= 1;
     reply.gameid = gameid;
     _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
 }
@@ -942,6 +945,7 @@ fn closeGame(ecx: usize, edx: usize) callconv(.c) usize {
     const gid: u32 = @truncate(ecx);
     sayFmt("d2host: pfCloseGame — game {d} ended", .{gid});
     if (live_games > 0) live_games -= 1;
+    health.games_destroyed +%= 1;
     if (realmConfigured() and gid != 0) {
         var c = std.mem.zeroes(proto.CloseGame);
         c.h = proto.header(.closegame, @sizeOf(proto.CloseGame), 0);
@@ -1757,7 +1761,12 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
         sayHex("d2host: GAME_CreateNewEmptyGame returned=", @intCast(ok));
         sayHex("d2host: esp after CreateNewEmptyGame = ", espNow());
         sayHex("d2host:   gameId=", game_id);
-        if (ok != 0) live_games += 1;
+        if (ok != 0) {
+            live_games += 1;
+            // Counted like any other, so the totals reconcile: a scrape showing one game live and
+            // none ever created reads as a broken counter rather than as a standalone server.
+            health.games_created +%= 1;
+        }
     } else {
         sayHex("d2host: joined the realm as gsid ", gsid);
     }
@@ -1803,16 +1812,28 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     gs_labels = "v=" ++ comptime d2version.spec(version).name;
     sayFmt("d2host: publishing labels [{s}]", .{gs_labels});
     say("d2host: ticking");
+    health.gsid = gsid;
+    health.games_max = max_games;
+    health.engine = comptime d2version.spec(version).name;
+    health.start();
     var i: usize = 0;
     var last_beat: usize = 0;
     while (realmConfigured() or i < tick_frames) : (i += 1) {
+        // Liveness is measured from HERE and nowhere else. A frame that never comes back is the
+        // failure a health endpoint exists to catch, and any beat taken further down would be
+        // skipped by exactly the hang worth reporting.
+        health.tick();
+        health.games_live = live_games;
         if (realmConfigured()) {
             pumpRealm();
             // ~5s at 50ms a frame. The record carries a 90s TTL, so missing a few beats under
             // load takes this server out of rotation rather than handing the realm a stale route.
             if (i - last_beat >= 100) {
                 last_beat = i;
-                _ = store.putHeartbeat(gsid, public_ip, public_port, max_games, live_games, live_games >= max_games, 90, gs_labels);
+                // The heartbeat's own answer IS readiness: a server the store did not accept is
+                // one no game can be routed to, and saying so is the whole difference between
+                // this and a TCP probe.
+                health.published = store.putHeartbeat(gsid, public_ip, public_port, max_games, live_games, live_games >= max_games, 90, gs_labels);
             }
         }
         // The stack pointer across the network pump. A callback whose declared arity does not match
@@ -1870,6 +1891,7 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
                 // after the first frame.
                 if (flush_game) |flush| {
                     flushes += 1;
+                    health.game_frames = @truncate(flushes);
                     if (flushes % 500 == 1) sayFmt("d2host: processed {d} game frame(s)", .{flushes});
                     _ = fastcall.fastcallAt(fn (usize, usize) callconv(.c) usize)
                         .call(@intFromPtr(flush), .{ worker_ctx, game });

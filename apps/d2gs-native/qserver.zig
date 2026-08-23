@@ -11,6 +11,7 @@
 const std = @import("std");
 const macho = @import("macho");
 const realm = @import("realm.zig");
+const health = @import("health.zig");
 
 var image: *const macho.load.Loaded = undefined;
 
@@ -150,6 +151,10 @@ fn bootstrap() void {
     // Only now: the link answers a create by calling into the engine, so it must not be reachable
     // before the server state it creates games in exists.
     realm.start(image);
+    // After it, so the endpoint reports the gsid and capacity the realm was told about rather than
+    // zeros. It is safe this early either way — nothing has ticked yet, so it answers 503 until
+    // the loop below starts, which is exactly what a startup probe should see.
+    health.start();
 }
 
 /// The two things the GAMELOGON handler consults before it will let anyone in, printed once so a
@@ -165,6 +170,10 @@ fn reportJoinPreconditions() void {
 /// every live game, then flush what the games queued back out. Exactly one sleep per pass either
 /// way — that is the engine's own pacing, and skipping it is what burns a core.
 fn tick() void {
+    // Liveness is measured from HERE and nowhere else: a fault inside the loaded image leaves this
+    // process's threads running, so a listener that answered for itself would keep saying 200 long
+    // after the last game stopped advancing.
+    health.tick();
     // Not gated on a realm being attached: the empty-game reap is a byte patch on the engine and
     // applies to a game a client made for itself just as much as to one the realm asked for.
     realm.holdGameForItsFirstPlayer();

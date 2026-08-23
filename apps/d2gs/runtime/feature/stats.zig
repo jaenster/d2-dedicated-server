@@ -15,6 +15,7 @@ const t = @import("../../engine/d2/types.zig");
 const fns = @import("../../engine/d2/functions.zig");
 const poolstat = @import("../poolstat.zig");
 const d2cs = @import("../../realmclient/d2cs.zig");
+const gs_health = @import("gs_health");
 
 extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
 
@@ -309,18 +310,23 @@ pub fn writeJson(buf: []u8) []const u8 {
 /// Prometheus text exposition of the same numbers. One HELP/TYPE pair per metric family.
 pub fn writeMetrics(buf: []u8) []const u8 {
     var w = Writer{ .buf = buf };
-    w.metric("d2gs_uptime_seconds", "gauge", "Seconds since the stats feature installed", uptimeMs() / 1000);
-    w.metric("d2gs_ticks_total", "counter", "Server ticks executed", ticks);
-
-    w.put("# HELP d2gs_tick_rate Server ticks per second, sampled each second\n# TYPE d2gs_tick_rate gauge\nd2gs_tick_rate ");
-    w.fixed2(tick_rate_x100);
-    w.put("\n");
-
-    w.metric("d2gs_ready", "gauge", "1 when this GS is registered with the realm", @intFromBool(d2cs.registered));
-    w.metric("d2gs_games_created_total", "counter", "Games created on this GS", games_created);
-    w.metric("d2gs_games_destroyed_total", "counter", "Games destroyed on this GS", games_destroyed);
-    w.metric("d2gs_games_live", "gauge", "Games currently hosted", liveGames());
-    w.metric("d2gs_players_joined_total", "counter", "Player joins seen", players_joined);
+    // The block every server in the fleet publishes, rendered from the one definition of it, so a
+    // dashboard panel written against this engine keeps working against the pre-1.14 ones. What
+    // follows is what only an engine we hold hooks into can answer.
+    gs_health.writeMetricsTo(&w, .{
+        .alive = true, // it is this engine's tick loop that got here
+        .published = d2cs.registered,
+        .engine = "1.14d",
+        .gsid = d2cs.gsid,
+        .uptime_s = uptimeMs() / 1000,
+        .ticks = ticks,
+        .tick_rate_x100 = tick_rate_x100,
+        .games_live = liveGames(),
+        .games_max = d2cs.max_games,
+        .games_created = games_created,
+        .games_destroyed = games_destroyed,
+        .players_joined = players_joined,
+    });
     w.metric("d2gs_players_left_total", "counter", "Player leaves seen", players_left);
     w.metric("d2gs_players_in_game", "gauge", "Clients currently in a game", playersInGame());
     w.metric("d2gs_pool_managers_in_use", "gauge", "Fog memory-pool managers held", poolstat.inUse());
@@ -360,48 +366,6 @@ pub fn writeMetrics(buf: []u8) []const u8 {
     return w.done();
 }
 
-/// Append-only writer over a caller-supplied buffer. Once full it drops the rest instead
-/// of failing: the head of the document is the part that matters, and both formats are
-/// written head-first (totals before the unbounded per-game/per-code lists).
-const Writer = struct {
-    buf: []u8,
-    n: usize = 0,
-
-    fn put(self: *Writer, s: []const u8) void {
-        const room = self.buf.len - self.n;
-        const k = @min(room, s.len);
-        @memcpy(self.buf[self.n..][0..k], s[0..k]);
-        self.n += k;
-    }
-
-    fn num(self: *Writer, v: u32) void {
-        var tmp: [12]u8 = undefined;
-        self.put(std.fmt.bufPrint(&tmp, "{d}", .{v}) catch return);
-    }
-
-    /// A value carried as hundredths, printed as a decimal ("2543" -> "25.43").
-    fn fixed2(self: *Writer, v: u32) void {
-        var tmp: [16]u8 = undefined;
-        self.put(std.fmt.bufPrint(&tmp, "{d}.{d:0>2}", .{ v / 100, v % 100 }) catch return);
-    }
-
-    fn metric(self: *Writer, name: []const u8, kind: []const u8, help: []const u8, v: u32) void {
-        self.put("# HELP ");
-        self.put(name);
-        self.put(" ");
-        self.put(help);
-        self.put("\n# TYPE ");
-        self.put(name);
-        self.put(" ");
-        self.put(kind);
-        self.put("\n");
-        self.put(name);
-        self.put(" ");
-        self.num(v);
-        self.put("\n");
-    }
-
-    fn done(self: *Writer) []const u8 {
-        return self.buf[0..self.n];
-    }
-};
+/// The shared renderer's writer. One definition, so the two documents this file emits and the
+/// ones the pre-1.14 hosts emit cannot drift in their formatting.
+const Writer = gs_health.Writer;

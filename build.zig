@@ -75,6 +75,14 @@ pub fn build(b: *std.Build) void {
     });
     gs_store.addImport("resp", resp);
 
+    // What a game server says about itself over HTTP. Here rather than in any one server for the
+    // same reason gs_store is: three different images answer these endpoints, and a probe or a
+    // dashboard panel that works against one engine has to work against all of them. Pure
+    // rendering — the sockets stay with each host, because they do not share a socket API.
+    const gs_health = b.addModule("gs_health", .{
+        .root_source_file = b.path("packages/gs-health/gs_health.zig"),
+    });
+
     // Host-side infrastructure (net/log/config/lock/store types) for the NATIVE binaries.
     // Deliberately NOT given to the DLL, so libc-socket / POSIX code never enters that build.
     const realm_infra = b.addModule("realm_infra", .{
@@ -140,6 +148,7 @@ pub fn build(b: *std.Build) void {
     d2gs.root_module.addImport("realm_proto", realm_proto);
     d2gs.root_module.addImport("resp", resp);
     d2gs.root_module.addImport("gs_store", gs_store);
+    d2gs.root_module.addImport("gs_health", gs_health);
     d2gs.root_module.addImport("obs", obs);
     d2gs.root_module.addImport("d2engine", d2engine);
     // As a module, not a relative import: the same file is the root of the `fastcall` module that
@@ -169,6 +178,7 @@ pub fn build(b: *std.Build) void {
     d2host.root_module.addOptions("build_options", d2host_options);
     d2host.root_module.addImport("fastcall", fastcall_mod);
     d2host.root_module.addImport("gs_store", gs_store);
+    d2host.root_module.addImport("gs_health", gs_health);
     d2host.root_module.addImport("d2engine", d2engine);
     d2host.root_module.addImport("realm_proto", realm_proto);
     b.installArtifact(d2host);
@@ -392,6 +402,17 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(resp_tests).step);
 
+    // The health vocabulary, asserted as whole documents: every server renders these names and a
+    // panel breaks silently when one of them moves.
+    const gs_health_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/gs-health/gs_health.zig"),
+            .target = host,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(gs_health_tests).step);
+
     // d2ingress's pure wire logic (the 0xAF greeting strip it applies to the GS→client splice),
     // rooted at the binary itself with its infra import.
     const ingress_tests = b.addTest(.{
@@ -479,6 +500,7 @@ pub fn build(b: *std.Build) void {
     d2gs_native.root_module.addImport("resp", resp);
     d2gs_native.root_module.addImport("darwin", darwin);
     d2gs_native.root_module.addImport("realm_proto", realm_proto);
+    d2gs_native.root_module.addImport("gs_health", gs_health);
     const native_realm_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/d2gs-native/realm.zig"),
