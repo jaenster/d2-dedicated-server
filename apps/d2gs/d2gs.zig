@@ -116,34 +116,13 @@ fn parseDottedQuad(s: []const u8) ?[4]u8 {
     return oct;
 }
 
-fn fnv1a(s: []const u8) u32 {
-    var h: u32 = 2166136261;
-    for (s) |c| {
-        h ^= c;
-        h *%= 16777619;
-    }
-    return h;
-}
-
-/// A stable per-GS id for the fleet: hash of the pod/host name together with the game port
-/// this GS owns.
-///
-/// Must be stable across restarts (realmd indexes live games by gsid) AND distinct per GS.
-/// The host name alone is only the first: two GS processes on one machine hash identically and
-/// realmd's registry is keyed by gsid, so the second to register silently replaces the first.
-/// The port is what separates them and is equally stable.
+/// This server's id in the fleet. The derivation is `gs_store.fleetId`, shared with the pre-1.14
+/// host so a realm running both cannot hand two servers the same id.
 fn computeGsId() u32 {
     var buf: [264]u8 = undefined;
     var sz: DWORD = 256;
-    var n: usize = 0;
-    if (GetComputerNameA(&buf, &sz).toBool() and sz > 0) {
-        n = sz;
-    } else {
-        buf[0..4].* = gs_public_ip; // no host name to be had — the address identifies us instead
-        n = 4;
-    }
-    std.mem.writeInt(u16, buf[n..][0..2], gs_public_port, .little);
-    return fnv1a(buf[0 .. n + 2]);
+    const name: []const u8 = if (GetComputerNameA(&buf, &sz).toBool() and sz > 0) buf[0..sz] else &.{};
+    return gsredis.fleetId(name, gs_public_ip, gs_public_port);
 }
 
 /// Matches `--flag` anywhere in the command line (token-aware).
