@@ -10,6 +10,7 @@ const log = @import("realm_infra").log;
 const proto = @import("proto.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
+const version = @import("version.zig");
 const d2s = @import("d2s.zig");
 const fleet = @import("fleet.zig");
 const guilds = @import("guilds.zig");
@@ -382,10 +383,35 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
 
         w.putU32(0xFFFF_FFFF); // expiration — far future so it's NOT "expired"
         w.putStr(names[i].slice()); // character name
-        writeStatString(&w, class, level, status, progression, @intCast(total), app1, app2); // CharSel.cpp layout
+        const era = eraCode(store.charVersion(c.accountName(), names[i].slice()).slice());
+        writeStatString(&w, class, level, status, progression, @intCast(total), app1, app2, era); // CharSel.cpp layout
         w.putU8(0); // statstring C-string terminator
     }
     finish(c, &w);
+}
+
+/// The two characters that stand for an engine in a character's guild tag.
+///
+/// The tag is the only field of the statstring the game hands straight back to the player, so it
+/// is where a realm serving several engines can say which one a character is — and every client
+/// shows it, not only one that was built knowing about it. It renders as " {14}" after the name.
+///
+/// TWO characters and never three. `D2CharSelStrc.szGuildTag` is `char[3]` filled by a strncpy of
+/// three, so a three-character tag arrives with no terminator and the client's `" {%s}"` runs on
+/// into the difficulty byte at 0x32D. Two leaves the statstring's own terminator to land in the
+/// third.
+///
+/// Two is enough because that is exactly where the tags differ: "1.06b", "1.09d", "1.14d" all
+/// carry their era in the two characters after the dot. Anything shaped differently gets no tag
+/// rather than a wrong one.
+fn eraCode(tag: []const u8) []const u8 {
+    if (tag.len < 4) return "";
+    if (tag[0] != '1' or tag[1] != '.') return "";
+    const code = tag[2..4];
+    for (code) |ch| {
+        if (ch < '0' or ch > '9') return "";
+    }
+    return code;
 }
 
 // 14-bit-encoded int: 7 bits/byte, high bit always set so the value never
@@ -413,7 +439,7 @@ fn putEquipSlot(w: *proto.Writer, app: []const u8) void {
     }
 }
 
-fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progression: u8, realm_count: u32, app1: []const u8, app2: []const u8) void {
+fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progression: u8, realm_count: u32, app1: []const u8, app2: []const u8, era: []const u8) void {
     enc14(w, realm_count); // realm char count (CharSel: nRealmCharCount)
     putEquipSlot(w, app1); // equip slot 1: body-component graphic codes (.d2s pAppearance1)
     w.putU8(class + 1); // class (CharSel subtracts CLASS_SORCERESS=1)
@@ -430,9 +456,11 @@ fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progressi
     w.putU8(0xFF); // act      (0xFF -> 0)
     w.putU8(0xFF); // field_0x32f
     w.putU8(0xFF); // field_0x330
-    // No guild tag: the statstring's trailing NUL (added by the caller) lands on the
-    // guild-tag slot, so CharSel's strncpy reads an empty tag. Emitting 0xFF bytes here
-    // instead made it append " {ÿÿÿ}" garbage to the char name (looked like "no name").
+    // The guild tag, which on this realm is the character's engine. Two characters, so the
+    // caller's trailing NUL lands in the third and terminates it; a realm with nothing to say
+    // writes none and the NUL lands on the first, which is the empty tag the game expects.
+    // Emitting 0xFF bytes here instead made it append " {ÿÿÿ}" to the character's name.
+    for (era) |ch| w.putU8(ch);
 }
 
 // MCP_CHARLOGON (0x07) replies. The client stores the result dword as the D2GS join result and
@@ -490,7 +518,12 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     // checkboxes set: expansion 0x20, hardcore 0x04, ladder 0x40.
     var r = proto.Reader.init(body);
     const class: u8 = @intCast(r.getU32() & 0xff);
-    const status_flags: u8 = @intCast(r.getU16() & 0x6C); // hardcore|died|expansion|ladder
+    const status_word = r.getU16();
+    const status_flags: u8 = @intCast(status_word & 0x6C); // hardcore|died|expansion|ladder
+    // The HIGH byte is not the game's. A stock client sends zero and the character takes the
+    // engine of the client that made it; a launcher that lets the player pick one sends its two
+    // digits, because that choice is made on the creation screen and not at logon.
+    const asked_era: u8 = @intCast(status_word >> 8);
     const name = r.getStr();
     const acct = c.accountName();
 
@@ -527,7 +560,10 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     // Which engine this character belongs to, decided once and never again. An extension may say
     // otherwise; the realm's own answer is the engine of the client that made it, which is empty
     // on a realm that has not mapped its clients and means the character is unconstrained.
-    const char_version = hook.charVersion(acct, name, c.clientVersion()) orelse c.clientVersion();
+    // Order: what the request asked for, then what an extension says, then what the client is.
+    // The request wins because it is the only one of the three that knows what the player picked.
+    const asked = version.byEraCode(asked_era);
+    const char_version = asked orelse hook.charVersion(acct, name, c.clientVersion()) orelse c.clientVersion();
     if (char_version.len != 0) _ = store.setCharVersion(acct, name, char_version);
     log.line(tag, "char create '{s}' class={d} engine={s} (account={s}) -> created", .{ name, class, char_version, acct });
     w.putU32(0); // success

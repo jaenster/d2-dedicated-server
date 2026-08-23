@@ -9,6 +9,7 @@
 //!   POST /admin/accounts     {"name","password"} -> create account
 //!   POST /admin/games/close  {"name"} (or ?name=) -> expire a game
 //!   POST /admin/chars/copy   {"src_account","src_char","dst_char"[,"dst_account"]} -> clone char
+//!   POST /admin/chars/import {"account","char","d2s":"<base64>"} -> put a save on an account
 const std = @import("std");
 const net = @import("realm_infra").net;
 const fleet = @import("fleet.zig");
@@ -344,6 +345,9 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
     } else if (std.mem.eql(u8, p, "/admin/chars/delete")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return charsDelete(fd, req);
+    } else if (std.mem.eql(u8, p, "/admin/chars/import")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return charsImport(fd, req);
     } else if (std.mem.eql(u8, p, "/admin/chars/copy")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return charsCopy(fd, req);
@@ -496,6 +500,29 @@ fn charsCopy(fd: net.Socket, req: []const u8) void {
     } else {
         respond(fd, conflict, "{\"error\":\"copy failed (missing source, invalid name, or destination exists)\"}");
     }
+}
+
+// POST /admin/chars/import {"account","char","d2s":"<base64>"} — put a save file on an account.
+//
+// Base64 because this is a JSON API and a .d2s is binary; standard alphabet with padding, which is
+// what every tool that will produce one emits. The realm rewrites the name and repairs the checksum
+// on the way in, so a save exported under one name lands correctly under another.
+fn charsImport(fd: net.Socket, req: []const u8) void {
+    const body = bodyOf(req);
+    const account = jsonStr(body, "account") orelse return respond(fd, bad_request, "{\"error\":\"missing account\"}");
+    const char = jsonStr(body, "char") orelse return respond(fd, bad_request, "{\"error\":\"missing char\"}");
+    const encoded = jsonStr(body, "d2s") orelse return respond(fd, bad_request, "{\"error\":\"missing d2s\"}");
+
+    var raw: [store.max_d2s]u8 = undefined;
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(encoded) catch return respond(fd, bad_request, "{\"error\":\"d2s is not base64\"}");
+    if (n > raw.len) return respond(fd, bad_request, "{\"error\":\"d2s too large\"}");
+    dec.decode(raw[0..n], encoded) catch return respond(fd, bad_request, "{\"error\":\"d2s is not base64\"}");
+
+    if (!store.importChar(account, char, raw[0..n])) {
+        return respond(fd, conflict, "{\"error\":\"import failed (bad save, invalid name, or character exists)\"}");
+    }
+    respond(fd, ok, "{\"imported\":true}");
 }
 
 // POST /admin/chars/delete {"account","char"} — remove one character. The companion to

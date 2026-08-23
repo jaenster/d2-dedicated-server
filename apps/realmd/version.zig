@@ -120,6 +120,24 @@ fn parseWhat(what: []const u8) ?u32 {
 ///
 /// The dword is asked first because it names an exact patch; the version byte only names a family
 /// and several patches share one, so it is the fallback rather than the answer.
+/// The engine whose tag carries these two digits, or null.
+///
+/// A character's engine is chosen on the creation screen, after the logon that would otherwise
+/// have decided it, so MCP_CHARCREATE carries it in the high byte of its status word — as the
+/// era's own two digits, 6 or 9 or 14. Matching them against the tags this realm is CONFIGURED
+/// with rather than against a table of our own means a realm can only ever stamp a character with
+/// an engine it actually serves.
+pub fn byEraCode(code: u8) ?[]const u8 {
+    if (code == 0) return null;
+    var buf: [2]u8 = .{ '0' + @as(u8, @intCast(code / 10)), '0' + @as(u8, @intCast(code % 10)) };
+    for (configured[0..configured_n]) |e| {
+        if (e.tag.len < 4) continue;
+        if (e.tag[0] != '1' or e.tag[1] != '.') continue;
+        if (std.mem.eql(u8, e.tag[2..4], &buf)) return e.tag;
+    }
+    return null;
+}
+
 pub fn resolve(exe_version: u32, verbyte: u8) ?[]const u8 {
     for (configured[0..configured_n]) |e| {
         if (e.exe_version != 0 and e.exe_version == exe_version) return e.tag;

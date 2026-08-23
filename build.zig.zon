@@ -19,8 +19,8 @@
         // every image build since the path landed failed on it. A pin also makes the version a
         // deliberate commit here rather than whatever happens to be checked out next door.
         .libd2 = .{
-            .url = "git+https://github.com/jaenster/libd2#fa2be8d7077538a3e53347d210144df3e2169432",
-            .hash = "libd2-0.6.2-wboU7a5MpgEi_0r6Oy7SUCdrpCcpsZwW1oX3y-AMxOPF",
+            .url = "git+https://github.com/jaenster/libd2#db503138e87e210029849a4b5014158ae006d4f8",
+            .hash = "libd2-0.6.5-wboU7c0iqQEB0zqTibDpAk-6dMhORMPb6HyvCfAglS5g",
         },
         // The real GS-join + world-decode leg, for tools/stress-e2e: d2-realm and d2-session are
         // published from there specifically so a second Zig program can drive real games without

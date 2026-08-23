@@ -260,7 +260,7 @@ pub fn setUserData(account: []const u8, key: []const u8, value: []const u8) bool
 
 /// Largest .d2s we will clone. A real 1.14d save is a few KB (a full char with stash is
 /// well under this); refusing larger avoids a silently-truncated, corrupt copy.
-const max_d2s = 32 * 1024;
+pub const max_d2s = 32 * 1024;
 
 /// Clone a character to a new name (and optionally a different account): read the source
 /// save, rewrite its embedded name + checksum, and persist it at the destination. Works on
@@ -277,6 +277,29 @@ pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []co
     if (!d2s.setName(buf[0..n], dst_char)) return false;
     d2s.fixChecksum(buf[0..n]);
     return saveCharD2s(dst_account, dst_char, buf[0..n]);
+}
+
+/// Put a save file on an account under `name`.
+///
+/// The same rewrite `copyChar` does, for the same reason: the .d2s carries its own name and its own
+/// checksum, and a client refuses one whose name does not match the character it asked for. So the
+/// name is written in and the checksum repaired rather than trusting whatever the file arrived with.
+///
+/// It will not overwrite. An import that silently replaced a character would be the one operation
+/// here with no way back.
+pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8) bool {
+    if (name.len == 0 or name.len > d2s.name_max) return false;
+    if (bytes.len == 0 or bytes.len > max_d2s) return false;
+    if (d2s.status(bytes) == null) return false; // not a save, or too short to be one
+
+    var probe: [16]u8 = undefined;
+    if (getCharD2s(account, name, &probe) != 0) return false;
+
+    var buf: [max_d2s]u8 = undefined;
+    @memcpy(buf[0..bytes.len], bytes);
+    if (!d2s.setName(buf[0..bytes.len], name)) return false;
+    d2s.fixChecksum(buf[0..bytes.len]);
+    return saveCharD2s(account, name, buf[0..bytes.len]);
 }
 
 /// Result of a classic -> expansion conversion.
