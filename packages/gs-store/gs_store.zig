@@ -72,6 +72,37 @@ var configured = false;
 /// `addr` is "host:port". The host may be a dotted quad or a name — in a cluster it is a Service
 /// name, and resolving it is this file's job: a GS that cannot reach the store never publishes
 /// itself, so it stays out of the fleet and takes no games, silently.
+/// A stable id for one game server in the fleet: the host name this process runs under, together
+/// with the game port it owns.
+///
+/// Stable across restarts, because the realm indexes live games by it — and distinct per server,
+/// which the host name alone is not: two servers on one machine hash identically and the second
+/// to register silently replaces the first. The port is what separates them and is equally stable.
+/// A machine with no name to give falls back to its public address, which identifies it just as
+/// well.
+///
+/// It lives here rather than in either server because both publish into the same fleet. Two
+/// derivations that drift apart give two servers the same id, and the symptom is one of them
+/// disappearing from a realm that never logged anything wrong.
+pub fn fleetId(host_name: []const u8, public_ip: [4]u8, gs_port: u16) u32 {
+    var buf: [264]u8 = undefined;
+    var n: usize = 0;
+    if (host_name.len != 0 and host_name.len <= 256) {
+        @memcpy(buf[0..host_name.len], host_name);
+        n = host_name.len;
+    } else {
+        buf[0..4].* = public_ip;
+        n = 4;
+    }
+    std.mem.writeInt(u16, buf[n..][0..2], gs_port, .little);
+    var h: u32 = 2166136261;
+    for (buf[0 .. n + 2]) |c| {
+        h ^= c;
+        h *%= 16777619;
+    }
+    return h;
+}
+
 pub fn configure(addr: []const u8) void {
     var host = addr;
     if (std.mem.lastIndexOfScalar(u8, addr, ':')) |i| {

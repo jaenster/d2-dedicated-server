@@ -27,6 +27,7 @@ extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
 extern "kernel32" fn InitializeCriticalSection(cs: *anyopaque) callconv(.winapi) void;
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
+extern "kernel32" fn GetComputerNameA(buf: [*]u8, size: *u32) callconv(.winapi) i32;
 extern "kernel32" fn GetProcAddress(m: HMODULE, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn SetCurrentDirectoryA(path: [*:0]const u8) callconv(.winapi) i32;
@@ -80,6 +81,10 @@ fn env(name: [*:0]const u8, buf: []u8) ?[]const u8 {
 var gsid: u32 = 0;
 var public_ip: [4]u8 = .{ 127, 0, 0, 1 };
 var public_port: u16 = 4100;
+/// Seven is the engine's own ceiling — Fog hands out eight memory-pool managers and the Global
+/// Pool System permanently holds the first. `D2GS_MAX_GAMES` lowers it, which is what a realm
+/// running several engines on one node wants; raising it only produces games the realm dispatches
+/// and the engine cannot take.
 var max_games: u32 = 7;
 var live_games: u32 = 0;
 
@@ -104,6 +109,11 @@ fn configureRealm() void {
     if (env("D2GS_REDIS_ADDR", &buf)) |addr| store.configure(addr);
     var idbuf: [32]u8 = undefined;
     if (env("D2GS_GSID", &idbuf)) |v| gsid = std.fmt.parseInt(u32, v, 10) catch 0;
+    var mgbuf: [32]u8 = undefined;
+    if (env("D2GS_MAX_GAMES", &mgbuf)) |v| {
+        const n = std.fmt.parseInt(u32, v, 10) catch 0;
+        if (n != 0) max_games = n;
+    }
     var abuf: [64]u8 = undefined;
     if (env("D2GS_GS_ADDR", &abuf)) |spec| {
         if (std.mem.lastIndexOfScalar(u8, spec, ':')) |c| {
@@ -112,10 +122,23 @@ fn configureRealm() void {
             var i: usize = 0;
             while (it.next()) |octet| : (i += 1) {
                 if (i >= 4) break;
-                public_ip[i] = std.fmt.parseInt(u8, octet, 10) catch return;
+                public_ip[i] = std.fmt.parseInt(u8, octet, 10) catch break;
             }
         }
     }
+    // Last, because the derivation is over the address just read. Without this a deployment that
+    // sets only the store address gets a server with no id, and `realmConfigured` reads that as
+    // "standalone" — it boots, it ticks, and it is invisible to the realm.
+    if (gsid == 0) gsid = deriveGsid();
+}
+
+/// This server's id in the fleet, when the deployment does not name one. `gs_store.fleetId` is
+/// shared with the 1.14d server so a realm running both cannot hand two servers the same id.
+fn deriveGsid() u32 {
+    var buf: [264]u8 = undefined;
+    var sz: u32 = 256;
+    const name: []const u8 = if (GetComputerNameA(&buf, &sz) != 0 and sz > 0) buf[0..sz] else &.{};
+    return store.fleetId(name, public_ip, public_port);
 }
 
 // ── the character load ───────────────────────────────────────────────────────

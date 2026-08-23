@@ -65,15 +65,35 @@ realmd (`templates/realmd-deployment.yaml`):
 | `REALMD_LOG_JSON` | `.Values.realmd.logJson` |
 | `REALMD_SHUTDOWN_GRACE_MS` | `.Values.realmd.shutdownGraceMs` |
 
-game server (`templates/gameserver-statefulset.yaml` — a stateless `Deployment`, consumed by `deploy/gs-entrypoint.sh`):
+game server (`templates/gameserver-deployment.yaml` — one stateless `Deployment` per engine):
+
+`gameServer.engines` is the list of eras this realm hosts, and every entry becomes its own
+Deployment named `d2gs-<engine>` running `images.gs.repository:<engine>` (or
+`<engine>-<images.gs.release>` when a release is pinned). An entry takes `version` plus any of
+`replicas`, `maxGames`, `tag`, `resources`, `extraDlls`, `extraArgs`; whatever it leaves out comes
+from `gameServer` itself.
+
+Nothing routes by hand. A server publishes `v=<engine>` alongside itself in redis, a character
+carries the engine it was made for, and realmd only ever places a game on a server running it — so
+adding an era is one line here, and removing one strands its characters rather than sending them
+to an engine that cannot read their saves.
 
 | env | source |
 |-|-|
 | `D2GS_REDIS_ADDR` | `realmd-redis:6379` (its only link to the realm) |
 | `POD_IP` | fieldRef `status.podIP` |
 | `D2GS_GS_ADDR` | `$(POD_IP):4000` (internal pod IP — d2ingress splices to it) |
-| `D2GS_MAX_GAMES` | `.Values.gameServer.maxGames` — omitted when empty, so the server advertises its real capacity |
-| `D2GS_EXTRA_DLLS` / `D2GS_EXTRA_ARGS` | optional, `.Values.gameServer.extraDlls` / `extraArgs` |
+| `D2GS_MAX_GAMES` | the entry's `maxGames`, else `.Values.gameServer.maxGames` — omitted when empty, so the server advertises its real capacity |
+| `D2GS_EXTRA_DLLS` / `D2GS_EXTRA_ARGS` | optional, wine-only (`deploy/gs-entrypoint.sh`) |
+
+`D2GS_GSID` is not set: both servers derive one from the pod name and the game port, which is
+stable across restarts and distinct per pod.
+
+1.14d is the only engine with the in-process health endpoint on 8086 — it is a `d2gs.dll` hook,
+and the earlier engines run `d2host.exe`, which has no HTTP surface. Their probes are `tcpSocket`
+on 4000 instead, which is weaker in one way worth knowing: it cannot see whether the server has
+published itself into redis, so such a pod can read Ready while the realm cannot place a game on
+it. The same split decides the prometheus scrape annotations.
 
 native game server (`templates/gameserver-native-deployment.yaml`): the same `D2GS_REDIS_ADDR`,
 `POD_IP`, `D2GS_GS_ADDR` and `D2GS_MAX_GAMES` contract, minus the wine-only extras. Two differences

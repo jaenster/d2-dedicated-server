@@ -37,3 +37,11 @@ app.kubernetes.io/name: {{ include "realm.name" .root }}
 app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
+
+{{/*
+An engine version as something a Kubernetes name can hold: 1.14d -> 1-14d. Dots are legal in a
+label value but not in a Deployment name, and the two have to agree or the selector stops matching.
+*/}}
+{{- define "realm.engineSlug" -}}
+{{- . | replace "." "-" -}}
+{{- end -}}

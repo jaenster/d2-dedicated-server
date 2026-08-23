@@ -14,7 +14,8 @@
 #   /wine   wine prefix (persist on a volume to skip re-init)
 #   /work   scratch: the assembled game dir + logs
 #
-# Env: D2GS_REDIS_ADDR, D2GS_GSID, D2GS_GS_ADDR — read by d2host itself.
+# Env, all read by d2host itself: D2GS_REDIS_ADDR, D2GS_GS_ADDR, D2GS_MAX_GAMES, and
+# D2GS_GSID — which can be left unset, and then comes from the host name and the game port.
 set -e
 
 export WINEPREFIX="${WINEPREFIX:-/wine}"
