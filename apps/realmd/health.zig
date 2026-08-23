@@ -89,9 +89,17 @@ fn readRequest(fd: net.Socket, buf: []u8) usize {
     return total;
 }
 
+/// Big enough for the largest thing the admin API accepts: a .d2s is capped at 32KB and arrives
+/// base64, which is a third larger again, plus headers. A probe is a few hundred bytes and pays
+/// nothing for this — the buffer is a stack frame per request, not a reservation.
+///
+/// Undersizing it does not fail cleanly: the request is simply cut where the buffer ends, and the
+/// handler reports whichever field happened to be past the cut as missing.
+const request_max = 64 * 1024;
+
 pub fn handle(fd: net.Socket, tag: []const u8) void {
     _ = tag;
-    var buf: [2048]u8 = undefined;
+    var buf: [request_max]u8 = undefined;
     const n = readRequest(fd, &buf);
     if (n == 0) return;
     const req = buf[0..n];
