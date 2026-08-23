@@ -1,34 +1,65 @@
-# Stateless Deployment (fungible pods): d2ingress routes to a pod by the IP recorded in
-# the redis token route, not via a stable name, and in-memory game state dies with the
-# pod anyway — so no StatefulSet / persistent identity is needed.
+{{/*
+One Deployment per engine in `gameServer.engines`, so a realm can host several eras at once.
+
+They are stateless (fungible pods): d2ingress routes to a pod by the IP recorded in the redis
+token route, not via a stable name, and in-memory game state dies with the pod anyway.
+
+The fleet is not partitioned by anything here — every server publishes itself into the same store
+with a `v=<engine>` label, and realmd narrows to that label when it places a game. So these pods
+never need to find each other, and a realm that hosts one era looks exactly like a realm that
+hosts five with four of the lines deleted.
+*/}}
+{{- $root := . -}}
+{{- range .Values.gameServer.engines }}
+{{- $engine := required "gameServer.engines[].version is required: the engine is what the image tag and the routing label both come from" .version -}}
+{{- $slug := include "realm.engineSlug" $engine -}}
+{{- $gs := $root.Values.gameServer -}}
+{{- $tag := .tag | default (ternary $engine (printf "%s-%s" $engine $root.Values.images.gs.release) (empty $root.Values.images.gs.release)) -}}
+{{- $maxGames := .maxGames | default $gs.maxGames -}}
+{{/*
+1.14d is served by injecting into Game.exe, which carries the in-process health endpoint on 8086;
+every earlier engine runs d2host, which has no HTTP surface at all. Same split as `target_for` in
+deploy/build-d2host.sh, and the probes have to follow it — an HTTP probe against d2host fails
+forever and the pod never goes Ready.
+*/}}
+{{- $hasHealth := eq $engine "1.14d" -}}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: d2gs
+  name: d2gs-{{ $slug }}
   labels:
-    {{- include "realm.labels" . | nindent 4 }}
+    {{- include "realm.labels" $root | nindent 4 }}
     app.kubernetes.io/component: gameserver
+    d2gs.io/engine: {{ $engine | quote }}
 spec:
-  replicas: {{ .Values.gameServer.replicas }}
-  revisionHistoryLimit: {{ .Values.realmd.revisionHistoryLimit }}
+  replicas: {{ .replicas | default $gs.replicas }}
+  revisionHistoryLimit: {{ $root.Values.realmd.revisionHistoryLimit }}
   selector:
     matchLabels:
-      {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 6 }}
+      {{- include "realm.selectorLabels" (dict "root" $root "component" "gameserver") | nindent 6 }}
+      d2gs.io/engine: {{ $engine | quote }}
   template:
     metadata:
       labels:
-        {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 8 }}
+        {{- include "realm.selectorLabels" (dict "root" $root "component" "gameserver") | nindent 8 }}
+        d2gs.io/engine: {{ $engine | quote }}
+      {{- if $hasHealth }}
       annotations:
         # The GS exposes its own counters (games, players, ticks, items rolled by quality)
         # on the same port the probes use — see apps/d2gs/runtime/feature/stats.zig.
         prometheus.io/scrape: "true"
         prometheus.io/port: "8086"
         prometheus.io/path: /metrics
+      {{- end }}
     spec:
       # The GS is INTERNAL — no public hostPort. d2ingress fronts the public :4000 and
       # splices to each GS by its pod IP (from the redis token route). Without a hostPort
       # node-level bind the fleet can exceed the node count, so anti-affinity is soft:
       # preferred (not required) still spreads replicas across nodes for fault tolerance.
+      #
+      # It spreads THIS engine's replicas, not the whole fleet: two engines on one node is fine
+      # and is what a small realm hosting five eras necessarily does.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -36,21 +67,24 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    {{- include "realm.selectorLabels" (dict "root" . "component" "gameserver") | nindent 20 }}
+                    {{- include "realm.selectorLabels" (dict "root" $root "component" "gameserver") | nindent 20 }}
+                    d2gs.io/engine: {{ $engine | quote }}
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: d2gs
-          image: "{{ .Values.images.gs.repository }}:{{ .Values.images.gs.tag }}"
-          imagePullPolicy: {{ .Values.images.gs.pullPolicy }}
+          image: "{{ $root.Values.images.gs.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ $root.Values.images.gs.pullPolicy }}
           ports:
             - { containerPort: 4000, name: game }
+            {{- if $hasHealth }}
             - { containerPort: 8086, name: health }
+            {{- end }}
           env:
             # The shared store. This is the game server's ONLY link to the realm: it publishes
             # itself here, takes create/join from its queue here, and reads and writes characters
             # here. There is no realmd address to point it at.
             - name: D2GS_REDIS_ADDR
-              value: {{ include "realm.redisAddr" . | quote }}
+              value: {{ include "realm.redisAddr" $root | quote }}
             # The GS registers its in-cluster POD IP — d2ingress (also in-cluster) dials
             # this to splice client game traffic through. No public exposure. POD_IP must
             # precede D2GS_GS_ADDR for the $(POD_IP) substitution to resolve.
@@ -59,30 +93,32 @@ spec:
                 fieldRef: { fieldPath: status.podIP }
             - name: D2GS_GS_ADDR
               value: "$(POD_IP):4000"
-            {{- if .Values.gameServer.maxGames }}
+            {{- if $maxGames }}
             - name: D2GS_MAX_GAMES
-              value: {{ .Values.gameServer.maxGames | quote }}
+              value: {{ $maxGames | quote }}
             {{- end }}
-            {{- if .Values.gameServer.extraDlls }}
+            {{- with .extraDlls | default $gs.extraDlls }}
             - name: D2GS_EXTRA_DLLS
-              value: {{ .Values.gameServer.extraDlls | quote }}
+              value: {{ . | quote }}
             {{- end }}
-            {{- if .Values.gameServer.extraArgs }}
+            {{- with .extraArgs | default $gs.extraArgs }}
             - name: D2GS_EXTRA_ARGS
-              value: {{ .Values.gameServer.extraArgs | quote }}
+              value: {{ . | quote }}
             {{- end }}
           volumeMounts:
             # No `game` mount by default: the image carries its own install at /game. A mount here
-            # HIDES it, which is exactly what serving a different one means.
-            {{- if .Values.gameServer.gameFiles.enabled }}
+            # HIDES it, which is exactly what serving a different one means. It is per-engine for
+            # the same reason the images are — a .bin table is a raw struct dump, so one era's
+            # tree in another era's server decodes as garbage.
+            {{- if $gs.gameFiles.enabled }}
             - { name: game, mountPath: /game, readOnly: true }
             {{- end }}
             - { name: wine, mountPath: /wine }
             - { name: work, mountPath: /work }
           resources:
-            {{- toYaml .Values.gameServer.resources | nindent 12 }}
+            {{- toYaml (.resources | default $gs.resources) | nindent 12 }}
+          {{- if $hasHealth }}
           # In-process health endpoint: 200 only while the engine tick loop is beating.
-          # Generous startup budget — wine prefix init + engine boot is slow.
           # Five minutes of grace: a cold wine prefix has to be initialised and the whole
           # engine data load run before the tick loop beats for the first time.
           startupProbe:
@@ -101,8 +137,25 @@ spec:
             httpGet: { path: /healthz, port: 8086 }
             periodSeconds: 15
             failureThreshold: 4
+          {{- else }}
+          # d2host serves no HTTP, so the only thing to ask it is whether the game port is open —
+          # which it opens once the engine is up. That is weaker than the 1.14d probes in a
+          # specific way worth knowing: it cannot tell that the server has published itself into
+          # redis, so a pre-1.14 pod can read Ready while the realm cannot place a game on it.
+          startupProbe:
+            tcpSocket: { port: 4000 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: 4000 }
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 4000 }
+            periodSeconds: 15
+            failureThreshold: 4
+          {{- end }}
       volumes:
-        {{- if .Values.gameServer.gameFiles.enabled }}
+        {{- if $gs.gameFiles.enabled }}
         - name: game
           persistentVolumeClaim:
             claimName: d2-gamefiles
@@ -111,3 +164,4 @@ spec:
           emptyDir: {}     # wine prefix re-inits per start; make it a PVC to persist
         - name: work
           emptyDir: {}
+{{ end }}

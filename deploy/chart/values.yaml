@@ -60,7 +60,10 @@ images:
   # host the game's own DLLs; which one a tag uses is not something a values file has to know.
   gs:
     repository: ghcr.io/jaenster/d2gs
-    tag: "1.14d"
+    # No tag here: the engine IS the tag, and a realm hosts several. Each entry in
+    # `gameServer.engines` gets `<engine>` — or `<engine>-<release>` when `release` is set, which
+    # is how a realm pins the build rather than following whatever last passed e2e.
+    release: ""
     pullPolicy: Always
   d2ingress:
     repository: ghcr.io/jaenster/d2ingress
@@ -188,6 +191,19 @@ redis:
 
 # ── gameServer: the d2gs fleet (internal pod-IP only; d2ingress fronts game traffic) ──
 gameServer:
+  # Which engines this realm hosts. One Deployment per entry, each running the image built for
+  # that engine, and the fleet is the union of them.
+  #
+  # Nothing routes by hand: a server publishes `v=<engine>` with itself, a character carries the
+  # engine it was made for, and realmd only ever picks among the servers running it. So adding a
+  # line here is the whole of adding an era to a realm — and REMOVING one strands every character
+  # made for it, which will simply find no server rather than land on an engine that cannot read
+  # its save.
+  #
+  # Each entry takes `version` plus any of `replicas`, `maxGames`, `tag`, `resources`,
+  # `extraDlls`, `extraArgs`; anything it leaves out falls back to the values below.
+  engines:
+    - version: "1.14d"
   replicas: 1
   # Unset: the server advertises what it can actually host. Fog's pool allocator keeps 8 managers
   # and the Global Pool System holds one, so seven games is the engine's ceiling — and the server
