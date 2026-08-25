@@ -141,6 +141,12 @@ fn setU16(b: []u8, i: usize, v: u16) void {
 pub fn apply(gpa: std.mem.Allocator, rec: Record, src: []const u8) ![]u8 {
     if (rec.isFull()) return gpa.dupe(u8, rec.payload[0..rec.tgt_size]);
     if (src.len != rec.src_size) return error.SourceSizeMismatch;
+    // A record never names a version. It names the bytes it expects: this CRC32 at this length.
+    // That is what makes a chain walkable without tracking version numbers - and what stops a
+    // delta being applied to the wrong build, which would corrupt silently rather than fail.
+    // Standard CRC-32, confirmed against D2Patch_101: all 20 of its records that name a file
+    // present in the 1.14b payload's PC-100 tree match it exactly, and none match on size alone.
+    if (rec.src_crc32 != 0 and std.hash.Crc32.hash(src) != rec.src_crc32) return error.SourceCrcMismatch;
     if (rec.payload.len < 8) return error.Truncated;
 
     const size_a = std.mem.readInt(u32, rec.payload[0..4], .little);
@@ -434,4 +440,21 @@ pub fn main(init: std.process.Init) !void {
     try writeFile(argv[4], out);
     const pe = out.len >= 2 and out[0] == 'M' and out[1] == 'Z';
     std.debug.print("wrote {s}: {d} bytes{s}\n", .{ argv[4], out.len, if (pe) " (PE)" else "" });
+}
+
+test "a delta refuses a source that is the right length but the wrong file" {
+    const gpa = std.testing.allocator;
+    const src = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+
+    var rec = [_]u8{0} ** 0x18;
+    std.mem.writeInt(u16, rec[0..2], 0x18, .little);
+    std.mem.writeInt(u16, rec[2..4], 0x0004, .little);
+    std.mem.writeInt(u32, rec[4..8], std.hash.Crc32.hash(&src) ^ 1, .little); // not this file
+    std.mem.writeInt(u32, rec[8..12], src.len, .little);
+    std.mem.writeInt(u32, rec[12..16], src.len, .little);
+    try std.testing.expectError(error.SourceCrcMismatch, apply(gpa, try Record.parse(&rec), &src));
+
+    // and accepts the one it does name
+    std.mem.writeInt(u32, rec[4..8], std.hash.Crc32.hash(&src), .little);
+    try std.testing.expectError(error.Truncated, apply(gpa, try Record.parse(&rec), &src));
 }
