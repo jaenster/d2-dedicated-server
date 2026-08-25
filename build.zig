@@ -219,6 +219,21 @@ pub fn build(b: *std.Build) void {
     b.step("mpqcat", "Extract one member from an MPQ by name")
         .dependOn(&b.addInstallArtifact(mpqcat, .{}).step);
 
+    // tools/d2install — build a game directory from an Installer Tome, without the installer.
+    const d2install = b.addExecutable(.{
+        .name = "d2install",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/d2install/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    d2install.root_module.addImport("libd2", libd2);
+    b.installArtifact(d2install);
+    b.step("d2install", "Install a payload from its Installer Tome")
+        .dependOn(&b.addInstallArtifact(d2install, .{}).step);
+
     // tools/d2patch — rebuild a patched file from its Ptc record. Left out of the build once, which
     // meant a stale binary silently outlived a fix to the decoder and kept miscompiling tables.
     const d2patch = b.addExecutable(.{
