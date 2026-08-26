@@ -21,6 +21,8 @@
 #
 # Config (env or ./.env):
 #   TREES        default ./.stack        one <TREES>/gs<tag> per engine, assembled by tools/make-minimal-engine.sh
+#                                        (`from-install` builds one straight from a
+#                                         blizzard-legacy-dl game directory)
 #   REDIS_ADDR   default 127.0.0.1:6390
 #   CLIENTLESS   default ../clientless/zig-out/bin/clientless
 #   GS_PORT_BASE default 14100           engine N listens on GS_PORT_BASE+N
@@ -158,10 +160,21 @@ for i in "${!ENGINES[@]}"; do
 
     # Registration, not a sleep: the server publishes itself into redis when it is ready to take
     # work, and until it does the realm has nothing to hand a client.
-    key="realmd:gs:$(printf '%x' "$gsid")"
+    #
+    # BOTH halves, and that is not belt-and-braces. Registration is two writes — the per-gsid key
+    # that describes the server, and membership of the fleet set the realm reads to place a game —
+    # and they do not land together. Waiting only for the key let a create run against an empty
+    # fleet set, which the client reports as "game servers are down" and the run scores as the
+    # ENGINE never reaching a world. That misattribution is the whole cost: it was a working tree
+    # every time, failing on the first run and passing on the next.
+    hex="$(printf '%x' "$gsid")"
+    key="realmd:gs:$hex"
     t=0; up=0
     while [ "$t" -lt "$BOOT_WAIT" ]; do
-        [ -n "$(redis EXISTS "$key" 2>/dev/null | grep 1)" ] && { up=1; break; }
+        if [ -n "$(redis EXISTS "$key" 2>/dev/null | grep 1)" ] &&
+           [ -n "$(redis SISMEMBER realmd:gs "$hex" 2>/dev/null | grep 1)" ]; then
+            up=1; break
+        fi
         pgrep -f 'd2host.exe' >/dev/null || break   # died during boot; no point waiting out the clock
         sleep 1; t=$((t+1))
     done

@@ -4,6 +4,7 @@
 #   tools/make-minimal-engine.sh base         <out>      the expansion archives, shared by 1.07+
 #   tools/make-minimal-engine.sh base-classic <out>      the classic archive, for 1.00/1.06b
 #   tools/make-minimal-engine.sh engine <ver> <out>      that engine's DLLs and tables
+#   tools/make-minimal-engine.sh from-install <dir> <out>  both layers, out of a finished install
 #
 # The split is the point. mpqmin keeps by EXTENSION, not by version, so the minimised archives come
 # out identical whichever engine you build them for — about 10 MB that every image can share rather
@@ -25,6 +26,23 @@
 # and reads expansion-format tables out of it for everything it has no loose override for, which
 # is not a licence question but a correctness one -- it was the whole reason 1.06b asserted in
 # ItemTbls.cpp.
+#
+# `from-install` takes a game directory that blizzard-legacy-dl already built and makes a tree out
+# of it in one step, with no patch installers and no 1.07 base to point at. It is not a shortcut:
+# that tool applies the same Ptc deltas to the same 1.07 files and its DLLs come out byte-identical
+# to the ones `engine` builds here, which is checked rather than assumed. Two things are better
+# that way round:
+#
+#   * Patch_D2.mpq is the ERA's. `engine` has only the 1.14d one to minimise, and hands it to every
+#     engine from 1.10 on regardless of era; an install carries the one its own patch.lst rebuilt.
+#   * One patch chain instead of two. Both used to derive the same DLLs by separate code, and the
+#     failure mode of that is not a build error — it is one of them going quietly stale.
+#
+# That first point changes a rule further down this file. `engine` withholds Patch_D2.mpq from
+# everything before 1.10 because the 1.14d-era one ACCESS VIOLATIONs a 1.09b boot — but that is a
+# fact about THAT archive, not about the file. Given its own, 1.09b boots and serves: measured at
+# 195 packets / 34 units through tools/e2e-engines.sh, the same as it manages with none. So this
+# mode ships whatever the install built and does not gate on era.
 #
 # This ships the RECIPE, not Blizzard's bytes.
 set -euo pipefail
@@ -196,6 +214,49 @@ engine)
         "$BASE/d2exp.mpq,$BASE/d2data.mpq" "$OUT/data/global/excel"
     rm -rf "$OUT/data/global/excel/.patchdata"
     du -sh "$OUT" | sed 's/^/==> engine layer: /'
+    ;;
+from-install)
+    SRC="${1:?usage: make-minimal-engine.sh from-install <install-dir> <out>}"
+    OUT="${2:?usage: make-minimal-engine.sh from-install <install-dir> <out>}"
+    [ -f "$SRC/d2data.mpq" ] || { echo "no d2data.mpq in $SRC — is that a game directory?"; exit 1; }
+    mkdir -p "$OUT"
+
+    # The archives, minimised the same way the shared base is. An install built from a 1.14b payload
+    # carries a full (listfile), so unlike the older archives nothing here needs one supplied.
+    for a in d2data.mpq d2exp.mpq; do
+        [ -f "$SRC/$a" ] || { echo "==> no $a (classic install)"; continue; }
+        echo "==> minimising $a"
+        "$MPQMIN" ${D2_LISTFILE:+--listfile $D2_LISTFILE} "$SRC/$a" "$OUT/$a"
+    done
+
+    # Already at the right version: these were patched on the way in, so there is nothing to apply.
+    echo "==> taking the engine DLLs from the install"
+    for m in D2Game.dll D2Common.dll D2Lang.dll D2CMP.dll Storm.dll; do
+        [ -f "$SRC/$m" ] || { echo "   $m: absent"; continue; }
+        cp "$SRC/$m" "$OUT/$m" && echo "   $m ok"
+    done
+
+    # The install's own patch archive, which is this era's rather than 1.14d's. Named with the
+    # capitalisation the shipped trees use: a case-insensitive filesystem hides the difference
+    # locally and a Linux container is where it would surface.
+    for p in patch_d2.mpq Patch_D2.mpq; do
+        [ -f "$SRC/$p" ] || continue
+        echo "==> minimising $p (era-correct, from the install)"
+        "$MPQMIN" ${D2_LISTFILE:+--listfile $D2_LISTFILE} "$SRC/$p" "$OUT/Patch_D2.mpq"
+        # An archive that names nothing minimises to nothing, and mpqmin says so in a line that
+        # reads like every other. Refuse it here: from 1.10 on the engine needs this file, and an
+        # empty one does not fail at boot -- it halts in level generation the first time a client
+        # enters, which points at everything except the archive.
+        # 2>&1 because mpqmin reports on stderr; without it this counts nothing and always fires.
+        if [ "$("$MPQMIN" --list "$OUT/Patch_D2.mpq" 2>&1 | wc -l)" -eq 0 ]; then
+            echo "!!  $p minimised to nothing: it names no members and no --listfile covered it."
+            echo "!!  Refusing to ship an empty Patch_D2.mpq."
+            exit 1
+        fi
+        break
+    done
+
+    du -sh "$OUT" | sed 's/^/==> tree: /'
     ;;
 *) usage ;;
 esac
