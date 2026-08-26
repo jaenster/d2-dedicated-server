@@ -205,7 +205,7 @@ pub fn build(b: *std.Build) void {
     b.step("d2fog", "Build our replacement Fog.dll (x86-windows)")
         .dependOn(&b.addInstallArtifact(d2fog, .{}).step);
 
-    // tools/mpqcat — pull one member out of an archive, to diff generated tables against shipped.
+    // tools/mpqcat — read an archive: one member by name, or all of it against a listfile.
     const mpqcat = b.addExecutable(.{
         .name = "mpqcat",
         .root_module = b.createModule(.{
@@ -216,7 +216,7 @@ pub fn build(b: *std.Build) void {
     });
     mpqcat.root_module.addImport("libd2", libd2);
     b.installArtifact(mpqcat);
-    b.step("mpqcat", "Extract one member from an MPQ by name")
+    b.step("mpqcat", "Read an MPQ: one member, or list and extract the whole archive")
         .dependOn(&b.addInstallArtifact(mpqcat, .{}).step);
 
     // tools/d2install — build a game directory from an Installer Tome, without the installer.
