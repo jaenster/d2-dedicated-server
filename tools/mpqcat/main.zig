@@ -127,9 +127,16 @@ fn cmdList(gpa: std.mem.Allocator, archive: mpq.Archive, names: []const []const 
         if (blk.flags & mpq.Flags.exists == 0) continue;
         if (by_block[i] != null) continue;
         nameless += 1;
-        const key = archive.recoverKey(gpa, @intCast(i)) catch null;
         var buf: [32]u8 = undefined;
         const label = std.fmt.bufPrint(&buf, "<block {d}>", .{i}) catch "<block>";
+        // Only an ENCRYPTED member needs a key, and its key is derived from the name we do not
+        // have. An unencrypted one reads out regardless, so saying "no key" about it would report
+        // a problem that is not there — most of Patch_D2.mpq is exactly that case.
+        if (blk.flags & mpq.Flags.encrypted == 0) {
+            printRow(label, blk, "no name (not encrypted, reads anyway)");
+            continue;
+        }
+        const key = archive.recoverKey(gpa, @intCast(i)) catch null;
         printRow(label, blk, if (key != null) "key recovered" else "NO NAME, NO KEY");
     }
     std.debug.print("\n{d} blocks: {d} named, {d} nameless\n", .{ archive.blocks.len, named, nameless });
@@ -265,7 +272,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--cross")) {
             cross = true;
         } else {
-            try texts.append(gpa, try readFile(gpa, a));
+            try texts.append(gpa, readFile(gpa, a) catch {
+                std.debug.print("cannot read listfile: {s}\n", .{arg});
+                return error.NoListfile;
+            });
         }
     }
     // An archive that carries its own `(listfile)` needs nothing from the caller. Blizzard's
