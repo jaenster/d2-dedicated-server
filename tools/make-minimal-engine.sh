@@ -248,13 +248,46 @@ from-install)
         # empty one does not fail at boot -- it halts in level generation the first time a client
         # enters, which points at everything except the archive.
         # 2>&1 because mpqmin reports on stderr; without it this counts nothing and always fires.
-        if [ "$("$MPQMIN" --list "$OUT/Patch_D2.mpq" 2>&1 | wc -l)" -eq 0 ]; then
+        # And discount `(listfile)`: mpqmin writes one into everything it produces, so an archive
+        # that kept nothing still lists a single member and a plain line count never reaches zero.
+        if [ "$("$MPQMIN" --list "$OUT/Patch_D2.mpq" 2>&1 | grep -cv '(listfile)')" -eq 0 ]; then
             echo "!!  $p minimised to nothing: it names no members and no --listfile covered it."
             echo "!!  Refusing to ship an empty Patch_D2.mpq."
             exit 1
         fi
         break
     done
+
+    # An install can be carrying CD keys, and a tree built from one gets published. The key is not
+    # a file with an obvious name -- it is hidden inside an archive under the name of an ordinary
+    # asset -- so nothing about a directory listing would show it. Today it does not survive:
+    # the classic key hides as a .wav, which mpqmin drops by extension, and the expansion key
+    # lives in d2char.mpq, which is not copied. Both of those are side effects of choices made for
+    # other reasons and either could change without anyone noticing.
+    #
+    # So check, rather than rely on it. LEGAL.md promises these trees carry no CD keys; this is
+    # what makes that a guarantee instead of a coincidence.
+    echo "==> checking no CD key came along"
+    leaked=0
+    for a in "$OUT"/*.mpq; do
+        [ -f "$a" ] || continue
+        for m in 'data\global\sfx\cursor\wavindx.wav' \
+                 'data\global\chars\am\cof\amblxbow.cof' \
+                 'data\global\sfx\cursor\curindx.wav'; do
+            if "$MPQCAT" "$a" "$m" >/dev/null 2>&1; then
+                # printf, not echo: these names are full of backslashes and a shell whose echo
+                # expands them truncates the message at \c — cutting it off precisely when it is
+                # the only thing telling you a key is about to be published.
+                printf '!!  %s still carries %s — that is where D2 hides the CD key\n' "$(basename "$a")" "$m"
+                leaked=1
+            fi
+        done
+    done
+    if [ "$leaked" = 1 ]; then
+        echo "!!  Refusing to leave key material in a tree that gets published."
+        exit 1
+    fi
+    echo "   clean"
 
     du -sh "$OUT" | sed 's/^/==> tree: /'
     ;;

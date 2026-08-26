@@ -181,6 +181,20 @@ separate package per mechanism: which of the three below serves a tag is our pro
   `tools/re/patchdata.py` rebuilds that version's tables from its own patch installer, and its DLLs
   come out of the same installer as Ptc deltas over the 1.07 base.
 
+  There is a shorter route if you have [blizzard-legacy-dl](https://github.com/jaenster/blizzard-legacy-dl),
+  which builds a playable game directory at any version straight from Blizzard's own payload:
+
+  ```sh
+  blizzard-legacy-dl install d2xp 1.13c --game ./d2-113c
+  tools/make-minimal-engine.sh from-install ./d2-113c .stack/gs113c
+  ```
+
+  That needs no patch installers and no 1.07 base to point at, because the patching already
+  happened on the way in. It is not a different result: both apply the same Ptc deltas to the same
+  files and their DLLs come out byte-identical, which is checked rather than assumed. What it does
+  do better is `Patch_D2.mpq` — the recipe above has only the 1.14d one to hand out, while an
+  install carries the one its own `patch.lst` rebuilt for that era.
+
   Every engine carries one, so there is nothing to mount for any of them, and every one of them
   reaches the tick loop from the image alone.
 
