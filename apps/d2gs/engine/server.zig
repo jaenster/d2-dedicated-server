@@ -127,12 +127,11 @@ pub fn GAME_CreateBattleNetGame(
 pub const ARENAFLAG_ClientUpdate: u32 = 0x04;
 pub const ARENAFLAG_Hardcore: u32 = 0x800; // 2048
 pub const ARENAFLAG_Expansion: u32 = 0x10_0000; // 1048576
-// Bit 21 -> pGame->eGameType (eGameType = (flags>>0x15)&1). Setting it marks the game NOT
-// single-player (0x01 GameFlags packet renders online NPCs, e.g. Cain by the Act 5 waypoint),
-// BUT also routes CLIENT_LoadCharacterAndSendGameData into a branch that refuses joins with
-// nReason 0x19 (verified live: on -> all joins refused, off -> joins succeed). Leave CLEAR
-// until that char-load path is understood — a working join beats Cain's cosmetic position.
-pub const ARENAFLAG_Multiplayer: u32 = 0x20_0000; // 2097152 (bit 21) — intentionally NOT set
+/// Bit 21 -> pGame->eGameType, which is the LADDER flag: the client gets it as byte 7 of the 0x01
+/// GameFlags packet and hands it to CLIENT_SetLadder, and CalculateGetFlags @0x569d80 refuses a
+/// join whose character disagrees with it (0x19 ladder char in a non-ladder game, 0x1a the
+/// reverse). It must track the game's ladder byte — see packages/d2engine/gameflags.zig.
+pub const ARENAFLAG_Ladder: u32 = 0x20_0000; // 2097152 (bit 21)
 /// Shared with the pre-1.14 host: both servers create games and the engine is equally unforgiving
 /// about ARENAFLAG_ClientUpdate on either.
 pub const gameFlags = @import("d2engine").gameflags.gameFlags;

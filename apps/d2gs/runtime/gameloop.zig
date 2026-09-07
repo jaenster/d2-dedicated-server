@@ -4,6 +4,7 @@
 //! through menus into a game (via the async fiber tasks).
 
 const patch = @import("patch.zig");
+const log = @import("../log.zig");
 const async_ = @import("async.zig");
 const feature = @import("../engine/feature.zig");
 
@@ -32,6 +33,26 @@ fn hookGameLoop() callconv(.c) void {
     Sleep(GAME_FRAME_SLEEP_MS); // yield: we clobbered the engine's own loop sleep
 }
 
+/// The in-game site replaces `cmp dword [0x70f7e0], 0` — and the instruction immediately after it,
+/// `jne 0x451c4a` @0x451c31, branches on THAT comparison's flags. Calling a C function in its place
+/// leaves the flags as whatever our last operation happened to set (in practice, whatever returning
+/// from Sleep leaves), so the engine's own frame sleep was being taken or skipped at random and the
+/// in-game frame was 10ms or 20ms from one iteration to the next.
+///
+/// We sleep for the frame ourselves, so the engine's sleep is the one we want SKIPPED, every time —
+/// that is the `jne` being taken, i.e. ZF clear. `test esp, esp` clears ZF unconditionally (ESP is
+/// never zero) and touches nothing else. It must be the last flag-affecting instruction before the
+/// `ret`, which is why this shim is naked asm rather than something appended to the Zig function.
+fn gameLoopShim() callconv(.naked) void {
+    asm volatile (
+        \\call %[cb:P]
+        \\test %%esp, %%esp
+        \\ret
+        :
+        : [cb] "X" (&hookGameLoop),
+    );
+}
+
 fn hookOogLoop() callconv(.c) void {
     async_.init();
     if (on_oog) |cb| cb();
@@ -40,7 +61,11 @@ fn hookOogLoop() callconv(.c) void {
 }
 
 pub fn install() void {
-    _ = patch.MemoryPatch(ADDR_GAME_LOOP).call(@intFromPtr(&hookGameLoop)).nops(2).commit();
+    // cmp dword ptr [0x70f7e0], 0 — stated so a drifted address refuses instead of corrupting.
+    const game_loop_orig = [_]u8{ 0x83, 0x3D, 0xE0, 0xF7, 0x70, 0x00, 0x00 };
+    if (!patch.MemoryPatch(ADDR_GAME_LOOP).expect(&game_loop_orig).call(@intFromPtr(&gameLoopShim)).nops(2).commit()) {
+        log.print("gameloop: in-game frame hook NOT installed");
+    }
     _ = patch.MemoryPatch(ADDR_OOG_LOOP).call(@intFromPtr(&hookOogLoop)).nops(18).commit();
 }
 

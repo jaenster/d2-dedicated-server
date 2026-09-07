@@ -69,6 +69,21 @@ pub const GameOrdinals = struct {
     create_empty_game: u16 = 10047,
     set_init_seed: u16 = 10010,
     shutdown: u16 = 10050,
+    /// The COOPERATIVE drive model, and the one a real 1.13c server uses.
+    ///
+    /// `process_all_games` walks the game array itself and is the only caller of the engine's
+    /// `ServerGameLoop` — the function that populates newly-activated rooms with their preset
+    /// units (`InitNewRooms`: NPCs, shrines, chests) and reveals rooms to a client as it moves
+    /// (`UpdateClients` -> `GAME_OnClientRoomChange` -> `CLIENT_RevealRoomAndSendUnits`). Driving
+    /// the engine with the per-game worker model instead still gets a character into a world,
+    /// because the initial view is sent by the JOIN, and then nothing else ever happens: no NPC
+    /// can be interacted with, no shrine appears, and the level materialises only in the bands the
+    /// join happened to cover.
+    ///
+    /// `dispatch_cleanup` is the outbound half, called only when a game actually ticked.
+    /// Both null on a version that has not been measured; such a version keeps the per-game model.
+    process_all_games: ?u16 = null,
+    dispatch_cleanup: ?u16 = null,
 };
 
 /// D2Common's host-facing entry points. Unlike D2Game's, these did NOT stay put: classic's export
@@ -232,6 +247,13 @@ pub fn spec(comptime v: Version) Spec {
                 .create_empty_game = 10044,
                 .set_init_seed = 10017, // unverified
                 .shutdown = 10047,
+                // Marsgod's working 1.13c D2Server drives the engine with exactly these two and
+                // never touches 10056: its whole per-frame loop is
+                // `10040(); if (10008(0)) 10024(0,0);`, which is 1.14d's
+                // QSERVER_CooperativeThreadMain @0x44cf20 one-for-one
+                // (HandleAnyIncomingPacket -> SrvProcessAllGames @0x52fc20 -> DispatchAndCleanup).
+                .process_all_games = 10008,
+                .dispatch_cleanup = 10024,
             },
             .common = .{ .load_all_txts = 10943, .set_compile_tables = 10563 },
             // 1.13c permuted D2Lang's whole NONAME block: its 10000 is a string hash taking
