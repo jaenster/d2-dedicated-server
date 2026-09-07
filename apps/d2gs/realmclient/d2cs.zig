@@ -14,7 +14,7 @@ const std = @import("std");
 const p = @import("realm_proto").protocol;
 const server = @import("../engine/server.zig");
 const command = @import("../engine/command.zig");
-const joinctx = @import("joinctx.zig");
+const joinctx = @import("gs_seats");
 const redis = @import("gs_store");
 const poolstat = @import("../runtime/poolstat.zig");
 const log = @import("../log.zig");
@@ -180,6 +180,10 @@ pub fn onGameDestroyed(name: []const u8) void {
 /// A game we never tracked is one we didn't create, so we have no gameid to name it by
 /// and stay quiet rather than guess.
 pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []const u8, level: u32, class: u32) void {
+    // A departing player's seat stops being one a later join has to work around. The MAPPING is
+    // kept — the engine's last save for this character runs after the leave is reported, and
+    // dropping the account here would lose exactly that save — the entry just becomes reusable.
+    if (!joined and char.len > 0) joinctx.release(char);
     const gid = peekGameId(name) orelse return;
     var buf: [@sizeOf(p.UpdateGameInfo) + 24]u8 = undefined;
     var r = std.mem.zeroes(p.UpdateGameInfo);
@@ -196,7 +200,17 @@ pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []co
     const n: usize = @min(char.len, buf.len - @sizeOf(p.UpdateGameInfo) - 1);
     @memcpy(buf[@sizeOf(p.UpdateGameInfo)..][0..n], char[0..n]);
     buf[@sizeOf(p.UpdateGameInfo) + n] = 0; // cstr terminator
-    const total = @sizeOf(p.UpdateGameInfo) + n + 1;
+    var total = @sizeOf(p.UpdateGameInfo) + n + 1;
+    // The account too, when we know it. Without it the realm has to free a departing player's
+    // character seat by NAME, and names are unique only per account here — two "Bob"s in one game
+    // and it frees the wrong one, out from under somebody still playing. Empty when unknown, which
+    // the realm reads as "cannot be sure" and leaves the seat for the game-close sweep.
+    var ab: [joinctx.max_account]u8 = undefined;
+    const acct = joinctx.accountForChar(char, &ab) orelse "";
+    const an: usize = @min(acct.len, buf.len - total - 1);
+    @memcpy(buf[total..][0..an], acct[0..an]);
+    buf[total + an] = 0;
+    total += an + 1;
     const hdr = p.header(.updategameinfo, @intCast(total), nextSeq());
     @memcpy(buf[0..@sizeOf(p.Header)], std.mem.asBytes(&hdr));
     emit(buf[0..total]);
@@ -239,7 +253,19 @@ fn handleCreateGame(seq: u32, body: []const u8) void {
     const expansion = body[1] != 0;
     const difficulty: u3 = @truncate(body[2]);
     const hardcore = body[3] != 0;
-    const flags = server.gameFlags(difficulty, expansion, hardcore);
+    // Ladder is BOTH a create-game argument and flag bit 21: the argument only lands in
+    // pGame->nLadder, while bit 21 is the one CalculateGetFlags matches against the joining
+    // character's status and the one the client is told about. Passing it in only one place is
+    // what refused every ladder character.
+    const flags = server.gameFlags(difficulty, expansion, hardcore, ladder != 0);
+    // The kind of game, on the record. Every join refusal downstream is a disagreement between
+    // these four and the joining character's own .d2s status byte, and the player is only ever
+    // told "Failed to join game" — so without this line the cause is unrecoverable after the fact.
+    log.hex("d2cs: CREATEGAME flags=0x", flags);
+    log.hex("d2cs:   ladder=", ladder);
+    log.hex("d2cs:   expansion=", @intFromBool(expansion));
+    log.hex("d2cs:   hardcore=", @intFromBool(hardcore));
+    log.hex("d2cs:   difficulty=", difficulty);
 
     // Enqueue for the tick thread (engine isn't safe to call from here directly).
     // The engine writes the server token (= gameid).
@@ -275,10 +301,21 @@ fn handleJoinGame(seq: u32, body: []const u8) void {
     // connects to :4000 (engine calls fpFindPlayerToken). We don't touch the
     // engine token table here — just remember who is joining so we can resolve
     // the account (and guild) when the engine asks us for the character save.
-    if (charname.len > 0 and account.len > 0) {
-        joinctx.remember(token, gameid, charname, account, guild_tag);
-        if (guild_tag.len > 0) log.print("d2cs: JOINGAME cached char/account/guild for fetch") else log.print("d2cs: JOINGAME cached char/account for fetch");
+    //
+    // Refused when we cannot keep it. The account is what every save this session is keyed by,
+    // so a join we admit without one is a session whose saves are silently lost — better to say
+    // no now than to hand the player a game that quietly rolls them back afterwards.
+    if (charname.len == 0 or account.len == 0) {
+        log.print("d2cs: JOINGAME with no char/account — refusing");
+        sendJoinGameReply(seq, 1, gameid);
+        return;
     }
+    if (!joinctx.remember(token, gameid, charname, account, guild_tag)) {
+        log.print("d2cs: JOINGAME cannot be tracked (name too long, or every seat is in a game) — refusing");
+        sendJoinGameReply(seq, 1, gameid);
+        return;
+    }
+    if (guild_tag.len > 0) log.print("d2cs: JOINGAME cached char/account/guild for fetch") else log.print("d2cs: JOINGAME cached char/account for fetch");
     sendJoinGameReply(seq, if (command.allow_create) 0 else 1, gameid);
     log.hex("d2cs: JOINGAME ack for gameid=0x", gameid);
 }

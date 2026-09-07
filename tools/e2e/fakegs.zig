@@ -13,6 +13,15 @@ const rc = @import("realmclient.zig");
 /// Where the harness's redis is. Set once by main before any FakeGS starts.
 pub var redis_port: u16 = 6399;
 
+/// The four bytes CREATEGAMEREQ leads its body with (realm-proto's CreateGameReq): the kind
+/// of game realmd made of the creating character's flags.
+pub const CreateFlags = struct {
+    ladder: u8 = 0,
+    expansion: u8 = 0,
+    difficulty: u8 = 0,
+    hardcore: u8 = 0,
+};
+
 pub const FakeGS = struct {
     gsid: u32 = 0xABCD,
     ip: [4]u8 = .{ 127, 0, 0, 1 },
@@ -25,7 +34,15 @@ pub const FakeGS = struct {
 
     registered: bool = false,
     creates: u32 = 0,
+    /// The flags of the LAST create request, so a scenario can assert on what its
+    /// character's status turned into on the wire. Meaningless while creates == 0.
+    create_flags: CreateFlags = .{},
     joins: u32 = 0,
+    /// The character and account of the LAST join request. A real GS keeps exactly this pairing
+    /// and keys every save of that session by it — the account never reaches the engine any other
+    /// way — so a scenario asserting on saves has to read it from here, as the server does.
+    join_char: [16]u8 = @splat(0),
+    join_account: [32]u8 = @splat(0),
     stop_flag: bool = false,
     thread: ?std.Thread = null,
     _next: u32 = 0,
@@ -97,6 +114,12 @@ pub const FakeGS = struct {
             var gid = self.gameid;
             if (typ == rc.GS_CREATEGAME) {
                 self.creates += 1;
+                if (n >= 12) self.create_flags = .{
+                    .ladder = buf[8],
+                    .expansion = buf[9],
+                    .difficulty = buf[10],
+                    .hardcore = buf[11],
+                };
                 if (self.refuse_create_with != 0) {
                     result = self.refuse_create_with;
                     gid = 0;
@@ -110,6 +133,21 @@ pub const FakeGS = struct {
                 }
             } else if (typ == rc.GS_JOINGAME) {
                 self.joins += 1;
+                // gameid(4) token(4) charname\0 account\0 [guild\0]
+                if (n > 16) {
+                    var off: usize = 16;
+                    const cs = off;
+                    while (off < n and buf[off] != 0) off += 1;
+                    const cn = @min(off - cs, self.join_char.len - 1);
+                    self.join_char = @splat(0);
+                    @memcpy(self.join_char[0..cn], buf[cs..][0..cn]);
+                    if (off < n) off += 1;
+                    const as = off;
+                    while (off < n and buf[off] != 0) off += 1;
+                    const an = @min(off - as, self.join_account.len - 1);
+                    self.join_account = @splat(0);
+                    @memcpy(self.join_account[0..an], buf[as..][0..an]);
+                }
             } else continue;
 
             var reply: [16]u8 = undefined;

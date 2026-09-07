@@ -19,6 +19,7 @@ const headless = @import("runtime/feature/headless.zig"); // server_ready flag f
 const health = @import("runtime/feature/health.zig"); // hacky in-process HTTP health endpoint
 const gsport = @import("runtime/gsport.zig");
 const gamereap = @import("runtime/gamereap.zig");
+const autosave = @import("runtime/autosave.zig");
 const roominit = @import("runtime/roominit.zig");
 const itemroll = @import("runtime/itemroll.zig");
 const gameloop = @import("runtime/gameloop.zig");
@@ -320,6 +321,18 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
             if (v > 0) gamereap.applyConfigured(v) else gamereap.applyDefault();
         } else gamereap.applyDefault();
     }
+    // How much play a crash is allowed to cost. The engine autosaves a character every 8192 game
+    // frames (~5.5 min) and otherwise only on a clean leave, so a game shorter than that never
+    // saves at all and a server lost mid-session hands the player back where they were minutes
+    // ago. Shortened here to ~20s; an unchanged character still costs nothing, because the engine
+    // compares the save it built against the one the realm gave it and skips the store.
+    {
+        var tmp: [16]u8 = undefined;
+        if (flagToken("autosave-frames", &tmp) orelse envToken("D2GS_AUTOSAVE_FRAMES", &tmp)) |n| {
+            const v = std.fmt.parseInt(u32, tmp[0..n], 10) catch 0;
+            if (v > 0) autosave.applyConfigured(v) else autosave.applyDefault();
+        } else autosave.applyDefault();
+    }
     // Per-game server hook surface: hook RoomInit to fan out roomInit() with a real
     // per-game GameCtx (the game's own FOG pool). Opt-in via a consumer flag so the
     // default server path stays byte-identical.
@@ -401,6 +414,9 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
             idle_ticks +%= 1;
             if (idle_ticks % IDLE_TICKS_PER_SAFETY == 0) server.tick(); // ~1 Hz safety tick (accept + reap)
         }
+        // Hand back any save the store refused earlier. Nothing to do on a healthy server, and on
+        // an unhealthy one this is the difference between a blip and a lost session.
+        _ = gsredis.retryPending();
         health.tick(); // heartbeat for the health endpoint (liveness = this advancing)
         poolstat.report(); // says who holds the 8 pool managers, but only when that changes
         // With games live, wait for the frame the engine is actually going to run: both

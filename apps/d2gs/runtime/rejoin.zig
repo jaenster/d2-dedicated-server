@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const patch = @import("patch.zig");
-const joinctx = @import("../realmclient/joinctx.zig");
+const joinctx = @import("gs_seats");
 const log = @import("../log.zig");
 
 extern "kernel32" fn EnterCriticalSection(cs: usize) callconv(.winapi) void;

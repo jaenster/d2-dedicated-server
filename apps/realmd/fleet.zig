@@ -323,9 +323,23 @@ fn apply(typ: p.Type, body: []const u8) void {
             // count alone only fills the PLAYERS column.
             state.global.setGameMember(gameid, flag != p.GAMEINFO_LEAVE, char, @intCast(@min(level, 255)), @intCast(@min(class, 255)));
             // Freed as the player leaves rather than when the game ends, so a character is
-            // available for its next game immediately. Matched by name because a departure
-            // carries no account, which is why the realm keeps the pairing itself.
-            if (flag == p.GAMEINFO_LEAVE and char.len > 0) _ = store.releaseGameCharByName(gameid, char);
+            // available for its next game immediately.
+            //
+            // With the account, the seat is named exactly. Without it — an older game server, or
+            // one that had lost the pairing — the fallback matches by character name, and that is
+            // only safe while the name is unambiguous inside the game: names are unique per
+            // account on this realm, so two "Bob"s in one game means guessing, and guessing frees
+            // a lock belonging to a player who is still in the world. `releaseGameCharByName`
+            // therefore releases nothing when it cannot tell them apart, and the seat waits for
+            // the game-close sweep, which needs no names at all.
+            const acct = if (off < body.len) p.readCStr(body, &off) else "";
+            if (flag == p.GAMEINFO_LEAVE and char.len > 0) {
+                if (acct.len > 0) {
+                    _ = store.releaseGameCharExact(gameid, acct, char);
+                } else {
+                    _ = store.releaseGameCharByName(gameid, char);
+                }
+            }
         },
         .closegame => {
             if (body.len < 8) return;

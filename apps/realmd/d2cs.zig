@@ -549,10 +549,26 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
         w.putU32(0x14);
         return finish(c, &w);
     }
+    // Claimed across the whole realm, not just this account, and claimed ATOMICALLY — which also
+    // settles the race the probe above cannot: two creates of the same name, on two instances, can
+    // both pass a check-then-act and the second silently replaces the first.
+    //
+    // Realm-wide because a character name is an identity everywhere downstream of here: the game
+    // servers' seat tables, the save-retry queue, a departing player's seat release, and the Mac
+    // engine's own `<charname>.d2s` all key on it. Two characters sharing a name is one player's
+    // save landing under the other's account.
+    if (!store.claimCharName(acct, name)) {
+        log.line(tag, "char create '{s}' (account={s}) -> name taken realm-wide", .{ name, acct });
+        w.putU32(0x14);
+        return finish(c, &w);
+    }
     var save: [d2s.new_save_size]u8 = undefined;
     const now: u32 = @truncate(@as(u64, @bitCast(@as(i64, time(null)))));
     // Honor the client's flags as-is (classic = no 0x20, expansion = 0x20, +hardcore/ladder).
     if (!d2s.newSave(&save, name, class, status_flags, now) or !store.saveCharD2s(acct, name, &save)) {
+        // The claim outlives the failure otherwise, and the name is then held by a character that
+        // does not exist — unusable by anyone, including the player who just tried.
+        store.releaseCharName(acct, name);
         log.line(tag, "char create '{s}' (account={s}) -> store FAILED", .{ name, acct });
         w.putU32(0x06);
         return finish(c, &w);
@@ -576,7 +592,12 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
 fn charStatus(c: *DConn) u8 {
     var save: [64]u8 = undefined;
     const n = store.getCharD2s(c.accountName(), c.charName(), &save);
-    if (n <= 0x24) return STATUS_EXPANSION;
+    if (n <= 0x24) {
+        // Say so. This decides whether the game is classic/hardcore/ladder, and guessing wrong
+        // makes the engine refuse the creator's own join for a reason the player never sees.
+        log.line("d2cs", "char status unreadable for '{s}' ({d} bytes) -> assuming expansion softcore non-ladder", .{ c.charName(), n });
+        return STATUS_EXPANSION;
+    }
     return save[0x24] & STATUS_JOIN_MASK;
 }
 
@@ -960,7 +981,22 @@ fn onCharDelete(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
     const name = r.getStr();
+    // Refused while the character is in a game. The game server holds it in memory and saves it
+    // back on its own timer, so deleting it here does not end the session — it just loses the
+    // race: the next save recreates the character, and if the player has meanwhile made a NEW one
+    // with the same name, that stale save lands on top of it. A delete that cannot be made to
+    // stick is better refused than half-done.
+    if (store.charInUse(c.accountName(), name)) {
+        log.line(tag, "char delete '{s}' (account={s}) -> REFUSED, still in a game", .{ name, c.accountName() });
+        var busy: [16]u8 = undefined;
+        var bw = startPacket(&busy, MCP_CHARDELETE);
+        bw.putU16(reqid);
+        bw.putU32(1);
+        return finish(c, &bw);
+    }
     const ok = store.deleteCharD2s(c.accountName(), name);
+    // The name goes back to the realm with the character.
+    if (ok) store.releaseCharName(c.accountName(), name);
     log.line(tag, "char delete '{s}' (account={s}) -> {s}", .{ name, c.accountName(), if (ok) "deleted" else "FAILED" });
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARDELETE);

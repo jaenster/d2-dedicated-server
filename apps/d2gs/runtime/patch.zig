@@ -6,6 +6,7 @@
 //! bytes. Unsynchronised, that lost ~2 boots in 3 (resumed mid-instruction, died reading 0x1a) —
 //! so a patch is applied whole with every other thread stopped and off the bytes (see quiesce).
 const std = @import("std");
+const log = @import("../log.zig");
 
 const DWORD = u32;
 const BYTE = u8;
@@ -319,16 +320,37 @@ pub fn revertAll() void {
 pub const Patch = struct {
     cursor: usize,
     ok: bool = true,
+    /// Set by a failed `expect()`: every later step becomes a no-op and commit() reports failure.
+    poisoned: bool = false,
 
     const Self = @This();
 
     fn step(self: Self, wrote: bool, len: usize) Self {
-        return .{ .cursor = self.cursor + len, .ok = self.ok and wrote };
+        return .{ .cursor = self.cursor + len, .ok = self.ok and wrote, .poisoned = self.poisoned };
+    }
+
+    /// Assert what is at the cursor BEFORE overwriting it, and abandon the chain if it differs.
+    ///
+    /// Without this a patch is a bare address, and an address that has drifted — a different
+    /// build, a different engine version, an offset miscounted by one — is not an error here: the
+    /// write lands on whatever happens to be there and the process runs on, corrupt, with nothing
+    /// in the log. That is the failure mode this project keeps paying for. Every patch that
+    /// CHANGES BEHAVIOUR should state the bytes it expects to replace, so a wrong address stops
+    /// being a silent corruption and becomes one greppable line.
+    pub fn expect(self: Self, want: []const u8) Self {
+        const at: [*]const u8 = @ptrFromInt(self.cursor);
+        if (std.mem.eql(u8, at[0..want.len], want)) return self;
+        log.hex("patch: REFUSED — unexpected bytes at 0x", self.cursor);
+        log.hex("patch:   wanted first byte 0x", want[0]);
+        log.hex("patch:   found  first byte 0x", at[0]);
+        // Poison the chain: `ok` is false and the cursor is parked, so nothing after this writes.
+        return .{ .cursor = self.cursor, .ok = false, .poisoned = true };
     }
 
     /// Raw bytes at the cursor. Staged, not written — commit() applies the whole chain
     /// at once, so no thread can ever run a partly-rewritten instruction.
     pub fn bytes(self: Self, b: []const u8) Self {
+        if (self.poisoned) return self; // an expect() already failed; write nothing
         const staged = stageWrite(self.cursor, b) or writeBytesProtected(self.cursor, b);
         return self.step(staged, b.len);
     }
@@ -379,12 +401,17 @@ pub const Patch = struct {
         return self.nops(addr - self.cursor);
     }
     /// Advance the cursor `n` bytes without writing (leave the originals intact).
+    ///
+    /// Carries `poisoned`, and that is not incidental: dropping it here let a chain that had
+    /// already REFUSED an `expect()` go on to write at the address past the skip. The refusal
+    /// still reported failure from commit(), so the bytes were on the ground and the log said
+    /// the patch had not been applied — the exact silent corruption `expect` exists to prevent.
     pub fn skip(self: Self, n: usize) Self {
-        return .{ .cursor = self.cursor + n, .ok = self.ok };
+        return .{ .cursor = self.cursor + n, .ok = self.ok, .poisoned = self.poisoned };
     }
-    /// Move the cursor back `n` bytes.
+    /// Move the cursor back `n` bytes. Carries `poisoned` for the same reason as `skip`.
     pub fn rewind(self: Self, n: usize) Self {
-        return .{ .cursor = self.cursor - n, .ok = self.ok };
+        return .{ .cursor = self.cursor - n, .ok = self.ok, .poisoned = self.poisoned };
     }
 
     // Readable shorthands for common one/two-byte ops (cf. Charon's ASM::*).
@@ -416,6 +443,10 @@ pub const Patch = struct {
     /// Finish the chain: apply everything it staged, with the world stopped, and report
     /// whether every step succeeded.
     pub fn commit(self: Self) bool {
+        if (self.poisoned) {
+            stage_len = 0; // drop anything staged before the mismatch
+            return false;
+        }
         if (stage_len == 0) return self.ok;
         stage_ok = true;
         withWorldStopped(stage_base, stage_len, &applyStaged);

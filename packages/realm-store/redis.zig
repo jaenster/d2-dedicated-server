@@ -1705,21 +1705,66 @@ pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32) usize {
 }
 
 /// Free one character this game holds, matched by name because that is all a departure carries.
+/// Release the seat this game holds for exactly this character.
+///
+/// The unambiguous form of `releaseGameCharByName`, for a game server that told us which account
+/// the departing player belongs to. Nothing is scanned and nothing is guessed: the member is
+/// built, not matched, so a second character with the same name in the same game is untouched.
+pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const u8, owner: []const u8) bool {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    var mb: [96]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    var lb: [128]u8 = undefined;
+    const lockkey = std.fmt.bufPrint(&lb, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch return false;
+    // The lock is released only if this game still owns it — the same compare-and-swap every other
+    // release does. A lapsed lease may already have been taken by somebody else, and a blind DEL
+    // would free THEIR claim.
+    const script =
+        \\if redis.call('SREM', KEYS[1], ARGV[2]) == 0 then return 0 end
+        \\if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+        \\return 1
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", key, lockkey, owner, member }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
+        else => false,
+    };
+}
+
 pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u8) bool {
     var kb: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
     var sb: [64]u8 = undefined;
     const suffix = std.fmt.bufPrint(&sb, "/{s}", .{charname}) catch return false;
+    // Two passes, and the second only runs if the first found EXACTLY one match.
+    //
+    // Members are "account/charname" and the game server reports a departure by character name
+    // alone — it never carries the account. Character names are only unique per account on this
+    // realm, so a game can legitimately hold two members ending in "/Bob". Releasing the first the
+    // set happens to yield (SMEMBERS is unordered) frees a lock belonging to a player who is still
+    // in the world; another game then claims that character, both sessions write it, and whichever
+    // finishes second silently discards the other. That is a rollback with no failure anywhere.
+    //
+    // Ambiguity therefore releases NOTHING. The lock lingers until the game ends, where
+    // `releaseGameChars` frees everything the game held by gameid and needs no names at all — a
+    // late release is a small delay, and the alternative is somebody else's character.
     const script =
+        \\local hit, n = nil, 0
         \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
         \\  if string.sub(m, -string.len(ARGV[3])) == ARGV[3] then
-        \\    local lk = ARGV[2] .. m
-        \\    if redis.call('GET', lk) == ARGV[1] then redis.call('DEL', lk) end
-        \\    redis.call('SREM', KEYS[1], m)
-        \\    return 1
+        \\    hit = m
+        \\    n = n + 1
         \\  end
         \\end
-        \\return 0
+        \\if n ~= 1 then return 0 end
+        \\local lk = ARGV[2] .. hit
+        \\if redis.call('GET', lk) == ARGV[1] then redis.call('DEL', lk) end
+        \\redis.call('SREM', KEYS[1], hit)
+        \\return 1
     ;
     const s = acquire();
     defer release(s);

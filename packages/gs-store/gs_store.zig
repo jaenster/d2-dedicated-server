@@ -6,6 +6,7 @@
 //! socket carries a receive timeout and a failed op returns rather than retrying mid-tick.
 const std = @import("std");
 const resp = @import("resp");
+const savequeue = @import("savequeue.zig");
 
 const SOCKET = usize;
 const INVALID_SOCKET: SOCKET = ~@as(usize, 0);
@@ -41,6 +42,7 @@ const hostent = extern struct {
     h_addr_list: ?[*]const ?*const u32,
 };
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
 
 const INADDR_NONE: u32 = 0xffff_ffff;
 
@@ -253,6 +255,42 @@ fn readReply(s: SOCKET) ?Reply {
 
 // the operations the game server actually needs
 
+/// A character as this server took it: the bytes, and the store version they were at.
+pub const Loaded = struct {
+    len: usize,
+    /// The value of `realmd:charver:<a>/<c>` when these bytes were read. Every save this server
+    /// later makes is fenced against it, so a save built from THESE bytes can never land on top of
+    /// somebody else's newer ones. 0 means the store had no version — a character that has never
+    /// been saved, or a redis that lost its state.
+    ver: u64,
+};
+
+/// Read a character and the version it is at.
+///
+/// The VERSION IS READ FIRST, and that order is the whole point. Read the other way round, a save
+/// landing between the two reads gives us its bytes while we record the older version — and the
+/// fence would then happily let us overwrite those newer bytes with something built from them.
+/// This way the same race gives us a version older than our bytes, and our next save is refused:
+/// conservative, which is the direction a save fence must fail in.
+pub fn getCharVersioned(account: []const u8, charname: []const u8, out: []u8) Loaded {
+    const ver = charVersion(account, charname);
+    return .{ .len = getChar(account, charname, out), .ver = ver };
+}
+
+/// The store's current version for a character, 0 if it has none.
+pub fn charVersion(account: []const u8, charname: []const u8) u64 {
+    var vb: [192]u8 = undefined;
+    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return 0;
+    const rep = command(&.{ "GET", verkey }) orelse return 0;
+    return switch (rep.value) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk 0;
+            break :blk std.fmt.parseInt(u64, v, 10) catch 0;
+        },
+        else => 0,
+    };
+}
+
 /// Fetch a character save into `out`, returning its length. 0 if absent or unreadable.
 pub fn getChar(account: []const u8, charname: []const u8, out: []u8) usize {
     var kb: [192]u8 = undefined;
@@ -272,9 +310,94 @@ pub fn getChar(account: []const u8, charname: []const u8, out: []u8) usize {
     };
 }
 
+/// The characters realmd's `sanitize` accepts in a key. A name outside this set is one realmd
+/// will refuse to read back, so writing it here would store a save at an address the login path
+/// can never reach — the same silent rollback as writing under the wrong account, one step
+/// further along. Refuse it on this side too, where the save still exists to complain about.
+pub fn keyable(name: []const u8) bool {
+    if (name.len == 0 or name.len > 63) return false;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// What happened to a fenced save.
+pub const SaveResult = union(enum) {
+    /// Stored; the character is now at this version.
+    stored: u64,
+    /// REFUSED because the store has moved on: somebody wrote this character after we loaded it.
+    /// Our bytes are older than what is there, and writing them would be a rollback. Never retry
+    /// one of these — the save is genuinely obsolete.
+    stale: u64,
+    /// The store could not be reached or did not answer. Nothing is known and nothing was written;
+    /// this one IS worth retrying.
+    unavailable,
+};
+
+/// Store a character save, but only if nothing has written it since we loaded it.
+///
+/// This is the mechanism that makes a rollback structurally impossible rather than merely
+/// unlikely. Every other guard in this repo — the seat table, the retry queue's age bound, the
+/// character lock, refusing to delete a character in a game — narrows the ways older bytes can
+/// reach the store. This one closes the question: the store itself will not accept them.
+///
+/// `expect` is the version this server read with the character. The whole compare-set-increment
+/// runs inside redis, so nothing can interleave between the check and the write.
+///
+/// A current version of ZERO is accepted whatever `expect` says. It means the store has no version
+/// for this character: either it has never been saved, or redis lost its state and was refilled
+/// from postgres. In both cases a live session's bytes are the newest thing in existence, and
+/// refusing them would turn a cache flush into the very data loss this exists to prevent. The
+/// realm's character lock is what keeps two servers from being in that position at once.
+pub fn putCharFenced(account: []const u8, charname: []const u8, save: []const u8, expect: u64) SaveResult {
+    if (!keyable(account) or !keyable(charname)) return .unavailable;
+    var kb: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return .unavailable;
+    var vb: [192]u8 = undefined;
+    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return .unavailable;
+    var sb: [192]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return .unavailable;
+    var mb: [192]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return .unavailable;
+    var eb: [24]u8 = undefined;
+    const expect_s = std.fmt.bufPrint(&eb, "{d}", .{expect}) catch return .unavailable;
+
+    // Returns the new version on success, or -(current+1) when it refuses, so the caller learns
+    // what the store is actually at without a second round trip.
+    const script =
+        \\local cur = tonumber(redis.call('GET', KEYS[2]) or '0')
+        \\if cur ~= 0 and cur ~= tonumber(ARGV[1]) then return -(cur + 1) end
+        \\redis.call('SET', KEYS[1], ARGV[4])
+        \\redis.call('SADD', KEYS[3], ARGV[2])
+        \\redis.call('SADD', KEYS[4], ARGV[3])
+        \\return redis.call('INCR', KEYS[2])
+    ;
+    const rep = commandBig(&.{
+        "EVAL",         script,  "4",     key,
+        verkey,         setkey,  "realmd:dirty",
+        expect_s,       charname, member,
+    }, save) orelse return .unavailable;
+    return switch (rep.value) {
+        .int => |v| if (v > 0)
+            .{ .stored = @intCast(v) }
+        else
+            .{ .stale = @intCast(-v - 1) },
+        else => .unavailable,
+    };
+}
+
 /// Store a character save and mark it for the realm's flush worker. Both, or neither — a save
 /// redis takes but nobody is told about would sit there while postgres fell behind.
+///
+/// The account's character set is written too. realmd's own save does it (`saveCharD2s`: SET +
+/// SADD), and that set is what `listChars` reads: a character whose newest bytes are only in
+/// redis and whose name is not in the set is one the character screen does not list until
+/// postgres catches up.
 pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) bool {
+    if (!keyable(account) or !keyable(charname)) return false;
     var kb: [192]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return false;
     const set = commandBig(&.{ "SET", key }, bytes) orelse return false;
@@ -283,6 +406,9 @@ pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) boo
         .bulk => |b| if (b == null) return false,
         else => return false,
     }
+    var sb: [192]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return false;
+    _ = command(&.{ "SADD", setkey, charname }) orelse return false;
     var vb: [192]u8 = undefined;
     const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return false;
     _ = command(&.{ "INCR", verkey }) orelse return false;
@@ -290,6 +416,60 @@ pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) boo
     const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
     _ = command(&.{ "SADD", "realmd:dirty", member }) orelse return false;
     return true;
+}
+
+/// Store a character save, and if the store will not take it, keep it and try again.
+///
+/// This is what every save path should call. `putChar` alone reports a failure the caller can only
+/// log: the bytes belong to a buffer the engine is about to reuse, so a store that blinked for
+/// half a second costs a player their session — and on the way out of a game there is no later
+/// save to make up for it. Parking them costs a few KB and makes the failure a delay.
+///
+/// The return value is whether it is DURABLE NOW, not whether it is safe: false with `pending()`
+/// non-zero means it is queued, false with `park` having refused means it really is gone, which is
+/// the only case worth shouting about.
+pub fn putCharDurable(account: []const u8, charname: []const u8, save: []const u8, expect: u64) SaveResult {
+    const r = putCharFenced(account, charname, save, expect);
+    switch (r) {
+        .stored => {
+            // A success supersedes anything queued for this character: retrying an older save on
+            // top of a newer one is a rollback caused by the retry machinery itself.
+            savequeue.drop(account, charname, save.len);
+        },
+        .stale => {
+            // Genuinely obsolete. Queueing it would be queueing a rollback, and anything already
+            // queued for this character is at least as obsolete, so that goes too.
+            savequeue.drop(account, charname, save.len);
+        },
+        .unavailable => _ = savequeue.park(account, charname, save, expect, GetTickCount()),
+    }
+    return r;
+}
+
+/// How many saves are waiting for the store to come back. Zero on a healthy server.
+pub fn pending() usize {
+    return savequeue.depth();
+}
+
+/// Retry one queued save. Call from the server's own tick; one per tick is plenty, because the
+/// queue is only ever non-empty while the store is unwell and hammering it does not help.
+///
+/// Returns true if one was stored, so a caller can drain faster while it is making progress.
+pub fn retryPending() bool {
+    var acct: [32]u8 = undefined;
+    var name: [24]u8 = undefined;
+    var save: [savequeue.max_bytes]u8 = undefined;
+    const p = savequeue.peek(&acct, &name, &save, GetTickCount()) orelse return false;
+    // Retried under the SAME fence it was parked with, so a queued save is no more able to
+    // overwrite a newer one than a fresh save is. A refusal means the character moved on while we
+    // were unable to write, and the queued bytes are obsolete: drop them rather than spin.
+    switch (putCharFenced(p.account, p.charname, p.save, p.expect)) {
+        .stored, .stale => {
+            savequeue.drop(p.account, p.charname, p.save.len);
+            return true;
+        },
+        .unavailable => return false,
+    }
 }
 
 /// Publish this server's heartbeat: it exists, where clients reach it, and how loaded it is.

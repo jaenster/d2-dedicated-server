@@ -312,6 +312,26 @@ fn createSchema(p: *pg.Pool) !void {
     // overwrite by writing the wrong key; `metadata` is free-form and belongs to whoever wrote it.
     // Empty version means "no engine recorded", which reads as no constraint — that is what every
     // character created before this column existed is.
+    // Character names, claimed across the whole realm.
+    //
+    // `chars` is keyed by (account, name), so two accounts could each hold a "Bob" — and everything
+    // downstream that identifies a character by NAME then has two answers: the game server's seat
+    // table, its save-retry queue, a departing player's seat release, and, on the Mac engine, the
+    // save file itself, which is literally `<save path><charname>.d2s`. The result is not a
+    // rollback but a character swap.
+    //
+    // A separate claim table rather than a unique index on `chars`: an index would have to be
+    // created over data that may already contain duplicates, and that failure would happen at
+    // startup, in the schema bootstrap, taking the realm down. This starts empty and only ever
+    // grows, so it cannot fail on anything already there — and `claimCharName` checks `chars` too,
+    // which is what covers the characters that predate it.
+    _ = try p.exec(
+        \\create table if not exists charnames(
+        \\  lname text primary key,
+        \\  account text not null,
+        \\  name text not null
+        \\)
+    , .{});
     _ = try p.exec("alter table chars add column if not exists version text not null default ''", .{});
     _ = try p.exec("alter table chars add column if not exists metadata jsonb not null default '{}'::jsonb", .{});
     // join password, player count + description (added separately so an existing table
@@ -382,6 +402,48 @@ pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8)
         \\on conflict (account, name) do update set d2s = excluded.d2s
     , .{ a, c, bytes }) catch return false;
     return true;
+}
+
+/// Claim a character name for `account`, across the whole realm. False if somebody else has it.
+///
+/// Atomic: the primary key on `lname` is what decides, so two instances racing to create the same
+/// name cannot both win. Re-claiming a name this account already holds succeeds, which is what
+/// lets a player delete a character and make another with the same name.
+///
+/// The `chars` probe covers characters created before this table existed — they hold their names
+/// without a claim row, and must still block a newcomer.
+pub fn claimCharName(account: []const u8, charname: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    const p = ensurePool() orelse return false;
+
+    // Somebody else already has a character by this name from before the claim table.
+    if (p.row("select 1 from chars where lower(name) = lower($1) and account <> $2", .{ c, a }) catch return false) |r| {
+        var row = r;
+        row.deinit() catch {};
+        return false;
+    }
+
+    var row = (p.row(
+        \\insert into charnames(lname, account, name) values (lower($1), $2, $1)
+        \\on conflict (lname) do update set name = excluded.name
+        \\where charnames.account = $2
+        \\returning account
+    , .{ c, a }) catch return false) orelse return false;
+    defer row.deinit() catch {};
+    return true;
+}
+
+/// Give a character name back, so it can be taken again. Called when a character is deleted.
+pub fn releaseCharName(account: []const u8, charname: []const u8) void {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return;
+    const c = sanitize(charname, &cb) orelse return;
+    const p = ensurePool() orelse return;
+    _ = p.exec("delete from charnames where lname = lower($1) and account = $2", .{ c, a }) catch return;
 }
 
 pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {

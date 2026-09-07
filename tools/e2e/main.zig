@@ -571,6 +571,233 @@ fn scCreateJoinGame() Result {
     return .{ .name = name, .status = .pass, .msg = msg("create+join ok create-token={d} join-token={d} gs_ip=127.0.0.1 (creates={d} joins={d})", .{ cg.token, jg.token, gs.creates, gs.joins }) };
 }
 
+/// The store refuses a save built from bytes it has since moved past.
+///
+/// This is the mechanism that makes a rollback impossible rather than merely unlikely. Every other
+/// guard narrows the ways older bytes can reach the store — the seat table, the character lock,
+/// the retry queue's age bound, refusing to delete a character that is in a game. This one closes
+/// the question: even if every one of those failed at once, the store itself will not accept a
+/// save whose version has been superseded.
+fn scSaveFence() Result {
+    const name = "save_fence";
+    const acct = "FenceAcct";
+    const char = "Fenced";
+
+    var d2s: [0x40]u8 = undefined;
+    const v1 = minimalD2s(&d2s, char, 1, 10);
+    if ((rc.storePutChar(acct, char, v1) catch 1) != 0) return fail(name, "staging failed", .{});
+
+    const at_load = rc.storeCharVersion(acct, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (at_load == 0) return fail(name, "staged character has no version to fence on", .{});
+
+    // A save built from what we loaded is accepted, and moves the version on.
+    var b2: [0x40]u8 = undefined;
+    const v2 = minimalD2s(&b2, char, 1, 20);
+    const after = (rc.storePutCharFenced(acct, char, v2, at_load) catch |e| return fail(name, "{s}", .{@errorName(e)})) orelse
+        return fail(name, "a save at the version we loaded was refused", .{});
+    if (after <= at_load) return fail(name, "version did not advance: {d} -> {d}", .{ at_load, after });
+
+    // Now the rollback, attempted directly: a second server still holding the OLD version tries to
+    // write the OLD bytes. This is what every bug in this area eventually reduces to, and it must
+    // be refused whatever led to it.
+    const stale = rc.storePutCharFenced(acct, char, v1, at_load) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (stale != null) return fail(name, "a stale save was ACCEPTED — the fence is not holding", .{});
+
+    // And the newer character is intact: refused, not partially applied.
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const cl = c.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    for (entries[0..cl.count]) |e| {
+        if (!std.mem.eql(u8, e.name, char)) continue;
+        if (e.level != 20) return fail(name, "level={d} after a refused stale save, want 20", .{e.level});
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("v{d} -> v{d} accepted; the same save replayed at v{d} refused, character still level 20", .{ at_load, after, at_load }) };
+}
+
+/// A character name belongs to the realm, not to an account.
+///
+/// Names used to be checked only within the creating account, so two players could both have a
+/// "Bob" — and then every part of the system that identifies a character by name alone had two
+/// answers: the game servers' seat tables, the save-retry queue, a departing player's seat
+/// release, and the Mac engine's own `<charname>.d2s`. That is not a rollback, it is one player's
+/// save filed under the other's account.
+fn scRealmUniqueNames() Result {
+    const name = "realm_unique_names";
+    const shared = "Contested";
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    a.login("NameOwner") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    a.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    a.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((a.startup() catch 1) != 0) return fail(name, "d2cs startup failed (A)", .{});
+    const made = a.charCreateFresh(1, 0x20, shared) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (made != 0) return fail(name, "first create of '{s}' failed: {d}", .{ shared, made });
+
+    var b = rc.RealmClient{};
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    b.login("NameRival") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    b.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    b.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((b.startup() catch 1) != 0) return fail(name, "d2cs startup failed (B)", .{});
+    const taken = b.charCreateFresh(1, 0x20, shared) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (taken == 0) return fail(name, "a second account created '{s}' — names are not realm-unique", .{shared});
+
+    // The rival must not have acquired anything.
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const cl = b.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    for (entries[0..cl.count]) |e| {
+        if (std.mem.eql(u8, e.name, shared)) return fail(name, "the refused character is listed for the second account", .{});
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("'{s}' claimed by one account; a second account refused (0x{x})", .{ shared, taken }) };
+}
+
+/// A character that is in a game cannot be deleted out from under it.
+///
+/// The game server holds the character in memory and writes it back on its own timer, so a delete
+/// accepted here does not end the session — it loses a race with it. The next save recreates the
+/// character; and if the player made a NEW one with the same name in between, that stale save
+/// lands on top of the new character instead. Both outcomes read to the player as a rollback.
+fn scDeleteInGame() Result {
+    const name = "delete_in_game";
+    const acct = "DelGuard";
+    const char = "Busy";
+
+    var gs = FakeGS{ .gsid = 0xDE1E, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 0xDE1E };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    if ((c.charCreateFresh(1, 0x20, char) catch 1) != 0) return fail(name, "could not create '{s}'", .{char});
+    if ((c.charLogon(char) catch 1) != 0) return fail(name, "could not log on as '{s}'", .{char});
+
+    // Deletable before it is anywhere. Asserted first so a later refusal cannot be mistaken for
+    // delete simply being broken.
+    const cg = c.createGame("delgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    const jg = c.joinGame("delgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
+
+    // Now it is in a game, and the realm holds its seat.
+    const refused = c.charDelete(char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (refused == 0) return fail(name, "delete of an in-game character SUCCEEDED, want refusal", .{});
+
+    // And it is still there.
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const after = c.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var present = false;
+    for (entries[0..after.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) present = true;
+    }
+    if (!present) return fail(name, "'{s}' vanished from the list after a refused delete", .{char});
+
+    return .{ .name = name, .status = .pass, .msg = msg("delete of an in-game character refused (0x{x}); '{s}' still listed", .{ refused, char }) };
+}
+
+/// A save is only durable if it is written under the right ACCOUNT — and the account reaches the
+/// game server in one place only: the JOINGAME the realm dispatches. Get that pairing wrong and
+/// nothing fails: the save lands at an address no login path reads, the server logs a success,
+/// and the player comes back rolled back to their previous session. `save_durability` below
+/// covers the other half — that a save which reached the store survives the flush; this one is
+/// about it reaching the right place to begin with. That silence is why it is a scenario.
+fn scSaveAccountKey() Result {
+    const name = "save_account_key";
+    const acct = "SaveAcct";
+    const char = "Persist";
+
+    var gs = FakeGS{ .gsid = 0x5A4E, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 0x5A4E };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    if ((c.charCreateFresh(1, 0x20, char) catch 1) != 0) return fail(name, "could not create '{s}'", .{char});
+    if ((c.charLogon(char) catch 1) != 0) return fail(name, "could not log on as '{s}'", .{char});
+
+    const cg = c.createGame("savegame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    const jg = c.joinGame("savegame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
+
+    // What the realm told the server this character belongs to. Everything below keys off this
+    // rather than off `acct`, because this is the only value a real server ever has.
+    const told_char = std.mem.sliceTo(&gs.join_char, 0);
+    const told_acct = std.mem.sliceTo(&gs.join_account, 0);
+    if (told_char.len == 0 or told_acct.len == 0)
+        return fail(name, "JOINGAME carried char='{s}' account='{s}' — the server cannot key a save without both", .{ told_char, told_acct });
+    if (!std.ascii.eqlIgnoreCase(told_char, char))
+        return fail(name, "JOINGAME named char '{s}', want '{s}'", .{ told_char, char });
+    if (!std.ascii.eqlIgnoreCase(told_acct, acct))
+        return fail(name, "JOINGAME named account '{s}', want '{s}'", .{ told_acct, acct });
+
+    // The session happens. The server saves under the account it was told.
+    var d2s: [0x40]u8 = undefined;
+    const played = minimalD2s(&d2s, char, 1, 42);
+    const sr = rc.storePutChar(told_acct, char, played) catch |e| return fail(name, "saving under '{s}': {s}", .{ told_acct, @errorName(e) });
+    if (sr != 0) return fail(name, "save under '{s}' failed: result={d}", .{ told_acct, sr });
+
+    // Logging back in must show the session that just happened, not the one before it.
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const after = c.charList(&entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var lvl: ?u32 = null;
+    for (entries[0..after.count]) |e| {
+        if (std.mem.eql(u8, e.name, char)) lvl = e.level;
+    }
+    const played_level = lvl orelse return fail(name, "'{s}' vanished from the character list after a save", .{char});
+    if (played_level != 42) return fail(name, "level={d} after the save, want 42 — the save did not come back", .{played_level});
+
+    // And the shape of the rollback, asserted directly. A save keyed by the CHARACTER's name
+    // instead of the account — what the server wrote whenever it had lost the join's account —
+    // must leave the real character untouched. It is a well-formed save at an address nothing
+    // reads, which is exactly why the bug was invisible from the server's side.
+    const stray = minimalD2s(&d2s, char, 1, 99);
+    _ = rc.storePutChar(char, char, stray) catch |e| return fail(name, "{s}", .{@errorName(e)});
+
+    var entries2: [64]rc.CharEntry = undefined;
+    var dst2: [4096]u8 = undefined;
+    const final = c.charList(&entries2, &dst2) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    for (entries2[0..final.count]) |e| {
+        if (!std.mem.eql(u8, e.name, char)) continue;
+        if (e.level != 42)
+            return fail(name, "level={d} after a save keyed by the character name, want 42", .{e.level});
+    }
+
+    return .{ .name = name, .status = .pass, .msg = msg("JOINGAME carried {s}/{s}; a save under that account came back (lvl 1 -> 42) and one under the char name did not", .{ told_acct, told_char }) };
+}
+
 /// The join screen's PLAYERS column, and the description beside it. realmd only ever sees
 /// joins pass through it, so a count it maintained alone could only ever climb; the number
 /// that matters is the one the hosting GS reports. Asserting a DROP is the whole point.
@@ -877,6 +1104,85 @@ fn scDifficultyGate() Result {
     }
 
     return .{ .name = name, .status = .pass, .msg = msg("Nightmare gated at progression 5, Hell at 10; Normal open (engine thresholds)", .{}) };
+}
+
+/// Make a character with `status`, log it on, and have it create a game — then hand back the
+/// flag bytes the request carried to the GS. The whole point is the trip: the .d2s status byte
+/// the client asked for has to survive into CREATEGAMEREQ, and only the server sees both ends.
+fn createGameFlags(gs: *FakeGS, acct: []const u8, char: []const u8, status: u8, game: []const u8) !fakegs.CreateFlags {
+    var c = rc.RealmClient{};
+    defer c.close();
+    try c.connectBnet();
+    try c.auth();
+    try c.login(acct);
+    try c.enterRealm();
+    try c.connectD2cs();
+    if ((try c.startup()) != 0) return error.StartupFailed;
+    if ((try c.charCreateFresh(1, status, char)) != 0) return error.CharCreateFailed; // 1 = Sorceress
+    if ((try c.charLogon(char)) != 0) return error.CharLogonFailed;
+    const cg = try c.createGame(game, "d");
+    if (cg.result != 0) return error.CreateGameRefused;
+    if (gs.creates == 0) return error.NoCreateReachedGs;
+    return gs.create_flags;
+}
+
+/// A classic character's game must reach the GS as classic. Getting this wrong makes the
+/// engine build an expansion world for a client that has no expansion data.
+fn scClassicGameFlags() Result {
+    const name = "classic_game_flags";
+    var gs = FakeGS{ .gsid = 0xC1A5, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 7101 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    const f = createGameFlags(&gs, "FlagAcct", "FlagClassic", 0, "classicflags") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (f.expansion != 0) return fail(name, "expansion={d}, want 0 for a classic character", .{f.expansion});
+    return .{ .name = name, .status = .pass, .msg = msg("classic creator -> expansion=0 (ladder={d} hardcore={d} diff={d})", .{ f.ladder, f.hardcore, f.difficulty }) };
+}
+
+/// Hardcore is the one flag a mistake cannot be undone by: a softcore world for a hardcore
+/// character silently drops permadeath.
+fn scHardcoreGameFlags() Result {
+    const name = "hardcore_game_flags";
+    var gs = FakeGS{ .gsid = 0xC0DE, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 7102 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    const f = createGameFlags(&gs, "FlagAcct", "FlagHardcore", 0x24, "hcflags") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (f.hardcore != 1) return fail(name, "hardcore={d}, want 1 for a hardcore character", .{f.hardcore});
+    if (f.expansion != 1) return fail(name, "expansion={d}, want 1 (the character has 0x20 too)", .{f.expansion});
+    return .{ .name = name, .status = .pass, .msg = msg("hardcore creator -> hardcore=1 expansion=1 (ladder={d})", .{f.ladder}) };
+}
+
+/// The ladder bit used to be dropped between the request and the engine's game flags, so
+/// every ladder character was refused entry to the game it had just made.
+fn scLadderGameFlags() Result {
+    const name = "ladder_game_flags";
+    var gs = FakeGS{ .gsid = 0x1ADD, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 7103 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    const f = createGameFlags(&gs, "FlagAcct", "FlagLadder", 0x60, "ladderflags") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (f.ladder != 1) return fail(name, "ladder={d}, want 1 for a ladder character", .{f.ladder});
+    if (f.expansion != 1) return fail(name, "expansion={d}, want 1 (the character has 0x20 too)", .{f.expansion});
+    return .{ .name = name, .status = .pass, .msg = msg("ladder creator -> ladder=1 expansion=1 (hardcore={d})", .{f.hardcore}) };
+}
+
+/// And the other edge: a non-ladder character must not be handed a ladder game, which is what
+/// a flag hardcoded on rather than dropped would do.
+fn scNonLadderGameFlags() Result {
+    const name = "non_ladder_game_flags";
+    var gs = FakeGS{ .gsid = 0x0ADD, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 7104 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    const f = createGameFlags(&gs, "FlagAcct", "FlagSoftie", 0x20, "noladderflags") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (f.ladder != 0) return fail(name, "ladder={d}, want 0 for a non-ladder character", .{f.ladder});
+    if (f.hardcore != 0) return fail(name, "hardcore={d}, want 0 for a softcore character", .{f.hardcore});
+    return .{ .name = name, .status = .pass, .msg = msg("non-ladder creator -> ladder=0 hardcore=0 (expansion={d})", .{f.expansion}) };
 }
 
 fn scGetFileTime() Result {
@@ -1563,15 +1869,36 @@ fn startStores() void {
     _ = system("docker exec e2e-redis redis-cli FLUSHALL >/dev/null 2>&1"); // clean slate
     _ = setenv("REALMD_REDIS_ADDR", "127.0.0.1:6399", 1);
     _ = setenv("REALMD_PG_DSN", "postgres://realmd:realmd@127.0.0.1:55499/realmd", 1);
-    // The port being open is not the same as the server accepting connections; postgres listens
-    // briefly before it will talk. Wait for a query to actually succeed rather than for realmd to
-    // discover it the hard way.
+    // The port being open is not the same as the server accepting connections, and neither is
+    // `pg_isready`.
+    //
+    // On its FIRST boot the postgres image runs initdb, which starts a temporary server to create
+    // the database and then shuts it down and restarts the real one. That temporary server listens
+    // on a Unix socket only — so `pg_isready`, which prefers the socket, reports "accepting
+    // connections" against a server that is about to disappear and was never reachable over TCP.
+    // Meanwhile docker has already published the port, so a plain port check passes too. realmd
+    // then connects into the gap and dies with `EndOfStream`, and the whole suite fails for
+    // reasons that have nothing to do with what it was testing. That was roughly one run in two.
+    //
+    // `-h 127.0.0.1` is what tells the two apart: it forces TCP, which only the real server
+    // offers. A query, not a ping, because a server can accept a connection while still recovering.
     var waited: u32 = 0;
-    while (waited < 30_000) : (waited += 250) {
-        if (system("docker exec e2e-postgres pg_isready -q -U realmd >/dev/null 2>&1") == 0) break;
+    var pg_ready = false;
+    while (waited < 60_000) : (waited += 250) {
+        if (system("docker exec e2e-postgres psql -U realmd -h 127.0.0.1 -d realmd -c 'select 1' >/dev/null 2>&1") == 0) {
+            pg_ready = true;
+            break;
+        }
         _ = net.usleep(250_000);
     }
-    std.debug.print("started e2e-redis :{d} and e2e-postgres :{d}\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
+    if (!pg_ready) {
+        // Said plainly and fatally. Carrying on gets realmd killed by a connection error further
+        // down, which reads as a realm bug rather than a container that never came up.
+        std.debug.print("ERROR: postgres never accepted a TCP query on :{d} within 60s\n", .{PG_HOST_PORT});
+        stopStores();
+        std.process.exit(2);
+    }
+    std.debug.print("started e2e-redis :{d} and e2e-postgres :{d} (postgres answered a query)\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
 }
 
 fn stopStores() void {
@@ -2476,6 +2803,10 @@ pub fn main() !void {
         scMcpOn6112(),
         scCharListStatstring(),
         scCreateJoinGame(),
+        scSaveAccountKey(),
+        scDeleteInGame(),
+        scSaveFence(),
+        scRealmUniqueNames(),
         scGamePopulation(),
         scJoinErrors(),
         scGameInfo(),
@@ -2501,6 +2832,10 @@ pub fn main() !void {
         scNameResolution(),
         scLeaveChannel(),
         scDifficultyGate(),
+        scClassicGameFlags(),
+        scHardcoreGameFlags(),
+        scLadderGameFlags(),
+        scNonLadderGameFlags(),
         scGetFileTime(),
         scBannerAd(),
         scSaveDurability(),
