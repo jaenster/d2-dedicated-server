@@ -148,7 +148,12 @@ pub const UpdateGameInfo = extern struct {
     players: u32,
     charlevel: u32,
     charclass: u32,
-    // followed by: cstr charname
+    // followed by: cstr charname, then cstr account (optional — absent from older servers)
+    //
+    // The account is what makes a departure unambiguous. Character names are unique only per
+    // account on this realm, so a game can hold two players whose characters are both called
+    // "Bob", and a leave carrying the name alone cannot say which one left. Guessing frees a lock
+    // belonging to somebody still playing.
 };
 
 /// UPDATEGAMEINFO flag values.

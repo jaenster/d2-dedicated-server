@@ -438,16 +438,34 @@ export fn SERVER_Send(kind: u32, client: u32, data: ?[*]const u8, len: u32) call
 /// -1, not 0: the drain loops break on -1 and 0 is a legitimate length.
 const no_message: u32 = 0xFFFF_FFFF;
 
+/// Which of the three drain loops the engine has actually asked for, reported once each.
+///
+/// The three are separated only by the list index they push, so an ordinal assigned to the wrong
+/// one is invisible: the engine keeps draining the lists it knows about and the packets routed to
+/// the one it never asks for simply accumulate and are never seen again. That failure reads as the
+/// engine ignoring the player — no movement, no interaction — while the connection stays healthy,
+/// so it is worth one line each to know the loop is running at all.
+var list_drained: [3]bool = .{ false, false, false };
+
+fn noteDrain(list: u32) void {
+    if (list >= list_drained.len or list_drained[list]) return;
+    list_drained[list] = true;
+    sayFmt("d2net: engine drained message list {d} for the first time", .{list});
+}
+
 export fn SERVER_ReadFromMessageList0(buf: ?[*]u8, len: u32) callconv(.winapi) u32 {
+    noteDrain(0);
     return takeMessageFor(0, buf, len);
 }
 export fn SERVER_ReadFromMessageList1(buf: ?[*]u8, len: u32) callconv(.winapi) u32 {
+    noteDrain(1);
     return takeMessageFor(1, buf, len);
 }
 
 /// List 2's processor reads its opcode at `buf[5]`, not `buf[4]` like the other two, so it takes a
 /// different envelope entirely. Nothing we originate belongs there yet.
 export fn SERVER_ReadFromMessageList2(buf: u32, len: u32) callconv(.winapi) u32 {
+    noteDrain(2);
     _ = buf;
     _ = len;
     return no_message;

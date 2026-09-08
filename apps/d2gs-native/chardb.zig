@@ -28,6 +28,7 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
 extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
 extern "c" fn fwrite(ptr: [*]const u8, size: usize, n: usize, f: *anyopaque) usize;
+extern "c" fn fread(ptr: [*]u8, size: usize, n: usize, f: *anyopaque) usize;
 extern "c" fn fclose(f: *anyopaque) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn usleep(usec: c_uint) c_int;
@@ -61,7 +62,7 @@ const save_source_memory: u8 = 2;
 
 /// What the engine will read on the file path: `fread(buf, 1, 0x2000, f)` at 0x0020ab5b. A save
 /// larger than this is one it would truncate, so it is not one worth carrying either way.
-const max_save = 0x2000;
+pub const max_save = 0x2000;
 
 /// One save in flight per seat in the game, and the engine admits eight clients (0x001a7a66). Any
 /// more would be a character nobody asked for.
@@ -111,12 +112,38 @@ pub fn installLoadHook(loaded: *const macho.load.Loaded) void {
     at[0] = 0xe8;
     std.mem.writeInt(i32, at[1..5], rel, .little);
 
-    // Stop the other half of the round trip: `SaveToFile` (timer, `ServerGameLoop`) writes
-    // `<save path><charname>.d2s`, but nothing reads it back once loads come from the realm.
-    // Clearing this flag is the engine's own `-nosave`; only `ClientInit_SetNoSaveFlag` writes
-    // this word and only ever with 0, so a value set here before init sticks.
+    // The other half of the round trip stays ON. `SaveToFile` (timer, `ServerGameLoop`) writes
+    // `<save path><charname>.d2s`, and this used to be cleared — the engine's own `-nosave` —
+    // because nothing read those files back once loads came from the realm.
+    //
+    // Nothing read them back, and nothing wrote the character anywhere else either: this server
+    // played perfectly and persisted NOTHING. Every session ended where it began. The file is now
+    // the source `savewatch` uploads from, which is why the flag is explicitly set rather than
+    // left alone — `ClientInit_SetNoSaveFlag` is the only other writer and it only ever clears.
+    //
+    // Using the engine's own serializer and its own timer, rather than hooking either, is
+    // deliberate: it is the code path Blizzard shipped and tested, it already fires far more often
+    // than the PC build's 5.5 minutes (~10s for a changed character, ~45s otherwise), and it costs
+    // no guesses about a Mach-O function's arguments.
     const enabled: *u32 = @ptrFromInt(loaded.at(addr.save_to_file_enabled));
-    enabled.* = 0;
+    enabled.* = 1;
+}
+
+/// Read back what the engine last wrote for `charname`. 0 if there is no save yet, or it does not
+/// fit — a short read is never returned, because a truncated save uploaded anywhere becomes a
+/// corrupt character.
+pub fn readEngineSave(charname: []const u8, out: []u8) usize {
+    var path: [1024]u8 = undefined;
+    const p = savePathFor(charname, &path) orelse return 0;
+    const open: *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) ?*anyopaque =
+        @ptrFromInt(image.at(addr.open_file));
+    const f = open(p.ptr, "rb") orelse return 0;
+    defer _ = fclose(f);
+    const n = fread(out.ptr, 1, out.len, f);
+    // Exactly filling the buffer cannot be told apart from a save too big for it, and the engine
+    // itself only ever reads 0x2000, so a save that large is not one worth carrying either way.
+    if (n == 0 or n == out.len) return 0;
+    return n;
 }
 
 /// Standing in for `CLIENT_LoadCharacterSave`; `game`/`client` are live pointers, not image
@@ -165,22 +192,35 @@ fn hand(client: u32, charname: []const u8) bool {
     return false;
 }
 
-/// Have the save for a character the realm is sending ready before that client arrives. Returns
-/// false if the realm has no such character, which is the answer that keeps the join from being
-/// accepted and then failing with reason 0x0e.
-pub fn place(account: []const u8, charname: []const u8) bool {
+/// Have the save for a character the realm is sending ready before that client arrives.
+///
+/// Returns the store VERSION the save was read at, or null if the realm has no such character —
+/// which is the answer that keeps the join from being accepted and then failing with reason 0x0e.
+/// The version goes on to fence every save this session makes, so it is carried out of here rather
+/// than re-read later: a second read could see a different number than the bytes came with.
+pub fn place(account: []const u8, charname: []const u8) ?u64 {
     if (charname.len >= name_max) {
         note("d2gs-native: chardb name too long: \"{s}\"\n", .{charname});
-        return false;
+        return null;
     }
+    // Whatever this server wrote for this character LAST time it played here is still on disk, and
+    // it is now stale: the realm's copy is the truth, and it may have moved on somewhere else
+    // entirely. It has to go before anything else happens, in BOTH modes.
+    //
+    // In file mode that is obvious. In memory mode it used to be skipped, and once the save
+    // watcher started uploading what it found on disk that became a guaranteed rollback on every
+    // rejoin: the engine has not written a new save yet, so the first poll after the join reads
+    // the OLD file and pushes it over the newer one the realm was holding.
+    clearFile(charname);
+
     var save: [max_save]u8 = undefined;
-    const n = fetch(account, charname, &save);
-    if (n == 0) {
+    const loaded = store.getCharVersioned(account, charname, &save);
+    if (loaded.len == 0) {
         note("d2gs-native: chardb no save for {s}/{s}\n", .{ account, charname });
-        if (from_file) clearFile(charname);
-        return false;
+        return null;
     }
-    return if (from_file) writeFile(charname, save[0..n]) else keep(charname, save[0..n]);
+    const ok = if (from_file) writeFile(charname, save[0..loaded.len]) else keep(charname, save[0..loaded.len]);
+    return if (ok) loaded.ver else null;
 }
 
 /// Park the bytes under the character's name, replacing anything left over from an earlier join by

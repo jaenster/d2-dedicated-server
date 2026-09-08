@@ -11,6 +11,8 @@
 const std = @import("std");
 const macho = @import("macho");
 const chardb = @import("chardb.zig");
+const seats = @import("gs_seats");
+const dedupe = @import("savededupe.zig");
 const store = @import("store.zig");
 const health = @import("health.zig");
 const p = @import("realm_proto").protocol;
@@ -664,6 +666,55 @@ fn runCreate(slot: *Slot) void {
     req_result = p.CREATE_OK;
 }
 
+/// How often the engine's saves are collected. The engine rewrites a changed character about
+/// every 10 seconds, so polling faster only re-reads the same bytes; `savededupe` would drop them
+/// anyway, but the read is the cost.
+const save_poll_ms: i64 = 2000;
+var last_poll_ms: i64 = 0;
+
+fn uploadOne(_: void, charname: []const u8, account: []const u8) void {
+    var buf: [chardb.max_save]u8 = undefined;
+    const n = chardb.readEngineSave(charname, &buf);
+    if (n == 0) return; // no save written yet, or one too big to be real
+    if (!dedupe.shouldUpload(charname, buf[0..n])) return;
+    // Fenced against the version this character was loaded at: the store takes these bytes only if
+    // nothing has written the character since. The engine's file on disk is a snapshot of THIS
+    // server's session, and without the fence a stale one could land on a newer save made
+    // somewhere else.
+    switch (store.putCharFenced(account, charname, buf[0..n], seats.version(charname))) {
+        .stored => |ver| {
+            seats.setVersion(charname, ver);
+            note("d2gs-native: saved {s}/{s} ({d} bytes, v{d})\n", .{ account, charname, n, ver });
+        },
+        .stale => |cur| {
+            // The store moved on: another server, an admin, an import. Our file is the OLD copy.
+            // Refusing is correct, and it is recorded as uploaded so we stop offering it — the
+            // next save the engine writes will be built from live state, not from this file.
+            note("d2gs-native: save REFUSED as stale for {s}/{s} — store at v{d}, ours v{d}\n", .{ account, charname, cur, seats.version(charname) });
+        },
+        .unavailable => {
+            // The bytes stay on disk and `savededupe` is told to forget them, so the next poll
+            // tries again — a store that blinks costs a delay, not a character.
+            note("d2gs-native: save DEFERRED for {s}/{s} — the store did not answer, will retry\n", .{ account, charname });
+            dedupe.forget(charname);
+        },
+    }
+}
+
+/// Collect what the engine has written for every character this server is responsible for.
+///
+/// The engine persists on its own timer into `<save path><charname>.d2s` and nothing reads those
+/// files back, so this is the step that turns a played session into a character the realm has.
+/// Polling rather than hooking the engine's save is on purpose: it uses the serializer Blizzard
+/// shipped, on the schedule Blizzard shipped, and needs no assumptions about a Mach-O function's
+/// arguments.
+fn collectSaves() void {
+    const now = nowMs();
+    if (now - last_poll_ms < save_poll_ms) return;
+    last_poll_ms = now;
+    seats.forEachRemembered({}, uploadOne);
+}
+
 /// Publish this server, then take create/join from its own queue. There is nothing to connect to:
 /// the realm is reached through the store, so an instance restarting is not an event here.
 fn thread() void {
@@ -701,6 +752,10 @@ fn thread() void {
             if (size > n or size < p.HEADER_LEN) continue;
             onPacket(typ, seq, buf[p.HEADER_LEN..size]);
         }
+        // The seat table has no clock of its own off Windows; this loop is it. Only the eviction
+        // ordering and the join TTL read it, so 20ms of granularity is ample.
+        seats.advanceClock(20);
+        collectSaves();
         _ = usleep(20_000);
     }
 }
@@ -750,7 +805,7 @@ fn onCreateGame(seq: u32, body: []const u8) void {
         copyz(&req_name, readCStr(body, &off));
         _ = readCStr(body, &off); // password: the realm already matched it
         copyz(&req_desc, readCStr(body, &off));
-        req_flags = gameFlags(body[2], body[1] != 0, body[3] != 0);
+        req_flags = gameFlags(body[2], body[1] != 0, body[3] != 0, body[0] != 0);
 
         req_done.store(false, .release);
         req_armed_ms = nowMs();
@@ -791,7 +846,29 @@ fn onJoinGame(seq: u32, body: []const u8) void {
 
     var seated = false;
     if (charname.len > 0 and account.len > 0) {
-        seated = chardb.place(account, charname);
+        // Remember WHICH ACCOUNT owns this character before fetching anything. Every save this
+        // server later writes is keyed by it, and this packet is the only place it is ever
+        // stated — the GAMELOGON that follows carries the name alone.
+        // Refused rather than served if we cannot keep it: a join admitted without an account is
+        // a session whose saves are silently lost, which is worse than a join that failed. The
+        // reply below still goes out — dropping it would leave the realm waiting on a join that
+        // never answered.
+        const tracked = seats.remember(0, gid, charname, account, "");
+        if (!tracked) {
+            note("d2gs-native: cannot track {s}/{s} — refusing the join rather than losing its saves\n", .{ account, charname });
+        }
+        if (tracked) {
+            if (chardb.place(account, charname)) |ver| {
+                seated = true;
+                // Hold the account for as long as the character is here (released on leave, which
+                // lets the seat be recycled without ever taking it from somebody still playing),
+                // and remember the version these bytes came at — every save this session makes is
+                // fenced against it.
+                seats.seat(charname);
+                seats.setVersion(charname, ver);
+                dedupe.forget(charname);
+            }
+        }
         // The realm has placed this character in a game, which is what makes releasing whatever
         // seat it still holds ELSEWHERE legitimate — see `takeVouch`.
         // Only when the game is actually known. A vouch recorded with a zero target authorises
@@ -840,12 +917,15 @@ fn sendCloseGame(gid: u32) void {
 }
 
 /// Bit 2 gates the per-frame client update and the engine asserts without it; bits 12-14 are the
-/// difficulty. Same set `apps/d2gs/engine/server.zig` builds, and the same one the 0x67 probe used.
-fn gameFlags(difficulty: u8, expansion: bool, hardcore: bool) u32 {
+/// difficulty; bit 21 is ladder, which the join gate matches against the character's own status.
+/// Same set `packages/d2engine/gameflags.zig` builds — kept local only because this server does not
+/// link the engine package.
+fn gameFlags(difficulty: u8, expansion: bool, hardcore: bool, ladder: bool) u32 {
     var f: u32 = @as(u32, difficulty & 7) << 12;
     f |= 0x04;
     if (expansion) f |= 0x10_0000;
     if (hardcore) f |= 0x800;
+    if (ladder) f |= 0x20_0000;
     return f;
 }
 
@@ -981,6 +1061,7 @@ test "host:port parses into octets and a port" {
 }
 
 test "game flags carry difficulty, the client-update gate and expansion" {
-    try std.testing.expectEqual(@as(u32, 0x10_0004), gameFlags(0, true, false));
-    try std.testing.expectEqual(@as(u32, 0x10_2804), gameFlags(2, true, true));
+    try std.testing.expectEqual(@as(u32, 0x10_0004), gameFlags(0, true, false, false));
+    try std.testing.expectEqual(@as(u32, 0x10_2804), gameFlags(2, true, true, false));
+    try std.testing.expectEqual(@as(u32, 0x30_2804), gameFlags(2, true, true, true));
 }

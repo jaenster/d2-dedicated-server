@@ -109,8 +109,15 @@ clean_realm() {
     for pat in 'realmd:char:e2e*' 'realmd:chars:e2e*' 'realmd:charver:e2e*'; do
         for k in $(redis --scan --pattern "$pat"); do redis DEL "$k" >/dev/null; done
     done
+    # The realm-wide name claim goes with the character. A name is claimed for as long as a
+    # character holds it, and the claim outlives a row deleted behind the realm's back — so a
+    # harness that clears `chars` but not this leaves the name owned by a character that no longer
+    # exists. It happens to be harmless while every run uses the same account per engine, since an
+    # account may re-claim its own name; it stops being harmless the moment the accounts change.
     docker exec d2gs-dev-postgres psql -qtAX -U realmd -d realmd \
         -c "delete from chars where account like 'e2e%'" >/dev/null 2>&1 || true
+    docker exec d2gs-dev-postgres psql -qtAX -U realmd -d realmd \
+        -c "delete from charnames where account like 'e2e%'" >/dev/null 2>&1 || true
     redis DEL realmd:gs >/dev/null
 }
 

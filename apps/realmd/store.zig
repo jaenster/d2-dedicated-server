@@ -267,6 +267,8 @@ pub const max_d2s = 32 * 1024;
 /// every backend (it goes through get/saveCharD2s). Returns false if the source is missing,
 /// the name is invalid, the save is implausibly large, or the destination already exists.
 pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []const u8, dst_char: []const u8) bool {
+    // The copy brings a new NAME into existence, so it claims one like any other creation.
+    if (!claimCharName(dst_account, dst_char)) return false;
     if (dst_char.len == 0 or dst_char.len > d2s.name_max) return false;
     var buf: [max_d2s]u8 = undefined;
     const n = getCharD2s(src_account, src_char, &buf);
@@ -288,6 +290,7 @@ pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []co
 /// It will not overwrite. An import that silently replaced a character would be the one operation
 /// here with no way back.
 pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8) bool {
+    if (!claimCharName(account, name)) return false;
     if (name.len == 0 or name.len > d2s.name_max) return false;
     if (bytes.len == 0 or bytes.len > max_d2s) return false;
     if (d2s.status(bytes) == null) return false; // not a save, or too short to be one
@@ -590,6 +593,28 @@ pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64
 /// short enough that a game server lost mid-session frees its characters within a game's length.
 pub const char_lock_ttl_s: u32 = 300;
 
+/// Claim a character name for `account` across the whole realm, or report that somebody else has
+/// it. Every path that brings a NEW character name into existence goes through here — create,
+/// copy, import — because a name that is unique only within an account is a name that identifies
+/// two different characters, and half the realm identifies a character by name alone.
+pub fn claimCharName(account: []const u8, charname: []const u8) bool {
+    return pg.claimCharName(account, charname);
+}
+
+/// Give a character name back, so somebody else may take it. Called after a delete.
+pub fn releaseCharName(account: []const u8, charname: []const u8) void {
+    pg.releaseCharName(account, charname);
+}
+
+/// Is this character in a game right now? Deleting, copying onto, or importing over one that is
+/// costs the player whatever they are doing: the game server holds it in memory and will write it
+/// back on its next save, which either resurrects what was deleted or — if the name was reused in
+/// between — lands an old session's bytes on a brand-new character.
+pub fn charInUse(account: []const u8, charname: []const u8) bool {
+    var buf: [64]u8 = undefined;
+    return charLockOwner(account, charname, &buf) != null;
+}
+
 pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
     return redis.lockChar(account, charname, owner, char_lock_ttl_s);
 }
@@ -643,6 +668,13 @@ pub fn releaseGameChars(gameid: u32) usize {
     var ob: [32]u8 = undefined;
     const owner = gameOwnerId(&ob, gameid);
     return redis.releaseGameChars(gameid, owner);
+}
+
+/// Release the seat this game holds for exactly this character. Preferred over the by-name form
+/// wherever the game server told us the account — it cannot pick the wrong player.
+pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const u8) bool {
+    var buf: [32]u8 = undefined;
+    return redis.releaseGameCharExact(gameid, account, charname, gameOwnerId(&buf, gameid));
 }
 
 pub fn releaseGameCharByName(gameid: u32, charname: []const u8) bool {

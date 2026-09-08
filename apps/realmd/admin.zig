@@ -532,7 +532,13 @@ fn charsDelete(fd: net.Socket, req: []const u8) void {
     const body = bodyOf(req);
     const account = jsonStr(body, "account") orelse return respond(fd, bad_request, "{\"error\":\"missing account\"}");
     const char = jsonStr(body, "char") orelse return respond(fd, bad_request, "{\"error\":\"missing char\"}");
+    // Same rule as the client's own delete: a character in a game is held in memory by the game
+    // server and written back on its next save, so deleting it here loses a race rather than
+    // ending a session — and if the name is reused before that save lands, the old session's bytes
+    // arrive on top of a brand-new character. An operator gets told to wait, not a silent no-op.
+    if (store.charInUse(account, char)) return respond(fd, conflict, "{\"error\":\"character is in a game\"}");
     if (!store.deleteCharD2s(account, char)) return respond(fd, conflict, "{\"error\":\"delete failed\"}");
+    store.releaseCharName(account, char);
     respond(fd, ok, "{\"deleted\":true}");
 }
 

@@ -19,10 +19,14 @@ const hostapi = @import("d2engine").hostapi;
 const gameflags = @import("d2engine").gameflags;
 const d2version = @import("d2engine").version;
 const charrecord = @import("d2engine").charrecord;
+const charsave = @import("d2engine").charsave;
+const saveinterval = @import("d2engine").saveinterval;
+const seats = @import("gs_seats");
 const build_options = @import("build_options");
 const health = @import("health.zig");
 
 const HMODULE = *anyopaque;
+extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *[2]u32) callconv(.winapi) void;
 extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?HMODULE;
 extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
 extern "kernel32" fn InitializeCriticalSection(cs: *anyopaque) callconv(.winapi) void;
@@ -37,6 +41,7 @@ extern "kernel32" fn WriteFile(h: *anyopaque, buf: [*]const u8, n: u32, wrote: *
 extern "kernel32" fn AllocConsole() callconv(.winapi) i32;
 extern "kernel32" fn AddVectoredExceptionHandler(first: u32, handler: *const fn (*ExceptionPointers) callconv(.winapi) i32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetCommandLineA() callconv(.winapi) [*:0]const u8;
+extern "kernel32" fn VirtualProtect(addr: usize, size: usize, protect: u32, old: *u32) callconv(.winapi) i32;
 
 var out_handle: ?*anyopaque = null;
 
@@ -184,8 +189,12 @@ const Pending = struct {
 /// token the engine carries with the player and hands back in SaveDatabaseCharacter. pvpgn's real
 /// 1.09 server sets it to these two constants, and matching a working host costs nothing where
 /// guessing might cost an afternoon.
+// The two dwords of a FILETIME, passed BY POINTER as the character save's timestamp. The engine
+// copies both into pClient->pFileTime and CompareFileTime's them against what fpGetDatabaseFileTime
+// reports, to refuse a ladder character whose save looks staler than the realm's copy. It is a
+// timestamp, not a pointer to one — handing it an address made every ladder join fail. Filled with
+// "now" per delivery: for a single-authority store the save we just handed over IS the newest.
 var load_filetime: [2]u32 = .{ 0, 0 };
-var load_filetimes: [2]u32 = undefined;
 
 /// What pvpgn's d2gs109 puts in PLAYERINFO before every character it sends.
 const player_info_pre110: [2]u32 = .{ 0xabcdef, 0xfedcba };
@@ -264,37 +273,11 @@ fn Binding(comptime version: d2version.Version) type {
                 for (0..32) |i| txt[i] = if (p[i] >= 0x20 and p[i] < 0x7f) p[i] else '.';
                 sayFmt("  [edx] = {s}", .{txt});
             }
-            var found_any = false;
-            for (&join_contexts) |*j| {
-                if (!j.used) continue;
-                const names = [_][]const u8{ j.charName(), std.mem.sliceTo(&j.account, 0) };
-                const labels = [_][]const u8{ "szCharName", "szAccName" };
-                for (names, labels) |needle, label| {
-                    if (needle.len == 0) continue;
-                    const span: usize = 0x600;
-                    const anchors = [_]struct { name: []const u8, at: usize }{
-                        .{ .name = "ecx", .at = ecx },
-                        .{ .name = "edx", .at = edx },
-                    };
-                    for (anchors) |anchor| {
-                        if (anchor.at <= span) continue;
-                        const from = anchor.at -% span;
-                        var at: usize = 0;
-                        while (at < span * 2) : (at += 1) {
-                            const p: [*]const u8 = @ptrFromInt(from + at);
-                            if (!std.mem.eql(u8, p[0..needle.len], needle)) continue;
-                            // A field, not a stray copy: it should be NUL-terminated in place.
-                            if (p[needle.len] != 0) continue;
-                            const delta = @as(isize, @intCast(from + at)) - @as(isize, @intCast(anchor.at));
-                            sayFmt("  found {s} \"{s}\" at {s}{d} (0x{x} away)", .{
-                                label, needle, anchor.name, delta, @abs(delta),
-                            });
-                            found_any = true;
-                        }
-                    }
-                }
-            }
-            if (!found_any) say("  neither name found within +/-0x600 of ecx — widen the search");
+            probe_found_any = false;
+            probe_ecx = ecx;
+            probe_edx = edx;
+            seats.forEachRemembered({}, probeForNames);
+            if (!probe_found_any) say("  neither name found within +/-0x600 of ecx — widen the search");
             say("d2host: probe only — refusing the join until the offsets are recorded");
             return 0;
         }
@@ -305,7 +288,8 @@ fn Binding(comptime version: d2version.Version) type {
         pub fn getDatabaseCharacterEdx(ecx: usize, edx: usize, client_id: usize) callconv(.c) usize {
             _ = ecx;
             const char_name = std.mem.sliceTo(@as([*:0]const u8, @ptrFromInt(edx)), 0);
-            const acct_name = accountFor(char_name) orelse "";
+            var ab: [seats.max_account]u8 = undefined;
+            const acct_name = accountFor(char_name, &ab) orelse "";
             if (acct_name.len == 0)
                 sayFmt("d2host: no account known for '{s}' — the realm sent no JOINGAME for it", .{char_name});
             const slot = for (&pending) |*p| {
@@ -315,7 +299,9 @@ fn Binding(comptime version: d2version.Version) type {
                 return 0;
             };
             slot.* = .{ .used = true, .client_id = @intCast(client_id), .container = 0 };
-            slot.len = @intCast(store.getChar(acct_name, char_name, &slot.save));
+            const loaded = store.getCharVersioned(acct_name, char_name, &slot.save);
+            slot.len = @intCast(loaded.len);
+            if (loaded.len > 0) seats.setVersion(char_name, loaded.ver);
             sayFmt("d2host: fpGetDatabaseCharacter ({s}) — save bytes 0x{x}", .{ char_name, slot.len });
             return 0;
         }
@@ -327,7 +313,8 @@ fn Binding(comptime version: d2version.Version) type {
             const char_name = std.mem.sliceTo(sz_char, 0);
             // The realm's JOINGAME is the only place the account is known; the engine leaves its
             // own field empty on this path, so fall back to it only if we were never told.
-            const acct_name = accountFor(char_name) orelse std.mem.sliceTo(sz_acct, 0);
+            var ab: [seats.max_account]u8 = undefined;
+            const acct_name = accountFor(char_name, &ab) orelse std.mem.sliceTo(sz_acct, 0);
             if (acct_name.len == 0) {
                 // Nothing told us the account: the engine leaves its field empty on this path and
                 // no JOINGAME for this character reached us. Say so, because the alternative is a
@@ -346,7 +333,9 @@ fn Binding(comptime version: d2version.Version) type {
             // save comes back and removes the client if it disagrees.
             const container_slot: *const usize = @ptrFromInt(ecx -% 8);
             slot.* = .{ .used = true, .client_id = @intCast(client_id), .container = container_slot.* };
-            slot.len = @intCast(store.getChar(acct_name, char_name, &slot.save));
+            const loaded = store.getCharVersioned(acct_name, char_name, &slot.save);
+            slot.len = @intCast(loaded.len);
+            if (loaded.len > 0) seats.setVersion(char_name, loaded.ver);
             sayHex("d2host: fpGetDatabaseCharacter — save bytes ", slot.len);
             return 0;
         }
@@ -393,7 +382,8 @@ fn Binding(comptime version: d2version.Version) type {
             });
             if (!realmConfigured()) return 1;
             const want = std.mem.sliceTo(char_name, 0);
-            const staged = accountFor(want) orelse {
+            var sb: [seats.max_account]u8 = undefined;
+            const staged = accountFor(want, &sb) orelse {
                 sayFmt("d2host: REFUSED join — the realm staged no context for '{s}'", .{want});
                 return 0;
             };
@@ -454,7 +444,14 @@ fn Binding(comptime version: d2version.Version) type {
                     cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
                     getDatabaseCharacter,
                 ).shim),
-                .save_database_character = stubFor(.fpSaveDatabaseCharacter, "pfSaveDatabaseCharacter"),
+                // The slot that makes progress survive the game. It was a reporting stub, which
+                // meant every pre-1.14 engine we host played perfectly and persisted nothing:
+                // a player's character came back from whatever the realm last wrote, which is
+                // character creation. Nothing logged a failure, because nothing failed.
+                .save_database_character = @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpSaveDatabaseCharacter),
+                    saveDatabaseCharacter,
+                ).shim),
                 .server_log_message = @ptrCast(&serverLogMessage),
                 .enter_game = stubFor(.fpEnterGame, "pfEnterGame"),
                 .find_player_token = @ptrCast(&fastcall.Callback2(
@@ -526,7 +523,8 @@ fn pumpCharacterLoads() void {
             // No container argument before 1.10: the engine had not started cross-checking it.
             _ = send(p.client_id, &p.save, size, size, lock, 0, &player_info_pre110);
         } else if (send_character) |send| {
-            _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetimes, p.container);
+            GetSystemTimeAsFileTime(&load_filetime);
+            _ = send(p.client_id, &p.save, size, size, lock, 0, &load_filetime, p.container);
         } else return;
         if (!refused) {
             sayHex("d2host: character delivered, bytes ", p.len);
@@ -612,7 +610,7 @@ fn handleCreateGame(seq: u32, body: []const u8) void {
     const is_expansion = body[1] != 0;
     const difficulty: u3 = @truncate(body[2]);
     const is_hardcore = body[3] != 0;
-    const flags = gameflags.gameFlags(difficulty, is_expansion, is_hardcore);
+    const flags = gameflags.gameFlags(difficulty, is_expansion, is_hardcore, ladder != 0);
 
     var off: usize = 4;
     const want_name = proto.readCStr(body, &off);
@@ -638,47 +636,52 @@ fn handleCreateGame(seq: u32, body: []const u8) void {
     _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
 }
 
-/// Who is joining, remembered from the realm's JOINGAME so the character fetch can find them.
+/// Who is joining, remembered from the realm's JOINGAME so the character fetch and every later
+/// save can find them.
 ///
-/// The engine's join path carries the character name and the token but **never the account** — it
-/// leaves `pClient+0x1D` empty — and the save is keyed by account. Without this the fetch looks up
-/// `realmd:char::<char>` and misses, which surfaces as a refused join with nothing to explain it.
-const JoinContext = struct {
-    used: bool = false,
-    char: [24]u8 = @splat(0),
-    account: [24]u8 = @splat(0),
+/// The table itself is `packages/gs-seats`, shared with both other game servers. It used to be a
+/// local array here, and the 1.14d DLL had its own, and the Mac server had none — three answers to
+/// one question, which is three chances for a save to be filed under the wrong account. It also
+/// carries the store VERSION each character was loaded at, which is what every save is fenced
+/// against.
+/// Scratch for `probeClientFields`, which walks the seat table through a callback and so cannot
+/// close over its own locals. Probe-only, single-threaded, and never read outside that path.
+var probe_ecx: usize = 0;
+var probe_edx: usize = 0;
+var probe_found_any = false;
 
-    fn charName(self: *const JoinContext) []const u8 {
-        return std.mem.sliceTo(&self.char, 0);
+/// Search memory around ECX/EDX for a name the realm told us about, and report the distance. That
+/// distance is the `hostapi.clientFields` measurement, taken from the only place the layout is
+/// actually visible.
+fn probeForNames(_: void, charname: []const u8, account: []const u8) void {
+    const names = [_][]const u8{ charname, account };
+    const labels = [_][]const u8{ "szCharName", "szAccName" };
+    for (names, labels) |needle, label| {
+        if (needle.len == 0) continue;
+        const span: usize = 0x600;
+        const anchors = [_]struct { name: []const u8, at: usize }{
+            .{ .name = "ecx", .at = probe_ecx },
+            .{ .name = "edx", .at = probe_edx },
+        };
+        for (anchors) |a| {
+            if (a.at <= span) continue;
+            const from = a.at -% span;
+            var at: usize = 0;
+            while (at < span * 2) : (at += 1) {
+                const p: [*]const u8 = @ptrFromInt(from + at);
+                if (!std.mem.eql(u8, p[0..needle.len], needle)) continue;
+                // A field, not a stray copy: it should be NUL-terminated in place.
+                if (p[needle.len] != 0) continue;
+                const delta = @as(isize, @intCast(from + at)) - @as(isize, @intCast(a.at));
+                sayFmt("  found {s} \"{s}\" at {s}{d} (0x{x} away)", .{ label, needle, a.name, delta, @abs(delta) });
+                probe_found_any = true;
+            }
+        }
     }
-};
-
-var join_contexts: [16]JoinContext = @splat(.{});
-
-fn rememberJoin(char: []const u8, account: []const u8) void {
-    if (char.len == 0 or account.len == 0) {
-        sayFmt("d2host: JOINGAME with no char/account to cache ('{s}'/'{s}')", .{ char, account });
-        return;
-    }
-    // Newest wins: a re-join of the same character replaces its entry rather than filling the
-    // table with stale copies.
-    const slot = for (&join_contexts) |*j| {
-        if (j.used and std.mem.eql(u8, j.charName(), char)) break j;
-    } else for (&join_contexts) |*j| {
-        if (!j.used) break j;
-    } else &join_contexts[0];
-
-    slot.* = .{ .used = true };
-    @memcpy(slot.char[0..@min(char.len, 23)], char[0..@min(char.len, 23)]);
-    @memcpy(slot.account[0..@min(account.len, 23)], account[0..@min(account.len, 23)]);
-    sayFmt("d2host: JOINGAME cached {s}/{s} for the character fetch", .{ account, char });
 }
 
-fn accountFor(char: []const u8) ?[]const u8 {
-    for (&join_contexts) |*j| {
-        if (j.used and std.mem.eql(u8, j.charName(), char)) return std.mem.sliceTo(&j.account, 0);
-    }
-    return null;
+fn accountFor(char: []const u8, out: []u8) ?[]const u8 {
+    return seats.accountForChar(char, out);
 }
 
 /// `JOINGAMEREQ: gameid, token, charname\0, account\0`. The realm has already authorised this
@@ -696,7 +699,16 @@ fn handleJoinGame(seq: u32, body: []const u8) void {
     var off: usize = 8;
     const charname = proto.readCStr(body, &off);
     const account = proto.readCStr(body, &off);
-    rememberJoin(charname, account);
+    // Refused rather than served if the seat cannot be tracked: a join admitted without an
+    // account is a session whose saves are silently lost, and a name already seated for a
+    // DIFFERENT account is one whose saves would land under the wrong one.
+    if (charname.len == 0 or account.len == 0 or !seats.remember(0, gameid, charname, account, "")) {
+        sayFmt("d2host: REFUSING join — cannot track '{s}'/'{s}' (name seated elsewhere, or unusable)", .{ account, charname });
+        reply.result = 1;
+        _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
+        return;
+    }
+    sayFmt("d2host: JOINGAME cached {s}/{s} for the character fetch", .{ account, charname });
     health.players_joined +%= 1;
     reply.gameid = gameid;
     _ = store.putReply(seq, std.mem.asBytes(&reply), 30);
@@ -940,6 +952,74 @@ const event_ttl_s: u32 = 3600;
 /// every character in it stayed claimed. That surfaces three moves later and reads as three
 /// separate bugs: `create game '<name>' -> name already exists`, `character '<name>' is held by
 /// game:N`, and a join refused 0x2b "game is full" with nobody in it.
+/// `fpSaveDatabaseCharacter` (slot 0x0C) — persist a character mid-game and on the way out.
+///
+/// `__fastcall (LPGAMEDATA, char *szCharName, char *szAccountName, void *pSave, u32 nSize,
+/// PLAYERDATA)`, four stack arguments on every version we host. That signature is pvpgn's own
+/// 1.09d game server header verbatim (`d2gelib/d2server.h`), and it matches what 1.14d's call site
+/// @0x53220d builds — the shape is shared across the whole family, which is why one handler serves
+/// every engine here.
+///
+/// `pSave` is a `u16` length followed by the .d2s; `packages/d2engine/charsave.zig` owns that
+/// decode so this host and the 1.14d one cannot drift on the two-byte offset.
+fn saveDatabaseCharacter(ecx: usize, edx: usize, account: usize, save: usize, size: usize, player: usize) callconv(.c) usize {
+    _ = .{ ecx, player };
+
+    if (save == 0 or size < charsave.min_blob or size > charsave.max_d2s + 2) {
+        sayFmt("d2host: pfSaveDatabaseCharacter — implausible save size {d}, dropped", .{size});
+        return 0;
+    }
+    const blob: [*]const u8 = @ptrFromInt(save);
+    const decoded = charsave.decode(blob[0..size]) catch |e| {
+        sayFmt("d2host: pfSaveDatabaseCharacter — not a save ({s}), dropped", .{@errorName(e)});
+        return 0;
+    };
+
+    // The account is what the save is keyed by, and there is no honest guess: a save filed under
+    // the wrong account is a well-formed save at an address no login path reads, so the player is
+    // silently rolled back. Prefer the engine's own argument, fall back to the realm's JOINGAME
+    // context, and drop it loudly rather than invent one.
+    const from_engine = if (account != 0) std.mem.sliceTo(@as([*:0]const u8, @ptrFromInt(account)), 0) else "";
+    var acct_fallback: [seats.max_account]u8 = undefined;
+    const acct = if (store.keyable(from_engine) and !eqlIgnoreCase(from_engine, decoded.charname))
+        from_engine
+    else
+        accountFor(decoded.charname, &acct_fallback) orelse {
+            sayFmt("d2host: pfSaveDatabaseCharacter — no account known for '{s}', save DROPPED", .{decoded.charname});
+            return 0;
+        };
+
+    // Fenced against the version this character was loaded at: the store accepts these bytes only
+    // if nothing has written the character since. That is what makes a rollback impossible here
+    // rather than merely unlikely.
+    switch (store.putCharDurable(acct, decoded.charname, decoded.d2s, seats.version(decoded.charname))) {
+        .stored => |ver| {
+            seats.setVersion(decoded.charname, ver);
+            sayFmt("d2host: saved {s}/{s} ({d} bytes, v{d})", .{ acct, decoded.charname, decoded.d2s.len, ver });
+        },
+        .stale => |cur| sayFmt(
+            "d2host: save REFUSED as stale for {s}/{s} — store is at v{d}, ours was v{d}; NOT overwriting",
+            .{ acct, decoded.charname, cur, seats.version(decoded.charname) },
+        ),
+        // Deferred, not lost: the bytes are queued with their fence and the service loop retries
+        // them. Said plainly anyway, because a queue that is never empty needs looking at.
+        .unavailable => sayFmt(
+            "d2host: save DEFERRED for {s}/{s} — store did not answer, {d} waiting",
+            .{ acct, decoded.charname, store.pending() },
+        ),
+    }
+    _ = edx; // szCharName; the save's own header names it, and that is what we file it under
+    return 1;
+}
+
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
 fn closeGame(ecx: usize, edx: usize) callconv(.c) usize {
     _ = edx;
     const gid: u32 = @truncate(ecx);
@@ -1171,6 +1251,76 @@ fn noteModule(name: []const u8, base: usize) void {
     }
     loaded_modules[loaded_module_count] = .{ .name = name, .base = base, .end = end };
     loaded_module_count += 1;
+    // D2Game owns the server game loop, and with it the save interval. Done here rather than at a
+    // fixed address because the address is different in every engine this host serves.
+    if (std.mem.eql(u8, name, "D2Game.dll")) shortenSaveInterval(name, base, end);
+}
+
+/// Shorten how often the engine saves a character mid-game.
+///
+/// Every engine here autosaves on a game-frame interval — 8192 frames, about five and a half
+/// minutes — and otherwise only on a clean leave. A game shorter than that never autosaves at all,
+/// and a server lost mid-session hands the player back where they were minutes ago. Neither is a
+/// rollback in the sense of old bytes overwriting new; both are simply progress that was never
+/// written down, which the player experiences identically.
+///
+/// The site is FOUND rather than measured, because there are five engines here and the constant
+/// identifies itself: see `saveinterval`. Exactly one match is required. Zero means this engine
+/// does something else; more than one means the constant is not the identity we assumed. Both
+/// leave the stock interval in place — a longer save interval is a known cost, and a byte written
+/// into the middle of the wrong instruction is not.
+fn shortenSaveInterval(module: []const u8, base: usize, end: usize) void {
+    if (end <= base) return;
+    const code: []const u8 = @as([*]const u8, @ptrFromInt(base))[0 .. end - base];
+
+    var sites: [4]saveinterval.Site = undefined;
+    const n = saveinterval.findMaskSites(code, saveinterval.stock_frames, &sites);
+    if (n != 1) {
+        sayFmt("d2host: autosave interval NOT shortened in {s} — {d} candidate sites, want exactly 1", .{ module, n });
+        return;
+    }
+
+    const frames = saveinterval.round(autosave_frames);
+    var mask_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &mask_bytes, saveinterval.mask(frames), .little);
+    var fixup_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &fixup_bytes, saveinterval.fixup(frames), .little);
+    const at = base + sites[0].imm_at;
+    // Read as bytes. An instruction's immediate is wherever the encoding puts it, which is almost
+    // never 4-byte aligned, and a typed load of it panics on "incorrect alignment" — which is
+    // exactly what this did the first time it was pointed at a real D2Game.dll.
+    const before = std.mem.readInt(u32, @as([*]const u8, @ptrFromInt(at))[0..4], .little);
+    if (before != saveinterval.mask(saveinterval.stock_frames)) {
+        sayFmt("d2host: autosave immediate moved under us in {s}; leaving it alone", .{module});
+        return;
+    }
+    if (!writeProtected(at, &mask_bytes)) {
+        sayFmt("d2host: could not write the autosave interval in {s}", .{module});
+        return;
+    }
+    // The negative-frame fixup has to agree with the mask or the two contradict each other. It is
+    // an unreachable path — the frame counter would have to run for years — so a miss here is
+    // reported and not fatal.
+    if (saveinterval.findFixupAfter(code, sites[0].at + sites[0].len, saveinterval.stock_frames, 32)) |fx| {
+        _ = writeProtected(base + fx.imm_at, &fixup_bytes);
+    }
+    sayFmt("d2host: {s} autosaves every {d} frames (~{d}s), was {d}", .{
+        module, frames, frames / saveinterval.fps, saveinterval.stock_frames,
+    });
+}
+
+/// How often a character is saved mid-game, in engine frames. Overridable because the right value
+/// is a trade between write load and how much play a crash costs, and that differs per realm.
+var autosave_frames: u32 = 512;
+
+/// Write bytes into a module's code, making the page writable for the duration.
+fn writeProtected(at: usize, bytes: []const u8) bool {
+    var old: u32 = 0;
+    if (VirtualProtect(at, bytes.len, 0x40, &old) == 0) return false; // PAGE_EXECUTE_READWRITE
+    @memcpy(@as([*]u8, @ptrFromInt(at))[0..bytes.len], bytes);
+    var back: u32 = 0;
+    _ = VirtualProtect(at, bytes.len, old, &back);
+    return true;
 }
 
 /// Which module `addr` is in, or null when it is not in any of them.
@@ -1739,7 +1889,6 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     // @10007 — the async half of fpGetDatabaseCharacter. Without it a fetched save has nowhere to
     // go and every join stalls, so say so at startup rather than at the first join.
     if (byOrdinal(d2game, hostapi.sendDatabaseCharacter(version).?.ordinal)) |p| {
-        load_filetimes = .{ @truncate(@intFromPtr(&load_filetime)), 0 };
         if (comptime hostapi.sendDatabaseCharacterArgs(version) orelse 8 == 7) {
             send_character7 = @ptrCast(@alignCast(p));
             say("d2host: D2GSSendDatabaseCharacter @10007 resolved (7-argument form)");
@@ -1757,7 +1906,7 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
         @memcpy(name[0..5], "spike");
         var game_id: u16 = 0;
         say("d2host: no realm configured — creating one game directly");
-        ok = create_game.?(&name, "", "d2host spike", gameflags.gameFlags(0, true, false), 0, 0, 8, &game_id);
+        ok = create_game.?(&name, "", "d2host spike", gameflags.gameFlags(0, true, false, false), 0, 0, 8, &game_id);
         sayHex("d2host: GAME_CreateNewEmptyGame returned=", @intCast(ok));
         sayHex("d2host: esp after CreateNewEmptyGame = ", espNow());
         sayHex("d2host:   gameId=", game_id);
@@ -1799,6 +1948,12 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
     const worker_ctx_fn = byOrdinal(d2game, game_ord.worker_context);
     const process_game = byOrdinal(d2game, game_ord.process_game);
     const flush_game = byOrdinal(d2game, game_ord.flush_game);
+    // The cooperative model, where this version has been measured against a real server. It
+    // replaces the per-game worker loop below rather than joining it: `process_all_games` walks
+    // the game array itself, so iterating games here as well would tick each one twice.
+    const process_all = if (comptime game_ord.process_all_games) |o| byOrdinal(d2game, o) else null;
+    const dispatch_cleanup = if (comptime game_ord.dispatch_cleanup) |o| byOrdinal(d2game, o) else null;
+    if (process_all != null) say("d2host: driving the engine cooperatively (process-all-games)");
 
     var worker_ctx: usize = 0;
     if (worker_ctx_fn) |p| {
@@ -1866,7 +2021,26 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
 
         // Drain every game the worker has ready, not just one per frame: at 50 ms a frame a
         // single game per tick is a hard cap on how fast anything reaches a client.
-        if (process_game) |proc| {
+        if (process_all) |all| {
+            // `SrvProcessAllGames(0)` returns whether any game ticked; the outbound dispatch runs
+            // only when one did, exactly as the reference server does it. Stack drift is measured
+            // because a wrong arity here is silent until something unrelated returns into it.
+            const esp_pre = espNow();
+            const ticked = @as(*const fn (u32) callconv(.winapi) u32, @ptrCast(@alignCast(all)))(0);
+            if (ticked != 0) {
+                flushes += 1;
+                health.game_frames = @truncate(flushes);
+                if (flushes % 500 == 1) sayFmt("d2host: processed {d} game frame(s)", .{flushes});
+                if (dispatch_cleanup) |disp| {
+                    _ = @as(*const fn (u32, u32) callconv(.winapi) u32, @ptrCast(@alignCast(disp)))(0, 0);
+                }
+            }
+            const esp_post = espNow();
+            if (esp_post != esp_pre and stack_drift_reports < 8) {
+                stack_drift_reports += 1;
+                sayFmt("d2host: STACK DRIFT across process-all-games: esp 0x{x} -> 0x{x}", .{ esp_pre, esp_post });
+            }
+        } else if (process_game) |proc| {
             var spins: usize = 0;
             while (spins < 64) : (spins += 1) {
                 // One word is enough: given 128 bytes of room and 1.06b driving it, the engine
@@ -1898,6 +2072,9 @@ fn createGame(comptime version: d2version.Version, d2game: HMODULE) !void {
                 }
             }
         }
+        // Hand back any save the store refused earlier. A no-op on a healthy server; on an
+        // unhealthy one it is what keeps a blip from costing somebody their session.
+        _ = store.retryPending();
         // 10 ms is the idle cadence a third-party host publishes as DEFAULT_IDLE_SLEEP, and
         // Blizzard's own worker loop is tighter still — it spins on a network wait rather than
         // sleeping. At 50 ms the engine's scheduler rarely had a game ready when we asked.

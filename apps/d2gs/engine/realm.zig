@@ -15,10 +15,11 @@ const server = @import("server.zig");
 const cb = @import("d2engine").callbacks;
 const hostapi = @import("d2engine").hostapi;
 const gsredis = @import("gs_store");
-const joinctx = @import("../realmclient/joinctx.zig");
+const joinctx = @import("gs_seats");
 const obs = @import("obs");
-const patch = @import("../runtime/patch.zig");
 const log = @import("../log.zig");
+
+extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *[2]u32) callconv(.winapi) void;
 
 /// The table we register via SetupAsBnetServer.
 pub var table: server.BnetServerService = .{};
@@ -34,8 +35,13 @@ pub var table: server.BnetServerService = .{};
 const OnDatabaseCharacterReceived: *const hostapi.SendDatabaseCharacterFn =
     @ptrFromInt(hostapi.sendDatabaseCharacter(.v114d).?.address);
 
-var load_filetime: [2]u32 = .{ 0, 0 }; // a zeroed FILETIME (load-time placeholder)
-var load_filetimes: [2]u32 = undefined; // { &load_filetime, unk0x194 }
+// Arg 7 of CLIENT_OnDatabaseCharacterReceived is a POINTER TO the two dwords of a FILETIME, not
+// a pointer to a pointer: @0x5307e8 the engine does `eax=[ebp+0x20]; [edi+0x190]=[eax];
+// [edi+0x194]=[eax+4]`, so both dwords land verbatim in pClient->pFileTime. That timestamp is the
+// left-hand side of the CompareFileTime in CalculateGetFlags @0x569d80: a ladder character joins
+// only while its save reads NEWER than the realm's stored copy, which for a single-authority store
+// is always true. Filled per delivery with "now".
+var load_filetime: [2]u32 = .{ 0, 0 };
 
 // Pending character delivery. fpGetDatabaseCharacter is meant to be async, but calling
 // OnDatabaseCharacterReceived synchronously runs it before SrvJoinGame's ClientSetDwSaveTo1 and
@@ -85,7 +91,8 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
     // The engine never fills the account on this path, so resolve it from the
     // join context the realm sent with JOINGAME (keyed by the joining char name),
     // and write it back into pClient->szAccName so the rest of the engine has it.
-    const acct_name = joinctx.accountForChar(char_name) orelse
+    var acct_buf: [joinctx.max_account]u8 = undefined;
+    const acct_name = joinctx.accountForChar(char_name, &acct_buf) orelse
         std.mem.sliceTo(sz_acct, 0); // fall back to whatever the engine had
     if (acct_name.len > 0 and acct_name.ptr != sz_acct) {
         const n = @min(acct_name.len, 63);
@@ -114,12 +121,21 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
         // fetch was never reached when the dial failed, and it read as a broken store.
         var sp = obs.enter("char_fetch");
         defer sp.exit();
-        save_len = gsredis.getChar(acct_name, char_name, &slot.save);
+        // Versioned: every save this session makes is fenced against the version these bytes came
+        // at, so a save built from them can never land on top of somebody else's newer ones.
+        const loaded = gsredis.getCharVersioned(acct_name, char_name, &slot.save);
+        save_len = loaded.len;
+        if (save_len > 0) joinctx.setVersion(char_name, loaded.ver);
     }
+
+    // The character is now this server's to save. Hold its account/char mapping until the engine
+    // reports it gone: every save for the rest of the session is keyed by that account, and an
+    // entry recycled from under a seated player sends their saves to a key nothing reads.
+    if (save_len > 0) joinctx.seat(char_name);
 
     // Queue the delivery for the tick loop; do NOT call OnDatabaseCharacterReceived
     // synchronously here (see Pending).
-    load_filetimes = .{ @truncate(@intFromPtr(&load_filetime)), 0 };
+    GetSystemTimeAsFileTime(&load_filetime);
     slot.client_id = @intCast(client_id);
     slot.container = container;
     slot.len = if (save_len > 0 and save_len <= 0xFFFF) @intCast(save_len) else 0;
@@ -138,25 +154,50 @@ pub fn pumpDelivery() void {
         defer slot.busy.store(false, .release);
         if (slot.len == 0) {
             log.print("realm:   char fetch FAILED — refusing join");
-            _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, 0, 0, 1, 0, &load_filetimes, @intFromPtr(slot.container));
+            _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, 0, 0, 1, 0, &load_filetime, @intFromPtr(slot.container));
             continue;
         }
-        _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, slot.len, slot.len, 0, 0, &load_filetimes, @intFromPtr(slot.container));
+        _ = OnDatabaseCharacterReceived(slot.client_id, &slot.save, slot.len, slot.len, 0, 0, &load_filetime, @intFromPtr(slot.container));
         log.print("realm:   char delivered (SendStateCommand 2)");
     }
 }
 
 pub const getDatabaseCharShim = cb.Shim(cb.v114d, .fpGetDatabaseCharacter, getDatabaseCharImpl).shim;
 
+/// Read a NUL-terminated engine string without trusting it to be terminated. Anything the engine
+/// hands us as `char*` is read this way: a missing terminator would otherwise walk off the end of
+/// its buffer, and the strings here decide where a save is written.
+fn boundedCStr(ptr: usize, max: usize) []const u8 {
+    if (ptr == 0) return "";
+    const p: [*]const u8 = @ptrFromInt(ptr);
+    var i: usize = 0;
+    while (i < max) : (i += 1) {
+        if (p[i] == 0) return p[0..i];
+    }
+    return "";
+}
+
 // fpSaveDatabaseCharacter (slot 0x0C). Called by SaveAllPlayers @0x52ca10 -> SaveGameAllGameTypes
 // @0x532400 -> SaveToFileBnet @0x531eb0 whenever the save CHANGED (~8192 frames / 5.5 min, or on
 // leave/disconnect). __fastcall ECX+EDX+4 stack (6 args), ret 0x10 (confirmed by disasm + runtime
-// arg dump): ECX=&realmId, EDX/s1=name strings, s2=&{u16 size; .d2s} (size=.d2s_len+2, .d2s at
-// s2+2), s3=total size, s4=client container. Char name is at .d2s offset 0x14 (16 bytes) after
-// validating the 0xaa55aa55 signature; account comes from the join context. Outbound-only — safe
-// to run synchronously on the tick thread.
+// arg dump). The call site is 0x53220d and sets up:
+//
+//   ECX = &nRealmId       a local COPY of the realm id on SaveToFileBnet's own frame. It is NOT
+//                         &pClient->pRealm, so the ECX-0x4B / ECX-0x5B trick that reads the
+//                         client's names in fpGetDatabaseCharacter does not work here.
+//   EDX = char*           the character name
+//   s1  = char*           THE ACCOUNT NAME — a local buffer SaveToFileBnet filled from
+//                         GetAccountName @0x5392f0 (`SStrCopy(szText, pClient->szAccName, 0x32)`).
+//   s2  = &{u16 size; .d2s}   size = .d2s_len + 2, the save itself at s2+2
+//   s3  = total size
+//   s4  = client container    pClient->pClientContainer (offset 0x60) by value — an opaque BNet
+//                             handle, not a pointer into D2ClientStrc.
+//
+// Char name is taken from .d2s offset 0x14 (16 bytes) after validating the 0xaa55aa55 signature
+// rather than from EDX, because the save is the thing being written and its own header is what
+// names it. Outbound-only — safe to run synchronously on the tick thread.
 fn saveDatabaseCharImpl(ecx: usize, edx: usize, s1: usize, s2: usize, s3: usize, s4: usize) callconv(.c) usize {
-    _ = .{ ecx, edx, s1, s3, s4 };
+    _ = .{ ecx, edx, s3, s4 };
     const buf: [*]const u8 = @ptrFromInt(s2);
     const total: usize = std.mem.readInt(u16, buf[0..2], .little);
     if (total < 2 + 0x24) {
@@ -170,7 +211,44 @@ fn saveDatabaseCharImpl(ecx: usize, edx: usize, s1: usize, s2: usize, s3: usize,
         return 0;
     }
     const char_name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&d2s[0x14])), 0);
-    const account = joinctx.accountForChar(char_name) orelse char_name;
+
+    // The save is keyed by ACCOUNT, and getting that wrong is invisible: a save written under the
+    // wrong account is a perfectly good save at an address no login path reads, so the player is
+    // rolled back to whatever their last correctly-keyed save was and nothing reports a failure.
+    // This used to fall back to the CHARACTER's own name, writing `realmd:char:<Char>:<Char>`.
+    //
+    // Two sources, in this order:
+    //
+    //  1. s1, the engine's own account string for THIS CLIENT — a local buffer SaveToFileBnet
+    //     fills from GetAccountName @0x5392f0, i.e. pClient->szAccName, which
+    //     fpGetDatabaseCharacter wrote the realm's account into on the way in. Our own value
+    //     handed back by the party that has held it all session.
+    //  2. the seat table, for a save whose JOINGAME we have but whose client field is empty.
+    //
+    // Neither: DROP the save and say so. There is no third guess that is not a lie.
+    //
+    // The per-client field goes FIRST because it is the only one of the two that is unambiguous.
+    // This realm does not make character names globally unique — the create-time check is scoped
+    // to one account — so a lookup BY NAME can return the wrong player's account entirely, which
+    // is not a rollback but a character swap. `gs_seats` refuses to seat two accounts' same-named
+    // characters at once precisely so its answer stays usable as the fallback, but the engine's
+    // own per-client field needs no such rule.
+    //
+    // `s1`'s identity is not taken on trust: it is the account argument in pvpgn's 1.09d game
+    // server header, it is what 1.14d's SaveGameAllGameTypes passes (`SaveToFileBnet(pGame,
+    // szAccountName, pUnit, szCharName, ...)`), and it is what the call site at 0x53220d loads.
+    // The guard below is for the one failure that would be silent anyway: the NEIGHBOURING
+    // argument is the character name, just as `keyable` as an account, and taking it would key
+    // every save to `realmd:char:<Char>:<Char>` — the exact bug this path exists to stop.
+    var acct_buf: [joinctx.max_account]u8 = undefined;
+    const from_engine = boundedCStr(s1, joinctx.max_account + 1);
+    const account = if (gsredis.keyable(from_engine) and !std.ascii.eqlIgnoreCase(from_engine, char_name))
+        from_engine
+    else joinctx.accountForChar(char_name, &acct_buf) orelse {
+        log.print("realm: fpSaveDatabaseCharacter — NO ACCOUNT for this character, save DROPPED");
+        log.cstr("realm:   char=", @intFromPtr(&d2s[0x14]));
+        return 1;
+    };
 
     log.print("realm: fpSaveDatabaseCharacter — persisting char");
     log.cstr("realm:   char=", @intFromPtr(&d2s[0x14]));
@@ -178,8 +256,29 @@ fn saveDatabaseCharImpl(ecx: usize, edx: usize, s1: usize, s2: usize, s3: usize,
 
     // Straight to the store, with no realm to dial first — the save is durable the moment it
     // lands there, and the realm's flush worker moves it to the store of record behind us.
-    const ok = gsredis.putChar(account, char_name, d2s);
-    log.print(if (ok) "realm:   char saved" else "realm:   char save FAILED");
+    // Fenced and durable. Fenced: the store accepts these bytes only if nothing has written this
+    // character since we loaded it, which is what makes a rollback impossible rather than merely
+    // unlikely. Durable: a store that could not be REACHED parks the save for the tick loop to
+    // retry, rather than the bytes going back into the engine's buffer never to be offered again.
+    switch (gsredis.putCharDurable(account, char_name, d2s, joinctx.version(char_name))) {
+        .stored => |ver| {
+            joinctx.setVersion(char_name, ver);
+            log.print("realm:   char saved");
+        },
+        .stale => |cur| {
+            // Somebody wrote this character after we loaded it — another server, an admin, an
+            // import. Our bytes are the OLD ones. Refusing them is the correct outcome and the
+            // whole point of the fence, so this is loud rather than quiet: it should not happen,
+            // and if it does the character lock is not doing its job.
+            log.print("realm:   char save REFUSED as stale — the store has a newer copy, not overwriting");
+            log.hex("realm:   store version is 0x", @as(usize, @intCast(cur)));
+            log.hex("realm:   ours was 0x", @as(usize, @intCast(joinctx.version(char_name))));
+        },
+        .unavailable => {
+            log.print("realm:   char save deferred — the store did not answer, queued for retry");
+            log.hex("realm:   saves waiting 0x", gsredis.pending());
+        },
+    }
     return 1;
 }
 
@@ -203,32 +302,66 @@ fn getFileTimeStub() callconv(.naked) void {
     );
 }
 
+// fpSetGameData (slot 0x34). Called once per game from SetGameDataHook @0x005379a0, during
+// GAME_CreateBattleNetGame. Takes NO arguments (the call site pushes nothing and ECX is zero) and
+// its return value is stored straight into pGame+0x20: `mov [esi+0x20], eax` @0x005379c4.
+//
+// That field is called pBnetGameData, which is a misnomer — nothing ever dereferences it. Its only
+// readers are eight `RANDOM_RandomNumberSelector((D2SeedStrc*)&pGame->pBnetGameData, nRoll)` calls
+// in the item drop path (Drop.cpp), which treat {+0x20, +0x24} as a 64-bit LCG state:
+// `state = state.lo * 0x6ac690c5 + state.hi`, result = state mod range (RANDOM_RandomNumberSelector
+// @0x0045c3e0). So this slot seeds the stream that decides what quality every item in the game
+// rolls.
+//
+// Leaving it null does not crash, which is why it went unnoticed: +0x20 stays 0 and +0x24 is
+// bGameIsSetup (1), so every game starts the same stream from {0, 1} and rolls the identical
+// sequence of qualities as every other game. Seeding it per game is the whole fix.
+//
+// pvpgn's GS answers with the constant 0x87654321 (d2gs109 callback.c) — which has the same defect,
+// just from a different starting point.
+var drop_seed_state: u64 = 0;
+
+/// SplitMix64 — one multiply-xor chain, no state beyond the counter, and well-distributed low bits
+/// (which matter here: the engine takes `state mod range` with small ranges).
+fn nextDropSeed() u32 {
+    drop_seed_state +%= 0x9E3779B97F4A7C15;
+    var z = drop_seed_state;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    z = z ^ (z >> 31);
+    const v: u32 = @truncate(z);
+    return if (v == 0) 0x9E3779B9 else v; // never hand back the value that means "unseeded"
+}
+
+fn setGameDataImpl() callconv(.c) u32 {
+    const seed = nextDropSeed();
+    log.hex("realm: fpSetGameData — item-drop seed for this game 0x", seed);
+    return seed;
+}
+
 /// Populate the realm callback table. Call before SetupAsBnetServer (i.e. before
 /// bootstrapRealmServer). Wires the char loader + token validation + leave.
 pub fn init() void {
     table.base.fpGetDatabaseCharacter = @ptrCast(&getDatabaseCharShim);
     table.base.fpSaveDatabaseCharacter = @ptrCast(&saveDatabaseCharShim);
     table.base.fpLeaveGame = @ptrCast(&leaveGameStub);
+    table.base.fpSetGameData = @ptrCast(&setGameDataImpl);
     table.ext.fpGetDatabaseFileTime = @ptrCast(&getFileTimeStub); // 1.14d only, past the shared table
     enableTokenValidation(); // register fpFindPlayerToken (engine IsBadCodePtr-checks it)
-    allowLadderAndLadderless();
+    // Per PROCESS, not per game: games on one server must not repeat each other's drop stream, and
+    // two servers started in the same tick must not share one either.
+    var ft: [2]u32 = .{ 0, 0 };
+    GetSystemTimeAsFileTime(&ft);
+    drop_seed_state = (@as(u64, ft[1]) << 32) | @as(u64, ft[0]);
 }
 
-// Charon-style "enable ladder + ladderless joins". CalculateGetFlags @0x569d80 runs a closed-realm
-// save-freshness / ladder anti-rollback gate (CompareFileTime vs the d2dbs per-char filetime) that
-// refuses ladder chars with nReason 0x1a (fpGetDatabaseFileTime returns "oldest"). The gate sits
-// behind `if (IsBattleNetServer)` via `JZ 0x569e17`; flip that JZ (74) to JMP (EB) so it's ALWAYS
-// skipped — anti-rollback is meaningless for our single-authority store.
-fn allowLadderAndLadderless() void {
-    const addr: usize = 0x00569dc3; // JZ 0x569e17 (74 52) after the IsBattleNetServer CMP
-    const cur: *const u8 = @ptrFromInt(addr);
-    if (cur.* == 0x74) {
-        _ = patch.writeBytes(addr, &[_]u8{0xEB}); // JZ -> JMP: always skip the freshness gate
-        log.print("realm: ladder gate patched (ladder + ladderless joins enabled)");
-    } else {
-        log.hex("realm: ladder-gate patch SKIPPED, unexpected byte 0x", cur.*);
-    }
-}
+// Ladder joins used to be unblocked here by flipping the `JZ 0x569e17` at 0x00569dc3 so
+// CalculateGetFlags skipped its whole IsBattleNetServer block. That is not needed any more and is
+// deliberately gone: the block refused ladder characters only because we broke its two inputs —
+// pClient->pFileTime was a truncated POINTER rather than a timestamp, and the game was created
+// without flag bit 21, so a ladder character always met a non-ladder game. Both are supplied
+// honestly now, which fixes the same refusal on every other engine too, where 0x00569dc3 is not
+// that instruction and a byte patch could never have helped.
 
 // fpFindPlayerToken (slot 0x18)
 // __fastcall: ECX + EDX + 7 stack args, callee-cleanup ret 0x1c, returns int

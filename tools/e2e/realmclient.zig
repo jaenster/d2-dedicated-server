@@ -864,12 +864,68 @@ pub const AdInfo = struct {
 /// them.
 ///
 /// Returns 0 on success, to keep the shape the callers already check.
+/// The store's current version for a character, 0 if it has none.
+pub fn storeCharVersion(account: []const u8, charname: []const u8) !u64 {
+    var c = try gsstore.Client.connect(fakegs.redis_port);
+    defer c.close();
+    var vb: [192]u8 = undefined;
+    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    return switch (try c.cmd(&.{ "GET", verkey })) {
+        .bulk => |b| if (b) |v| std.fmt.parseInt(u64, v, 10) catch 0 else 0,
+        else => 0,
+    };
+}
+
+/// A fenced save, exactly as a game server performs one: the store takes the bytes only if nothing
+/// has written this character since version `expect`. The script is the same one
+/// `gs_store.putCharFenced` runs, kept here in the harness so the rule can be exercised against a
+/// real redis without a game server.
+///
+/// Returns the new version, or null when the store refused it as stale.
+pub fn storePutCharFenced(account: []const u8, charname: []const u8, d2s: []const u8, expect: u64) !?u64 {
+    var c = try gsstore.Client.connect(fakegs.redis_port);
+    defer c.close();
+    var kb: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
+    var vb: [192]u8 = undefined;
+    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    var sb: [192]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
+    var mb: [192]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    var eb: [24]u8 = undefined;
+    const expect_s = std.fmt.bufPrint(&eb, "{d}", .{expect}) catch return error.NameTooLong;
+    const script =
+        \\local cur = tonumber(redis.call('GET', KEYS[2]) or '0')
+        \\if cur ~= 0 and cur ~= tonumber(ARGV[1]) then return -(cur + 1) end
+        \\redis.call('SET', KEYS[1], ARGV[4])
+        \\redis.call('SADD', KEYS[3], ARGV[2])
+        \\redis.call('SADD', KEYS[4], ARGV[3])
+        \\return redis.call('INCR', KEYS[2])
+    ;
+    const rep = try c.cmdBig(&.{
+        "EVAL",   script,   "4",      key,
+        verkey,   setkey,   "realmd:dirty",
+        expect_s, charname, member,
+    }, d2s);
+    return switch (rep) {
+        .int => |v| if (v > 0) @as(u64, @intCast(v)) else null,
+        else => error.UnexpectedReply,
+    };
+}
+
 pub fn storePutChar(account: []const u8, charname: []const u8, d2s: []const u8) !u32 {
     var c = try gsstore.Client.connect(fakegs.redis_port);
     defer c.close();
     var kb: [192]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
     _ = try c.cmdBig(&.{ "SET", key }, d2s);
+    // The account's character set, exactly as the game server's own `putChar` writes it: that
+    // set is what CHARLIST reads for anything postgres has not caught up with yet, so a harness
+    // that skipped it would be testing a save path the server does not have.
+    var sb: [192]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
+    _ = try c.cmd(&.{ "SADD", setkey, charname });
     var vb: [192]u8 = undefined;
     _ = try c.cmd(&.{ "INCR", std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong });
     var mb: [128]u8 = undefined;

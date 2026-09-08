@@ -65,6 +65,13 @@ pub fn build(b: *std.Build) void {
     });
     d2engine.addImport("fastcall", fastcall_mod);
 
+    // Which account owns a character seated here. Shared by both game servers: the 1.14d DLL and
+    // the Mac native host have the same gap (the engine never carries an account) and the same
+    // consequence for getting it wrong, so they share one table and one set of tests.
+    const gs_seats = b.addModule("gs_seats", .{
+        .root_source_file = b.path("packages/gs-seats/gs_seats.zig"),
+    });
+
     // The game server's side of the shared store: the ops a GS needs of the realm — fetch and
     // save a character, advertise itself, take create/join requests, report events. Domain ops on
     // the outside, redis on the inside. It lives here rather than inside apps/d2gs because a
@@ -148,6 +155,7 @@ pub fn build(b: *std.Build) void {
     d2gs.root_module.addImport("realm_proto", realm_proto);
     d2gs.root_module.addImport("resp", resp);
     d2gs.root_module.addImport("gs_store", gs_store);
+    d2gs.root_module.addImport("gs_seats", gs_seats);
     d2gs.root_module.addImport("gs_health", gs_health);
     d2gs.root_module.addImport("obs", obs);
     d2gs.root_module.addImport("d2engine", d2engine);
@@ -178,6 +186,7 @@ pub fn build(b: *std.Build) void {
     d2host.root_module.addOptions("build_options", d2host_options);
     d2host.root_module.addImport("fastcall", fastcall_mod);
     d2host.root_module.addImport("gs_store", gs_store);
+    d2host.root_module.addImport("gs_seats", gs_seats);
     d2host.root_module.addImport("gs_health", gs_health);
     d2host.root_module.addImport("d2engine", d2engine);
     d2host.root_module.addImport("realm_proto", realm_proto);
@@ -452,6 +461,13 @@ pub fn build(b: *std.Build) void {
         // The native host's crash reporter. Rooted here rather than at main.zig because that one
         // runs the game; this is the part with logic worth asserting.
         .{ "apps/d2gs-native/crash.zig", false, false },
+        // Which saves have already been sent to the store. Pure logic, and the thing standing
+        // between an idle server and a redundant write per player per 45 seconds — and, in the
+        // other direction, between a changed character and a save that never leaves the disk.
+        .{ "apps/d2gs-native/savededupe.zig", false, false },
+        // Saves the store refused, kept until it takes them. Pure logic, and the difference
+        // between a redis blip costing a delay and it costing a player's session.
+        .{ "packages/gs-store/savequeue.zig", false, false },
         // The engine callback contract: its layout asserts are the point, and they fire at
         // compile time on any target, so they are worth checking here and not only in the DLL.
         .{ "packages/d2engine/d2engine.zig", false, false },
@@ -461,6 +477,11 @@ pub fn build(b: *std.Build) void {
         // Does our Fog export everything the engines import? Checked against a committed manifest
         // rather than the DLLs, so it runs on a machine with no game files.
         .{ "packages/d2fog/ordinals.zig", false, false },
+        // The account/character seat table both game servers key their saves by. Pure logic with
+        // a swappable clock, and the piece that decides which key a character's save is written
+        // under — get it wrong and a player is silently rolled back, which is exactly the bug
+        // these tests are here to keep out.
+        .{ "packages/gs-seats/gs_seats.zig", false, false },
         // Does every engine we claim to serve have the measurements that claim rests on? Reads
         // deploy/e2e-engines.txt at compile time. A test root of its own on purpose: the claim is
         // about our confidence, not about anything d2host does at runtime, and folding it into the
@@ -516,6 +537,8 @@ pub fn build(b: *std.Build) void {
     d2gs_native.root_module.addImport("darwin", darwin);
     d2gs_native.root_module.addImport("realm_proto", realm_proto);
     d2gs_native.root_module.addImport("gs_health", gs_health);
+    // The same seat table the 1.14d DLL keys its saves by; see packages/gs-seats.
+    d2gs_native.root_module.addImport("gs_seats", gs_seats);
     const native_realm_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/d2gs-native/realm.zig"),
@@ -526,6 +549,7 @@ pub fn build(b: *std.Build) void {
     });
     native_realm_tests.root_module.addImport("macho", macho);
     native_realm_tests.root_module.addImport("realm_proto", realm_proto);
+    native_realm_tests.root_module.addImport("gs_seats", gs_seats);
     test_step.dependOn(&b.addRunArtifact(native_realm_tests).step);
 
     b.step("d2gs-native", "Build the wine-free native game server").dependOn(

@@ -222,6 +222,15 @@ pub fn serverTick() void {
         e.int("clients", @as(i32, @bitCast(readU32(pg, 140))));
         e.int("players", @as(i32, @bitCast(readU32(pg, 144))));
         e.int("monsters", @as(i32, @bitCast(readU32(pg, 148))));
+        // The item-drop RNG state. Despite the name the recon gives pGame+0x20 it is not a pointer
+        // and is never dereferenced: its only readers are the eight
+        // RANDOM_RandomNumberSelector((D2SeedStrc*)&pGame->pBnetGameData, nRoll) calls in Drop.cpp,
+        // which advance {+0x20, +0x24} as one 64-bit LCG. +0x20 is whatever fpSetGameData returned
+        // and +0x24 is bGameIsSetup. Reported here rather than at game_alloc because
+        // EVENT_AllocTimerQueue runs BEFORE SetGameDataHook, so at creation it always reads zero
+        // whether the slot is filled or not. A stream that never varies between games is invisible
+        // in every other way, so it is worth a field.
+        e.int("dropSeed", @as(i32, @bitCast(readU32(pg, 0x20))));
         e.end();
     }
 }
@@ -303,6 +312,83 @@ fn onPlayerJoin(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
     // (Clients.cpp @0x539... `pGame->nClientsCount++`), so by here the joiner is counted.
     notifyPlayers(pgame, pclient, readU32(pgame, GAME_CLIENTS), true);
     if (ctxFor(pgame)) |ctx| feature.fanPlayerJoin(&ctx, if (pclient == 0) 0 else readU32(pclient, CL_SLOT));
+}
+
+/// Why a join was turned away, in the engine's own numbering. The refusal is decided deep inside
+/// the char load and only ever reaches the player as "Failed to join game", so without this the
+/// server has no record of the cause at all — which is exactly how a report of "ladder characters
+/// cannot enter" arrives with nothing to go on.
+///
+/// Sources: CalculateGetFlags @0x569d80 raises 0x08-0x0e and 0x19/0x1a; the second, redundant set
+/// of the same checks in CLIENT_LoadCharacterAndSendGameData @0x539760 raises 0x13-0x18; and the
+/// save parser PLAYERSAVE_ParseHeaderAndCreateUnit @0x56a090 raises 3-7.
+fn refusalReason(code: u32) []const u8 {
+    return switch (code) {
+        3 => "client has no character name",
+        4 => "save truncated, or bad class id",
+        5 => "save size does not match its header",
+        6 => "save checksum mismatch",
+        7 => "save version out of range, or name does not match the client",
+        0x08, 0x18 => "expansion character in a classic game (0x18 also: assassin/druid in a classic game)",
+        0x09, 0x17 => "classic character in an expansion game",
+        0x0a, 0x15 => "hardcore character that has already died",
+        0x0b, 0x14 => "hardcore character in a softcore game",
+        0x0c, 0x13 => "softcore character in a hardcore game",
+        0x0d => "nightmare not unlocked for this character",
+        0x0e => "hell not unlocked for this character",
+        0x19 => "ladder character in a non-ladder game (game flag bit 21 clear)",
+        0x1a => "non-ladder character in a ladder game (game flag bit 21 set)",
+        else => "unknown",
+    };
+}
+
+/// NET_D2GS_SERVER_Send_0xB4_ConnectionRefused — __fastcall ECX=nClientId, EDX=nReason. The last
+/// thing the engine does before the client sees "Failed to join game".
+fn onJoinRefused(client_id: usize, reason: usize, _: usize) callconv(.c) void {
+    var e = ev("join_refused");
+    e.int("clientId", trunc32(client_id));
+    e.hex("reason", reason);
+    e.str("why", refusalReason(trunc32(reason)));
+    e.end();
+}
+
+/// The save path, observed at its two decision points.
+///
+/// Between them these say exactly where a character save stops, which is otherwise invisible:
+/// every gate on the way to the realm's `fpSaveDatabaseCharacter` either does nothing or takes a
+/// branch, and none of them logs. `save_sweep` fires when the engine decides it is time to save a
+/// game's players at all; `save_route` fires once per player and carries the two values that
+/// decide where those bytes go. If a player reports lost progress, the two lines and the
+/// `fpSaveDatabaseCharacter` line in realm.zig localise it without another RE session:
+///
+///   no save_sweep            -> the periodic trigger never fired (see runtime/autosave.zig) and
+///                               no leave or timeout happened either
+///   sweep but no save_route  -> the client had no player unit; nothing to serialise
+///   route with type 1 or 2   -> SaveToBuffer: an open-bnet/LAN game, where the CLIENT owns the
+///                               save, so it never reaches the realm at all
+///   route with callbacks 0   -> SaveToFile: the realm callback table was never registered
+///   route otherwise          -> SaveToFileBnet, and the next word is realm.zig's
+fn onSaveSweep(pgame: usize, _: usize, _: usize) callconv(.c) void {
+    var e = ev("save_sweep");
+    putGame(&e, pgame);
+    e.end();
+}
+
+/// `SaveGameAllGameTypes` @0x532400, `__fastcall(pGame, pUnit, ...)`. `nGameType` is the byte at
+/// +0x6A — eD2HostGameType, NOT the ladder flag, which is a different field entirely — and the
+/// callback table is the global the router tests against null.
+const SAVE_GAME_TYPE = 0x6A;
+const BNET_SERVICE_PTR: usize = 0x00883d50;
+
+fn onSaveRoute(pgame: usize, punit: usize, _: usize) callconv(.c) void {
+    var e = ev("save_route");
+    putGame(&e, pgame);
+    e.int("unit", trunc32(punit));
+    e.int("game_type", if (pgame == 0) 0xff else readU8(pgame, SAVE_GAME_TYPE));
+    // Read, not assumed: "the table is registered" is exactly the belief that was wrong for every
+    // server in the fleet.
+    e.int("callbacks", @as(u32, @intFromBool(@as(*const usize, @ptrFromInt(BNET_SERVICE_PTR)).* != 0)));
+    e.end();
 }
 
 fn onPlayerLeave(pgame: usize, pclient: usize, _: usize) callconv(.c) void {
@@ -1543,6 +1629,10 @@ const hooks = [_]Hook{
     .{ .addr = 0x52C7F0, .prologue = 7, .label = "game_destroy", .handler = &onGameDestroy, .a1 = .ecx, .a2 = .edx },
     .{ .addr = 0x52C410, .prologue = 6, .label = "player_join", .handler = &onPlayerJoin, .game = .ecx, .a1 = .ecx, .a2 = .edx },
     .{ .addr = 0x52C500, .prologue = 5, .label = "player_leave", .handler = &onPlayerLeave, .game = .ecx, .a1 = .ecx, .a2 = .edx },
+    // The save path. `55 8b ec 83 ec 10` and `55 8b ec 83 ec 58` — six bytes each, no short
+    // branches. Both take the game in ECX.
+    .{ .addr = 0x52CA10, .prologue = 6, .label = "save_sweep", .handler = &onSaveSweep, .game = .ecx, .a1 = .ecx },
+    .{ .addr = 0x532400, .prologue = 6, .label = "save_route", .handler = &onSaveRoute, .game = .ecx, .a1 = .ecx, .a2 = .edx },
 
     // -- combat --
     .{ .addr = 0x57C6C0, .prologue = 6, .label = "damage", .handler = &onDamage, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 0xC } },
@@ -1576,6 +1666,7 @@ const hooks = [_]Hook{
     .{ .addr = 0x54C300, .prologue = 7, .label = "cube_transmute", .handler = &onCube, .game = .ecx, .a1 = .edx }, // ECX=pGame EDX=pPlayer
     .{ .addr = 0x5A5E50, .prologue = 6, .label = "hostility", .handler = &onHostility, .game = .ecx, .a1 = .edx, .a2 = .{ .stack = 4 }, .a3 = .{ .stack = 8 } }, // ECX=pGame EDX=pUnit, [esp+4]=pTarget, [esp+8]=bHostile
     .{ .addr = 0x5A5BE0, .prologue = 5, .label = "party_invite", .handler = &onPartyInvite, .a1 = .edx, .a2 = .{ .stack = 4 } }, // EDX=inviter, [esp+4]=pTarget
+    .{ .addr = 0x53B260, .prologue = 6, .label = "join_refused", .handler = &onJoinRefused, .a1 = .ecx, .a2 = .edx }, // ECX=nClientId EDX=nReason
 
     // -- decoded player actions (SCMD handlers; ECX=pGame EDX=player, [esp+4]=pkt) --
     .{ .addr = 0x549D80, .prologue = 5, .label = "skill_left", .handler = &onSkillLeft, .game = .ecx, .a1 = .edx }, // 0x06 LeftSkillOnEntity

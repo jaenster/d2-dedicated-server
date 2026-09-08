@@ -248,6 +248,78 @@ pub fn getChar(account: []const u8, charname: []const u8, out: []u8) usize {
     };
 }
 
+/// A character as this server took it: the bytes and the store version they were at.
+pub const Loaded = struct { len: usize, ver: u64 };
+
+/// The store's current version for a character, 0 if it has none.
+pub fn charVersion(account: []const u8, charname: []const u8) u64 {
+    var vb: [192]u8 = undefined;
+    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return 0;
+    const r = cmd(&.{ "GET", verkey }) orelse return 0;
+    return switch (r) {
+        .bulk => |b| blk: {
+            const v = b orelse break :blk 0;
+            break :blk std.fmt.parseInt(u64, v, 10) catch 0;
+        },
+        else => 0,
+    };
+}
+
+/// Read a character and the version it is at. The VERSION FIRST — see gs_store.getCharVersioned:
+/// the other order lets a save landing between the two reads be overwritten by bytes built from
+/// it, which is precisely the rollback the fence exists to stop.
+pub fn getCharVersioned(account: []const u8, charname: []const u8, out: []u8) Loaded {
+    const ver = charVersion(account, charname);
+    return .{ .len = getChar(account, charname, out), .ver = ver };
+}
+
+/// What happened to a fenced save. Mirrors `gs_store.SaveResult`; the two servers speak to the
+/// same store and must agree on what a refusal means.
+pub const SaveResult = union(enum) {
+    stored: u64,
+    /// The store has a newer copy. These bytes are obsolete and writing them would be a rollback.
+    stale: u64,
+    /// Nothing is known and nothing was written. Worth retrying.
+    unavailable,
+};
+
+/// Store a character save, but only if nothing has written it since we loaded it.
+///
+/// The compare-set-increment runs inside redis, so nothing can interleave between the check and
+/// the write. A current version of ZERO is accepted whatever `expect` says: it means the store has
+/// no version for this character — never saved, or a redis that lost its state and was refilled
+/// from postgres — and in both cases a live session's bytes are the newest thing there is.
+pub fn putCharFenced(account: []const u8, charname: []const u8, save: []const u8, expect: u64) SaveResult {
+    var kb: [192]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return .unavailable;
+    var vb: [192]u8 = undefined;
+    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return .unavailable;
+    var sb: [192]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return .unavailable;
+    var mb: [192]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return .unavailable;
+    var eb: [24]u8 = undefined;
+    const expect_s = std.fmt.bufPrint(&eb, "{d}", .{expect}) catch return .unavailable;
+
+    const script =
+        \\local cur = tonumber(redis.call('GET', KEYS[2]) or '0')
+        \\if cur ~= 0 and cur ~= tonumber(ARGV[1]) then return -(cur + 1) end
+        \\redis.call('SET', KEYS[1], ARGV[4])
+        \\redis.call('SADD', KEYS[3], ARGV[2])
+        \\redis.call('SADD', KEYS[4], ARGV[3])
+        \\return redis.call('INCR', KEYS[2])
+    ;
+    const r = cmdBig(&.{
+        "EVAL",   script,   "4",      key,
+        verkey,   setkey,   "realmd:dirty",
+        expect_s, charname, member,
+    }, save) orelse return .unavailable;
+    return switch (r) {
+        .int => |v| if (v > 0) .{ .stored = @intCast(v) } else .{ .stale = @intCast(-v - 1) },
+        else => .unavailable,
+    };
+}
+
 /// Store a character and mark it for the realm's flush worker. Both or neither: a save redis took
 /// but nobody was told about would sit there while Postgres fell behind.
 pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) bool {
