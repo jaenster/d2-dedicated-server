@@ -25,6 +25,7 @@ const itemroll = @import("runtime/itemroll.zig");
 const gameloop = @import("runtime/gameloop.zig");
 const joindiag = @import("runtime/joindiag.zig");
 const rejoin = @import("runtime/rejoin.zig");
+const hangup = @import("runtime/hangup.zig");
 const eipprof = @import("runtime/eipprof.zig");
 const poolstat = @import("runtime/poolstat.zig");
 const poolgrow = @import("runtime/poolgrow.zig");
@@ -357,6 +358,9 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // is the real idle-CPU cost (~50% of a core on the cluster). ~10 Hz is plenty for a
     // server with no menu UI.
     gameloop.installServerOogPacing();
+    // Before the QServer's socket thread exists: see a client's hang-up however the host's
+    // select() reports it.
+    hangup.install();
     if (use_realm) {
         joindiag.install(); // log nReason when the engine refuses a join
         rejoin.install(); // let a character re-enter without waiting for its old seat to clear
