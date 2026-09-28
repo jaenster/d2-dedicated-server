@@ -203,11 +203,13 @@ pub const FakeGS = struct {
 
     /// Report a game ending, freeing whatever characters it still held.
     pub fn sendCloseGame(self: *FakeGS, gameid: u32) !void {
-        var b: [12]u8 = undefined;
-        std.mem.writeInt(u16, b[0..2], 12, .little);
+        // realm-proto's CloseGame: header, a reserved dword, then the gameid.
+        var b: [16]u8 = undefined;
+        std.mem.writeInt(u16, b[0..2], 16, .little);
         std.mem.writeInt(u16, b[2..4], rc.GS_CLOSEGAME, .little);
         std.mem.writeInt(u32, b[4..8], 0, .little);
-        std.mem.writeInt(u32, b[8..12], gameid, .little);
+        std.mem.writeInt(u32, b[8..12], 0, .little);
+        std.mem.writeInt(u32, b[12..16], gameid, .little);
         try self.emit(&b);
     }
 
