@@ -601,8 +601,19 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     // A created character is the logged-on one: NET_MCP_CLIENT_HandleCharCreation @0x435e10 goes
     // straight to the lobby on success and never sends CHARLOGON for it. Without this the next
     // create/join names whichever character was logged on before, or none.
-    c.setChar(name);
-    hook.charLogon(acct, name);
+    //
+    // Unless it belongs to another engine than this client (a launcher picked the era): logon
+    // refuses exactly that pairing, and making it active here would hand the next game a save
+    // this client cannot play. It is made for the client that will be launched for it.
+    const client_version = c.clientVersion();
+    const playable = hook.charCompatible(acct, name, char_version, client_version) orelse
+        (char_version.len == 0 or client_version.len == 0 or std.mem.eql(u8, char_version, client_version));
+    if (playable) {
+        c.setChar(name);
+        hook.charLogon(acct, name);
+    } else {
+        log.line(tag, "char create '{s}' (account={s}) -> {s} character, {s} client: not made the active character", .{ name, acct, char_version, client_version });
+    }
     w.putU32(0); // success
     finish(c, &w);
 }

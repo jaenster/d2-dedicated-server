@@ -1223,6 +1223,37 @@ fn scDeadGsLeasesLapse() Result {
     return .{ .name = name, .status = .pass, .msg = msg("dead server's leases left to lapse (PTTL {d}ms); character set has a TTL ({d}s)", .{ left, set_ttl }) };
 }
 
+/// A character created for another engine (a launcher picks the era on the creation screen) is
+/// not playable by the client that made it, and character logon refuses exactly that pairing.
+/// Create made it the logged-on character anyway, so the next game was joined as it.
+fn scCrossEraCreateNotActive() Result {
+    const name = "cross_era_create_not_active";
+    var gs = FakeGS{ .gsid = 0xAB15, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7900 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "EraHost", "Timeless") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    if ((host.createGame("eraroom", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "host create refused", .{});
+
+    // A 1.13c client (REALMD_CLIENT_VERSIONS maps 1.0.0.9 to it).
+    var c = rc.RealmClient{ .exe_version = (1 << 24) | 9 };
+    defer c.close();
+    enterAs(&c, "EraAcct", "Keeper") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = c.charDelete("Visitor") catch 0;
+    // Era 10 in the status word's high byte: a 1.10f character.
+    const made = c.charCreate(1, 0x20 | (10 << 8), "Visitor") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (made != 0) return fail(name, "create Visitor -> 0x{x}", .{made});
+    const j = c.joinGame("eraroom") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const who = std.mem.sliceTo(&gs.join_char, 0);
+    if (std.mem.eql(u8, who, "Visitor"))
+        return fail(name, "a 1.10f character was sent into a game by a 1.13c client (join 0x{x})", .{j.result});
+    if (j.result != 0 or !std.mem.eql(u8, who, "Keeper")) return fail(name, "join -> 0x{x} as '{s}', want 0 as 'Keeper'", .{ j.result, who });
+    return .{ .name = name, .status = .pass, .msg = msg("cross-era character not made active; the client plays its own (Keeper)", .{}) };
+}
+
 /// A save is only durable if it is written under the right ACCOUNT — and the account reaches the
 /// game server in one place only: the JOINGAME the realm dispatches. Get that pairing wrong and
 /// nothing fails: the save lands at an address no login path reads, the server logs a success,
@@ -2472,7 +2503,7 @@ fn maybeStartRealmd() !?c_int {
     // Two invented client builds, so the version scenario has two engines to disagree about. Real
     // builds are not used deliberately: this asserts the MECHANISM, and it must not start failing
     // the day someone corrects a real build number.
-    _ = setenv("REALMD_CLIENT_VERSIONS", "1.0.0.7=e2e-old,1.0.0.8=e2e-new", 1);
+    _ = setenv("REALMD_CLIENT_VERSIONS", "1.0.0.7=e2e-old,1.0.0.8=e2e-new,1.0.0.9=1.13c,1.0.0.10=1.10f", 1);
     // Lease passes every 300ms instead of every minute, so a scenario can watch one happen.
     _ = setenv("REALMD_LEASE_RENEW_MS", "300", 1);
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
@@ -3368,6 +3399,7 @@ pub fn main() !void {
         scStaleLeaveKeepsRetake(),
         scLateArrivalReclaims(),
         scDeadGsLeasesLapse(),
+        scCrossEraCreateNotActive(),
     };
 
     if (child) |pid| {
