@@ -375,13 +375,30 @@ const lease_pass_games = 256;
 /// game only stays in this index while its server is still heartbeating — a server that dies has
 /// its games expired on the spot, so nothing renews them and they lapse on schedule. Liveness still
 /// comes from the server; the realm only carries it.
+///
+/// It is also where a game whose server died is closed. A server that stops publishing itself
+/// sends no CLOSEGAME, and one that comes back under a different id (a replaced pod) never
+/// sends the "started" that expires its old games either; without this the game stayed listed
+/// and every character in it stayed claimed, renewed by this very loop, for the game record's
+/// whole six-hour life. The server's record lapses `store.gs_ttl_s` after its last refresh; the
+/// sweep runs more often than the renewal so the characters come free soon after that.
 pub fn renewCharLeases() void {
     var games: [lease_pass_games]state.GameInfo = undefined;
+    var tick: u32 = 0;
     while (true) {
-        _ = usleep(lease_renew_us);
+        _ = usleep(dead_gs_sweep_us);
+        tick +%= 1;
         const n = state.snapshotGames(&games);
-        var renewed: usize = 0;
+        var live: usize = 0;
         for (games[0..n]) |g| {
+            if (!closeIfServerGone(g)) {
+                games[live] = g;
+                live += 1;
+            }
+        }
+        if (tick % (lease_renew_us / dead_gs_sweep_us) != 0) continue;
+        var renewed: usize = 0;
+        for (games[0..live]) |g| {
             const pass = store.renewGameCharLeases(g.gameid);
             renewed += pass.renewed;
             if (pass.withdrawn == 0) continue;
@@ -389,8 +406,57 @@ pub fn renewCharLeases() void {
             if (pass.uncount > 0) _ = state.global.adjustGamePlayers(g.gameid, -@as(i32, @intCast(pass.uncount)));
             log.line("fleet", "game {d}: withdrew {d} claim(s) from joins that never arrived", .{ g.gameid, pass.withdrawn });
         }
-        if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
+        if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, live });
     }
+}
+
+/// How often games are checked against the servers still publishing themselves.
+const dead_gs_sweep_us: c_uint = 10 * 1_000_000;
+
+/// How long a server must stay missing before its games are closed, on top of the record's own
+/// TTL. A store that lost its data (a redis restarted without persistence) is missing every
+/// record at once until each server's next refresh; closing games in that window would free the
+/// characters of players who are still in them.
+const dead_gs_confirm_ms: i64 = 45_000;
+
+/// Servers seen missing, and since when. Only this thread touches it.
+var missing_gs: [64]struct { gsid: u32 = 0, since_ms: i64 = 0 } = @splat(.{});
+
+extern "c" fn time(t: ?*c_long) c_long;
+/// Unix time in ms at second resolution, which is all a 45 s window needs (see realmd.zig).
+fn nowMs() i64 {
+    return @as(i64, time(null)) * 1000;
+}
+
+/// True once `gsid` has been missing from the fleet for `dead_gs_confirm_ms`; a server that is
+/// seen again is forgotten.
+fn confirmedGone(gsid: u32, alive: bool) bool {
+    var free: ?usize = null;
+    for (&missing_gs, 0..) |*m, i| {
+        if (m.gsid == gsid) {
+            if (alive) {
+                m.* = .{};
+                return false;
+            }
+            return nowMs() - m.since_ms >= dead_gs_confirm_ms;
+        }
+        if (m.gsid == 0 and free == null) free = i;
+    }
+    if (alive) return false;
+    if (free) |i| missing_gs[i] = .{ .gsid = gsid, .since_ms = nowMs() };
+    return false;
+}
+
+/// Close `g` the way its CLOSEGAME would have if its server is no longer in the fleet. True if it
+/// was closed. A store that cannot answer is not evidence of anything and closes nothing.
+fn closeIfServerGone(g: state.GameInfo) bool {
+    if (g.gsid == 0) return false;
+    const alive = store.gsAlive(g.gsid) orelse return false;
+    if (!confirmedGone(g.gsid, alive)) return false;
+    const freed = store.releaseGameChars(g.gameid);
+    state.global.removeGameById(g.gameid);
+    log.line("fleet", "game {d} '{s}' closed: its server 0x{x} stopped publishing itself; {d} character(s) freed", .{ g.gameid, g.name_slice(), g.gsid, freed });
+    return true;
 }
 
 /// Drain game-server events forever. Every instance runs one; each event is consumed by exactly
