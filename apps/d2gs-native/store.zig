@@ -6,6 +6,7 @@
 //! empty while writes still look fine.
 const std = @import("std");
 const resp = @import("resp");
+const claims = @import("realm_proto").claims;
 
 extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
@@ -116,6 +117,30 @@ pub fn cmd(args: []const []const u8) ?resp.Reply {
         return null;
     }
     return readReply(s);
+}
+
+/// Check, before loading a joining character into a game, that the realm's claim on it is this
+/// game's, and mark it loaded (see `realm_proto.claims`). A load for a claim the realm has since
+/// moved to another game must be refused: the character would be in two games.
+///
+/// `gameid` 0 means the caller cannot say which game; the claim then only has to be this server's.
+pub fn checkCharLoad(account: []const u8, charname: []const u8, gsid: u32, gameid: u32) claims.Load {
+    var call = claims.LoadCall{};
+    const argv = call.command(account, charname, gsid, gameid) orelse return .unknown;
+    lock();
+    defer unlock();
+    const s = ensure() orelse return .unknown;
+    // The script alone is larger than `cmd`'s buffer.
+    var tx: [4096]u8 = undefined;
+    const wire = resp.encode(&tx, argv) orelse return .unknown;
+    if (!sendAll(s, wire)) {
+        drop();
+        return .unknown;
+    }
+    return switch (readReply(s) orelse return .unknown) {
+        .int => |v| claims.decodeLoad(v),
+        else => .unknown,
+    };
 }
 
 /// Same, but the LAST argument may be arbitrarily large — a .d2s save or a control packet is

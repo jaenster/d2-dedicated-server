@@ -310,18 +310,23 @@ fn apply(typ: p.Type, body: []const u8) void {
             // The server is the only party that sees players leave, so its count replaces ours
             // outright rather than adjusting it — an absolute value cannot drift if an event
             // is lost.
-            if (body.len < 20) return;
+            //
+            // Everything here is about ONE game on ONE server: gameids are numbered per server,
+            // so the gsid the event carries is half of the game's name.
+            const fixed = @sizeOf(p.UpdateGameInfo) - p.HEADER_LEN;
+            if (body.len < fixed) return;
             const flag = std.mem.readInt(u32, body[0..4], .little);
             const gameid = std.mem.readInt(u32, body[4..8], .little);
             const players = std.mem.readInt(u32, body[8..12], .little);
             const level = std.mem.readInt(u32, body[12..16], .little);
             const class = std.mem.readInt(u32, body[16..20], .little);
-            var off: usize = 20;
+            const game: state.GameRef = .{ .gsid = std.mem.readInt(u32, body[20..24], .little), .gameid = gameid };
+            var off: usize = fixed;
             const char = p.readCStr(body, &off);
-            _ = state.global.setGamePlayers(gameid, @intCast(@min(players, 0xFFFF)));
+            _ = state.global.setGamePlayers(game, @intCast(@min(players, 0xFFFF)));
             // The roster is what makes the join screen's detail panel able to name anyone; the
             // count alone only fills the PLAYERS column.
-            state.global.setGameMember(gameid, flag != p.GAMEINFO_LEAVE, char, @intCast(@min(level, 255)), @intCast(@min(class, 255)));
+            state.global.setGameMember(game, flag != p.GAMEINFO_LEAVE, char, @intCast(@min(level, 255)), @intCast(@min(class, 255)));
             // Freed as the player leaves rather than when the game ends, so a character is
             // available for its next game immediately.
             //
@@ -335,13 +340,13 @@ fn apply(typ: p.Type, body: []const u8) void {
             const acct = if (off < body.len) p.readCStr(body, &off) else "";
             if (flag == p.GAMEINFO_LEAVE and char.len > 0) {
                 if (acct.len > 0) {
-                    _ = store.releaseGameCharExact(gameid, acct, char);
+                    _ = store.releaseGameCharExact(game, acct, char);
                 } else {
-                    _ = store.releaseGameCharByName(gameid, char);
+                    _ = store.releaseGameCharByName(game, char);
                 }
             }
             // The arrival turns the join's claim from pending into a seat.
-            if (flag == p.GAMEINFO_ENTER and char.len > 0) switch (store.confirmGameChar(gameid, acct, char)) {
+            if (flag == p.GAMEINFO_ENTER and char.len > 0) switch (store.confirmGameChar(game, acct, char)) {
                 .none, .confirmed => {},
                 .reclaimed => log.line("fleet", "game {d}: '{s}' arrived after its claim was withdrawn; claimed again", .{ gameid, char }),
                 .conflict => {
@@ -352,18 +357,19 @@ fn apply(typ: p.Type, body: []const u8) void {
             };
         },
         .closegame => {
-            if (body.len < 8) return;
+            if (body.len < @sizeOf(p.CloseGame) - p.HEADER_LEN) return;
             const gameid = std.mem.readInt(u32, body[4..8], .little);
             if (gameid == 0) return;
+            const game: state.GameRef = .{ .gsid = std.mem.readInt(u32, body[0..4], .little), .gameid = gameid };
             // Whatever the game still holds is free now. A backstop for players the engine never
             // reported leaving — a client that vanished, or a server lost mid-game — since
             // otherwise those characters would stay claimed until their lease ran out.
             //
             // The record goes first: a join claims only a game still in the index, so a claim
             // racing this close either lands before and is swept here, or finds the game gone.
-            state.global.removeGameById(gameid);
-            _ = store.releaseGameChars(gameid);
-            log.line("fleet", "game {d} closed", .{gameid});
+            state.global.removeGame(game);
+            _ = store.releaseGameChars(game);
+            log.line("fleet", "game {d} on 0x{x} closed", .{ gameid, game.gsid });
         },
         else => {},
     }
@@ -406,11 +412,12 @@ pub fn renewCharLeases() void {
                 orphaned += 1;
                 continue;
             }
-            const pass = store.renewGameCharLeases(g.gameid);
+            const game: state.GameRef = .{ .gsid = g.gsid, .gameid = g.gameid };
+            const pass = store.renewGameCharLeases(game);
             renewed += pass.renewed;
             if (pass.withdrawn == 0) continue;
             // Joins that never arrived: their bump on the player count goes with them.
-            if (pass.uncount > 0) _ = state.global.adjustGamePlayers(g.gameid, -@as(i32, @intCast(pass.uncount)));
+            if (pass.uncount > 0) _ = state.global.adjustGamePlayers(game, -@as(i32, @intCast(pass.uncount)));
             log.line("fleet", "game {d}: withdrew {d} claim(s) from joins that never arrived", .{ g.gameid, pass.withdrawn });
         }
         if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });

@@ -16,6 +16,7 @@ const cb = @import("d2engine").callbacks;
 const hostapi = @import("d2engine").hostapi;
 const gsredis = @import("gs_store");
 const joinctx = @import("gs_seats");
+const d2cs = @import("../realmclient/d2cs.zig");
 const obs = @import("obs");
 const log = @import("../log.zig");
 
@@ -121,11 +122,20 @@ fn getDatabaseCharImpl(ecx: usize, edx: usize, client_id: usize, account: usize)
         // fetch was never reached when the dial failed, and it read as a broken store.
         var sp = obs.enter("char_fetch");
         defer sp.exit();
-        // Versioned: every save this session makes is fenced against the version these bytes came
-        // at, so a save built from them can never land on top of somebody else's newer ones.
-        const loaded = gsredis.getCharVersioned(acct_name, char_name, &slot.save);
-        save_len = loaded.len;
-        if (save_len > 0) joinctx.setVersion(char_name, loaded.ver);
+        // The realm's claim has to be this game's first. A load for a claim it has since handed to
+        // another game would put the character in two games; checking also marks the claim loaded,
+        // so the realm stops handing it elsewhere. See `realm_proto.claims`. An empty save is
+        // what refuses the join below.
+        const verdict = gsredis.checkCharLoad(acct_name, char_name, d2cs.gsid, joinctx.gameForChar(char_name) orelse 0);
+        if (!verdict.allowed()) {
+            log.print("realm:   character is claimed by another game — refusing this load");
+        } else {
+            // Versioned: every save this session makes is fenced against the version these bytes
+            // came at, so a save built from them can never land on top of somebody else's newer ones.
+            const loaded = gsredis.getCharVersioned(acct_name, char_name, &slot.save);
+            save_len = loaded.len;
+            if (save_len > 0) joinctx.setVersion(char_name, loaded.ver);
+        }
     }
 
     // The character is now this server's to save. Hold its account/char mapping until the engine

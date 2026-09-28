@@ -934,7 +934,7 @@ fn scAbandonedJoinRelogin() Result {
 
     const past: u64 = 120_000;
     backdate("realmd:charjoin:RelogAcct/LostSorc", past) catch |e| return fail(name, "backdate claim: {s}", .{@errorName(e)});
-    backdate("realmd:gamecounted:7200", past) catch |e| return fail(name, "backdate count: {s}", .{@errorName(e)});
+    backdate("realmd:gamecounted:ab0e.7200", past) catch |e| return fail(name, "backdate count: {s}", .{@errorName(e)});
     const late = again.joinGame("relogfresh") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (late.result != 0) return fail(name, "join after the claim went stale -> 0x{x}, want 0", .{late.result});
     if (!awaitListed(&host, "relogroom", 1))
@@ -1146,7 +1146,7 @@ fn scStaleLeaveKeepsRetake() Result {
     _ = net.usleep(300_000);
     var lb: [64]u8 = undefined;
     const holder = redisGet("realmd:charlock:RetakeAcct/Retaker", &lb) orelse "nobody";
-    if (!std.mem.eql(u8, holder, "game:7600"))
+    if (!std.mem.eql(u8, holder, "game:ab12.7600"))
         return fail(name, "Retaker is in retakeroom but held by {s} (the first attempt's leave released the second's claim)", .{holder});
 
     var again = rc.RealmClient{};
@@ -1184,7 +1184,7 @@ fn scLateArrivalReclaims() Result {
     if (!awaitKey("realmd:charlock:LateAcct/Slowpoke", null, 5000)) return fail(name, "the stale claim was never withdrawn", .{});
 
     gs.sendPlayerUpdateFor(7700, 2, true, "Slowpoke", "LateAcct", 1, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (!awaitKey("realmd:charlock:LateAcct/Slowpoke", "game:7700", 2000))
+    if (!awaitKey("realmd:charlock:LateAcct/Slowpoke", "game:ab13.7700", 2000))
         return fail(name, "Slowpoke arrived in lateroom after its claim was withdrawn and nothing holds it", .{});
     var again = rc.RealmClient{};
     defer again.close();
@@ -1210,8 +1210,8 @@ fn scDeadGsLeasesLapse() Result {
     enterAs(&host, "DeadHost", "Ghosted") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
     seat(&gs, &host, "deadroom", 7800, "DeadHost", "Ghosted", 1) catch |e| return fail(name, "host: {s}", .{@errorName(e)});
     const lock = "realmd:charlock:DeadHost/Ghosted";
-    if (!awaitKey(lock, "game:7800", 2000) or !awaitKey("realmd:charjoin:DeadHost/Ghosted", null, 2000)) return fail(name, "never seated", .{});
-    const set_ttl = redisInt(&.{ "TTL", "realmd:gamechars:7800" }) orelse -3;
+    if (!awaitKey(lock, "game:ab14.7800", 2000) or !awaitKey("realmd:charjoin:DeadHost/Ghosted", null, 2000)) return fail(name, "never seated", .{});
+    const set_ttl = redisInt(&.{ "TTL", "realmd:gamechars:ab14.7800" }) orelse -3;
 
     // The server dies: its record goes, no close is ever sent.
     gs.stop();
@@ -1252,6 +1252,92 @@ fn scCrossEraCreateNotActive() Result {
         return fail(name, "a 1.10f character was sent into a game by a 1.13c client (join 0x{x})", .{j.result});
     if (j.result != 0 or !std.mem.eql(u8, who, "Keeper")) return fail(name, "join -> 0x{x} as '{s}', want 0 as 'Keeper'", .{ j.result, who });
     return .{ .name = name, .status = .pass, .msg = msg("cross-era character not made active; the client plays its own (Keeper)", .{}) };
+}
+
+/// One client, one character, two games. A session retrying a join may take over its own pending
+/// claim, because the earlier attempt never reached a game. Once a game server has LOADED the
+/// character for that claim, the earlier attempt is in a game; taking the claim over then let a
+/// modified client load the same character into a second game. The server's load check marks the
+/// claim, and a load for a claim that has since moved is refused.
+fn scDupeWindowClosed() Result {
+    const name = "dupe_window_closed";
+    var gs = FakeGS{ .gsid = 0xAB16, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 8000 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "DupeHost", "Anchor") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    seat(&gs, &host, "duperoom", 8000, "DupeHost", "Anchor", 1) catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    if (!awaitListed(&host, "duperoom", 1)) return fail(name, "host's arrival not reflected", .{});
+    if ((host.createGame("dupeelse", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "second create refused", .{});
+
+    // Loaded: the retry must not take it.
+    var p = rc.RealmClient{};
+    defer p.close();
+    enterAs(&p, "DupeAcct", "Twinned") catch |e| return fail(name, "p: {s}", .{@errorName(e)});
+    if ((p.joinGame("duperoom") catch return fail(name, "join", .{})).result != 0) return fail(name, "first join refused", .{});
+    const loaded = gs.loadChar("DupeAcct", "Twinned", 8000) catch |e| return fail(name, "load: {s}", .{@errorName(e)});
+    if (loaded != .ours) return fail(name, "server's load of a claimed character -> {s}, want ours", .{@tagName(loaded)});
+    const dup = p.joinGame("dupeelse") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (dup.result != 0x2b) return fail(name, "same session took a LOADED character into a second game -> 0x{x}, want 0x2b", .{dup.result});
+
+    // Never loaded: the retry still takes it (the abandoned join stays fixed), and the first
+    // game's server may then not load it.
+    var q = rc.RealmClient{};
+    defer q.close();
+    enterAs(&q, "DupeAcctQ", "Abandon") catch |e| return fail(name, "q: {s}", .{@errorName(e)});
+    if ((q.joinGame("duperoom") catch return fail(name, "join", .{})).result != 0) return fail(name, "q first join refused", .{});
+    const retry = q.joinGame("dupeelse") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (retry.result != 0) return fail(name, "retry of a join that never reached a server -> 0x{x}, want 0", .{retry.result});
+    const stale = gs.loadChar("DupeAcctQ", "Abandon", 8000) catch |e| return fail(name, "load: {s}", .{@errorName(e)});
+    if (stale != .refused) return fail(name, "load into the game the claim moved away from -> {s}, want refused", .{@tagName(stale)});
+    const fresh = gs.loadChar("DupeAcctQ", "Abandon", 8001) catch |e| return fail(name, "load: {s}", .{@errorName(e)});
+    if (fresh != .ours) return fail(name, "load into the claim's own game -> {s}, want ours", .{@tagName(fresh)});
+
+    // A loaded client that vanishes without a departure is still freed, on the longer grace.
+    backdate("realmd:charjoin:DupeAcct/Twinned", 400_000) catch |e| return fail(name, "backdate: {s}", .{@errorName(e)});
+    if (!awaitKey("realmd:charlock:DupeAcct/Twinned", null, 5000)) return fail(name, "a loaded claim past the loaded grace was never withdrawn", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("loaded claim held against the retry (0x2b); unloaded retry allowed, stale load refused; loaded grace frees it", .{}) };
+}
+
+/// Every server numbers its games from its own counter, so two servers host a game 9000 at the
+/// same time. A close from one of them removed whichever game 9000 the realm had indexed last and
+/// freed the characters of both.
+fn scGameIdAcrossServers() Result {
+    const name = "gameid_across_servers";
+    var a = FakeGS{ .gsid = 0xAB18, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 9000 };
+    a.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer a.stop();
+    var b = FakeGS{ .gsid = 0xAB19, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 9000 };
+    b.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer b.stop();
+    if (!a.isRegistered() or !b.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var one = rc.RealmClient{};
+    defer one.close();
+    enterAs(&one, "TwinAcctA", "Firstborn") catch |e| return fail(name, "one: {s}", .{@errorName(e)});
+    if ((one.createGame("twin_one", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "create twin_one refused", .{});
+    const first_on_a = a.creates == 1;
+    var two = rc.RealmClient{};
+    defer two.close();
+    enterAs(&two, "TwinAcctB", "Secondborn") catch |e| return fail(name, "two: {s}", .{@errorName(e)});
+    if ((two.createGame("twin_two", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "create twin_two refused", .{});
+    if (a.creates != 1 or b.creates != 1) return fail(name, "games not spread over both servers (a={d} b={d})", .{ a.creates, b.creates });
+    if ((one.joinGame("twin_one") catch return fail(name, "join", .{})).result != 0) return fail(name, "join twin_one refused", .{});
+    if ((two.joinGame("twin_two") catch return fail(name, "join", .{})).result != 0) return fail(name, "join twin_two refused", .{});
+
+    // twin_one's server closes ITS game 9000.
+    const closer = if (first_on_a) &a else &b;
+    closer.sendCloseGame(9000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitKey("realmd:charlock:TwinAcctA/Firstborn", null, 2000)) return fail(name, "the closed game's character was not freed", .{});
+    _ = net.usleep(200_000);
+    if (listedPlayers(&two, "twin_two") == null) return fail(name, "the OTHER server's game 9000 was delisted by this close", .{});
+    var lb: [64]u8 = undefined;
+    if (redisGet("realmd:charlock:TwinAcctB/Secondborn", &lb) == null) return fail(name, "the OTHER server's player was freed by this close", .{});
+    if (listedPlayers(&one, "twin_one") != null) return fail(name, "the closed game is still listed", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("close of game 9000 on one server left the other server's game 9000 and its player alone", .{}) };
 }
 
 /// A save is only durable if it is written under the right ACCOUNT — and the account reaches the
@@ -3400,6 +3486,8 @@ pub fn main() !void {
         scLateArrivalReclaims(),
         scDeadGsLeasesLapse(),
         scCrossEraCreateNotActive(),
+        scDupeWindowClosed(),
+        scGameIdAcrossServers(),
     };
 
     if (child) |pid| {

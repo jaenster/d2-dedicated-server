@@ -22,6 +22,7 @@ pub const Name = types.Name;
 pub const CharRec = types.CharRec;
 pub const VersionTag = types.VersionTag;
 pub const GameRec = types.GameRec;
+pub const GameRef = types.GameRef;
 pub const Route = types.Route;
 pub const TokenRoute = types.TokenRoute;
 pub const max_chars = types.max_chars;
@@ -473,16 +474,16 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
 
 /// Overwrite a hosted game's player count (UPDATEGAMEINFO from the GS that hosts it).
 /// False if no live game carries that id.
-pub fn setGamePlayers(gameid: u32, players: u16) bool {
-    return redis.setGamePlayers(gameid, players);
+pub fn setGamePlayers(game: GameRef, players: u16) bool {
+    return redis.setGamePlayers(game, players);
 }
 
 pub fn findGame(name: []const u8) ?GameRec {
     return redis.findGame(name);
 }
 
-pub fn removeGameById(gameid: u32) void {
-    redis.removeGameById(gameid);
+pub fn removeGame(game: GameRef) void {
+    redis.removeGame(game);
 }
 
 pub fn expireGamesByGs(gsid: u32) void {
@@ -681,64 +682,69 @@ pub fn releaseGameName(name: []const u8) void {
 
 /// The owner id a game uses for the characters it holds. Stable across instances, because any
 /// realmd may be the one that closes the game.
-pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {
-    return std.fmt.bufPrint(buf, "game:{d}", .{gameid}) catch buf[0..0];
+pub fn gameOwnerId(buf: []u8, game: GameRef) []const u8 {
+    return std.fmt.bufPrint(buf, "game:{x}.{d}", .{ game.gsid, game.gameid }) catch buf[0..0];
 }
 
 /// How long a join may go unconfirmed in a game whose server reports arrivals before the realm
 /// treats it as abandoned. Well past the client's own give-up on a join that goes nowhere.
 pub const join_grace_s: u32 = 60;
 
+/// The same, for a claim whose character a game server has already loaded. That client got as far
+/// as the game, so the claim is not withdrawn on the join grace; this is only the backstop for a
+/// server that never reports the departure of a client that loaded and then vanished.
+pub const loaded_grace_s: u32 = char_lock_ttl_s;
+
 pub const JoinClaim = redis.JoinClaim;
 
 /// Claim the character for a join into game `game_name` (`gameid`) by realm session `session`.
 /// See `redis.claimCharForJoin` for when a claim left by a join that never arrived is taken over.
-pub fn claimCharForJoin(account: []const u8, charname: []const u8, game_name: []const u8, gameid: u32, session: u64) JoinClaim {
-    return redis.claimCharForJoin(account, charname, game_name, gameid, session, char_lock_ttl_s, join_grace_s, game_ttl_s);
+pub fn claimCharForJoin(account: []const u8, charname: []const u8, game_name: []const u8, game: GameRef, session: u64) JoinClaim {
+    return redis.claimCharForJoin(account, charname, game_name, game, session, char_lock_ttl_s, join_grace_s, loaded_grace_s, game_ttl_s);
 }
 
 pub const Arrival = redis.Arrival;
 
 /// The game server saw this character arrive; its claim is no longer pending.
-pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8) Arrival {
-    return redis.confirmGameChar(gameid, account, charname, game_ttl_s, char_lock_ttl_s);
+pub fn confirmGameChar(game: GameRef, account: []const u8, charname: []const u8) Arrival {
+    return redis.confirmGameChar(game, account, charname, game_ttl_s, char_lock_ttl_s);
 }
 
 /// Count a join into the game's listing, as the record stands now. False if the game is gone.
-pub fn countJoin(gameid: u32) bool {
-    return redis.countJoin(gameid, game_ttl_s);
+pub fn countJoin(game: GameRef) bool {
+    return redis.countJoin(game, game_ttl_s);
 }
 
-pub fn adjustGamePlayers(gameid: u32, delta: i32) bool {
-    return redis.adjustGamePlayers(gameid, delta);
+pub fn adjustGamePlayers(game: GameRef, delta: i32) bool {
+    return redis.adjustGamePlayers(game, delta);
 }
 
 pub const LeasePass = redis.LeasePass;
 
 /// Renew the leases on every character a live game holds, withdrawing joins that never arrived.
 /// The realm calls this on a timer for every game still in the index; see `fleet.renewCharLeases`.
-pub fn renewGameCharLeases(gameid: u32) LeasePass {
+pub fn renewGameCharLeases(game: GameRef) LeasePass {
     var ob: [32]u8 = undefined;
-    return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s, join_grace_s, game_ttl_s);
+    return redis.renewGameCharLeases(game, gameOwnerId(&ob, game), char_lock_ttl_s, join_grace_s, loaded_grace_s, game_ttl_s);
 }
 
-pub fn releaseGameChars(gameid: u32) usize {
+pub fn releaseGameChars(game: GameRef) usize {
     var ob: [32]u8 = undefined;
-    const owner = gameOwnerId(&ob, gameid);
-    return redis.releaseGameChars(gameid, owner);
+    const owner = gameOwnerId(&ob, game);
+    return redis.releaseGameChars(game, owner);
 }
 
 /// Release the seat this game holds for exactly this character. Preferred over the by-name form
 /// wherever the game server told us the account — it cannot pick the wrong player.
-pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const u8) bool {
+pub fn releaseGameCharExact(game: GameRef, account: []const u8, charname: []const u8) bool {
     var buf: [32]u8 = undefined;
-    return redis.releaseGameCharExact(gameid, account, charname, gameOwnerId(&buf, gameid));
+    return redis.releaseGameCharExact(game, account, charname, gameOwnerId(&buf, game));
 }
 
-pub fn releaseGameCharByName(gameid: u32, charname: []const u8) bool {
+pub fn releaseGameCharByName(game: GameRef, charname: []const u8) bool {
     var ob: [32]u8 = undefined;
-    const owner = gameOwnerId(&ob, gameid);
-    return redis.releaseGameCharByName(gameid, charname, owner);
+    const owner = gameOwnerId(&ob, game);
+    return redis.releaseGameCharByName(game, charname, owner);
 }
 
 /// Which game holds this character, or null if it is free.

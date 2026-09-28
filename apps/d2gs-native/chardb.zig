@@ -21,6 +21,14 @@
 const std = @import("std");
 const macho = @import("macho");
 const store = @import("store.zig");
+const seats = @import("gs_seats");
+
+/// This server's fleet id, for the claim check at load. Set by realm.zig once it is known.
+pub var gsid: u32 = 0;
+
+/// What `CLIENT_LoadCharacterSave` answers when there is no save to load (see the header); the
+/// same answer refuses a load the realm's claim does not allow.
+const no_save: u32 = 0x0e;
 
 extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
@@ -162,6 +170,11 @@ fn loadCharacterSave(
     a7: u32,
     a8: u32,
 ) callconv(.c) u32 {
+    // The realm's claim has to be this game's before the character goes in. This is the moment the
+    // engine loads it (GAMELOGON), not JOINGAMEREQ: a join the client never followed up must stay
+    // one the realm can hand elsewhere. Refused before anything is handed, in both source modes;
+    // in file mode the placed file would otherwise load regardless.
+    if (charname != 0 and !claimAllows(std.mem.span(@as([*:0]const u8, @ptrFromInt(charname))))) return no_save;
     const source: *u8 = @ptrFromInt(game + game_save_source);
     const was = source.*;
     const handed = if (charname != 0) hand(client, std.mem.span(@as([*:0]const u8, @ptrFromInt(charname)))) else false;
@@ -173,6 +186,19 @@ fn loadCharacterSave(
 
     if (handed) source.* = was;
     return rc;
+}
+
+/// Whether the realm's claim lets this game load `charname` now, marking it loaded if so (see
+/// `realm_proto.claims`). A character the realm has since handed to another game would otherwise
+/// be in two games. No realm join known for it (no account) or no store: nothing to check against.
+fn claimAllows(charname: []const u8) bool {
+    if (!store.enabled()) return true;
+    var ab: [seats.max_account]u8 = undefined;
+    const account = seats.accountForChar(charname, &ab) orelse return true;
+    const verdict = store.checkCharLoad(account, charname, gsid, seats.gameForChar(charname) orelse 0);
+    if (verdict.allowed()) return true;
+    note("d2gs-native: {s}/{s} is claimed by another game — refusing this load\n", .{ account, charname });
+    return false;
 }
 
 /// Give the client the save fetched for `charname`, if one is waiting. The engine allocates and

@@ -20,6 +20,8 @@ const Name = types.Name;
 const GameRec = types.GameRec;
 const Route = types.Route;
 const TokenRoute = types.TokenRoute;
+const GameRef = types.GameRef;
+const claims = @import("realm_proto").claims;
 
 const prefix = "realmd:";
 
@@ -918,7 +920,7 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
     // contain spaces. Same encoding as the fs backend, so parseGame is shared in spirit.
     const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, status, difficulty, password, description }) catch return false;
     var ik: [64]u8 = undefined;
-    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
+    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}.{d}", .{ gsid, gameid }) catch return false;
     var gb: [64]u8 = undefined;
     const gskey = std.fmt.bufPrint(&gb, prefix ++ "game:bygs:{x}", .{gsid}) catch return false;
 
@@ -1095,10 +1097,10 @@ fn parseGame(val: []const u8) ?GameRec {
 /// Overwrite a game's player count, found via the byid index. Rewrites the record with
 /// `SET ... KEEPTTL` so the game keeps the lease it already had — a join or a leave says
 /// nothing about how much longer the game should stay listed.
-pub fn setGamePlayers(gameid: u32, players: u16) bool {
+pub fn setGamePlayers(game: GameRef, players: u16) bool {
     // When the server's own count last replaced ours: a join claimed before this is no longer in it.
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamecounted:{d}", .{gameid}) catch return false;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamecounted:{x}.{d}", .{ game.gsid, game.gameid }) catch return false;
     const script = lua_now_ms ++
         \\redis.call('SET', KEYS[1], string.format('%d', now_ms()), 'EX', 21600)
         \\return 1
@@ -1109,19 +1111,19 @@ pub fn setGamePlayers(gameid: u32, players: u16) bool {
         var r: Reader = undefined;
         _ = command(s, &r, &.{ "EVAL", script, "1", key });
     }
-    return rewriteGamePlayers(gameid, .{ .set = players }, 0);
+    return rewriteGamePlayers(game, .{ .set = players }, 0);
 }
 
 /// Move a game's player count by `delta`, floored at zero. For a claim the realm withdraws: the
 /// game server never counted a player who never arrived, so only the realm's own bump comes back.
-pub fn adjustGamePlayers(gameid: u32, delta: i32) bool {
-    return rewriteGamePlayers(gameid, .{ .delta = delta }, 0);
+pub fn adjustGamePlayers(game: GameRef, delta: i32) bool {
+    return rewriteGamePlayers(game, .{ .delta = delta }, 0);
 }
 
 /// Count a join the realm just authorised, against the record as it is NOW, and renew the game's
 /// listing. False if the game is no longer indexed: a join never brings a closed game back.
-pub fn countJoin(gameid: u32, ttl_s: u32) bool {
-    return rewriteGamePlayers(gameid, .{ .delta = 1 }, @as(u64, ttl_s) * 1000);
+pub fn countJoin(game: GameRef, ttl_s: u32) bool {
+    return rewriteGamePlayers(game, .{ .delta = 1 }, @as(u64, ttl_s) * 1000);
 }
 
 const PlayerCount = union(enum) { set: u16, delta: i32 };
@@ -1132,9 +1134,9 @@ const PlayerCount = union(enum) { set: u16, delta: i32 };
 /// if the record is still there. As separate commands, a close landing between the read and the
 /// write (from another instance, which the in-process lock does not order against) was undone by
 /// the write, and a `SET ... KEEPTTL` on a key that is gone leaves it with no TTL at all.
-fn rewriteGamePlayers(gameid: u32, count: PlayerCount, renew_ms: u64) bool {
+fn rewriteGamePlayers(game: GameRef, count: PlayerCount, renew_ms: u64) bool {
     var ik: [64]u8 = undefined;
-    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
+    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}.{d}", .{ game.gsid, game.gameid }) catch return false;
     var vb: [24]u8 = undefined;
     const kind: []const u8, const val = switch (count) {
         .set => |n| .{ "set", std.fmt.bufPrint(&vb, "{d}", .{n}) catch return false },
@@ -1179,9 +1181,9 @@ fn rewriteGamePlayers(gameid: u32, count: PlayerCount, renew_ms: u64) bool {
 
 /// Look up the game name for an engine gameid via the byid index, then delete the
 /// game record and that index entry.
-pub fn removeGameById(gameid: u32) void {
+pub fn removeGame(game: GameRef) void {
     var ik: [64]u8 = undefined;
-    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return;
+    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}.{d}", .{ game.gsid, game.gameid }) catch return;
 
     // Resolves a name through byid, which a concurrent create may have just rebound.
     game_index_lock.lock();
@@ -1283,7 +1285,7 @@ pub fn expireGamesByGs(gsid: u32) void {
         }) |val| {
             if (parseGame(val)) |rec| {
                 var ik: [64]u8 = undefined;
-                const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{rec.gameid}) catch null;
+                const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}.{d}", .{ gsid, rec.gameid }) catch null;
                 if (idkey) |k| _ = command(s, &r, &.{ "DEL", k });
             }
         }
@@ -1510,7 +1512,7 @@ pub const JoinClaim = union(enum) {
 };
 
 pub const Withdrawn = struct {
-    gameid: u32,
+    game: GameRef,
     /// The join's bump is still in that game's player count: no count from its server has
     /// replaced it since.
     counted: bool,
@@ -1525,30 +1527,15 @@ const lua_now_ms =
     \\
 ;
 
-/// A pending join's record, `realmd:charjoin:<member>` = "<gameid>|<session>|<flags>|<ms>".
-///
-/// `flags` holds 'L' when this claim took over a pending claim on the SAME game: that earlier
-/// attempt may still be in the engine, and the departure the engine reports for it arrives after
-/// this claim and must not be applied to it. The first such departure is absorbed instead. A
-/// value without the flags field ("<gameid>|<session>|<ms>") is read as having none.
-const lua_parse_join =
-    \\local function parse_join(v)
-    \\  if not v then return nil end
-    \\  local g, s, rest = string.match(v, '^(%d+)|([^|]*)|(.*)$')
-    \\  if not g then return nil end
-    \\  local f, at = string.match(rest, '^([^|]*)|(%d+)$')
-    \\  if not f then f, at = '', string.match(rest, '^(%d+)$') end
-    \\  if not at then return nil end
-    \\  return g, s, f, tonumber(at)
-    \\end
-    \\
-;
+/// The pending-join record and its flags are the realm/game-server contract in
+/// `realm_proto.claims`; the parser is shared with the game servers' load check.
+const lua_parse_join = claims.lua_parse_join;
 
-/// Where a claim withdrawn as abandoned is remembered (`realmd:charleft:<member>` = gameid), so
+/// Where a claim withdrawn as abandoned is remembered (`realmd:charleft:<member>` = game ref), so
 /// the arrival it was waiting for can still reclaim the character if it turns up late.
 const charleft = "charleft:";
 
-/// Claim a character for a join into `gameid`, recording the claim as PENDING until the game
+/// Claim a character for a join into `game`, recording the claim as PENDING until the game
 /// server reports the player arrived (`confirmGameChar`).
 ///
 /// A pending claim is a join the realm authorised and nobody has seen complete. It is given up to
@@ -1556,14 +1543,19 @@ const charleft = "charleft:";
 /// previous attempt is dead), or when its game reports arrivals and this one has not arrived within
 /// `grace_s`. Otherwise it is held exactly like a seated character.
 ///
+/// Once a game server has LOADED the character for the claim (flag 'D', set by the server's load
+/// check in `realm_proto.claims`), the attempt is not dead however the client behaves: the same
+/// session may not take it over, and only `loaded_grace_s` (well past any load) withdraws it.
+/// Taking it over earlier is how one client would get the character into two games.
+///
 /// The game has to still be the one named `game_name` in the index, checked in the same script:
 /// a join that waited for its character can outlive the game it is joining, and a claim on a game
 /// that has closed is never released by that game's close.
-pub fn claimCharForJoin(account: []const u8, charname: []const u8, game_name: []const u8, gameid: u32, session: u64, ttl_s: u32, grace_s: u32, game_ttl_s: u32) JoinClaim {
+pub fn claimCharForJoin(account: []const u8, charname: []const u8, game_name: []const u8, game: GameRef, session: u64, ttl_s: u32, grace_s: u32, loaded_grace_s: u32, game_ttl_s: u32) JoinClaim {
     var nb: [64]u8 = undefined;
     const safe = gameKey(game_name, &nb) orelse return .gone;
     var xb: [64]u8 = undefined;
-    const idkey = std.fmt.bufPrint(&xb, prefix ++ "game:byid:{x}", .{gameid}) catch return .held;
+    const idkey = std.fmt.bufPrint(&xb, prefix ++ "game:byid:{x}.{d}", .{ game.gsid, game.gameid }) catch return .held;
     var gtb: [24]u8 = undefined;
     const game_px = std.fmt.bufPrint(&gtb, "{d}", .{@as(u64, game_ttl_s) * 1000}) catch return .held;
     var mb: [96]u8 = undefined;
@@ -1573,19 +1565,21 @@ pub fn claimCharForJoin(account: []const u8, charname: []const u8, game_name: []
     var jb: [128]u8 = undefined;
     const joinkey = std.fmt.bufPrint(&jb, prefix ++ "charjoin:{s}", .{member}) catch return .held;
     var gb: [64]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&gb, prefix ++ "gamechars:{d}", .{gameid}) catch return .held;
+    const setkey = std.fmt.bufPrint(&gb, prefix ++ "gamechars:{x}.{d}", .{ game.gsid, game.gameid }) catch return .held;
     var ob: [32]u8 = undefined;
-    const owner = std.fmt.bufPrint(&ob, "game:{d}", .{gameid}) catch return .held;
-    var ib: [16]u8 = undefined;
-    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return .held;
+    const owner = std.fmt.bufPrint(&ob, "game:{x}.{d}", .{ game.gsid, game.gameid }) catch return .held;
+    var ib: [32]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{x}.{d}", .{ game.gsid, game.gameid }) catch return .held;
     var sb: [24]u8 = undefined;
     const sess = std.fmt.bufPrint(&sb, "{x}", .{session}) catch return .held;
     var pb: [16]u8 = undefined;
     const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return .held;
     var tb: [16]u8 = undefined;
     const grace = std.fmt.bufPrint(&tb, "{d}", .{grace_s}) catch return .held;
-    // -2 gone, -1 held, 0 claimed, otherwise 2 * the gameid the pending claim was taken from,
-    // plus 1 when its bump is still in that game's count.
+    var lgb: [16]u8 = undefined;
+    const loaded_grace = std.fmt.bufPrint(&lgb, "{d}", .{loaded_grace_s}) catch return .held;
+    // -2 gone, -1 held, 0 claimed; a claim taken over answers "T<counted><ref>" with the game it
+    // was taken from and whether its bump is still in that game's count.
     const script = lua_now_ms ++ lua_parse_join ++
         \\if redis.call('GET', KEYS[4]) ~= ARGV[8] then return -2 end
         \\local now = now_ms()
@@ -1600,25 +1594,30 @@ pub fn claimCharForJoin(account: []const u8, charname: []const u8, game_name: []
         \\if not holder then take('') return 0 end
         \\local g, s, f, at = parse_join(redis.call('GET', KEYS[2]))
         \\if not g or holder ~= ('game:' .. g) then return -1 end
-        \\local dead = (s == ARGV[4])
+        \\local loaded = string.find(f, 'D', 1, true) ~= nil
+        \\local dead = (s == ARGV[4]) and not loaded
         \\if not dead and redis.call('EXISTS', ARGV[7] .. 'gamearrived:' .. g) == 1 then
-        \\  dead = (now - at) > tonumber(ARGV[6]) * 1000
+        \\  local limit = loaded and ARGV[10] or ARGV[6]
+        \\  dead = (now - at) > tonumber(limit) * 1000
         \\end
         \\if not dead then return -1 end
         \\redis.call('SREM', ARGV[7] .. 'gamechars:' .. g, ARGV[2])
         \\local counted = tonumber(redis.call('GET', ARGV[7] .. 'gamecounted:' .. g) or '0')
         \\take((g == ARGV[3]) and 'L' or '')
-        \\return tonumber(g) * 2 + ((counted < at) and 1 or 0)
+        \\return 'T' .. ((counted < at) and '1' or '0') .. g
     ;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "4", lockkey, joinkey, setkey, idkey, owner, member, gid, sess, px, grace, prefix, safe, game_px }) orelse return .held;
+    const rep = command(s, &r, &.{ "EVAL", script, "4", lockkey, joinkey, setkey, idkey, owner, member, gid, sess, px, grace, prefix, safe, game_px, loaded_grace }) orelse return .held;
     return switch (rep) {
-        .int => |v| if (v == 0) .claimed else if (v > 0) .{ .took_over = .{
-            .gameid = @intCast(@divTrunc(v, 2)),
-            .counted = @mod(v, 2) == 1,
-        } } else if (v == -2) .gone else .held,
+        .int => |v| if (v == 0) .claimed else if (v == -2) .gone else .held,
+        .bulk => |b| blk: {
+            const t = b orelse break :blk .held;
+            if (t.len < 3 or t[0] != 'T') break :blk .held;
+            const old = GameRef.parse(t[2..]) orelse break :blk .held;
+            break :blk .{ .took_over = .{ .game = old, .counted = t[1] == '1' } };
+        },
         else => .held,
     };
 }
@@ -1644,15 +1643,15 @@ pub const Arrival = enum {
 /// withdrawn as abandoned (a slow load, or an arrival held up in the event queue) takes the
 /// character back for this game if nobody else has it, and only while the game is still indexed:
 /// otherwise a player in the world would be free for a second login to take elsewhere.
-pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8, game_ttl_s: u32, lock_ttl_s: u32) Arrival {
+pub fn confirmGameChar(game: GameRef, account: []const u8, charname: []const u8, game_ttl_s: u32, lock_ttl_s: u32) Arrival {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .none;
-    var ib: [16]u8 = undefined;
-    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return .none;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{x}.{d}", .{ game.gsid, game.gameid }) catch return .none;
+    var ib: [32]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{x}.{d}", .{ game.gsid, game.gameid }) catch return .none;
     var tb: [16]u8 = undefined;
     const ttl = std.fmt.bufPrint(&tb, "{d}", .{game_ttl_s}) catch return .none;
     var xb: [64]u8 = undefined;
-    const idkey = std.fmt.bufPrint(&xb, prefix ++ "game:byid:{x}", .{gameid}) catch return .none;
+    const idkey = std.fmt.bufPrint(&xb, prefix ++ "game:byid:{x}.{d}", .{ game.gsid, game.gameid }) catch return .none;
     var pb: [16]u8 = undefined;
     const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, lock_ttl_s) * 1000}) catch return .none;
     const script = lua_parse_join ++
@@ -1849,9 +1848,9 @@ pub fn cacheCharIfAbsent(account: []const u8, charname: []const u8, bytes: []con
 /// Each release is still owner-checked: a character whose lease lapsed and was taken by another
 /// game must not be freed by this one closing. Done in a single script so a character cannot be
 /// claimed between the check and the delete.
-pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
+pub fn releaseGameChars(game: GameRef, owner: []const u8) usize {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{x}.{d}", .{ game.gsid, game.gameid }) catch return 0;
     const script =
         \\local n = 0
         \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
@@ -1866,8 +1865,8 @@ pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
         \\redis.call('DEL', ARGV[3] .. 'gamearrived:' .. ARGV[4], ARGV[3] .. 'gamecounted:' .. ARGV[4])
         \\return n
     ;
-    var ib: [16]u8 = undefined;
-    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return 0;
+    var ib: [32]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{x}.{d}", .{ game.gsid, game.gameid }) catch return 0;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -1903,17 +1902,19 @@ pub const LeasePass = struct {
 /// The game's character set is kept alive with it: it carries a TTL so a game that never reports a
 /// close cannot leak it, and a game that outlives that TTL must not lose it, or its players' leases
 /// stop being renewed while they play.
-pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32, grace_s: u32, game_ttl_s: u32) LeasePass {
+pub fn renewGameCharLeases(game: GameRef, owner: []const u8, ttl_s: u32, grace_s: u32, loaded_grace_s: u32, game_ttl_s: u32) LeasePass {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .{};
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{x}.{d}", .{ game.gsid, game.gameid }) catch return .{};
     var pb: [16]u8 = undefined;
     const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return .{};
-    var ib: [16]u8 = undefined;
-    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return .{};
+    var ib: [32]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{x}.{d}", .{ game.gsid, game.gameid }) catch return .{};
     var tb: [16]u8 = undefined;
     const grace = std.fmt.bufPrint(&tb, "{d}", .{grace_s}) catch return .{};
     var gtb: [16]u8 = undefined;
     const game_ttl = std.fmt.bufPrint(&gtb, "{d}", .{game_ttl_s}) catch return .{};
+    var lgb: [16]u8 = undefined;
+    const loaded_grace = std.fmt.bufPrint(&lgb, "{d}", .{loaded_grace_s}) catch return .{};
     const script = lua_now_ms ++ lua_parse_join ++
         \\redis.call('EXPIRE', KEYS[1], ARGV[7])
         \\local n, w, u = 0, 0, 0
@@ -1924,9 +1925,10 @@ pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32, grace_s: 
         \\  local lk = ARGV[3] .. m
         \\  if redis.call('GET', lk) == ARGV[1] then
         \\    local jk = ARGV[4] .. 'charjoin:' .. m
-        \\    local g, _, _, at = parse_join(redis.call('GET', jk))
+        \\    local g, _, f, at = parse_join(redis.call('GET', jk))
         \\    if g ~= ARGV[5] then at = nil end
-        \\    if arrived and at and now - at > tonumber(ARGV[6]) * 1000 then
+        \\    local limit = (f and string.find(f, 'D', 1, true)) and ARGV[8] or ARGV[6]
+        \\    if arrived and at and now - at > tonumber(limit) * 1000 then
         \\      redis.call('DEL', lk)
         \\      redis.call('DEL', jk)
         \\      redis.call('SREM', KEYS[1], m)
@@ -1944,7 +1946,7 @@ pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32, grace_s: 
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, px, prefix ++ "charlock:", prefix, gid, grace, game_ttl }) orelse return .{};
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, px, prefix ++ "charlock:", prefix, gid, grace, game_ttl, loaded_grace }) orelse return .{};
     const len: usize = switch (rep) {
         .array_len => |n| if (n <= 0) return .{} else @intCast(n),
         else => return .{},
@@ -1970,9 +1972,9 @@ pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32, grace_s: 
 /// The unambiguous form of `releaseGameCharByName`, for a game server that told us which account
 /// the departing player belongs to. Nothing is scanned and nothing is guessed: the member is
 /// built, not matched, so a second character with the same name in the same game is untouched.
-pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const u8, owner: []const u8) bool {
+pub fn releaseGameCharExact(game: GameRef, account: []const u8, charname: []const u8, owner: []const u8) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{x}.{d}", .{ game.gsid, game.gameid }) catch return false;
     var mb: [96]u8 = undefined;
     const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
     var lb: [128]u8 = undefined;
@@ -1981,8 +1983,8 @@ pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const 
     const joinkey = std.fmt.bufPrint(&jb, prefix ++ "charjoin:{s}/{s}", .{ account, charname }) catch return false;
     var tkb: [128]u8 = undefined;
     const leftkey = std.fmt.bufPrint(&tkb, prefix ++ charleft ++ "{s}/{s}", .{ account, charname }) catch return false;
-    var ib: [16]u8 = undefined;
-    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return false;
+    var ib: [32]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{x}.{d}", .{ game.gsid, game.gameid }) catch return false;
     // The lock is released only if this game still owns it — the same compare-and-swap every other
     // release does. A lapsed lease may already have been taken by somebody else, and a blind DEL
     // would free THEIR claim.
@@ -2012,9 +2014,9 @@ pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const 
     };
 }
 
-pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u8) bool {
+pub fn releaseGameCharByName(game: GameRef, charname: []const u8, owner: []const u8) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{x}.{d}", .{ game.gsid, game.gameid }) catch return false;
     var sb: [64]u8 = undefined;
     const suffix = std.fmt.bufPrint(&sb, "/{s}", .{charname}) catch return false;
     // Two passes, and the second only runs if the first found EXACTLY one match.
@@ -2029,8 +2031,8 @@ pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u
     // Ambiguity therefore releases NOTHING. The lock lingers until the game ends, where
     // `releaseGameChars` frees everything the game held by gameid and needs no names at all — a
     // late release is a small delay, and the alternative is somebody else's character.
-    var ib: [16]u8 = undefined;
-    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return false;
+    var ib: [32]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{x}.{d}", .{ game.gsid, game.gameid }) catch return false;
     const script = lua_parse_join ++
         \\local hit, n = nil, 0
         \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do

@@ -26,7 +26,7 @@ pub const Client = struct {
     /// Send one command and read one reply. The reply's slices point into this client's buffer
     /// and are valid until the next call.
     pub fn cmd(self: *Client, args: []const []const u8) !resp.Reply {
-        var tx: [1024]u8 = undefined;
+        var tx: [4096]u8 = undefined;
         const wire = resp.encode(&tx, args) orelse return error.TooLong;
         try net.writeAll(self.fd, wire);
         return self.readReply();
@@ -35,7 +35,7 @@ pub const Client = struct {
     /// Same, but the last argument may be larger than the command buffer — a reply packet, or a
     /// character save.
     pub fn cmdBig(self: *Client, head: []const []const u8, tail: []const u8) !resp.Reply {
-        var tx: [1024]u8 = undefined;
+        var tx: [4096]u8 = undefined;
         var n: usize = 0;
         n += (std.fmt.bufPrint(tx[n..], "*{d}\r\n", .{head.len + 1}) catch return error.TooLong).len;
         for (head) |a| {

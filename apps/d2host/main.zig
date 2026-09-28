@@ -104,6 +104,23 @@ var gs_labels: []const u8 = "";
 
 /// The realm link is optional. Without a store address this stays a standalone spike that creates
 /// one game and ticks — which is exactly what it was, and still the quickest way to prove a build.
+/// The character's save, when the realm's claim lets THIS game load it; nothing otherwise, which
+/// the engine answers by refusing the join. The claim names the game the realm sent the character
+/// to; a load into any other (the realm has since handed the character elsewhere) would put it in
+/// two games. Checking marks the claim loaded, which is what stops the realm handing it elsewhere
+/// from here on. See `realm_proto.claims`.
+fn fetchClaimed(acct_name: []const u8, char_name: []const u8, out: []u8) store.Loaded {
+    if (realmConfigured()) {
+        const verdict = store.checkCharLoad(acct_name, char_name, gsid, seats.gameForChar(char_name) orelse 0);
+        if (!verdict.allowed()) {
+            sayFmt("d2host: '{s}' is claimed by another game — refusing this load", .{char_name});
+            return .{ .len = 0, .ver = 0 };
+        }
+        if (verdict == .reclaimed) sayFmt("d2host: '{s}' was unclaimed; claimed it for this game", .{char_name});
+    }
+    return store.getCharVersioned(acct_name, char_name, out);
+}
+
 fn realmConfigured() bool {
     return gsid != 0 and store.enabled();
 }
@@ -301,7 +318,7 @@ fn Binding(comptime version: d2version.Version) type {
                 return 0;
             };
             slot.* = .{ .used = true, .client_id = @intCast(client_id), .container = 0 };
-            const loaded = store.getCharVersioned(acct_name, char_name, &slot.save);
+            const loaded = fetchClaimed(acct_name, char_name, &slot.save);
             slot.len = @intCast(loaded.len);
             if (loaded.len > 0) seats.setVersion(char_name, loaded.ver);
             sayFmt("d2host: fpGetDatabaseCharacter ({s}) — save bytes 0x{x}", .{ char_name, slot.len });
@@ -335,7 +352,7 @@ fn Binding(comptime version: d2version.Version) type {
             // save comes back and removes the client if it disagrees.
             const container_slot: *const usize = @ptrFromInt(ecx -% 8);
             slot.* = .{ .used = true, .client_id = @intCast(client_id), .container = container_slot.* };
-            const loaded = store.getCharVersioned(acct_name, char_name, &slot.save);
+            const loaded = fetchClaimed(acct_name, char_name, &slot.save);
             slot.len = @intCast(loaded.len);
             if (loaded.len > 0) seats.setVersion(char_name, loaded.ver);
             sayHex("d2host: fpGetDatabaseCharacter — save bytes ", slot.len);
@@ -1042,6 +1059,7 @@ fn closeGame(ecx: usize, edx: usize) callconv(.c) usize {
     if (realmConfigured() and gid != 0) {
         var c = std.mem.zeroes(proto.CloseGame);
         c.h = proto.header(.closegame, @sizeOf(proto.CloseGame), 0);
+        c.gsid = gsid;
         c.gameid = gid;
         _ = store.pushEvent(std.mem.asBytes(&c), event_cap, event_ttl_s);
     }
@@ -1114,6 +1132,7 @@ fn sendArrival(_: void, e: seats.roster.Event) void {
     const pkt = proto.encodeUpdateGameInfo(
         &buf,
         0,
+        gsid,
         if (e.kind == .enter) proto.GAMEINFO_ENTER else proto.GAMEINFO_LEAVE,
         e.gameid,
         e.players,

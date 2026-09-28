@@ -8,3 +8,11 @@ pub const protocol = @import("protocol.zig");
 /// The cut "Guild Halls" data model (reconstructed from the beta/1.00 binaries).
 /// Authoritative state lives in realmd; the GS + client read it for display.
 pub const guild = @import("guild.zig");
+
+/// The character claim both sides of the realm read and write in the shared store.
+pub const claims = @import("claims.zig");
+
+test {
+    _ = protocol;
+    _ = claims;
+}

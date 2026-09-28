@@ -127,12 +127,13 @@ pub const JoinGameReply = extern struct {
     gameid: u32,
 };
 
-/// CLOSEGAME (0x23). GS -> D2CS when a game is destroyed. The handler reads the
-/// gameid at body offset 4 (the reserved word mirrors CreateGameReply's result
-/// slot), then removeGameById drops it from the join list + redis indexes.
+/// CLOSEGAME (0x23). GS -> realm when a game is destroyed.
+///
+/// `gsid` is the sending server's fleet id. Engine gameids are numbered per server, so a gameid
+/// alone names a game on every server of the fleet at once; the realm acts on (gsid, gameid).
 pub const CloseGame = extern struct {
     h: Header,
-    reserved: u32 = 0,
+    gsid: u32,
     gameid: u32,
 };
 
@@ -148,6 +149,8 @@ pub const UpdateGameInfo = extern struct {
     players: u32,
     charlevel: u32,
     charclass: u32,
+    /// The sending server's fleet id: `gameid` is only unique on it. See CloseGame.
+    gsid: u32,
     // followed by: cstr charname, then cstr account (optional — absent from older servers)
     //
     // The account is what makes a departure unambiguous. Character names are unique only per
@@ -184,6 +187,7 @@ pub const update_game_info_max = @sizeOf(UpdateGameInfo) + 16 + 32;
 pub fn encodeUpdateGameInfo(
     buf: *[update_game_info_max]u8,
     seqno: u32,
+    gsid: u32,
     flag: u32,
     gameid: u32,
     players: u32,
@@ -193,6 +197,7 @@ pub fn encodeUpdateGameInfo(
     account: []const u8,
 ) []const u8 {
     var r = std.mem.zeroes(UpdateGameInfo);
+    r.gsid = gsid;
     r.flag = flag;
     r.gameid = gameid;
     r.players = players;
@@ -214,20 +219,21 @@ pub fn encodeUpdateGameInfo(
 
 test "an UPDATEGAMEINFO carries the count, the character and the account" {
     var buf: [update_game_info_max]u8 = undefined;
-    const out = encodeUpdateGameInfo(&buf, 7, GAMEINFO_ENTER, 42, 3, 12, 1, "Bob", "acct");
+    const out = encodeUpdateGameInfo(&buf, 7, 0xab10, GAMEINFO_ENTER, 42, 3, 12, 1, "Bob", "acct");
     try std.testing.expectEqualSlices(u8, &.{
-        37, 0, 0x22, 0, 7, 0, 0, 0,
+        41, 0, 0x22, 0, 7, 0, 0, 0,
         1, 0, 0, 0, 42, 0, 0, 0,
         3, 0, 0, 0, 12, 0, 0, 0,
-        1, 0, 0, 0, 'B', 'o', 'b', 0,
+        1, 0, 0, 0, 0x10, 0xab, 0, 0,
+        'B', 'o', 'b', 0,
         'a', 'c', 'c', 't', 0,
     }, out);
 }
 
 test "an over-long name is cut to what D2 allows" {
     var buf: [update_game_info_max]u8 = undefined;
-    const out = encodeUpdateGameInfo(&buf, 1, GAMEINFO_LEAVE, 1, 0, 0, 0, "ABCDEFGHIJKLMNOPQRS", "");
+    const out = encodeUpdateGameInfo(&buf, 1, 1, GAMEINFO_LEAVE, 1, 0, 0, 0, "ABCDEFGHIJKLMNOPQRS", "");
     try std.testing.expectEqual(@as(usize, @sizeOf(UpdateGameInfo) + 16 + 1), out.len);
-    var off: usize = 20;
+    var off: usize = @sizeOf(UpdateGameInfo) - HEADER_LEN;
     try std.testing.expectEqualStrings("ABCDEFGHIJKLMNO", readCStr(out[HEADER_LEN..], &off));
 }

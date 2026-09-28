@@ -430,6 +430,7 @@ pub fn start(loaded: *const macho.load.Loaded) void {
     store.configure(rip, rport);
     chardb.configure(image);
     gsid = identity();
+    chardb.gsid = gsid;
     readGameCap();
     health.gsid = gsid;
     health.games_max = game_cap;
@@ -945,6 +946,7 @@ fn sendArrival(_: void, e: seats.roster.Event) void {
     const pkt = p.encodeUpdateGameInfo(
         &buf,
         seqno,
+        gsid,
         if (e.kind == .enter) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE,
         e.gameid,
         e.players,
@@ -962,6 +964,7 @@ fn sendArrival(_: void, e: seats.roster.Event) void {
 fn sendCloseGame(gid: u32) void {
     var c = std.mem.zeroes(p.CloseGame);
     c.h = header(.closegame, @sizeOf(p.CloseGame));
+    c.gsid = gsid;
     c.gameid = gid;
     _ = store.pushEvent(std.mem.asBytes(&c), event_cap, event_ttl_s);
     publish(); // a freed slot the realm learns about only at the next heartbeat is a slot it will not use

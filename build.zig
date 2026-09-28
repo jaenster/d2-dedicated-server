@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("packages/gs-store/gs_store.zig"),
     });
     gs_store.addImport("resp", resp);
+    gs_store.addImport("realm_proto", realm_proto);
 
     // What a game server says about itself over HTTP. Here rather than in any one server for the
     // same reason gs_store is: three different images answer these endpoints, and a probe or a
@@ -123,6 +124,7 @@ pub fn build(b: *std.Build) void {
     });
     realm_store.addImport("realm_infra", realm_infra);
     realm_store.addImport("resp", resp);
+    realm_store.addImport("realm_proto", realm_proto);
     if (b.lazyDependency("pg", .{ .target = host, .optimize = optimize })) |pg_dep| {
         realm_store.addImport("pg", pg_dep.module("pg"));
     }
@@ -507,6 +509,7 @@ pub fn build(b: *std.Build) void {
         mod_tests.root_module.addAnonymousImport("served_engines", .{ .root_source_file = b.path("deploy/e2e-engines.txt") });
         if (spec[1]) mod_tests.root_module.addImport("realm_infra", realm_infra);
         if (spec[2]) {
+            mod_tests.root_module.addImport("realm_proto", realm_proto);
             if (b.lazyDependency("pg", .{ .target = host, .optimize = optimize })) |pg_dep| {
                 mod_tests.root_module.addImport("pg", pg_dep.module("pg"));
             }
@@ -615,6 +618,7 @@ pub fn build(b: *std.Build) void {
     // same IO-free RESP codec both real ends use — sharing it is what keeps the harness from
     // drifting away from the thing it tests.
     e2e.root_module.addImport("resp", resp);
+    e2e.root_module.addImport("realm_proto", realm_proto);
     const run_e2e = b.addRunArtifact(e2e);
     run_e2e.step.dependOn(&b.addInstallArtifact(realmd, .{}).step);
     run_e2e.step.dependOn(&b.addInstallArtifact(d2ingress, .{}).step); // d2ingress_routing spawns it

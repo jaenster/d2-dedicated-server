@@ -9,6 +9,7 @@ const std = @import("std");
 const net = @import("net.zig");
 const gsstore = @import("gsstore.zig");
 const rc = @import("realmclient.zig");
+const claims = @import("realm_proto").claims;
 
 /// Where the harness's redis is (layout.zig). Set once by main before any FakeGS starts.
 pub var redis_port: u16 = 0;
@@ -192,6 +193,7 @@ pub const FakeGS = struct {
         w.u32v(players);
         w.u32v(level);
         w.u32v(class);
+        w.u32v(self.gsid);
         w.cstr(char);
         if (account.len > 0) w.cstr(account);
         const total = 8 + w.slice().len;
@@ -203,14 +205,28 @@ pub const FakeGS = struct {
 
     /// Report a game ending, freeing whatever characters it still held.
     pub fn sendCloseGame(self: *FakeGS, gameid: u32) !void {
-        // realm-proto's CloseGame: header, a reserved dword, then the gameid.
+        // realm-proto's CloseGame: header, this server's gsid, then the gameid.
         var b: [16]u8 = undefined;
         std.mem.writeInt(u16, b[0..2], 16, .little);
         std.mem.writeInt(u16, b[2..4], rc.GS_CLOSEGAME, .little);
         std.mem.writeInt(u32, b[4..8], 0, .little);
-        std.mem.writeInt(u32, b[8..12], 0, .little);
+        std.mem.writeInt(u32, b[8..12], self.gsid, .little);
         std.mem.writeInt(u32, b[12..16], gameid, .little);
         try self.emit(&b);
+    }
+
+    /// Load a joining character the way a real server does at GAMELOGON: check and mark its claim
+    /// in the shared store first (`realm_proto.claims`), and refuse the load when it is not ours.
+    pub fn loadChar(self: *FakeGS, account: []const u8, char: []const u8, gameid: u32) !claims.Load {
+        var call = claims.LoadCall{};
+        const argv = call.command(account, char, self.gsid, gameid) orelse return error.TooLong;
+        if (self.ev == null) return error.NotConnected;
+        self.evLock();
+        defer self.evUnlock();
+        return switch (try self.ev.?.cmdBig(argv[0 .. argv.len - 1], argv[argv.len - 1])) {
+            .int => |v| claims.decodeLoad(v),
+            else => .unknown,
+        };
     }
 
     fn emit(self: *FakeGS, packet: []const u8) !void {

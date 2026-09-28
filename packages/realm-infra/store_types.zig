@@ -193,6 +193,32 @@ pub const GsRec = struct {
 /// on every heartbeat and every game create, on paths that do not allocate.
 pub const labels_max = 96;
 
+/// One game on one server. Engine game ids are numbered per server (every server starts at 1),
+/// so a gameid alone names a different game on each server of the fleet; everything the realm
+/// keeps about a running game is keyed by the pair.
+pub const GameRef = struct {
+    gsid: u32,
+    gameid: u32,
+
+    /// The pair as the store spells it in keys and values: "<gsid hex>.<gameid>".
+    pub fn text(r: GameRef, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{x}.{d}", .{ r.gsid, r.gameid }) catch buf[0..0];
+    }
+
+    /// The inverse of `text`.
+    pub fn parse(t: []const u8) ?GameRef {
+        const dot = std.mem.indexOfScalar(u8, t, '.') orelse return null;
+        return .{
+            .gsid = std.fmt.parseInt(u32, t[0..dot], 16) catch return null,
+            .gameid = std.fmt.parseInt(u32, t[dot + 1 ..], 10) catch return null,
+        };
+    }
+
+    pub fn eql(a: GameRef, b: GameRef) bool {
+        return a.gsid == b.gsid and a.gameid == b.gameid;
+    }
+};
+
 /// A game enumerated from the shared store (name + record) — used to serve /admin/games
 /// when sessions/games live in redis/pg rather than the per-instance in-memory table.
 pub const NamedGame = struct {

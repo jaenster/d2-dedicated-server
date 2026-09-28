@@ -165,6 +165,7 @@ pub fn onGameDestroyed(name: []const u8) void {
     const gid = takeGameId(name) orelse return;
     var r = std.mem.zeroes(p.CloseGame);
     r.h = p.header(.closegame, @sizeOf(p.CloseGame), nextSeq());
+    r.gsid = gsid;
     r.gameid = gid;
     emit(std.mem.asBytes(&r));
     log.hex("d2cs: game closed, gameid=0x", gid);
@@ -188,6 +189,7 @@ pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []co
     var buf: [@sizeOf(p.UpdateGameInfo) + 24]u8 = undefined;
     var r = std.mem.zeroes(p.UpdateGameInfo);
     r.flag = if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE;
+    r.gsid = gsid;
     r.gameid = gid;
     r.players = players;
     r.charlevel = level;

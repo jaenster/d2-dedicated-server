@@ -290,6 +290,16 @@ pub fn accountForChar(charname: []const u8, out: []u8) ?[]const u8 {
     return out[0..slot.account_len];
 }
 
+/// The engine gameid the realm authorised this character's join into, or null if unknown. The
+/// load check needs it: the realm's claim names the game, and a load into any other one is the
+/// character going somewhere it was not sent.
+pub fn gameForChar(charname: []const u8) ?u32 {
+    const slot = find(charname) orelse return null;
+    const gid = slot.gameid;
+    if (gid == 0 or !eqlIgnoreCase(slot.char[0..slot.char_len], charname)) return null;
+    return gid;
+}
+
 /// Resolve the guild tag for a character (case-insensitive), copied into `out`. Null if the
 /// player is in no guild / is unknown.
 pub fn guildForChar(charname: []const u8, out: []u8) ?[]const u8 {

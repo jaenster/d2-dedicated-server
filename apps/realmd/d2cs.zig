@@ -799,7 +799,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // reservation has done its job. Holding it any longer would refuse a name for the rest of its
     // TTL after the game it guarded had already ended.
     store.releaseGameName(name);
-    state.global.noteGameCreated(rr.gameid); // starts the clock the detail panel counts from
+    state.global.noteGameCreated(.{ .gsid = rr.gsid, .gameid = rr.gameid }); // starts the clock the detail panel counts from
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -902,12 +902,13 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // A seat is released when the player leaves, and the engine takes a moment to notice a socket
     // has gone, so the character a client is bringing to its NEXT game can still be held by the
     // one it just left. Wait for that to clear before refusing.
-    var claim = store.claimCharForJoin(c.accountName(), c.charName(), name, g.gameid, c.session);
+    const gref: state.GameRef = .{ .gsid = g.gsid, .gameid = g.gameid };
+    var claim = store.claimCharForJoin(c.accountName(), c.charName(), name, gref, c.session);
     if (claim == .held) {
         var waited: u32 = 0;
         while (waited < seat_release_ms) : (waited += create_poll_ms) {
             sleepMs(create_poll_ms);
-            claim = store.claimCharForJoin(c.accountName(), c.charName(), name, g.gameid, c.session);
+            claim = store.claimCharForJoin(c.accountName(), c.charName(), name, gref, c.session);
             if (claim != .held) break;
         }
         if (claim != .held and waited > 0)
@@ -918,8 +919,8 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         .took_over => |old| {
             // The join it replaces never arrived, so the player it added to that game's count was
             // never there.
-            if (old.counted) _ = state.global.adjustGamePlayers(old.gameid, -1);
-            log.line(tag, "join game '{s}' -> '{s}' never arrived in game {d}; that claim is withdrawn", .{ name, c.charName(), old.gameid });
+            if (old.counted) _ = state.global.adjustGamePlayers(old.game, -1);
+            log.line(tag, "join game '{s}' -> '{s}' never arrived in game {d} on 0x{x}; that claim is withdrawn", .{ name, c.charName(), old.game.gameid, old.game.gsid });
         },
         .gone => {
             // It closed while this join waited for the character to leave its last game.
@@ -944,7 +945,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // both directions) as soon as the player is actually in the game. Added to the count as it is
     // now, not to `g`: that copy was read before any wait above, and writing it back erased joins
     // made meanwhile and relisted a game that had closed.
-    _ = state.global.countJoin(g.gameid);
+    _ = state.global.countJoin(gref);
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
@@ -1073,8 +1074,8 @@ fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
     const g = game;
 
     var members: [state.max_members]state.Member = undefined;
-    const n = state.global.gameMembers(g.gameid, &members);
-    const created = state.global.gameCreated(g.gameid);
+    const n = state.global.gameMembers(.{ .gsid = g.gsid, .gameid = g.gameid }, &members);
+    const created = state.global.gameCreated(.{ .gsid = g.gsid, .gameid = g.gameid });
     const uptime: u32 = if (created > 0) @intCast(@max(0, time(null) - created)) else 0;
 
     w.putU32(g.gameid); // +3 token: a real entry (not -1/-2)
