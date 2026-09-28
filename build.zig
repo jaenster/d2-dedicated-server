@@ -411,7 +411,9 @@ pub fn build(b: *std.Build) void {
     realm_tests.root_module.addImport("realm_infra", realm_infra);
     realm_tests.root_module.addImport("realm_store", realm_store);
     realm_tests.root_module.addImport("libd2", libd2);
-    test_step.dependOn(&b.addRunArtifact(realm_tests).step);
+    const run_realm_tests = b.addRunArtifact(realm_tests);
+    test_step.dependOn(&run_realm_tests.step);
+    b.step("test-realm", "Run only the realm server's unit tests").dependOn(&run_realm_tests.step);
 
     // The RESP codec. Worth its own test binary rather than riding along with realmd's: it is
     // IO-free by design, so it is the one piece of the store path that can be tested exhaustively

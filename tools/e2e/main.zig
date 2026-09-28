@@ -110,6 +110,18 @@ fn d2sWithExperience(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, 
 
 // Scenarios
 
+/// Ladder board types as the client asks for them (CHATDLG_RequestLadderRank @0x43ec60).
+const ladder_expansion_softcore: u8 = 0x1b;
+const ladder_expansion_hardcore: u8 = 0x13;
+const ladder_classic_softcore: u8 = 0x09;
+
+/// Mark a save as a ladder character (.d2s status 0x40): only those are on the ladder.
+fn ladderChar(save: []const u8) []const u8 {
+    const m: []u8 = @constCast(save);
+    m[0x24] |= 0x40;
+    return save;
+}
+
 fn scLogin() Result {
     const name = "login";
     var c = rc.RealmClient{};
@@ -269,9 +281,9 @@ fn scLadder() Result {
     const name = "ladder_list";
     const acct = "LadderAcct";
     var d2s: [0x40]u8 = undefined;
-    const king = rc.storePutChar(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const king = rc.storePutChar(acct, "LadderKing", ladderChar(minimalD2s(&d2s, "LadderKing", 1, 99))) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (king != 0) return fail(name, "save LadderKing result={d}", .{king});
-    const pawn = rc.storePutChar(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const pawn = rc.storePutChar(acct, "LadderPawn", ladderChar(minimalD2s(&d2s, "LadderPawn", 1, 1))) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (pawn != 0) return fail(name, "save LadderPawn result={d}", .{pawn});
 
     var c = rc.RealmClient{};
@@ -285,7 +297,7 @@ fn scLadder() Result {
 
     var entries: [256]rc.LadderEntry = undefined;
     var dst: [8192]u8 = undefined;
-    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cnt = c.ladderData(ladder_expansion_softcore, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     var king_rank: ?usize = null;
     var pawn_rank: ?usize = null;
     var king_level: u32 = 0;
@@ -310,9 +322,9 @@ fn scLadderExperience() Result {
     const name = "ladder_experience";
     const acct = "ExpAcct";
     var buf: [0x80]u8 = undefined;
-    const ahead = rc.storePutChar(acct, "ExpAhead", d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const ahead = rc.storePutChar(acct, "ExpAhead", ladderChar(d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000))) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (ahead != 0) return fail(name, "save ExpAhead result={d}", .{ahead});
-    const behind = rc.storePutChar(acct, "ExpBehind", d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const behind = rc.storePutChar(acct, "ExpBehind", ladderChar(d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000))) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (behind != 0) return fail(name, "save ExpBehind result={d}", .{behind});
 
     var c = rc.RealmClient{};
@@ -326,7 +338,7 @@ fn scLadderExperience() Result {
 
     var entries: [256]rc.LadderEntry = undefined;
     var dst: [8192]u8 = undefined;
-    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cnt = c.ladderData(ladder_expansion_softcore, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     var ahead_rank: ?usize = null;
     var behind_rank: ?usize = null;
     var ahead_exp: u32 = 0;
@@ -342,6 +354,63 @@ fn scLadderExperience() Result {
     if (ahead_exp != 1_900_000_000) return fail(name, "ExpAhead experience={d}, want 1900000000 (decoded from the attribute list)", .{ahead_exp});
     if (ar >= br) return fail(name, "same level, more experience did not rank first: ExpAhead@{d} vs ExpBehind@{d}", .{ ar, br });
     return .{ .name = name, .status = .pass, .msg = msg("equal level 90: exp {d} @{d} ranked above exp 1200000000 @{d}", .{ ahead_exp, ar, br }) };
+}
+
+/// Each board holds only its own kind of character, and the row flags say what the client
+/// draws: hardcore 0x20 and expansion 0x40 pick the title, dead 0x10 greys the row. The
+/// realm used to answer every board with every character, the hardcore and expansion bits
+/// swapped, and any character that had ever died - softcore included - drawn grey.
+fn scLadderBoards() Result {
+    const name = "ladder_boards";
+    const acct = "BoardAcct";
+    const Fx = struct { n: []const u8, class: u8, level: u8, status: u8 };
+    const fixtures = [_]Fx{
+        .{ .n = "BrdExpSc", .class = 0, .level = 50, .status = 0x20 | 0x40 },
+        .{ .n = "BrdExpScDied", .class = 1, .level = 49, .status = 0x20 | 0x40 | 0x08 },
+        .{ .n = "BrdExpHc", .class = 2, .level = 48, .status = 0x20 | 0x40 | 0x04 },
+        .{ .n = "BrdExpHcDead", .class = 4, .level = 47, .status = 0x20 | 0x40 | 0x04 | 0x08 },
+        .{ .n = "BrdClsSc", .class = 3, .level = 46, .status = 0x40 },
+        .{ .n = "BrdNonLadder", .class = 5, .level = 98, .status = 0x20 },
+    };
+    for (fixtures) |f| {
+        var d2s: [0x40]u8 = undefined;
+        const save = minimalD2s(&d2s, f.n, f.class, f.level);
+        d2s[0x24] = f.status;
+        const r = rc.storePutChar(acct, f.n, save) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (r != 0) return fail(name, "save {s} result={d}", .{ f.n, r });
+    }
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    // Only this scenario's rows (the realm's store is shared with every other scenario), as
+    // "name flags" lines in board order, compared whole.
+    const Board = struct { t: u8, want: []const u8 };
+    const boards = [_]Board{
+        .{ .t = ladder_expansion_softcore, .want = "BrdExpSc 40\nBrdExpScDied 40\n" },
+        .{ .t = ladder_expansion_hardcore, .want = "BrdExpHc 60\nBrdExpHcDead 70\n" },
+        .{ .t = ladder_classic_softcore, .want = "BrdClsSc 00\n" },
+    };
+    for (boards) |b| {
+        var entries: [256]rc.LadderEntry = undefined;
+        var dst: [8192]u8 = undefined;
+        const cnt = c.ladderData(b.t, &entries, &dst) catch |e| return fail(name, "type 0x{x}: {s}", .{ b.t, @errorName(e) });
+        var got_buf: [512]u8 = undefined;
+        var got = std.Io.Writer.fixed(&got_buf);
+        for (entries[0..cnt]) |e| {
+            if (!std.mem.startsWith(u8, e.name, "Brd")) continue;
+            got.print("{s} {x:0>2}\n", .{ e.name, e.flags }) catch return fail(name, "overflow", .{});
+        }
+        if (!std.mem.eql(u8, got.buffered(), b.want))
+            return fail(name, "type 0x{x}: got [{s}] want [{s}]", .{ b.t, got.buffered(), b.want });
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("3 boards hold only their own kind; hc 0x20, exp 0x40, grey only on a hardcore death", .{}) };
 }
 
 /// CHARUPGRADE has to actually convert the save. It used to ack success and change
@@ -2821,6 +2890,7 @@ pub fn main() !void {
         scClassicChar(),
         scLadder(),
         scLadderExperience(),
+        scLadderBoards(),
         scCharUpgrade(),
         scCharDelete(),
         scCharCopy(),
