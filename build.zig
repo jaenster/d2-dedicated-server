@@ -487,6 +487,9 @@ pub fn build(b: *std.Build) void {
         // about our confidence, not about anything d2host does at runtime, and folding it into the
         // d2engine module made a test-expectations file a compile input to every shipped image.
         .{ "packages/d2engine/served.zig", false, false },
+        // Which level an uber red portal names. The engine leaves every Harrogath red portal
+        // saying Nihlathak's Temple, so the byte the ubers feature stamps over it is asserted here.
+        .{ "apps/d2gs/runtime/feature/uber_portal.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{

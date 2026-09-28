@@ -15,6 +15,7 @@ const feature = @import("../../engine/feature.zig");
 const d2types = @import("../../engine/d2types.zig");
 const d2 = @import("../../engine/d2/functions.zig");
 const types = @import("../../engine/d2/types.zig");
+const uber_portal = @import("uber_portal.zig");
 
 const UnitAny = types.UnitAny;
 const Room1 = types.Room1;
@@ -127,6 +128,10 @@ fn portalTo(pGame: *d2types.D2GameStrc, pUnit: *UnitAny, level_id: i32, is_blue:
     var pPortal: ?*UnitAny = null;
     const class_id: i32 = if (is_blue) 0x3B else 0x3C;
     d2.SpawnPortal.call(.{ @ptrCast(pGame), null, @ptrCast(target), pos.x, pos.y, level_id, &pPortal, class_id, 0 });
+    // The red portal's init names every Harrogath portal Nihlathak's Temple; say where this one goes.
+    if (pPortal) |portal| {
+        if (portal.pUnitData) |data| uber_portal.setDestination(@ptrCast(@alignCast(data)), @bitCast(level_id));
+    }
     return pPortal;
 }
 
