@@ -12,11 +12,18 @@
 //!   * it is a multiple of `span` (100), so two different valid bases can never overlap, or it
 //!     is the default 6112 (what a plain `zig build e2e` uses);
 //!   * its block fits below 65536 and starts at or above 1024;
-//!   * its block does not overlap the default block [6112, 6212), i.e. 6100 and 6200 are refused.
+//!   * it does not overlap the default run: neither its block [6112, 6212) (so 6100 and 6200 are
+//!     refused) nor its health port 18080 (so 18000 is refused).
+//!
+//! The default run is the one exception to "every port is in the block": its health port stays
+//! 18080, the port run-stack.sh gives realmd, so a plain `zig build e2e` that reuses an
+//! already-running realmd on 6112 still asks it for health where it answers.
 //! Concurrent runs therefore just pick different multiples of 100: 23000, 27000, 30000, 34000.
 const std = @import("std");
 
 pub const default_base: u16 = 6112;
+/// The default run's health port, kept from before the layout existed; see the header.
+pub const default_health: u16 = 18080;
 /// Ports one run may use: [base, base + span). Every offset below is < span.
 pub const span: u16 = 100;
 pub const min_base: u16 = 1024;
@@ -95,6 +102,7 @@ pub fn validate(base: u16) Error!void {
     if (base == default_base) return;
     if (base % span != 0) return error.NotOnGrid;
     if (base < default_base + span and base + span > default_base) return error.OverlapsDefault;
+    if (base <= default_health and default_health < base + span) return error.OverlapsDefault;
 }
 
 pub fn forBase(base: u16) Error!Layout {
@@ -102,7 +110,7 @@ pub fn forBase(base: u16) Error!Layout {
     const b = base;
     return .{
         .base = b,
-        .main = .{ .bnet = b + 0, .health = b + 1 },
+        .main = .{ .bnet = b + 0, .health = if (b == default_base) default_health else b + 1 },
         .redis = b + 2,
         .postgres = b + 3,
         .ingress = b + 4,
@@ -139,7 +147,7 @@ pub fn explain(err: Error) []const u8 {
         error.NotANumber => "E2E_PORT_BASE is not a number",
         error.OutOfRange => std.fmt.comptimePrint("E2E_PORT_BASE must be within [{d}, {d}] so the run's {d}-port block fits", .{ min_base, max_base, span }),
         error.NotOnGrid => std.fmt.comptimePrint("E2E_PORT_BASE must be a multiple of {d} (or {d}), so concurrent runs cannot overlap; e.g. 23000, 30000, 34000", .{ span, default_base }),
-        error.OverlapsDefault => std.fmt.comptimePrint("E2E_PORT_BASE overlaps the default run's block [{d}, {d})", .{ default_base, default_base + span }),
+        error.OverlapsDefault => std.fmt.comptimePrint("E2E_PORT_BASE overlaps the default run's block [{d}, {d}) or its health port {d}", .{ default_base, default_base + span, default_health }),
     };
 }
 
@@ -162,6 +170,7 @@ test "every port of a run is distinct and inside its block" {
         const l = try forBase(b);
         const ps = l.ports();
         for (ps, 0..) |p, i| {
+            if (b == default_base and p == default_health) continue; // the one legacy exception
             try std.testing.expect(p >= b and p < @as(u32, b) + span);
             for (ps[i + 1 ..]) |q| try std.testing.expect(p != q);
         }
@@ -173,6 +182,11 @@ test "no two valid bases share a port" {
     const bases = validBases(&buf); // ascending
     for (bases[0 .. bases.len - 1], bases[1..]) |lo, hi| {
         try std.testing.expect(@as(u32, lo) + span <= hi);
+    }
+    // The default run's out-of-block health port belongs to no numbered base's block.
+    for (bases) |b| {
+        if (b == default_base) continue;
+        try std.testing.expect(!(b <= default_health and default_health < @as(u32, b) + span));
     }
     // And concretely, for the pair a concurrent check uses.
     const a = try forBase(30000);
@@ -187,6 +201,9 @@ test "bad bases are refused" {
     try std.testing.expectError(error.NotOnGrid, forBase(30001));
     try std.testing.expectError(error.OverlapsDefault, forBase(6100));
     try std.testing.expectError(error.OverlapsDefault, forBase(6200));
+    try std.testing.expectError(error.OverlapsDefault, forBase(18000));
+    _ = try forBase(17900);
+    _ = try forBase(18100);
     try std.testing.expectError(error.OutOfRange, forBase(1000));
     try std.testing.expectError(error.OutOfRange, forBase(0));
     try std.testing.expectError(error.OutOfRange, forBase(65500));
@@ -199,6 +216,8 @@ test "bad bases are refused" {
 test "unset keeps the default run" {
     const l = try fromEnv(null);
     try std.testing.expectEqual(@as(u16, 6112), l.main.bnet);
+    try std.testing.expectEqual(@as(u16, 18080), l.main.health);
+    try std.testing.expectEqual(@as(u16, 31001), (try forBase(31000)).main.health);
     try std.testing.expectEqualStrings("e2e-redis-6112", l.redis_container.get());
     try std.testing.expectEqualStrings("/tmp/e2e-realmd-6112", l.data_dir.get());
     const e = try fromEnv("");
