@@ -223,7 +223,7 @@ fn playOnce(c: *rc.RealmClient, who: *const Who, game: []const u8, create: bool,
     }
     const j = try c.joinGame(game);
     if (j.result != 0) return switch (j.result) {
-        0x2b => "join: character held (0x2b)",
+        0x2b => "join: game full, or the character is in a game (0x2b)",
         0x2e => "join: game full (0x2e)",
         0x2a => "join: no such game (0x2a)",
         else => "join: refused",
@@ -591,7 +591,7 @@ fn scCap(n: usize, hold_s: u32) bool {
 }
 
 const SoakCfg = struct { runs: u32, dwell_ms: i64, same_game: bool };
-const SoakOut = struct { ok: u32 = 0, fail: u32 = 0, reasons: [8][64]u8 = undefined, nreasons: usize = 0 };
+const SoakOut = struct { ok: u32 = 0, fail: u32 = 0, waits: u32 = 0 };
 
 fn soakClient(who: Who, tag: []const u8, idx: usize, cfg: SoakCfg, out: *SoakOut) void {
     var c = rc.RealmClient{};
@@ -609,7 +609,16 @@ fn soakClient(who: Who, tag: []const u8, idx: usize, cfg: SoakCfg, out: *SoakOut
         else
             std.fmt.bufPrint(&gb, "sk{s}{c}{d}", .{ tag, 'a' + @as(u8, @intCast(idx)), run }) catch unreachable;
         const create = !cfg.same_game or run == 0;
-        const r = playOnce(&c, &who, game, create, cfg.dwell_ms) catch |e| @errorName(e);
+        // A full server is capacity, not a fault: a finished game holds its slot for the reap
+        // window. Retry the way a player would, and count only what never succeeds.
+        var r: []const u8 = "";
+        const give_up = session.nowMs() + 30_000;
+        while (true) {
+            r = playOnce(&c, &who, game, create, cfg.dwell_ms) catch |e| @errorName(e);
+            if (!std.mem.eql(u8, r, "create: servers down") or session.nowMs() > give_up) break;
+            out.waits += 1;
+            _ = usleep(1_000_000);
+        }
         if (std.mem.eql(u8, r, "ok")) {
             out.ok += 1;
         } else {
@@ -628,11 +637,13 @@ fn scSoak(n: usize, cfg: SoakCfg) bool {
     for (threads[0..n]) |t| t.join();
     var ok: u32 = 0;
     var fail: u32 = 0;
+    var waits: u32 = 0;
     for (outs[0..n]) |o| {
         ok += o.ok;
         fail += o.fail;
+        waits += o.waits;
     }
-    say("==> soak: {d} played, {d} failed ({d:.1}s): {s}", .{ ok, fail, since(), if (fail == 0) "PASS" else "FAIL" });
+    say("==> soak: {d} played, {d} failed, {d} waits on a full server ({d:.1}s): {s}", .{ ok, fail, waits, since(), if (fail == 0) "PASS" else "FAIL" });
     return fail == 0;
 }
 
