@@ -2182,6 +2182,22 @@ pub fn registerGs(rec: types.GsRec, ttl_s: u32) bool {
     return ok;
 }
 
+/// Whether a game server's record is still in the shared view: false once it has gone a whole
+/// record TTL without a refresh (or deregistered), null when the store could not be asked.
+pub fn gsAlive(gsid: u32) ?bool {
+    var kb: [64]u8 = undefined;
+    const key = gsKey(&kb, gsid);
+    if (key.len == 0) return null;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EXISTS", key }) orelse return null;
+    return switch (rep) {
+        .int => |v| v == 1,
+        else => null,
+    };
+}
+
 /// Drop a game server from the shared view — its control connection is gone.
 pub fn removeGs(gsid: u32) void {
     var kb: [64]u8 = undefined;

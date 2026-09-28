@@ -162,7 +162,7 @@ pub const EID_ERROR = 0x13;
 /// Reply to MCP_CREATEGAME / MCP_JOINGAME. Named rather than anonymous so the
 /// no-password wrappers can forward the password-carrying versions' return value.
 pub const CreateResult = struct { token: u16, result: u32 };
-pub const JoinResult = struct { token: u16, ip: [4]u8, result: u32 };
+pub const JoinResult = struct { token: u16, ip: [4]u8, result: u32, game_hash: u32 = 0 };
 
 /// The join screen's detail panel for one game (MCP_GAMEINFO).
 pub const GameDetail = struct {
@@ -918,10 +918,11 @@ pub const AdInfo = struct {
         // <HHHIII reqid,token,unk,ip,gh,result>
         const token = net.rdU16(r.body, 2);
         const ip_le = net.rdU32(r.body, 6);
+        const game_hash = net.rdU32(r.body, 10);
         const result = net.rdU32(r.body, 14);
         var ip: [4]u8 = undefined;
         std.mem.writeInt(u32, &ip, ip_le, .little);
-        return .{ .token = token, .ip = ip, .result = result };
+        return .{ .token = token, .ip = ip, .result = result, .game_hash = game_hash };
     }
 
     pub fn close(self: *RealmClient) void {

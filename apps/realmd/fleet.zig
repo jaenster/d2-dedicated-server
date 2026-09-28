@@ -390,28 +390,36 @@ const lease_pass_games = 256;
 ///
 /// The realm renews rather than the game server, because the lease's owner is the GAME
 /// (`game:<id>`), not the server, so the server is not the party that can prove ownership.
-/// Liveness still comes from the server: a game whose server is not in the fleet (its heartbeat
-/// has lapsed) is not renewed. Its games stay in the index until their record TTL, or until a
-/// server with the same id starts again, so renewing everything indexed would hold a dead server's
-/// players for hours rather than for the lease. A server gone for one pass only (a missed
-/// heartbeat, a store failover) costs nothing: the lease outlasts several passes.
+/// Liveness still comes from the server: a game whose server has stopped publishing itself is
+/// closed below rather than renewed.
+///
+/// It is also where a game whose server died is closed. A server that stops publishing itself
+/// sends no CLOSEGAME, and one that comes back under a different id (a replaced pod) never
+/// sends the "started" that expires its old games either; without this the game stayed listed
+/// and every character in it stayed claimed, renewed by this very loop, for the game record's
+/// whole six-hour life. The server's record lapses `store.gs_ttl_s` after its last refresh; the
+/// sweep runs more often than the renewal so the characters come free soon after that.
 pub fn renewCharLeases() void {
     var games: [lease_pass_games]state.GameInfo = undefined;
-    var fleet_now: [max_gs]store.GsRec = undefined;
-    var last_orphaned: usize = 0;
+    var since_renew_ms: u32 = 0;
     while (true) {
-        _ = usleep(@intCast(@as(u64, lease_renew_ms) * 1000));
+        const sweep_ms = @min(dead_gs_sweep_ms, lease_renew_ms);
+        _ = usleep(@intCast(@as(u64, sweep_ms) * 1000));
+        since_renew_ms += sweep_ms;
         const n = state.snapshotGames(&games);
-        const live = store.snapshotGs(&fleet_now);
-        // A full buffer may have cut servers off the end; judge nobody dead on a partial view.
-        const whole = live < fleet_now.len;
-        var renewed: usize = 0;
-        var orphaned: usize = 0;
+        var live: usize = 0;
         for (games[0..n]) |g| {
-            if (whole and g.gsid != 0 and !hosted(fleet_now[0..live], g.gsid)) {
-                orphaned += 1;
-                continue;
+            // A game whose server is missing is not renewed either, even before it is confirmed
+            // gone: its leases lapse on their own TTL if the server never comes back.
+            if (sweepGame(g) == .alive) {
+                games[live] = g;
+                live += 1;
             }
+        }
+        if (since_renew_ms < lease_renew_ms) continue;
+        since_renew_ms = 0;
+        var renewed: usize = 0;
+        for (games[0..live]) |g| {
             const game: state.GameRef = .{ .gsid = g.gsid, .gameid = g.gameid };
             const pass = store.renewGameCharLeases(game);
             renewed += pass.renewed;
@@ -420,18 +428,60 @@ pub fn renewCharLeases() void {
             if (pass.uncount > 0) _ = state.global.adjustGamePlayers(game, -@as(i32, @intCast(pass.uncount)));
             log.line("fleet", "game {d}: withdrew {d} claim(s) from joins that never arrived", .{ g.gameid, pass.withdrawn });
         }
-        if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
-        if (orphaned > 0 and orphaned != last_orphaned)
-            log.line("fleet", "{d} game(s) on servers no longer in the fleet: their leases are left to lapse", .{orphaned});
-        last_orphaned = orphaned;
+        if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, live });
     }
 }
 
-fn hosted(recs: []const store.GsRec, gsid: u32) bool {
-    for (recs) |r| {
-        if (r.gsid == gsid) return true;
+/// How often games are checked against the servers still publishing themselves.
+const dead_gs_sweep_ms: u32 = 10_000;
+
+/// How long a server must stay missing before its games are closed, on top of the record's own
+/// TTL. A store that lost its data (a redis restarted without persistence) is missing every
+/// record at once until each server's next refresh; closing games in that window would free the
+/// characters of players who are still in them.
+const dead_gs_confirm_ms: i64 = 45_000;
+
+/// Servers seen missing, and since when. Only this thread touches it.
+var missing_gs: [64]struct { gsid: u32 = 0, since_ms: i64 = 0 } = @splat(.{});
+
+extern "c" fn time(t: ?*c_long) c_long;
+/// Unix time in ms at second resolution, which is all a 45 s window needs (see realmd.zig).
+fn nowMs() i64 {
+    return @as(i64, time(null)) * 1000;
+}
+
+/// True once `gsid` has been missing from the fleet for `dead_gs_confirm_ms`; a server that is
+/// seen again is forgotten.
+fn confirmedGone(gsid: u32, alive: bool) bool {
+    var free: ?usize = null;
+    for (&missing_gs, 0..) |*m, i| {
+        if (m.gsid == gsid) {
+            if (alive) {
+                m.* = .{};
+                return false;
+            }
+            return nowMs() - m.since_ms >= dead_gs_confirm_ms;
+        }
+        if (m.gsid == 0 and free == null) free = i;
     }
+    if (alive) return false;
+    if (free) |i| missing_gs[i] = .{ .gsid = gsid, .since_ms = nowMs() };
     return false;
+}
+
+const Sweep = enum { alive, missing, closed };
+
+/// Close `g` the way its CLOSEGAME would have if its server is no longer in the fleet. A store that
+/// cannot answer is not evidence of anything: the game counts as alive and nothing is closed.
+fn sweepGame(g: state.GameInfo) Sweep {
+    if (g.gsid == 0) return .alive;
+    const alive = store.gsAlive(g.gsid) orelse return .alive;
+    if (!confirmedGone(g.gsid, alive)) return if (alive) .alive else .missing;
+    const game: state.GameRef = .{ .gsid = g.gsid, .gameid = g.gameid };
+    const freed = store.releaseGameChars(game);
+    state.global.removeGame(game);
+    log.line("fleet", "game {d} '{s}' closed: its server 0x{x} stopped publishing itself; {d} character(s) freed", .{ g.gameid, g.name_slice(), g.gsid, freed });
+    return .closed;
 }
 
 /// Drain game-server events forever. Every instance runs one; each event is consumed by exactly

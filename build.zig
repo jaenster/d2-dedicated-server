@@ -679,6 +679,27 @@ pub fn build(b: *std.Build) void {
     const run_gamestress = b.addRunArtifact(gamestress);
     b.step("gamestress", "Create N games against a running realm (reaper stress test)").dependOn(&run_gamestress.step);
 
+    // livesoak — join/game lifecycle scenarios against a RUNNING realm and a real GS (manual:
+    // `zig build livesoak -- abandon silent`). Lazy for the same reason as stress-e2e.
+    if (b.lazyDependency("clientless", .{ .target = host, .optimize = optimize })) |clientless_dep| {
+        const livesoak = b.addExecutable(.{
+            .name = "livesoak",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/livesoak/main.zig"),
+                .target = host,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        livesoak.root_module.addImport("realmclient", realmclient);
+        livesoak.root_module.addImport("d2-session", clientless_dep.module("d2-session"));
+        const run_livesoak = b.addRunArtifact(livesoak);
+        if (b.args) |args| run_livesoak.addArgs(args);
+        const livesoak_step = b.step("livesoak", "Join/game lifecycle scenarios against a running realm + GS");
+        livesoak_step.dependOn(&b.addInstallArtifact(livesoak, .{}).step);
+        livesoak_step.dependOn(&run_livesoak.step);
+    }
+
     // bnftp-probe — clientless BNFTP discovery client (point it at a real bnet,
     // optionally via SOCKS5). Manual: `zig build bnftp-probe -- [opts] <host> ...`
     const probe = b.addExecutable(.{

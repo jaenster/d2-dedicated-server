@@ -1810,6 +1810,55 @@ fn scGameIdAcrossServers() Result {
     return .{ .name = name, .status = .pass, .msg = msg("close of game 9000 on one server left the other server's game 9000 and its player alone", .{}) };
 }
 
+/// A game server that dies sends no CLOSEGAME. Its record lapses, but the realm kept its games
+/// listed and renewed the claims of every character in them, so a player whose server crashed
+/// was refused as "still in a game" for the game record's whole six-hour life — and a replacement
+/// server under a new id never sends the "started" that would have cleared them.
+fn scDeadServerFreesCharacters() Result {
+    const name = "dead_server_frees_characters";
+    var dead = FakeGS{ .gsid = 0xDEAD1, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7400 };
+    dead.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var dead_stopped = false;
+    defer if (!dead_stopped) dead.stop();
+    if (!dead.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    enterAs(&c, "CrashAcct", "Crashee") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.createGame("crashroom", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "create refused", .{});
+    if ((c.joinGame("crashroom") catch return fail(name, "join", .{})).result != 0) return fail(name, "join refused", .{});
+    dead.sendPlayerUpdateFor(7400, 1, true, "Crashee", "CrashAcct", 1, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitListed(&c, "crashroom", 1)) return fail(name, "arrival not reflected", .{});
+
+    // The server dies: its record goes, nothing else is said.
+    dead.stop();
+    dead_stopped = true;
+    var next = FakeGS{ .gsid = 0xDEAD2, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7500 };
+    next.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer next.stop();
+    if (!next.isRegistered()) return fail(name, "replacement FakeGS did not publish itself", .{});
+
+    var again = rc.RealmClient{};
+    defer again.close();
+    enterAs(&again, "CrashAcct", "Crashee") catch |e| return fail(name, "relogin: {s}", .{@errorName(e)});
+    var waited: u32 = 0;
+    var last: u32 = 0xffff_ffff;
+    while (waited < 90_000) : (waited += 500) {
+        if (listedPlayers(&again, "crashroom") == null) {
+            var gb: [24]u8 = undefined;
+            const g = std.fmt.bufPrint(&gb, "aftercrash{d}", .{waited / 500}) catch "aftercrash";
+            const cg = again.createGame(g, "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+            if (cg.result == 0) {
+                const jg = again.joinGame(g) catch |e| return fail(name, "{s}", .{@errorName(e)});
+                last = jg.result;
+                if (jg.result == 0) return .{ .name = name, .status = .pass, .msg = msg("dead server's game unlisted and its character free after ~{d}ms", .{waited}) };
+            }
+        }
+        _ = net.usleep(500_000);
+    }
+    return fail(name, "90s after its server died: game listed={}, last join result=0x{x} (0x2b = still claimed)", .{ listedPlayers(&again, "crashroom") != null, last });
+}
+
 /// A save is only durable if it is written under the right ACCOUNT — and the account reaches the
 /// game server in one place only: the JOINGAME the realm dispatches. Get that pairing wrong and
 /// nothing fails: the save lands at an address no login path reads, the server logs a success,
@@ -3964,6 +4013,7 @@ pub fn main() !void {
         scCrossEraCreateNotActive(),
         scDupeWindowClosed(),
         scGameIdAcrossServers(),
+        scDeadServerFreesCharacters(),
     };
 
     if (child) |pid| {

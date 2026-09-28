@@ -845,6 +845,12 @@ pub fn removeGs(gsid: u32) void {
     redis.removeGs(gsid);
 }
 
+/// Whether this game server is still publishing itself. Null when the store cannot say, which
+/// callers must treat as "alive": acting on a store outage would close every game in the realm.
+pub fn gsAlive(gsid: u32) ?bool {
+    return redis.gsAlive(gsid);
+}
+
 /// The fleet as the whole realm sees it. 0 means "nothing shared" — not "no servers".
 pub fn snapshotGs(out: []GsRec) usize {
     return redis.snapshotGs(out);

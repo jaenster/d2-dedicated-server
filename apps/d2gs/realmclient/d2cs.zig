@@ -186,36 +186,31 @@ pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []co
     // dropping the account here would lose exactly that save — the entry just becomes reusable.
     if (!joined and char.len > 0) joinctx.release(char);
     const gid = peekGameId(name) orelse return;
-    var buf: [@sizeOf(p.UpdateGameInfo) + 24]u8 = undefined;
-    var r = std.mem.zeroes(p.UpdateGameInfo);
-    r.flag = if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE;
-    r.gsid = gsid;
-    r.gameid = gid;
-    r.players = players;
-    r.charlevel = level;
-    r.charclass = class;
-    @memcpy(buf[0..@sizeOf(p.UpdateGameInfo)], std.mem.asBytes(&r));
-    // `n` is spelled usize on purpose. @min against a comptime bound gives the result the
-    // smallest type that holds it — here u5 — and then `@sizeOf(UpdateGameInfo) + n` is u5
-    // arithmetic that overflows at 32, so every character whose name is 4 or more letters
-    // long panicked this thread on the way into a game.
-    const n: usize = @min(char.len, buf.len - @sizeOf(p.UpdateGameInfo) - 1);
-    @memcpy(buf[@sizeOf(p.UpdateGameInfo)..][0..n], char[0..n]);
-    buf[@sizeOf(p.UpdateGameInfo) + n] = 0; // cstr terminator
-    var total = @sizeOf(p.UpdateGameInfo) + n + 1;
     // The account too, when we know it. Without it the realm has to free a departing player's
     // character seat by NAME, and names are unique only per account here — two "Bob"s in one game
     // and it frees the wrong one, out from under somebody still playing. Empty when unknown, which
     // the realm reads as "cannot be sure" and leaves the seat for the game-close sweep.
+    //
+    // The shared encoder, the one d2host and d2gs-native send with. This server used to pack the
+    // packet itself into a buffer with 24 bytes for both names, so a character and account longer
+    // than that together arrived with the account cut short. The realm then matched no seat: the
+    // arrival never confirmed the join and the departure never released it, and a minute later
+    // the realm withdrew the claim of a player who was still in the game.
     var ab: [joinctx.max_account]u8 = undefined;
     const acct = joinctx.accountForChar(char, &ab) orelse "";
-    const an: usize = @min(acct.len, buf.len - total - 1);
-    @memcpy(buf[total..][0..an], acct[0..an]);
-    buf[total + an] = 0;
-    total += an + 1;
-    const hdr = p.header(.updategameinfo, @intCast(total), nextSeq());
-    @memcpy(buf[0..@sizeOf(p.Header)], std.mem.asBytes(&hdr));
-    emit(buf[0..total]);
+    var buf: [p.update_game_info_max]u8 = undefined;
+    emit(p.encodeUpdateGameInfo(
+        &buf,
+        nextSeq(),
+        gsid,
+        if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE,
+        gid,
+        players,
+        level,
+        class,
+        char,
+        acct,
+    ));
 }
 
 /// CREATEGAMEREQ: ladder/expansion/difficulty/hardcore byte flags, then
