@@ -8,8 +8,8 @@ const fakegs = @import("fakegs.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
 const Socket = net.Socket;
 
-// Ports the harness's own realmd listens on. Overridable as a block via E2E_PORT_BASE
-// (set by main() before anything connects) so a run is not at the mercy of whatever else
+// Ports the harness's own realmd listens on. Set by main() from the run layout (layout.zig,
+// keyed by E2E_PORT_BASE) before anything connects, so a run is not at the mercy of whatever else
 // happens to be sitting on 6112 — which silently turns the whole suite into a test of
 // someone else's server.
 pub var HOST_BNET: u16 = 6112;
