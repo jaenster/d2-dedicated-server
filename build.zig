@@ -598,8 +598,9 @@ pub fn build(b: *std.Build) void {
 
     // e2e — clientless wire-protocol test harness (pure Zig, no wine/Game.exe).
     // Builds realmd first, then `zig build e2e` builds AND runs the harness; it
-    // auto-starts its own realmd child (REALMD_BIN, health 18080) and runs the
-    // named scenarios. Native host target, link_libc (libc TCP sockets).
+    // auto-starts its own realmd child (REALMD_BIN) and runs the named scenarios. Every port,
+    // store container and data dir a run uses derives from E2E_PORT_BASE (tools/e2e/layout.zig),
+    // so runs on different bases can go at once. Native host target, link_libc (libc TCP sockets).
     const e2e = b.addExecutable(.{
         .name = "e2e",
         .root_module = b.createModule(.{
@@ -619,6 +620,16 @@ pub fn build(b: *std.Build) void {
     run_e2e.step.dependOn(&b.addInstallArtifact(d2ingress, .{}).step); // d2ingress_routing spawns it
     const e2e_step = b.step("e2e", "Build + run the clientless realmd E2E test harness");
     e2e_step.dependOn(&run_e2e.step);
+    // The run layout is pure arithmetic, so its rules (distinct ports, disjoint blocks, refused
+    // bases) are unit tests rather than something only a pair of concurrent runs would catch.
+    const e2e_layout_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/e2e/layout.zig"),
+            .target = host,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(e2e_layout_tests).step);
 
     // stress-e2e — a round loop against a REAL GS (clientless's d2-realm/d2-session,
     // not FakeGS): each round spawns --clients threads that log in once and play --runs games.

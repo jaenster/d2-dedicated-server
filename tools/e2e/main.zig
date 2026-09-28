@@ -1,6 +1,6 @@
 //! Clientless E2E test runner for realmd. Optionally auto-starts its own realmd
-//! (REALMD_BIN, default ./zig-out/bin/realmd) with a temp data dir + health port
-//! 18080, runs the named scenarios, prints [PASS]/[FAIL]/[SKIP] + a summary, and
+//! (REALMD_BIN, default ./zig-out/bin/realmd) with a temp data dir + health port from
+//! layout.zig, runs the named scenarios, prints [PASS]/[FAIL]/[SKIP] + a summary, and
 //! exits non-zero on any failure. Ported from tools/e2e/{run,scenarios}.py.
 const std = @import("std");
 const net = @import("net.zig");
@@ -8,6 +8,7 @@ const rc = @import("realmclient.zig");
 const gsstore = @import("gsstore.zig");
 const fakegs = @import("fakegs.zig");
 const FakeGS = @import("fakegs.zig").FakeGS;
+const layout = @import("layout.zig");
 
 // libc process control. The 0.16 std.process.spawn API requires an Io instance
 // + Environ.Map; we call fork/execve/kill/waitpid directly instead — same
@@ -47,7 +48,20 @@ const alloc = std.heap.c_allocator;
 
 // Admin API bearer token the harness starts realmd with (REALMD_ADMIN_TOKEN).
 const ADMIN_TOKEN = "testtoken";
-var HEALTH_PORT: u16 = 18080;
+/// This run's ports, container names and data dirs, from E2E_PORT_BASE. Set first thing in main.
+var run: layout.Layout = undefined;
+var HEALTH_PORT: u16 = 0;
+
+/// A port as the NUL-terminated string an env var wants. Leaks a few bytes per call; the harness
+/// is short-lived.
+fn portZ(port: u16) [*:0]const u8 {
+    return cmdZ("{d}", .{port});
+}
+
+/// A formatted shell command (or any other NUL-terminated string). Leaks, like portZ.
+fn cmdZ(comptime fmt: []const u8, args: anytype) [*:0]const u8 {
+    return (std.fmt.allocPrintSentinel(alloc, fmt, args, 0) catch @panic("oom")).ptr;
+}
 
 fn msg(comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(alloc, fmt, args) catch "(alloc failed)";
@@ -1424,7 +1438,7 @@ fn scNonLadderGameFlags() Result {
 
 fn scGetFileTime() Result {
     const name = "get_file_time";
-    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+    const data_dir = envOr("REALMD_DATA_DIR", run.data_dir.get());
 
     var cmd: [512]u8 = undefined;
     const staged = std.fmt.bufPrintZ(&cmd, "mkdir -p '{s}/bnftp' && printf gateways > '{s}/bnftp/bnserver-D2DV.ini'", .{ data_dir, data_dir }) catch
@@ -2078,34 +2092,38 @@ fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
 // The realm runs ephemeral state (sessions + games + token routes) in redis, and the
 // d2ingress reads token routes from it asynchronously — so the harness brings up a real
 // redis in docker, points realmd + d2ingress at it, and flushes it for a clean slate.
-const REDIS_HOST_PORT: u16 = 6399;
-const PG_HOST_PORT: u16 = 55499;
 
 /// Bring up the two stores realmd needs. Both, always: there is no filesystem fallback to fall
 /// back to, which is the point — a harness that could run without them would be testing a
 /// configuration that does not exist.
+///
+/// Container names and host ports are this run's own (see layout.zig), so the stale-container
+/// clean-up below can only ever remove what an earlier run on the SAME base left behind — never
+/// the stores of a run going on next to this one.
 fn startStores() void {
-    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1"); // clear stale containers
-    if (system("docker run -d --rm --name e2e-redis -p 6399:6379 redis:7-alpine >/dev/null 2>&1") != 0) {
+    const redis = run.redis_container.get();
+    const pg = run.postgres_container.get();
+    stopStores(); // clear stale containers of this base
+    if (system(cmdZ("docker run -d --rm --name {s} -p {d}:6379 redis:7-alpine >/dev/null 2>&1", .{ redis, run.redis })) != 0) {
         std.debug.print("ERROR: could not start the redis container (docker is required).\n", .{});
         std.process.exit(2);
     }
-    if (system("docker run -d --rm --name e2e-postgres -p 55499:5432 " ++
+    if (system(cmdZ("docker run -d --rm --name {s} -p {d}:5432 " ++
         "-e POSTGRES_USER=realmd -e POSTGRES_PASSWORD=realmd -e POSTGRES_DB=realmd " ++
-        "postgres:16-alpine >/dev/null 2>&1") != 0)
+        "postgres:16-alpine >/dev/null 2>&1", .{ pg, run.postgres })) != 0)
     {
         std.debug.print("ERROR: could not start the postgres container (docker is required).\n", .{});
         stopStores();
         std.process.exit(2);
     }
-    if (!waitPort(REDIS_HOST_PORT, 10_000) or !waitPort(PG_HOST_PORT, 30_000)) {
-        std.debug.print("ERROR: a store container did not come up (redis :{d}, postgres :{d})\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
+    if (!waitPort(run.redis, 10_000) or !waitPort(run.postgres, 30_000)) {
+        std.debug.print("ERROR: a store container did not come up (redis :{d}, postgres :{d})\n", .{ run.redis, run.postgres });
         stopStores();
         std.process.exit(2);
     }
-    _ = system("docker exec e2e-redis redis-cli FLUSHALL >/dev/null 2>&1"); // clean slate
-    _ = setenv("REALMD_REDIS_ADDR", "127.0.0.1:6399", 1);
-    _ = setenv("REALMD_PG_DSN", "postgres://realmd:realmd@127.0.0.1:55499/realmd", 1);
+    _ = system(cmdZ("docker exec {s} redis-cli FLUSHALL >/dev/null 2>&1", .{redis})); // clean slate
+    _ = setenv("REALMD_REDIS_ADDR", cmdZ("127.0.0.1:{d}", .{run.redis}), 1);
+    _ = setenv("REALMD_PG_DSN", cmdZ("postgres://realmd:realmd@127.0.0.1:{d}/realmd", .{run.postgres}), 1);
     // The port being open is not the same as the server accepting connections, and neither is
     // `pg_isready`.
     //
@@ -2122,7 +2140,7 @@ fn startStores() void {
     var waited: u32 = 0;
     var pg_ready = false;
     while (waited < 60_000) : (waited += 250) {
-        if (system("docker exec e2e-postgres psql -U realmd -h 127.0.0.1 -d realmd -c 'select 1' >/dev/null 2>&1") == 0) {
+        if (system(cmdZ("docker exec {s} psql -U realmd -h 127.0.0.1 -d realmd -c 'select 1' >/dev/null 2>&1", .{pg})) == 0) {
             pg_ready = true;
             break;
         }
@@ -2131,15 +2149,16 @@ fn startStores() void {
     if (!pg_ready) {
         // Said plainly and fatally. Carrying on gets realmd killed by a connection error further
         // down, which reads as a realm bug rather than a container that never came up.
-        std.debug.print("ERROR: postgres never accepted a TCP query on :{d} within 60s\n", .{PG_HOST_PORT});
+        std.debug.print("ERROR: postgres never accepted a TCP query on :{d} within 60s\n", .{run.postgres});
         stopStores();
         std.process.exit(2);
     }
-    std.debug.print("started e2e-redis :{d} and e2e-postgres :{d} (postgres answered a query)\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
+    std.debug.print("started {s} :{d} and {s} :{d} (postgres answered a query)\n", .{ redis, run.redis, pg, run.postgres });
 }
 
+/// Removes this run's store containers, and only those.
 fn stopStores() void {
-    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1");
+    _ = system(cmdZ("docker rm -f {s} {s} >/dev/null 2>&1", .{ run.redis_container.get(), run.postgres_container.get() }));
 }
 
 fn maybeStartRealmd() !?c_int {
@@ -2163,13 +2182,13 @@ fn maybeStartRealmd() !?c_int {
         return null;
     }
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
-    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+    const data_dir = envOr("REALMD_DATA_DIR", run.data_dir.get());
     // The child has to be told the SAME health port the scenarios above will ask on. That is
     // HEALTH_PORT, which E2E_PORT_BASE has already moved — so defaulting this to a literal 18080
     // meant the base override started a child that tried to bind whatever else owned 18080,
     // failed, and left every scenario reporting ConnectFailed as though the server were broken.
     var health_buf: [8]u8 = undefined;
-    const health = envOr("REALMD_HEALTH_PORT", std.fmt.bufPrintZ(&health_buf, "{d}", .{HEALTH_PORT}) catch "18080");
+    const health = envOr("REALMD_HEALTH_PORT", std.fmt.bufPrintZ(&health_buf, "{d}", .{HEALTH_PORT}) catch unreachable);
     // Fresh data dir each run — accounts/chars/games persist otherwise and break
     // isolation (e.g. a re-created account would already exist on the 2nd run).
     var rmbuf: [512]u8 = undefined;
@@ -2272,7 +2291,7 @@ fn scMultiGameOneGs() Result {
 fn scBannerAd() Result {
     const name = "banner_ad";
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
-    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+    const data_dir = envOr("REALMD_DATA_DIR", run.data_dir.get());
 
     // The ad file has to be fetchable, so drop it where BNFTP serves from.
     var cmd: [512]u8 = undefined;
@@ -2288,18 +2307,18 @@ fn scBannerAd() Result {
         .{ .name = "REALMD_PERMISSIVE_AUTH", .value = "1" },
         .{ .name = "REALMD_AD_FILE", .value = "banner.pcx" },
         .{ .name = "REALMD_AD_URL", .value = "https://example.invalid/promo" },
-        .{ .name = "REALMD_BNET_PORT", .value = "20112" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "20118" },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.ad.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.ad.health) },
         .{ .name = "REALMD_GAME_PORT", .value = "0" },
         .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
-    const pid = spawnRealmd(bin, &envs, 20112) catch |e| return fail(name, "spawn {s}", .{@errorName(e)});
+    const pid = spawnRealmd(bin, &envs, run.ad.bnet) catch |e| return fail(name, "spawn {s}", .{@errorName(e)});
     defer {
         _ = kill(pid, 15);
         _ = waitpid(pid, null, 0);
     }
 
-    var c = rc.RealmClient{ .bnet_port = 20112, .d2cs_port = 20112 };
+    var c = rc.RealmClient{ .bnet_port = run.ad.bnet, .d2cs_port = run.ad.bnet };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -2392,7 +2411,7 @@ fn scSaveDurability() Result {
 fn scFriendsPersist() Result {
     const name = "friends_persist";
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
-    const data_dir = "/tmp/e2e-realmd-friends";
+    const data_dir = run.friends_dir.get();
     const acct = "FriendKeeper";
 
     // Its own data dir and its own instances: this test is about what reaches disk, so it
@@ -2409,16 +2428,16 @@ fn scFriendsPersist() Result {
     };
     const envs_w = base ++ [_]EnvVar{
         .{ .name = "REALMD_INSTANCE", .value = "FW" },
-        .{ .name = "REALMD_BNET_PORT", .value = "21112" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "21118" },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.friends_writer.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.friends_writer.health) },
     };
-    const writer_pid = spawnRealmd(bin, &envs_w, 21112) catch |e| return fail(name, "spawn writer {s}", .{@errorName(e)});
+    const writer_pid = spawnRealmd(bin, &envs_w, run.friends_writer.bnet) catch |e| return fail(name, "spawn writer {s}", .{@errorName(e)});
     defer {
         _ = kill(writer_pid, 15);
         _ = waitpid(writer_pid, null, 0);
     }
 
-    var c = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21112 };
+    var c = rc.RealmClient{ .bnet_port = run.friends_writer.bnet, .d2cs_port = run.friends_writer.bnet };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -2437,16 +2456,16 @@ fn scFriendsPersist() Result {
     // it can list them is off disk.
     const envs_r = base ++ [_]EnvVar{
         .{ .name = "REALMD_INSTANCE", .value = "FR" },
-        .{ .name = "REALMD_BNET_PORT", .value = "22112" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "22118" },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.friends_cold.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.friends_cold.health) },
     };
-    const cold_pid = spawnRealmd(bin, &envs_r, 22112) catch |e| return fail(name, "spawn cold {s}", .{@errorName(e)});
+    const cold_pid = spawnRealmd(bin, &envs_r, run.friends_cold.bnet) catch |e| return fail(name, "spawn cold {s}", .{@errorName(e)});
     defer {
         _ = kill(cold_pid, 15);
         _ = waitpid(cold_pid, null, 0);
     }
 
-    var cold = rc.RealmClient{ .bnet_port = 22112, .d2cs_port = 22112 };
+    var cold = rc.RealmClient{ .bnet_port = run.friends_cold.bnet, .d2cs_port = run.friends_cold.bnet };
     defer cold.close();
     cold.connectBnet() catch |e| return fail(name, "cold {s}", .{@errorName(e)});
     cold.auth() catch |e| return fail(name, "cold {s}", .{@errorName(e)});
@@ -2467,7 +2486,7 @@ fn scFriendsPersist() Result {
     // A friend who is actually in a channel should be reported as being there. This is the
     // only part of the friends feature a real 1.14d client can see, since it arrives as
     // chat text — the structured 0x65 reply is dropped by the client outright.
-    var pal = rc.RealmClient{ .bnet_port = 21112, .d2cs_port = 21112 };
+    var pal = rc.RealmClient{ .bnet_port = run.friends_writer.bnet, .d2cs_port = run.friends_writer.bnet };
     defer pal.close();
     pal.connectBnet() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
     pal.auth() catch |e| return fail(name, "pal {s}", .{@errorName(e)});
@@ -2497,8 +2516,7 @@ fn scFriendsPersist() Result {
 
 // Two realmd instances (A, B) sharing one data dir (REALMD_SHARED) keep sessions
 // in a shared store: a session minted on A's bnetd must resolve on B's d2cs.
-// Instance A: bnet 16112 / health 16118.
-// Instance B: 17112 / 17113 / 17114 / 17115 / 17118, SAME data dir, instance "B".
+// Instance A: run.peer_a, instance B: run.peer_b, SAME data dir.
 /// Chat across two realmd instances: a channel is the union of what every instance holds, or it
 /// is not a channel. The failure this guards is silent — talk simply does not arrive, a whisper
 /// says "that user is not logged on" about someone plainly online, and the user list shows half
@@ -2510,20 +2528,20 @@ fn scChatAcrossInstances() Result {
 
     const envs_a = [_]EnvVar{
         .{ .name = "REALMD_INSTANCE", .value = "ChatA" },
-        .{ .name = "REALMD_BNET_PORT", .value = "16112" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.peer_a.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.peer_a.health) },
         .{ .name = "REALMD_GAME_PORT", .value = "0" },
         .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
-    const a_pid = spawnRealmd(bin, &envs_a, 16112) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
+    const a_pid = spawnRealmd(bin, &envs_a, run.peer_a.bnet) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
     const envs_b = [_]EnvVar{
         .{ .name = "REALMD_INSTANCE", .value = "ChatB" },
-        .{ .name = "REALMD_BNET_PORT", .value = "17112" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "17118" },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.peer_b.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.peer_b.health) },
         .{ .name = "REALMD_GAME_PORT", .value = "0" },
         .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
-    const b_pid = spawnRealmd(bin, &envs_b, 17112) catch |e| {
+    const b_pid = spawnRealmd(bin, &envs_b, run.peer_b.bnet) catch |e| {
         _ = kill(a_pid, 15);
         _ = waitpid(a_pid, null, 0);
         return fail(name, "spawn B {s}", .{@errorName(e)});
@@ -2535,7 +2553,7 @@ fn scChatAcrossInstances() Result {
         _ = waitpid(b_pid, null, 0);
     }
 
-    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16112 };
+    var a = rc.RealmClient{ .bnet_port = run.peer_a.bnet, .d2cs_port = run.peer_a.bnet };
     defer a.close();
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
@@ -2547,7 +2565,7 @@ fn scChatAcrossInstances() Result {
     // B joins second, on the OTHER instance, so its user list has to include someone it does not
     // hold. This is the part that silently showed an empty room.
     _ = net.usleep(200_000);
-    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17112 };
+    var b = rc.RealmClient{ .bnet_port = run.peer_b.bnet, .d2cs_port = run.peer_b.bnet };
     defer b.close();
     b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
@@ -2603,7 +2621,7 @@ fn scMultiInstance() Result {
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
 
     // Shared data dir, fresh each run (isolation: accounts/sessions persist on fs).
-    const data_dir = "/tmp/e2e-realmd-shared";
+    const data_dir = run.shared_dir.get();
     var rmbuf: [256]u8 = undefined;
     if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
         _ = system(cmd.ptr);
@@ -2614,23 +2632,23 @@ fn scMultiInstance() Result {
         .{ .name = "REALMD_SHARED", .value = "1" },
         .{ .name = "REALMD_INSTANCE", .value = "A" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
-        .{ .name = "REALMD_BNET_PORT", .value = "16112" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "16118" },
-        .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (avoid 14001 clash)
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.peer_a.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.peer_a.health) },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (would clash with the edge scenario's)
         .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
-    const a_pid = spawnRealmd(bin, &envs_a, 16112) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
+    const a_pid = spawnRealmd(bin, &envs_a, run.peer_a.bnet) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
 
     const envs_b = [_]EnvVar{
         .{ .name = "REALMD_SHARED", .value = "1" },
         .{ .name = "REALMD_INSTANCE", .value = "B" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
-        .{ .name = "REALMD_BNET_PORT", .value = "17112" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "17118" },
-        .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (avoid 14001 clash)
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.peer_b.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.peer_b.health) },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" }, // no embedded edge (would clash with the edge scenario's)
         .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
-    const b_pid = spawnRealmd(bin, &envs_b, 17112) catch |e| {
+    const b_pid = spawnRealmd(bin, &envs_b, run.peer_b.bnet) catch |e| {
         _ = kill(a_pid, 15);
         _ = waitpid(a_pid, null, 0);
         return fail(name, "spawn B {s}", .{@errorName(e)});
@@ -2649,8 +2667,8 @@ fn scMultiInstance() Result {
     defer gs.stop();
     if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
 
-    // Mint a session on instance A (bnetd 16112 -> d2cs handoff lives in shared store).
-    var a = rc.RealmClient{ .bnet_port = 16112, .d2cs_port = 16112 };
+    // Mint a session on instance A (bnetd -> d2cs handoff lives in shared store).
+    var a = rc.RealmClient{ .bnet_port = run.peer_a.bnet, .d2cs_port = run.peer_a.bnet };
     defer a.close();
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
@@ -2658,9 +2676,9 @@ fn scMultiInstance() Result {
     a.enterRealm() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     if (a.sessionId() < 1) return fail(name, "A minted no session", .{});
 
-    // Resolve A's session on instance B's d2cs (17113). Copy A's session fields
+    // Resolve A's session on instance B's d2cs. Copy A's session fields
     // into B's client so its STARTUP carries A's cookie/status/lo/hi/account.
-    var b = rc.RealmClient{ .bnet_port = 17112, .d2cs_port = 17112 };
+    var b = rc.RealmClient{ .bnet_port = run.peer_b.bnet, .d2cs_port = run.peer_b.bnet };
     defer b.close();
     b.cookie = a.cookie;
     b.status = a.status;
@@ -2679,7 +2697,7 @@ fn scMultiInstance() Result {
     if (cg.result != 0) return fail(name, "A create result={d}", .{cg.result});
     // ...and confirm B's admin API lists it (shared-store snapshotGames, not A's memory).
     var rxbuf: [4096]u8 = undefined;
-    const lg = net.httpRequest(17118, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "B admin games {s}", .{@errorName(e)});
+    const lg = net.httpRequest(run.peer_b.health, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "B admin games {s}", .{@errorName(e)});
     if (lg.status != 200) return fail(name, "B admin games status={d}", .{lg.status});
     if (std.mem.indexOf(u8, lg.body, "fleetgame") == null)
         return fail(name, "game created on A is NOT visible via B's /admin/games (shared enumeration broken)", .{});
@@ -2782,7 +2800,7 @@ const EchoServer = struct {
 /// the port; exits the harness if it never comes up. Mirrors spawnRealmd.
 fn spawnD2ingress(ingress_port: u16) !c_int {
     const bin = envOr("REALMD_D2INGRESS_BIN", "./zig-out/bin/d2ingress");
-    const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
+    const data_dir = envOr("REALMD_DATA_DIR", run.data_dir.get());
     var pbuf: [8]u8 = undefined;
     const portz = std.fmt.bufPrintZ(&pbuf, "{d}", .{ingress_port}) catch return error.BadPort;
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
@@ -2812,12 +2830,12 @@ const INGRESS_TOKEN_OFFSET: usize = 5;
 //      first packet so we can assert the rewritten token.
 //   2. FakeGS registers with ip=127.0.0.1 / gs_port=P and a known gameid=3.
 //   3. client create+joins — realmd records {token T -> 127.0.0.1:P, gameid 3}, returns T.
-//   4. spawn d2ingress on :14000, pointed at the same redis realmd wrote the route to.
-//   5. connect to :14000, send GAMELOGON buf[0]=0x68, token T @offset 5, tail "PAYLOAD".
+//   4. spawn d2ingress on run.ingress, pointed at the same redis realmd wrote the route to.
+//   5. connect to it, send GAMELOGON buf[0]=0x68, token T @offset 5, tail "PAYLOAD".
 //      Assert echo got byte[0]==0x68, u16@5==3 (rewrite proof), tail matches (splice proof).
 fn scD2ingressTokenTranslate() Result {
     const name = "d2ingress_token_translate";
-    const INGRESS_PORT: u16 = 14000;
+    const INGRESS_PORT: u16 = run.ingress;
     const GS_GAMEID: u32 = 3;
 
     // Greeting ON: the echo backend opens with 0xAF00 (like the real engine), so this
@@ -2906,11 +2924,11 @@ fn scD2ingressTokenTranslate() Result {
 // d2ingress are mutually-exclusive deploy modes — we don't want both in one process.
 fn scEmbeddedGameEdge() Result {
     const name = "embedded_game_edge";
-    const EDGE_PORT: u16 = 14001;
+    const EDGE_PORT: u16 = run.edge_game;
     const GS_GAMEID: u32 = 5;
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
 
-    const data_dir = "/tmp/e2e-realmd-edge";
+    const data_dir = run.edge_dir.get();
     var rmbuf: [256]u8 = undefined;
     if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
         _ = system(cmd.ptr);
@@ -2920,12 +2938,12 @@ fn scEmbeddedGameEdge() Result {
         .{ .name = "REALMD_SHARED", .value = "1" },
         .{ .name = "REALMD_INSTANCE", .value = "E" },
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
-        .{ .name = "REALMD_BNET_PORT", .value = "18112" },
-        .{ .name = "REALMD_HEALTH_PORT", .value = "18118" },
-        .{ .name = "REALMD_GAME_PORT", .value = "14001" }, // the embedded edge under test
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.edge.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.edge.health) },
+        .{ .name = "REALMD_GAME_PORT", .value = portZ(run.edge_game) }, // the embedded edge under test
         .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
     };
-    const pid = spawnRealmd(bin, &envs, 18112) catch |e| return fail(name, "spawn edge realmd {s}", .{@errorName(e)});
+    const pid = spawnRealmd(bin, &envs, run.edge.bnet) catch |e| return fail(name, "spawn edge realmd {s}", .{@errorName(e)});
     defer {
         _ = kill(pid, 15);
         _ = waitpid(pid, null, 0);
@@ -2941,7 +2959,7 @@ fn scEmbeddedGameEdge() Result {
     defer gs.stop();
     if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
 
-    var c = rc.RealmClient{ .bnet_port = 18112, .d2cs_port = 18112 };
+    var c = rc.RealmClient{ .bnet_port = run.edge.bnet, .d2cs_port = run.edge.bnet };
     defer c.close();
     c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
     c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -3025,12 +3043,18 @@ fn resetFixtures() void {
 pub fn main() !void {
     // A whole run can be moved off the default ports. Without this, a stray realm server
     // on 6112 quietly becomes the system under test.
-    const port_base = std.fmt.parseInt(u16, envOr("E2E_PORT_BASE", "0"), 10) catch 0;
-    if (port_base != 0) {
-        rc.setPortBase(port_base);
-        HEALTH_PORT = port_base + 1968; // keeps the usual 6112 -> 18080 relationship
-        std.debug.print("port base overridden: bnet={d} health={d}\n", .{ rc.HOST_BNET, HEALTH_PORT });
-    }
+    // Everything else the run occupies moves with it: see layout.zig for the block rule.
+    const base_env: ?[]const u8 = if (getenv("E2E_PORT_BASE")) |v| std.mem.span(v) else null;
+    run = layout.fromEnv(base_env) catch |e| {
+        std.debug.print("ERROR: E2E_PORT_BASE={s}: {s}\n", .{ base_env orelse "", layout.explain(e) });
+        std.process.exit(2);
+    };
+    rc.setPortBase(run.main.bnet);
+    fakegs.redis_port = run.redis;
+    HEALTH_PORT = run.main.health;
+    std.debug.print("port base {d} (block {d}..{d}): bnet={d} health={d} redis={d} postgres={d}, data dir {s}\n", .{
+        run.base, run.base, run.base + layout.span - 1, run.main.bnet, HEALTH_PORT, run.redis, run.postgres, run.data_dir.get(),
+    });
     startStores();
     const child = try maybeStartRealmd();
     resetFixtures();

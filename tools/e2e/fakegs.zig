@@ -10,8 +10,8 @@ const net = @import("net.zig");
 const gsstore = @import("gsstore.zig");
 const rc = @import("realmclient.zig");
 
-/// Where the harness's redis is. Set once by main before any FakeGS starts.
-pub var redis_port: u16 = 6399;
+/// Where the harness's redis is (layout.zig). Set once by main before any FakeGS starts.
+pub var redis_port: u16 = 0;
 
 /// The four bytes CREATEGAMEREQ leads its body with (realm-proto's CreateGameReq): the kind
 /// of game realmd made of the creating character's flags.
