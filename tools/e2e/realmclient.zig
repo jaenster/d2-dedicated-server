@@ -641,13 +641,36 @@ pub const AdInfo = struct {
     /// body = [u8 flag][u16 total][u16 chunk][u16 offset][u32 rankBase][u32 count][u32 entrySize]
     /// then count × [u32 expLo][u32 expHi][u32 stats][entrySize-byte name].
     pub fn ladderData(self: *RealmClient, mode: u8, out: []LadderEntry, dst: []u8) !usize {
+        return self.ladderPage(mode, 0, out, dst, 5000);
+    }
+
+    /// One page of a board, from zero-based rank `first` - what the client asks for as its "-"
+    /// lines scroll into view. `error.NoReply` when the realm sends nothing within `wait_ms`, which
+    /// is its answer for a page with nobody on it.
+    pub fn ladderPage(self: *RealmClient, mode: u8, first: u16, out: []LadderEntry, dst: []u8, wait_ms: u32) !usize {
         const fd = self.d2cs.?;
         var body: [4]u8 = undefined;
         var w = net.Writer.init(&body);
         w.u8v(mode);
-        w.u16v(0); // first rank
+        w.u16v(first);
         try mcpSend(fd, MCP_LADDERDATA, w.slice());
-        return self.readLadder(out, dst);
+        return self.readLadderWithin(out, dst, wait_ms);
+    }
+
+    /// A whole board, page by page as the client fills it, until a short page or no reply.
+    pub fn ladderBoard(self: *RealmClient, mode: u8, out: []LadderEntry, dst: []u8) !usize {
+        var n: usize = 0;
+        var page: u16 = 0;
+        while (page < 200) : (page += 16) {
+            const got = self.ladderPage(mode, page, out[n..], dst[@as(usize, page) * 16 ..], if (page == 0) 5000 else 1000) catch |e| switch (e) {
+                error.NoReply => break,
+                else => return e,
+            };
+            if (got != 0 and self.ladder_first_rank != page) return error.LadderWrongPage;
+            n += got;
+            if (got < 16) break;
+        }
+        return n;
     }
 
     /// MCP_CHARRANK (0x16): where a character stands on its kind's overall board. The answer is a
@@ -669,15 +692,24 @@ pub const AdInfo = struct {
     /// chunks are reassembled by their write offsets until the whole buffer is there
     /// (NET_MCP_CLIENT_Incoming0x11 @0x44afc0). Returns 0 for the all-zero not-on-the-ladder form.
     pub fn readLadder(self: *RealmClient, out: []LadderEntry, dst: []u8) !usize {
+        return self.readLadderWithin(out, dst, 5000);
+    }
+
+    fn readLadderWithin(self: *RealmClient, out: []LadderEntry, dst: []u8, wait_ms: u32) !usize {
         const fd = self.d2cs.?;
         // A reply that never comes (a dropped board) is a failure to report, not a hang.
-        net.setRecvTimeout(fd, 5000);
+        net.setRecvTimeout(fd, wait_ms);
         defer net.setRecvTimeout(fd, 0);
         var whole: [8192]u8 = undefined;
         var total: usize = 0;
         var filled: usize = 0;
+        var first_packet = true;
         while (true) {
-            const r = try mcpRecv(fd, &self.rxbuf);
+            const r = mcpRecv(fd, &self.rxbuf) catch |e| {
+                if (first_packet) return error.NoReply;
+                return e;
+            };
+            first_packet = false;
             if (r.id != MCP_LADDERDATA) return error.LadderBadId;
             if (r.body.len + 3 > 0x400) return error.LadderPacketTooBigForClient;
             if (r.body.len < 7) return error.LadderShort;

@@ -11,6 +11,7 @@
 //! everywhere, nothing to keep in sync.
 const std = @import("std");
 const d2s = @import("d2s.zig");
+const ladder = @import("ladder.zig");
 const hook = @import("hook.zig");
 const adapter = @import("realm_store");
 const assets = adapter.assets;
@@ -55,7 +56,12 @@ pub fn init(cfg: Config) void {
 /// Read the live character. Redis first, because that is where a game's most recent save lands
 /// and Postgres may still be a flush behind it — reading Postgres first would hand back a stale
 /// character and undo the player's last session.
+/// How many times a character's save has been read, by anything. What the ladder is measured by:
+/// opening a board reads none.
+pub var save_reads = std.atomic.Value(u64).init(0);
+
 pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
+    _ = save_reads.fetchAdd(1, .monotonic);
     const cached = redis.getCharD2s(account, charname, out);
     if (cached != 0) return cached;
     const n = pg.getCharD2s(account, charname, out);
@@ -82,6 +88,7 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
 /// redis, so redis runs `noeviction`): one ladder request through it would copy the whole realm
 /// into redis for good, until redis is full and refuses the next game's save.
 pub fn peekCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
+    _ = save_reads.fetchAdd(1, .monotonic);
     const cached = redis.getCharD2s(account, charname, out);
     if (cached != 0) return cached;
     return pg.getCharD2s(account, charname, out);
@@ -417,6 +424,11 @@ pub fn deleteAccount(name: []const u8) bool {
     return pg.deleteAccount(name);
 }
 
+/// Whether any account is an admin.
+pub fn anyAdmin() bool {
+    return pg.anyAdmin();
+}
+
 /// List account names for the admin API.
 pub fn listAccounts(names: [][32]u8) usize {
     return pg.listAccounts(names);
@@ -555,7 +567,39 @@ pub fn flushCharToDurable(account: []const u8, charname: []const u8) bool {
     const n = redis.getCharD2s(account, charname, &buf);
     if (n == 0) return false;
     if (n == buf.len) return false; // implausibly large, likely truncated — do not persist it
-    return pg.saveCharD2s(account, charname, buf[0..n]);
+    return pg.saveCharD2s(account, charname, buf[0..n], standingOf(charname, buf[0..n]));
+}
+
+// ladder
+
+pub const Standing = pg.Standing;
+pub const LadderRow = pg.LadderRow;
+
+/// A save's ladder standing. A save too short to have a header stands nowhere: status 0 is on no
+/// board, and a derived-but-empty standing is not mistaken for one still to derive.
+pub fn standingOf(charname: []const u8, save: []const u8) Standing {
+    const e = ladder.entryFromSave(charname, save) orelse return .{ .status = 0, .stats = 0, .experience = 0 };
+    return .{ .status = e.status, .stats = e.stats, .experience = e.experience };
+}
+
+fn keyOf(b: ladder.Board) pg.BoardKey {
+    return .{ .kind = ladder.kindOf(b), .class = b.class };
+}
+
+/// Rows of a board from rank `first` on, from the standings the store keeps: no save is read.
+pub fn ladderPage(b: ladder.Board, first: u32, out: []LadderRow) usize {
+    return pg.ladderPage(keyOf(b), first, out);
+}
+
+/// A character's zero-based rank on a board, within the rows the ladder shows.
+pub fn ladderRank(b: ladder.Board, charname: []const u8) ?u32 {
+    return pg.ladderRank(keyOf(b), charname, ladder.max_entries);
+}
+
+/// Derive the standings the store lacks (`all` false), or all of them again (`all` true), from
+/// the saves it holds. The bootstrap for rows older than the standings, and the repair.
+pub fn ladderRebuild(all: bool) usize {
+    return pg.ladderRebuild(all, standingOf);
 }
 
 /// Is the shared store actually reachable? Asked once at startup, because everything the realm

@@ -80,6 +80,24 @@ pub fn board(ladder_type: u8) ?Board {
     return null;
 }
 
+/// The status bits a board is decided by, and the value they have on it: ladder, and the board's
+/// hardcore and expansion. What `onBoard` tests, as the store's index filters on it.
+pub const kind_mask: u8 = status_ladder | status_expansion | status_hardcore;
+
+pub fn kindOf(b: Board) u8 {
+    return status_ladder | (if (b.hardcore) status_hardcore else 0) | (if (b.expansion) status_expansion else 0);
+}
+
+/// The rows a request for rank `first` is answered with: the page of 16 the client asks for
+/// (CHATDLG_UpdateChatRoomList @0x4402a0 asks for the 16-aligned page holding the first line
+/// still showing its "-" placeholder), cut at the 200 it draws. Null past the end: the client
+/// has no page there to fill.
+pub const page_rows = 16;
+pub fn pageSpan(first: u32) ?usize {
+    if (first >= max_entries) return null;
+    return @min(page_rows, max_entries - first);
+}
+
 /// The overall board's type for a character kind: what MCP_CHARRANK's two flags pick.
 pub fn overallType(hardcore: bool, expansion: bool) u8 {
     if (expansion) return if (hardcore) base_expansion_hardcore else base_expansion_softcore;
@@ -258,13 +276,6 @@ pub fn writeNotOnLadder(w: *proto.Writer) void {
     w.zeros(14);
 }
 
-/// Where a rank search lands: the page of 16 holding the character, as the retail client pages.
-pub fn pageOf(rows: []const Entry, name: []const u8) ?u32 {
-    for (rows, 0..) |e, i| {
-        if (std.ascii.eqlIgnoreCase(e.nameSlice(), name)) return @intCast(i - i % 16);
-    }
-    return null;
-}
 
 // tests
 
@@ -513,16 +524,54 @@ test "an empty board is the not-on-the-ladder form only when asked for" {
     , try boardSnapshot(0x01, &text)); // classic hardcore amazon: nobody
 }
 
-test "a rank search lands on the character's page" {
-    var rows: [40]Entry = undefined;
-    for (&rows, 0..) |*e, i| {
-        e.* = .{};
-        _ = std.fmt.bufPrint(&e.name, "Char{d}", .{i}) catch unreachable;
-    }
-    try testing.expectEqual(@as(?u32, 0), pageOf(&rows, "char3"));
-    try testing.expectEqual(@as(?u32, 16), pageOf(&rows, "Char16"));
-    try testing.expectEqual(@as(?u32, 32), pageOf(&rows, "Char39"));
-    try testing.expectEqual(@as(?u32, null), pageOf(&rows, "Nobody"));
+test "a page is 16 rows from the rank asked for, cut at the 200 the client draws" {
+    try testing.expectEqual(@as(?usize, 16), pageSpan(0));
+    try testing.expectEqual(@as(?usize, 16), pageSpan(176));
+    try testing.expectEqual(@as(?usize, 8), pageSpan(192));
+    try testing.expectEqual(@as(?usize, null), pageSpan(200));
+    try testing.expectEqual(@as(u8, 0x64), kindOf(board(0x13).?)); // expansion hardcore
+    try testing.expectEqual(@as(u8, 0x40), kindOf(board(0x0a).?)); // classic softcore amazon
+}
+
+test "the second page of a board says where its rows go" {
+    var board_rows: [40]Entry = undefined;
+    fullBoard(&board_rows);
+    var buf: [max_reply]u8 = undefined;
+    var text: [4096]u8 = undefined;
+    // The client drew the first page already; it asks for rank 16 when its "-" lines come into view.
+    try testing.expectEqualStrings(
+        \\packet 470: type=0x1b total=460 chunk=460 offset=0
+        \\17 Row17 ama lvl=80 title=0 exp=24000 exp
+        \\18 Row18 ama lvl=80 title=0 exp=23000 exp
+        \\19 Row19 ama lvl=80 title=0 exp=22000 exp
+        \\20 Row20 ama lvl=80 title=0 exp=21000 exp
+        \\21 Row21 ama lvl=80 title=0 exp=20000 exp
+        \\22 Row22 ama lvl=80 title=0 exp=19000 exp
+        \\23 Row23 ama lvl=80 title=0 exp=18000 exp
+        \\24 Row24 ama lvl=80 title=0 exp=17000 exp
+        \\25 Row25 ama lvl=80 title=0 exp=16000 exp
+        \\26 Row26 ama lvl=80 title=0 exp=15000 exp
+        \\27 Row27 ama lvl=80 title=0 exp=14000 exp
+        \\28 Row28 ama lvl=80 title=0 exp=13000 exp
+        \\29 Row29 ama lvl=80 title=0 exp=12000 exp
+        \\30 Row30 ama lvl=80 title=0 exp=11000 exp
+        \\31 Row31 ama lvl=80 title=0 exp=10000 exp
+        \\32 Row32 ama lvl=80 title=0 exp=9000 exp
+        \\
+    , try renderBoard(writeReply(&buf, 0x1b, 16, board_rows[16..32]), &text));
+    // The last, short page.
+    try testing.expectEqualStrings(
+        \\packet 246: type=0x1b total=236 chunk=236 offset=0
+        \\33 Row33 ama lvl=80 title=0 exp=8000 exp
+        \\34 Row34 ama lvl=80 title=0 exp=7000 exp
+        \\35 Row35 ama lvl=80 title=0 exp=6000 exp
+        \\36 Row36 ama lvl=80 title=0 exp=5000 exp
+        \\37 Row37 ama lvl=80 title=0 exp=4000 exp
+        \\38 Row38 ama lvl=80 title=0 exp=3000 exp
+        \\39 Row39 ama lvl=80 title=0 exp=2000 exp
+        \\40 Row40 ama lvl=80 title=0 exp=1000 exp
+        \\
+    , try renderBoard(writeReply(&buf, 0x1b, 32, board_rows[32..40]), &text));
 }
 
 test "a board with more ladder characters than it shows keeps the best ones" {

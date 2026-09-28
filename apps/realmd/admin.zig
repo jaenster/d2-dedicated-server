@@ -15,6 +15,7 @@ const net = @import("realm_infra").net;
 const fleet = @import("fleet.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
+const standings = @import("standings.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -342,6 +343,12 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
     } else if (std.mem.eql(u8, p, "/admin/accounts/admin")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return setAdminEndpoint(fd, req, auth.?.name);
+    } else if (std.mem.eql(u8, p, "/admin/ladder/check")) {
+        if (!is_get) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return ladderCheck(fd);
+    } else if (std.mem.eql(u8, p, "/admin/ladder/rebuild")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return ladderRebuild(fd);
     } else if (std.mem.eql(u8, p, "/admin/chars/delete")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return charsDelete(fd, req);
@@ -382,13 +389,14 @@ fn login(fd: net.Socket, req: []const u8) void {
 
 fn status(fd: net.Socket) void {
     var buf: [512]u8 = undefined;
-    const body = std.fmt.bufPrint(&buf, "{{\"sessions\":{d},\"games\":{d},\"gameservers\":{d},\"instance\":\"{s}\",\"durable\":\"{s}\",\"ephemeral\":\"{s}\"}}", .{
+    const body = std.fmt.bufPrint(&buf, "{{\"sessions\":{d},\"games\":{d},\"gameservers\":{d},\"instance\":\"{s}\",\"durable\":\"{s}\",\"ephemeral\":\"{s}\",\"save_reads\":{d}}}", .{
         state.global.sessionCount(),
         countGames(),
         fleet.registeredCount(),
         instance,
         durable,
         ephemeral,
+        store.save_reads.load(.monotonic),
     }) catch return respond(fd, ok, "{}");
     respond(fd, ok, body);
 }
@@ -466,24 +474,45 @@ fn games(fd: net.Socket) void {
 }
 
 fn accountsList(fd: net.Socket) void {
+    // Every account, a page at a time: the list used to stop at the first 256.
+    var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    w.writeAll("{\"accounts\":[") catch return respond(fd, server_error, "{}");
     var names: [256][32]u8 = undefined;
-    const n = store.listAccounts(&names);
-    var buf: [8192]u8 = undefined;
-    var w: usize = 0;
-    const head = "{\"accounts\":[";
-    @memcpy(buf[0..head.len], head);
-    w = head.len;
-    for (names[0..n], 0..) |nm, i| {
-        const name = std.mem.sliceTo(&nm, 0);
-        const seg = std.fmt.bufPrint(buf[w..], "{s}{{\"name\":\"{s}\",\"admin\":{}}}", .{ if (i == 0) "" else ",", name, store.accountIsAdmin(name) }) catch break;
-        w += seg.len;
+    var after: [32]u8 = .{0} ** 32;
+    var first = true;
+    while (true) {
+        const n = store.listAccountsAfter(std.mem.sliceTo(&after, 0), &names);
+        if (n == 0) break;
+        for (names[0..n]) |*nm| {
+            const name = std.mem.sliceTo(nm, 0);
+            w.print("{s}{{\"name\":\"{s}\",\"admin\":{}}}", .{ if (first) "" else ",", name, store.accountIsAdmin(name) }) catch return respond(fd, server_error, "{}");
+            first = false;
+        }
+        after = names[n - 1];
     }
-    const tail = "]}";
-    if (w + tail.len <= buf.len) {
-        @memcpy(buf[w..][0..tail.len], tail);
-        w += tail.len;
-    }
-    respond(fd, ok, buf[0..w]);
+    w.writeAll("]}") catch return respond(fd, server_error, "{}");
+    respond(fd, ok, out.written());
+}
+
+// GET /admin/ladder/check - every board as kept, compared with the same board scanned from the
+// saves. It reads the whole realm, which is the point; it is an operator's audit, not a player's.
+fn ladderCheck(fd: net.Socket) void {
+    const rep = standings.check();
+    var buf: [128]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"boards\":{d},\"mismatches\":{d},\"first_mismatch\":{d}}}", .{
+        rep.boards, rep.mismatches, if (rep.first_mismatch) |t| @as(i32, t) else -1,
+    }) catch return respond(fd, ok, "{}");
+    respond(fd, ok, body);
+}
+
+// POST /admin/ladder/rebuild - derive every character's standing again from its save: the repair
+// for standings that went wrong, or that an older derivation wrote.
+fn ladderRebuild(fd: net.Socket) void {
+    const n = store.ladderRebuild(true);
+    var buf: [64]u8 = undefined;
+    respond(fd, ok, std.fmt.bufPrint(&buf, "{{\"rebuilt\":{d}}}", .{n}) catch "{}");
 }
 
 // POST /admin/chars/copy {"src_account","src_char","dst_char"[,"dst_account"]} — clone a

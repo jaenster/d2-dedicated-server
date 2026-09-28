@@ -13,6 +13,7 @@ const store = @import("store.zig");
 const version = @import("version.zig");
 const d2s = @import("d2s.zig");
 const ladder_board = @import("ladder.zig");
+const standings = @import("standings.zig");
 const fleet = @import("fleet.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
@@ -1100,48 +1101,30 @@ fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// MCP_LADDERDATA (0x11). Request: [u8 ladder type][u16 first rank]. Which characters a type
-// names, and the reply's layout, are in ladder.zig. The whole board goes out in one reply from
-// rank 0 whatever page was asked for: it is capped at 200 rows, which is also all the client
-// draws, so a later page request is answered by rows the client already holds. The reply is
-// several MCP packets, since one board is more than the client's 1024-byte receive buffer.
+// MCP_LADDERDATA (0x11). Request: [u8 ladder type][u16 first rank]
+// (NET_MCP_CLIENT_Send_0x11_RequestLadderData @0x44aa10). Which characters a type names, and the
+// reply's layout, are in ladder.zig. The client fills its board a page at a time: it lays out 200
+// "-" lines (CHATDLG_ClearLadderBoard @0x43f0e0), and whenever one shows on screen it asks for
+// the 16-aligned page holding it (CHATDLG_UpdateChatRoomList @0x4402a0); CHATDLG_HandleChatListClick
+// @0x4403f0 then draws the reply's rows at the ranks it says they start from. So a request is
+// answered with its own page, read from the standings the store keeps: no save is read.
 //
-// An empty board gets no reply at all. The client has already cleared the board when it asked,
-// and the only empty form it understands is the rank search's "Player '<name>' is not on the
-// ladder." popup, which is wrong for a board nobody is on yet.
-
-/// The ranked rows of one board, from every character on the realm.
-///
-/// Every account, paged, rather than one buffer's worth: the accounts come back in name order, so
-/// a fixed buffer would keep everyone past its end off the ladder for good. The saves are read
-/// with `peekCharD2s`, which does not cache: this reads the whole realm.
-fn boardStandings(top: *ladder_board.Top) void {
-    var accts: [256][32]u8 = undefined;
-    var after: [32]u8 = .{0} ** 32;
-    while (true) {
-        const na = store.listAccountsAfter(std.mem.sliceTo(&after, 0), &accts);
-        if (na == 0) break;
-        for (accts[0..na]) |*acct_buf| {
-            const acct = std.mem.sliceTo(acct_buf, 0);
-            if (acct.len == 0) continue;
-            var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
-            const nc = store.listChars(acct, &names);
-            for (names[0..nc]) |nm| {
-                // Big enough to reach the attribute section of a played save; the header
-                // alone would give the level but never the experience.
-                var save: [8192]u8 = undefined;
-                const sz = store.peekCharD2s(acct, nm.slice(), &save);
-                if (sz == 0) continue;
-                top.offer(ladder_board.entryFromSave(nm.slice(), save[0..sz]) orelse continue);
-            }
-        }
-        after = accts[na - 1];
-    }
-}
+// A page with nobody on it gets no reply at all. The client has already cleared the board when it
+// asked, and the only empty form it understands is the rank search's "Player '<name>' is not on
+// the ladder." popup, which is wrong for a board nobody is on yet, or a page past its end.
 
 fn sendLadder(c: *DConn, ladder_type: u8, first_rank: u32, rows: []const ladder_board.Entry) void {
     var buf: [ladder_board.max_reply]u8 = undefined;
     queue(c, ladder_board.writeReply(&buf, ladder_type, first_rank, rows));
+}
+
+/// Answer with the page from rank `first` on, or nothing when there is none.
+fn sendPage(c: *DConn, ladder_type: u8, b: ladder_board.Board, first: u32) usize {
+    const span = ladder_board.pageSpan(first) orelse return 0;
+    var rows: [ladder_board.page_rows]ladder_board.Entry = undefined;
+    const n = standings.page(b, first, rows[0..span]);
+    if (n != 0) sendLadder(c, ladder_type, first, rows[0..n]);
+    return n;
 }
 
 fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
@@ -1152,11 +1135,8 @@ fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "ladder data request type=0x{x} -> unknown board, ignored", .{ladder_type});
         return;
     };
-    var top = ladder_board.Top{ .board = b };
-    boardStandings(&top);
-    log.line(tag, "ladder data request type=0x{x} from={d} -> {d} entries", .{ ladder_type, first_rank, top.n });
-    if (top.n == 0) return;
-    sendLadder(c, ladder_type, 0, top.slice());
+    const n = sendPage(c, ladder_type, b, first_rank);
+    log.line(tag, "ladder data request type=0x{x} from={d} -> {d} entries", .{ ladder_type, first_rank, n });
 }
 
 // MCP_CHARUPGRADE (0x18). Request: cstr charname. This is the CharSel screen's
@@ -1205,14 +1185,13 @@ fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
     const expansion = r.getU32() != 0;
     const name = r.getStr();
     const ladder_type = ladder_board.overallType(hardcore, expansion);
-
-    var top = ladder_board.Top{ .board = ladder_board.board(ladder_type).? };
-    boardStandings(&top);
-    const rows = top.slice();
-    const page = ladder_board.pageOf(rows, name);
-    log.line(tag, "char rank request '{s}' type=0x{x} -> {s}", .{ name, ladder_type, if (page == null) "not on the ladder" else "found" });
-    // No rows is the not-on-the-ladder form.
-    if (page) |p| sendLadder(c, ladder_type, p, rows[p..]) else sendLadder(c, ladder_type, 0, &.{});
+    const b = ladder_board.board(ladder_type).?;
+    const rank = store.ladderRank(b, name);
+    log.line(tag, "char rank request '{s}' type=0x{x} -> {s}", .{ name, ladder_type, if (rank == null) "not on the ladder" else "found" });
+    if (rank) |k| {
+        if (sendPage(c, ladder_type, b, k - k % ladder_board.page_rows) != 0) return;
+    }
+    sendLadder(c, ladder_type, 0, &.{}); // no rows: the not-on-the-ladder form
 }
 
 fn statStringFor(buf: []u8, status: u8) []u8 {
