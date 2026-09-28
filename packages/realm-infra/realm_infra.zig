@@ -6,6 +6,7 @@ pub const net = @import("net.zig");
 pub const log = @import("log.zig");
 pub const obs = @import("obs"); // per-thread trace/span context (log.zig stamps it)
 pub const config = @import("config.zig");
+pub const greeting = @import("greeting.zig");
 pub const lock = @import("lock.zig");
 pub const types = @import("store_types.zig");
 
@@ -16,6 +17,7 @@ test {
     _ = log;
     _ = obs;
     _ = config;
+    _ = greeting;
     _ = lock;
     _ = types;
 }

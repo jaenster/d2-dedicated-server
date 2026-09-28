@@ -27,6 +27,29 @@ the engine's `0xAF` greeting frame, which it strips. Everything after is opaque 
 directions -- so gameplay changes cannot break it, and it never needs to keep up with the
 engine.
 
+## The greeting
+
+The client sends nothing until it has seen a `0xAF` frame, and d2ingress cannot route until the
+client has sent `GAMELOGON`, so d2ingress speaks first, on accept, for whichever game server the
+client turns out to belong to. The bytes are `REALMD_INGRESS_GREETING`, written as hex; default
+`af00`. The 2nd byte is the client's phase flag: `af00` is the raw, unframed stream every engine
+here serves, `af01` the length-framed Huffman one.
+
+The value is sent verbatim -- any bytes, up to 64 -- so it is also a way to try what a client does
+with something else. Only malformed hex, an empty value or one over 64 bytes is refused, at
+startup. It goes out before routing, so it is **one value per ingress, not per backend engine**:
+every game server behind the gateway meets the client in the mode this greeting put it in. realmd's
+embedded edge (`REALMD_GAME_PORT`) reads the same variable.
+
+| Env | Default | |
+|-|-|-|
+| `REALMD_BIND` | `0.0.0.0` | listen address |
+| `REALMD_INGRESS_PORT` | `4000` | the client-facing game port |
+| `REALMD_REDIS_ADDR` | `redis:6379` | where the token routes are |
+| `REALMD_INGRESS_GREETING` | `af00` | hex bytes sent to each client on accept |
+| `REALMD_INGRESS_TRACE` | off | hexdump spliced traffic |
+| `REALMD_LOG_JSON` | off | structured JSON logs |
+
 ## Why it needs no state of its own
 
 Because the token is realm-global, **any** gateway pod resolves **any** token: no session

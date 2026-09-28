@@ -14,6 +14,7 @@
 const std = @import("std");
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const config = @import("realm_infra").config;
+const greeting = @import("realm_infra").greeting;
 /// Public because an extension that binds a listener needs both: it writes a `net.Handler` exactly
 /// as bncs.zig and health.zig do, and its lines belong in the realm's log rather than on stderr
 /// where nothing collects them.
@@ -152,6 +153,14 @@ pub fn run(init: std.process.Init.Minimal) !void {
     log.line("realmd", "starting instance={s} bind={s} bnet={d} realm={s}@{s} capture={}", .{
         cfg.instance_id, cfg.bind, cfg.bnet_port, cfg.realm_name, cfg.realm_addr, cfg.capture,
     });
+    // Checked before anything is dialled, so a bad value fails the start rather than a join.
+    if (cfg.game_port != 0) {
+        gameedge.hello = greeting.parse(cfg.ingress_greeting) catch |e| {
+            log.line("realmd", "FATAL REALMD_INGRESS_GREETING '{s}' {s}", .{ cfg.ingress_greeting, greeting.describe(e) });
+            return e;
+        };
+        log.line("realmd", "game edge greets clients with {x} on accept", .{gameedge.hello.bytes()});
+    }
     // Graceful shutdown for k8s rolling updates + readiness gating.
     health.require_gs = cfg.require_gs;
     // Admin API + web UI (served on the health port under /admin/*). Enabled by any of:

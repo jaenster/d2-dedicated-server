@@ -45,6 +45,9 @@ pub const Config = struct {
     /// port itself — the lightweight, single-binary alternative to a standalone d2ingress
     /// (in-process token-route lookup, thread-per-conn splice). 0 = off (use d2ingress).
     game_port: u16 = 0,
+    /// The 0xAF greeting an ingress (d2ingress or the embedded edge) sends a client on accept,
+    /// as hex, sent verbatim. Parsed by `greeting.parse`; each binary refuses to start on bad hex.
+    ingress_greeting: []const u8 = "af00",
 
     /// Directory for durable data (character saves). A shared volume here is
     /// what lets multiple instances see the same characters.
@@ -211,6 +214,7 @@ pub fn fromEnv() Config {
     if (env("REALMD_ROUTE_TTL_S")) |v| c.route_ttl_s = std.fmt.parseInt(u32, v, 10) catch c.route_ttl_s;
     c.ingress_port = envPort("REALMD_INGRESS_PORT", c.ingress_port);
     c.game_port = envPort("REALMD_GAME_PORT", c.game_port);
+    if (env("REALMD_INGRESS_GREETING")) |v| c.ingress_greeting = v;
     if (env("REALMD_REALM_NAME")) |v| c.realm_name = v;
     if (env("REALMD_ADMINS")) |v| c.admins = v;
     if (env("REALMD_AD_FILE")) |v| c.ad_file = v;

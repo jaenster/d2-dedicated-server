@@ -52,6 +52,7 @@ to it. See [`docs/redis.md`](docs/redis.md).
 | `REALMD_DATA_DIR` | `realmd-data` | where BNFTP assets are read from (read-only image content) |
 | `REALMD_INSTANCE` | `realmd-0` | REQUIRED to differ per instance: it seeds session ids and dispatch request ids, so two instances sharing one collect each other's replies |
 | `REALMD_GAME_PORT` | `0` (off) | run the embedded game edge on this port instead of a separate d2ingress |
+| `REALMD_INGRESS_GREETING` | `af00` | hex bytes the game edge (and d2ingress) sends each client on accept, before routing; one value per ingress, not per engine. See [`apps/d2ingress`](apps/d2ingress/README.md#the-greeting) |
 | `REALMD_LOG_JSON` | off | structured JSON logs to stdout (for Loki) |
 | `REALMD_CAPTURE` | off | hexdump raw bytes instead of speaking the protocol |
 

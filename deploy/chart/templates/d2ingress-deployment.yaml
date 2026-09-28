@@ -37,6 +37,8 @@ spec:
               value: {{ include "realm.redisAddr" . | quote }}
             - name: REALMD_LOG_JSON
               value: {{ ternary "1" "0" .Values.d2ingress.logJson | quote }}
+            - name: REALMD_INGRESS_GREETING
+              value: {{ .Values.d2ingress.greeting | quote }}
           resources:
             {{- toYaml .Values.d2ingress.resources | nindent 12 }}
 {{- end }}
