@@ -189,6 +189,8 @@ pub const LadderEntry = struct {
     level: u32 = 0,
     class_id: u8 = 0,
     experience: u32 = 0,
+    /// The row flags above the class: dead 0x10, hardcore 0x20, expansion 0x40.
+    flags: u8 = 0,
 };
 
 pub const CharEntry = struct {
@@ -638,7 +640,7 @@ pub const AdInfo = struct {
         var body: [4]u8 = undefined;
         var w = net.Writer.init(&body);
         w.u8v(mode);
-        w.u16v(0); // reqid
+        w.u16v(0); // first rank
         try mcpSend(fd, MCP_LADDERDATA, w.slice());
         const r = try mcpRecv(fd, &self.rxbuf);
         if (r.id != MCP_LADDERDATA) return error.LadderBadId;
@@ -656,7 +658,7 @@ pub const AdInfo = struct {
             const stats = net.rdU32(data, off + 8);
             const nm = std.mem.sliceTo(data[off + 12 .. off + 12 + entry_size], 0);
             @memcpy(dst[di .. di + nm.len], nm);
-            out[n] = .{ .name = dst[di .. di + nm.len], .level = stats >> 16, .class_id = @intCast(stats & 0xf), .experience = experience };
+            out[n] = .{ .name = dst[di .. di + nm.len], .level = stats >> 16, .class_id = @intCast(stats & 0xf), .experience = experience, .flags = @intCast(stats & 0xf0) };
             di += nm.len;
             off += 12 + entry_size;
         }

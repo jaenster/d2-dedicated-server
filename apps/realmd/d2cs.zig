@@ -12,6 +12,7 @@ const state = @import("state.zig");
 const store = @import("store.zig");
 const version = @import("version.zig");
 const d2s = @import("d2s.zig");
+const ladder_board = @import("ladder.zig");
 const fleet = @import("fleet.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
@@ -1094,32 +1095,17 @@ fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// MCP_LADDERDATA (0x11). Request: u8 mode, u16 reqid; reply ranks the realm's characters. Wire
-// format from NET_MCP_CLIENT_Incoming0x11 @0x44afc0 + CHATDLG_HandleChatListClick @0x4403f0:
-// after the id, [u8 flag][u16 total][u16 chunk][u16 offset][data]; `data` (one chunk) =
-// [u32 rankBase=0][u32 count][u32 entrySize] then count entries of [u32 expLo][u32 expHi]
-// [u32 charStats][entrySize-byte name]. charStats = class(&0xf) | died<<4 | expansion<<5 |
-// hardcore<<6 | progression<<8 | level<<16. Empty realm -> the all-zero form; count/entrySize
-// are capped (<=256 / <=16) by the client parser. Ordering is by experience, which is NOT in the
-// header but in the packed attribute list (see d2s.attribute); the level byte alone ties.
-const ladder_max = 200;
-const ladder_entry_size: u32 = 16; // name field width
+// MCP_LADDERDATA (0x11). Request: [u8 ladder type][u16 first rank]. Which characters a type
+// names, and the reply's layout, are in ladder.zig. The whole board goes out in one reply from
+// rank 0 whatever page was asked for: it is capped at 200 rows, which is also all the client
+// draws, so a later page request is answered by rows the client already holds.
+//
+// An empty board gets no reply at all. The client has already cleared the board when it asked,
+// and the only empty form it understands is the rank search's "Player '<name>' is not on the
+// ladder." popup, which is wrong for a board nobody is on yet.
 
-const LadderEntry = struct {
-    name: [16]u8 = .{0} ** 16,
-    stats: u32 = 0,
-    experience: u32 = 0,
-};
-
-/// Highest experience first, falling back to level for characters whose save has no
-/// attribute section yet — a character created but never played has no experience to
-/// compare, and should not outrank one that has some.
-fn ladderRankDesc(_: void, a: LadderEntry, b: LadderEntry) bool {
-    if (a.experience != b.experience) return a.experience > b.experience;
-    return (a.stats >> 16) > (b.stats >> 16);
-}
-
-fn collectLadder(out: *[ladder_max]LadderEntry) usize {
+/// Every character on the realm as a ladder row, unranked and unfiltered.
+fn collectLadder(out: []ladder_board.Entry) usize {
     var n: usize = 0;
     var accts: [256][32]u8 = undefined;
     const na = store.listAccounts(&accts);
@@ -1129,56 +1115,44 @@ fn collectLadder(out: *[ladder_max]LadderEntry) usize {
         var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
         const nc = store.listChars(acct, &names);
         for (names[0..nc]) |nm| {
-            if (n >= ladder_max) return n;
+            if (n >= out.len) return n;
             // Big enough to reach the attribute section of a played save; the header
             // alone would give the level but never the experience.
             var save: [8192]u8 = undefined;
             const sz = store.getCharD2s(acct, nm.slice(), &save);
-            if (sz <= 0x2b) continue;
-            const status = save[0x24];
-            const progression: u32 = if (sz > 0x25) save[0x25] else 0;
-            var stats: u32 = save[0x28] & 0xf; // class
-            if (status & 0x08 != 0) stats |= 0x10; // died
-            if (status & 0x20 != 0) stats |= 0x20; // expansion
-            if (status & 0x04 != 0) stats |= 0x40; // hardcore
-            stats |= (progression & 0x1f) << 8;
-            stats |= @as(u32, save[0x2b]) << 16; // level
-            const cn = nm.slice();
-            out[n] = .{ .stats = stats, .experience = d2s.attribute(save[0..sz], d2s.stat_experience) orelse 0 };
-            @memcpy(out[n].name[0..@min(cn.len, 16)], cn[0..@min(cn.len, 16)]);
+            if (sz <= 0) continue;
+            out[n] = ladder_board.entryFromSave(nm.slice(), save[0..@intCast(sz)]) orelse continue;
             n += 1;
         }
     }
     return n;
 }
 
+/// The ranked rows of one board.
+fn boardStandings(b: ladder_board.Board, out: *[ladder_board.max_entries]ladder_board.Entry) usize {
+    // Every board is a slice of the whole realm, so gather more than one board's worth before
+    // filtering; otherwise the first 200 characters listed would decide who can rank at all.
+    var all: [ladder_board.max_entries * 8]ladder_board.Entry = undefined;
+    const n = collectLadder(&all);
+    return ladder_board.standings(b, all[0..n], out);
+}
+
 fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
-    const mode: u8 = if (body.len > 0) body[0] else 0;
-    var entries: [ladder_max]LadderEntry = undefined;
-    const n = collectLadder(&entries);
-    std.sort.pdq(LadderEntry, entries[0..n], {}, ladderRankDesc);
-    log.line(tag, "ladder data request mode=0x{x} -> {d} entries", .{ mode, n });
+    var r = proto.Reader.init(body);
+    const ladder_type = r.getU8();
+    const first_rank = r.getU16();
+    const b = ladder_board.board(ladder_type) orelse {
+        log.line(tag, "ladder data request type=0x{x} -> unknown board, ignored", .{ladder_type});
+        return;
+    };
+    var rows: [ladder_board.max_entries]ladder_board.Entry = undefined;
+    const n = boardStandings(b, &rows);
+    log.line(tag, "ladder data request type=0x{x} from={d} -> {d} entries", .{ ladder_type, first_rank, n });
+    if (n == 0) return;
 
     var buf: [8192]u8 = undefined;
     var w = startPacket(&buf, MCP_LADDERDATA);
-    if (n == 0) {
-        w.zeros(14); // empty-ladder form (Incoming0x11 clear-and-done path)
-        return finish(c, &w);
-    }
-    const total: u16 = @intCast(12 + n * (12 + ladder_entry_size));
-    w.putU8(mode); // flag — echo the requested mode so the client renders this tab
-    w.putU16(total); // whole-buffer size
-    w.putU16(total); // this chunk's length (single chunk)
-    w.putU16(0); // write offset
-    w.putU32(0); // rankBase
-    w.putU32(@intCast(n)); // count
-    w.putU32(ladder_entry_size); // per-entry name width
-    for (entries[0..n]) |e| {
-        w.putU32(e.experience); // experience low
-        w.putU32(0); // experience high — D2 experience is a u32, so this is always 0
-        w.putU32(e.stats);
-        w.putBytes(&e.name);
-    }
+    ladder_board.writeRows(&w, ladder_type, 0, rows[0..n]);
     finish(c, &w);
 }
 
@@ -1214,15 +1188,34 @@ fn onCancelCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     log.line(tag, "cancel game create (no-op)", .{});
 }
 
-// MCP_CHARRANK (0x16). Request: cstr charname, u32, u32. There is deliberately no reply:
-// the client's incoming dispatch table (Src::McpConnect::INCOMING @0x70ed00, bounds-checked
-// against 0x19) holds a null at index 0x16, so a 0x16 we sent back would be discarded before
-// any handler saw it. Logging it is the whole of the correct behaviour.
+// MCP_CHARRANK (0x16). Request: [u32 hardcore][u32 expansion][cstr name]
+// (NET_MCP_CLIENT_Send_0x16_CharRank @0x44aae0, fed by CHATDLG_RequestLadderRank @0x43ec60).
+// The answer is not a 0x16 - the client's incoming table holds a null there - but an
+// MCP_LADDERDATA for that kind's overall board, which the client made the board on screen
+// when it asked. Rows start at the character's page and the client scrolls to it; the name is
+// drawn white against the others because the client compares every row to the one it searched
+// for. A character not on the board gets the all-zero form, which the client reports as
+// "Player '<name>' is not on the ladder."
 fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
-    _ = c;
     var r = proto.Reader.init(body);
+    const hardcore = r.getU32() != 0;
+    const expansion = r.getU32() != 0;
     const name = r.getStr();
-    log.line(tag, "char rank request '{s}' (client has no 0x16 handler; nothing to reply)", .{name});
+    const ladder_type = ladder_board.overallType(hardcore, expansion);
+
+    var rows: [ladder_board.max_entries]ladder_board.Entry = undefined;
+    const n = boardStandings(ladder_board.board(ladder_type).?, &rows);
+    const page = ladder_board.pageOf(rows[0..n], name);
+    log.line(tag, "char rank request '{s}' type=0x{x} -> {s}", .{ name, ladder_type, if (page == null) "not on the ladder" else "found" });
+
+    var buf: [8192]u8 = undefined;
+    var w = startPacket(&buf, MCP_LADDERDATA);
+    if (page) |p| {
+        ladder_board.writeRows(&w, ladder_type, p, rows[p..n]);
+    } else {
+        ladder_board.writeNotOnLadder(&w);
+    }
+    finish(c, &w);
 }
 
 fn statStringFor(buf: []u8, status: u8) []u8 {
