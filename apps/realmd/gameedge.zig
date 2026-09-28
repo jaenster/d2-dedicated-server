@@ -1,6 +1,7 @@
 //! Embedded game-traffic edge — the lightweight, in-realmd version of d2ingress.
 //!
-//! Clients dial one public :4000; we speak `0xAF00` for the not-yet-dialled GS, read the
+//! Clients dial one public :4000; we speak the greeting (`0xAF00` by default,
+//! REALMD_INGRESS_GREETING) for the not-yet-dialled GS, read the
 //! GAMELOGON (0x68) token, look up {gs_ip,gs_port,gameid} in the in-process store (no redis
 //! hop), rewrite the token to the GS's real engine gameid, dial the GS, replay the first
 //! packet, then splice both directions. Thread-per-connection fits the single-binary path;
@@ -9,7 +10,11 @@
 const std = @import("std");
 const net = @import("realm_infra").net;
 const log = @import("realm_infra").log;
+const greeting = @import("realm_infra").greeting;
 const store = @import("store.zig");
+
+/// Sent on accept; set once at startup from REALMD_INGRESS_GREETING.
+pub var hello: greeting.Greeting = .{};
 
 const GAMELOGON_ID: u8 = 0x68;
 // Raw-wire layout: nId(u8,=0x68) ++ nGameHash(u32) ++ nGameToken(u16) ++ ... → token@5.
@@ -17,12 +22,12 @@ const TOKEN_OFFSET: usize = 5;
 const MIN_LOGON_BYTES: usize = TOKEN_OFFSET + 2;
 
 pub fn handle(fd: net.Socket, tag: []const u8) void {
-    // Speak 0xAF00 (ack-only) for the GS we haven't dialled yet — the client needs a
-    // connection-established packet to advance, but we can't route until we read its
-    // GAMELOGON token. The GS's own 0xAF01 (relayed once spliced) does the real flip
-    // to the compressed game phase; sending 0xAF00 here keeps the client in the raw
+    // Speak the greeting (0xAF00, ack-only, by default) for the GS we haven't dialled yet —
+    // the client needs a connection-established packet to advance, but we can't route until
+    // we read its GAMELOGON token. The GS's own 0xAF01 (relayed once spliced) does the real
+    // flip to the compressed game phase; sending 0xAF00 here keeps the client in the raw
     // handshake phase so that switch isn't duplicated/desynced.
-    if (!net.writeAll(fd, &[_]u8{ 0xaf, 0x00 })) return;
+    if (!net.writeAll(fd, hello.bytes())) return;
 
     // Accumulate the client's first packet until the GAMELOGON token is readable.
     var buf: [1024]u8 = undefined;

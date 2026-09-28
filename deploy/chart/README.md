@@ -101,7 +101,9 @@ that matter: it has no health endpoint (that is a `d2gs.dll` hook, and there is 
 probes are `tcpSocket` on 4000; and its image is `FROM scratch`, so an emptyDir is mounted at `/tmp`
 for the resource file the engine writes at startup — Kubernetes ignores the Dockerfile's `VOLUME`.
 
-d2ingress: `REALMD_BIND`, `REALMD_INGRESS_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON`. Its image
+d2ingress: `REALMD_BIND`, `REALMD_INGRESS_PORT`, `REALMD_REDIS_ADDR`, `REALMD_LOG_JSON`, and
+`REALMD_INGRESS_GREETING` from `d2ingress.greeting` (hex, default `af00`: the bytes every client
+gets on accept, before routing, so one value for the whole fleet behind it). Its image
 is usually private — set `d2ingress.pullSecret` to a dockerconfigjson secret (e.g. `ghcr`).
 
 Version check: the d2gs client bypasses it (`--bypass-checkrev`) and realmd accepts any auth-check, so no version MPQ is served.

@@ -297,6 +297,9 @@ const Gateway = struct {
     pend_head: usize = 0,
     pend_count: usize = 0,
 
+    // Sent to every client on accept, before it can be routed (REALMD_INGRESS_GREETING).
+    greeting: infra.greeting.Greeting = .{},
+
     fn init(g: *Gateway) void {
         for (0..POOL_N) |i| g.pool_free[i] = @intCast(i);
         g.pool_top = POOL_N;
@@ -646,15 +649,16 @@ const Gateway = struct {
             c.cli = cfd;
             // The client waits for a connection-established (0xAF) packet promptly after connect
             // or it never advances; the gateway can't reach the GS yet (needs the GAMELOGON token
-            // to route), so it speaks for the GS and sends one now. We send 0xAF00: the client's
-            // demux reads 0xAF's 2nd byte as a phase flag, two disjoint paths in
-            // ThreadClientToServer @0x52ab30 (gated on ParseRecvBufferIntoPacketQueues @0x52a8d0):
-            // `af 00` = raw recv+parse, no framing, no DecompressPacket; `af 01` = length-framed
-            // Huffman loop. We pick 0x00 and have the GS send in nMode==2 (SendPacketToClient
-            // @0x52b330, same exemption the greeting uses) so a stock client needs no patch.
-            const af00 = [2]u8{ 0xaf, 0x00 };
-            _ = write(cfd, &af00, af00.len);
-            log.line("d2ingress", "accepted game connection (fd={d}) — sent 0xAF00, awaiting GAMELOGON", .{cfd});
+            // to route), so it speaks for the GS and sends one now (REALMD_INGRESS_GREETING,
+            // default 0xAF00): the client's demux reads 0xAF's 2nd byte as a phase flag, two
+            // disjoint paths in ThreadClientToServer @0x52ab30 (gated on
+            // ParseRecvBufferIntoPacketQueues @0x52a8d0): `af 00` = raw recv+parse, no framing, no
+            // DecompressPacket; `af 01` = length-framed Huffman loop. With 0x00 the GS sends in
+            // nMode==2 (SendPacketToClient @0x52b330, same exemption the greeting uses) so a stock
+            // client needs no patch.
+            const hello = g.greeting.bytes();
+            _ = write(cfd, hello.ptr, hello.len);
+            log.line("d2ingress", "accepted game connection (fd={d}) — sent greeting, awaiting GAMELOGON", .{cfd});
         }
     }
 
@@ -945,6 +949,12 @@ pub fn main() !void {
         return error.RedisResolveFailed;
     };
 
+    const greeting = infra.greeting.parse(cfg.ingress_greeting) catch |e| {
+        log.line("d2ingress", "FATAL REALMD_INGRESS_GREETING '{s}' {s}", .{ cfg.ingress_greeting, infra.greeting.describe(e) });
+        return e;
+    };
+    log.line("d2ingress", "greeting clients with {x} on accept", .{greeting.bytes()});
+
     const listen_fd = try listenTcp(cfg.bind, cfg.ingress_port);
     log.line("d2ingress", "d2ingress listening on {s}:{d} (poll loop, redis {d}.{d}.{d}.{d}:{d}, conns={d}, pool={d}x{d})", .{ cfg.bind, cfg.ingress_port, redis_ip[0], redis_ip[1], redis_ip[2], redis_ip[3], rport, MAX_CONN, POOL_N, BUF_SZ });
 
@@ -955,5 +965,6 @@ pub fn main() !void {
     gw.init();
     gw.redis_ip = redis_ip;
     gw.redis_port = rport;
+    gw.greeting = greeting;
     gw.run(listen_fd);
 }

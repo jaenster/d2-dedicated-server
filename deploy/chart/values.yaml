@@ -249,6 +249,9 @@ gameServerNative:
 d2ingress:
   enabled: true
   logJson: true
+  # Hex bytes sent to every client on accept, before it is routed -- so one value for every
+  # engine behind this ingress. af00 = the raw stream all of ours serve.
+  greeting: af00
   # The d2ingress image is typically private (unlike the public realmd/d2gs). Set the
   # imagePullSecret name (e.g. the cluster-standard `ghcr` dockerconfigjson) to pull it.
   pullSecret: ""
