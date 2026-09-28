@@ -891,12 +891,12 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // A seat is released when the player leaves, and the engine takes a moment to notice a socket
     // has gone, so the character a client is bringing to its NEXT game can still be held by the
     // one it just left. Wait for that to clear before refusing.
-    var claim = store.claimCharForJoin(c.accountName(), c.charName(), g.gameid, c.session);
+    var claim = store.claimCharForJoin(c.accountName(), c.charName(), name, g.gameid, c.session);
     if (claim == .held) {
         var waited: u32 = 0;
         while (waited < seat_release_ms) : (waited += create_poll_ms) {
             sleepMs(create_poll_ms);
-            claim = store.claimCharForJoin(c.accountName(), c.charName(), g.gameid, c.session);
+            claim = store.claimCharForJoin(c.accountName(), c.charName(), name, g.gameid, c.session);
             if (claim != .held) break;
         }
         if (claim != .held and waited > 0)
@@ -909,6 +909,11 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
             // never there.
             if (old.counted) _ = state.global.adjustGamePlayers(old.gameid, -1);
             log.line(tag, "join game '{s}' -> '{s}' never arrived in game {d}; that claim is withdrawn", .{ name, c.charName(), old.gameid });
+        },
+        .gone => {
+            // It closed while this join waited for the character to leave its last game.
+            log.line(tag, "join game '{s}' (account={s}) -> the game closed while the join waited", .{ name, c.accountName() });
+            return rejectJoin(c, &w, JOIN_NO_SUCH_GAME);
         },
         .held => {
             var whob: [64]u8 = undefined;
@@ -925,8 +930,10 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // back missing — this read is what promotes it, and it is a no-op once it is there.
     warmChar(c.accountName(), c.charName());
     // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
-    // both directions) as soon as the player is actually in the game.
-    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc());
+    // both directions) as soon as the player is actually in the game. Added to the count as it is
+    // now, not to `g`: that copy was read before any wait above, and writing it back erased joins
+    // made meanwhile and relisted a game that had closed.
+    _ = state.global.countJoin(g.gameid);
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.

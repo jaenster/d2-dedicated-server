@@ -691,15 +691,22 @@ pub const join_grace_s: u32 = 60;
 
 pub const JoinClaim = redis.JoinClaim;
 
-/// Claim the character for a join into `gameid` by realm session `session`. See
-/// `redis.claimCharForJoin` for when a claim left by a join that never arrived is taken over.
-pub fn claimCharForJoin(account: []const u8, charname: []const u8, gameid: u32, session: u64) JoinClaim {
-    return redis.claimCharForJoin(account, charname, gameid, session, char_lock_ttl_s, join_grace_s);
+/// Claim the character for a join into game `game_name` (`gameid`) by realm session `session`.
+/// See `redis.claimCharForJoin` for when a claim left by a join that never arrived is taken over.
+pub fn claimCharForJoin(account: []const u8, charname: []const u8, game_name: []const u8, gameid: u32, session: u64) JoinClaim {
+    return redis.claimCharForJoin(account, charname, game_name, gameid, session, char_lock_ttl_s, join_grace_s, game_ttl_s);
 }
 
+pub const Arrival = redis.Arrival;
+
 /// The game server saw this character arrive; its claim is no longer pending.
-pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
-    return redis.confirmGameChar(gameid, account, charname, game_ttl_s);
+pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8) Arrival {
+    return redis.confirmGameChar(gameid, account, charname, game_ttl_s, char_lock_ttl_s);
+}
+
+/// Count a join into the game's listing, as the record stands now. False if the game is gone.
+pub fn countJoin(gameid: u32) bool {
+    return redis.countJoin(gameid, game_ttl_s);
 }
 
 pub fn adjustGamePlayers(gameid: u32, delta: i32) bool {
@@ -712,7 +719,7 @@ pub const LeasePass = redis.LeasePass;
 /// The realm calls this on a timer for every game still in the index; see `fleet.renewCharLeases`.
 pub fn renewGameCharLeases(gameid: u32) LeasePass {
     var ob: [32]u8 = undefined;
-    return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s, join_grace_s);
+    return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s, join_grace_s, game_ttl_s);
 }
 
 pub fn releaseGameChars(gameid: u32) usize {

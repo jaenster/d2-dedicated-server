@@ -231,6 +231,11 @@ pub fn run(init: std.process.Init.Minimal) !void {
     // Which engine each client build is. Only matters on a realm hosting more than one; an
     // unmapped client resolves to no engine, which constrains nothing.
     if (getenv("REALMD_CLIENT_VERSIONS")) |v| version.configure(std.mem.span(v));
+    if (getenv("REALMD_LEASE_RENEW_MS")) |v| {
+        if (std.fmt.parseInt(u32, std.mem.span(v), 10)) |ms| {
+            if (ms > 0) fleet.lease_renew_ms = ms;
+        } else |_| {}
+    }
     bncs.admin_accounts = cfg.admins;
     bncs.ad_file = cfg.ad_file;
     bncs.ad_url = cfg.ad_url;

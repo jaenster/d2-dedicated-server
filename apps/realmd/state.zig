@@ -251,6 +251,13 @@ pub const State = struct {
         return false;
     }
 
+    /// Count a join the realm just authorised, against the count as it is now. False if the game
+    /// is no longer there.
+    pub fn countJoin(st: *State, gameid: u32) bool {
+        if (shared) return store.countJoin(gameid);
+        return st.adjustGamePlayers(gameid, 1);
+    }
+
     /// Move a game's player count by `delta`, floored at zero.
     pub fn adjustGamePlayers(st: *State, gameid: u32, delta: i32) bool {
         if (shared) return store.adjustGamePlayers(gameid, delta);

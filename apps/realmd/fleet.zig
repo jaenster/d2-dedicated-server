@@ -341,7 +341,15 @@ fn apply(typ: p.Type, body: []const u8) void {
                 }
             }
             // The arrival turns the join's claim from pending into a seat.
-            if (flag == p.GAMEINFO_ENTER and char.len > 0) _ = store.confirmGameChar(gameid, acct, char);
+            if (flag == p.GAMEINFO_ENTER and char.len > 0) switch (store.confirmGameChar(gameid, acct, char)) {
+                .none, .confirmed => {},
+                .reclaimed => log.line("fleet", "game {d}: '{s}' arrived after its claim was withdrawn; claimed again", .{ gameid, char }),
+                .conflict => {
+                    var hb: [64]u8 = undefined;
+                    const holder = store.charLockOwner(acct, char, &hb) orelse "?";
+                    log.line("fleet", "game {d}: '{s}' (account={s}) arrived but is claimed by {s}: the character is in two games", .{ gameid, char, acct, holder });
+                },
+            };
         },
         .closegame => {
             if (body.len < 8) return;
@@ -350,8 +358,11 @@ fn apply(typ: p.Type, body: []const u8) void {
             // Whatever the game still holds is free now. A backstop for players the engine never
             // reported leaving — a client that vanished, or a server lost mid-game — since
             // otherwise those characters would stay claimed until their lease ran out.
-            _ = store.releaseGameChars(gameid);
+            //
+            // The record goes first: a join claims only a game still in the index, so a claim
+            // racing this close either lands before and is swept here, or finds the game gone.
             state.global.removeGameById(gameid);
+            _ = store.releaseGameChars(gameid);
             log.line("fleet", "game {d} closed", .{gameid});
         },
         else => {},
@@ -360,7 +371,8 @@ fn apply(typ: p.Type, body: []const u8) void {
 
 /// How often the realm renews the leases on characters in live games, and the bound on how many
 /// games one pass covers. A minute against a five-minute lease leaves four missed passes of slack.
-const lease_renew_us: c_uint = 60 * 1_000_000;
+/// REALMD_LEASE_RENEW_MS overrides it; the test harness runs passes far more often than that.
+pub var lease_renew_ms: u32 = 60_000;
 const lease_pass_games = 256;
 
 /// Renew every live game's character leases, forever.
@@ -370,18 +382,30 @@ const lease_pass_games = 256;
 /// one: a game that outlives the TTL loses its claim mid-session, another game takes the character,
 /// and then two games hold it with neither able to release the other's.
 ///
-/// The realm renews rather than the game server, for two reasons. The lease's owner is the GAME
-/// (`game:<id>`), not the server, so the server is not the party that can prove ownership. And a
-/// game only stays in this index while its server is still heartbeating — a server that dies has
-/// its games expired on the spot, so nothing renews them and they lapse on schedule. Liveness still
-/// comes from the server; the realm only carries it.
+/// The realm renews rather than the game server, because the lease's owner is the GAME
+/// (`game:<id>`), not the server, so the server is not the party that can prove ownership.
+/// Liveness still comes from the server: a game whose server is not in the fleet (its heartbeat
+/// has lapsed) is not renewed. Its games stay in the index until their record TTL, or until a
+/// server with the same id starts again, so renewing everything indexed would hold a dead server's
+/// players for hours rather than for the lease. A server gone for one pass only (a missed
+/// heartbeat, a store failover) costs nothing: the lease outlasts several passes.
 pub fn renewCharLeases() void {
     var games: [lease_pass_games]state.GameInfo = undefined;
+    var fleet_now: [max_gs]store.GsRec = undefined;
+    var last_orphaned: usize = 0;
     while (true) {
-        _ = usleep(lease_renew_us);
+        _ = usleep(@intCast(@as(u64, lease_renew_ms) * 1000));
         const n = state.snapshotGames(&games);
+        const live = store.snapshotGs(&fleet_now);
+        // A full buffer may have cut servers off the end; judge nobody dead on a partial view.
+        const whole = live < fleet_now.len;
         var renewed: usize = 0;
+        var orphaned: usize = 0;
         for (games[0..n]) |g| {
+            if (whole and g.gsid != 0 and !hosted(fleet_now[0..live], g.gsid)) {
+                orphaned += 1;
+                continue;
+            }
             const pass = store.renewGameCharLeases(g.gameid);
             renewed += pass.renewed;
             if (pass.withdrawn == 0) continue;
@@ -390,7 +414,17 @@ pub fn renewCharLeases() void {
             log.line("fleet", "game {d}: withdrew {d} claim(s) from joins that never arrived", .{ g.gameid, pass.withdrawn });
         }
         if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
+        if (orphaned > 0 and orphaned != last_orphaned)
+            log.line("fleet", "{d} game(s) on servers no longer in the fleet: their leases are left to lapse", .{orphaned});
+        last_orphaned = orphaned;
     }
+}
+
+fn hosted(recs: []const store.GsRec, gsid: u32) bool {
+    for (recs) |r| {
+        if (r.gsid == gsid) return true;
+    }
+    return false;
 }
 
 /// Drain game-server events forever. Every instance runs one; each event is consumed by exactly

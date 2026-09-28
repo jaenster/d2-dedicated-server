@@ -816,8 +816,8 @@ fn enterAs(c: *rc.RealmClient, acct: []const u8, char: []const u8) !void {
 
 /// The player count the game list shows for `game`, or null if it is not listed.
 fn listedPlayers(c: *rc.RealmClient, game: []const u8) ?u8 {
-    var rows: [32]rc.GameEntry = undefined;
-    var dst: [2048]u8 = undefined;
+    var rows: [64]rc.GameEntry = undefined;
+    var dst: [4096]u8 = undefined;
     const n = c.gameList(&rows, &dst) catch return null;
     for (rows[0..n]) |g| {
         if (std.mem.eql(u8, g.name, game)) return g.players;
@@ -967,6 +967,260 @@ fn scNewCharPlaysAtOnce() Result {
     if (!std.mem.eql(u8, who, "NewChar")) return fail(name, "game server was told '{s}' is joining, want 'NewChar'", .{who});
 
     return .{ .name = name, .status = .pass, .msg = msg("new character created, then create+join as it straight away", .{}) };
+}
+
+/// The value of a redis key, copied into `out`; null when it does not exist.
+fn redisGet(key: []const u8, out: []u8) ?[]const u8 {
+    var c = gsstore.Client.connect(fakegs.redis_port) catch return null;
+    defer c.close();
+    const val = switch (c.cmd(&.{ "GET", key }) catch return null) {
+        .bulk => |b| b orelse return null,
+        else => return null,
+    };
+    const n = @min(val.len, out.len);
+    @memcpy(out[0..n], val[0..n]);
+    return out[0..n];
+}
+
+/// An integer-reply command (TTL, PTTL, EXISTS ...); null when the store did not answer one.
+fn redisInt(args: []const []const u8) ?i64 {
+    var c = gsstore.Client.connect(fakegs.redis_port) catch return null;
+    defer c.close();
+    return switch (c.cmd(args) catch return null) {
+        .int => |v| v,
+        else => null,
+    };
+}
+
+/// Poll until `key` holds `want` (or, with `want` null, until it is gone).
+fn awaitKey(key: []const u8, want: ?[]const u8, ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 25) {
+        var b: [128]u8 = undefined;
+        const v = redisGet(key, &b);
+        if (want) |w| {
+            if (v != null and std.mem.eql(u8, v.?, w)) return true;
+        } else if (v == null) return true;
+        _ = net.usleep(25_000);
+    }
+    return false;
+}
+
+/// Put a character into a game on `gs` and have the server report it there.
+fn seat(gs: *FakeGS, c: *rc.RealmClient, game: []const u8, gameid: u32, acct: []const u8, char: []const u8, players: u32) !void {
+    if ((try c.createGame(game, "d")).result != 0) return error.CreateRefused;
+    if ((try c.joinGame(game)).result != 0) return error.JoinRefused;
+    try gs.sendPlayerUpdateFor(gameid, players, true, char, acct, 1, 1);
+}
+
+const CloseThenFree = struct {
+    gs: *FakeGS,
+    close_gameid: u32,
+    home_gameid: u32,
+    fn run(self: *CloseThenFree) void {
+        _ = net.usleep(250_000);
+        self.gs.sendCloseGame(self.close_gameid) catch {};
+        _ = net.usleep(250_000);
+        self.gs.sendPlayerUpdateFor(self.home_gameid, 0, false, "Wanderer", "WanderAcct", 1, 1) catch {};
+    }
+};
+
+/// A join that has to wait for its character to leave the last game can outlive the game it is
+/// joining. The join used to finish by rewriting that game's record from the copy it read before
+/// waiting, so a game that had closed in the meantime came back: listed for its full record TTL,
+/// holding the joiner's character, on a server that no longer had it.
+fn scJoinIntoClosingGame() Result {
+    const name = "join_into_closing_game";
+    var gs = FakeGS{ .gsid = 0xAB10, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7400 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "CloseHost", "Closer") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    seat(&gs, &host, "closingroom", 7400, "CloseHost", "Closer", 1) catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    var w = rc.RealmClient{};
+    defer w.close();
+    enterAs(&w, "WanderAcct", "Wanderer") catch |e| return fail(name, "wanderer: {s}", .{@errorName(e)});
+    seat(&gs, &w, "wanderhome", 7401, "WanderAcct", "Wanderer", 1) catch |e| return fail(name, "wanderer: {s}", .{@errorName(e)});
+    if (!awaitKey("realmd:charjoin:WanderAcct/Wanderer", null, 2000)) return fail(name, "wanderer never seated", .{});
+
+    // The join waits for Wanderer to leave wanderhome; closingroom ends while it waits.
+    var bg = CloseThenFree{ .gs = &gs, .close_gameid = 7400, .home_gameid = 7401 };
+    const t = std.Thread.spawn(.{}, CloseThenFree.run, .{&bg}) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const j = w.joinGame("closingroom") catch |e| {
+        t.join();
+        return fail(name, "{s}", .{@errorName(e)});
+    };
+    t.join();
+    _ = net.usleep(200_000);
+    if (listedPlayers(&host, "closingroom")) |n|
+        return fail(name, "closed game is listed again ({d} players) after a join that waited through its close (join 0x{x})", .{ n, j.result });
+    var lb: [64]u8 = undefined;
+    if (redisGet("realmd:charlock:WanderAcct/Wanderer", &lb)) |holder|
+        return fail(name, "Wanderer is held by {s} after joining a game that had closed (join 0x{x})", .{ holder, j.result });
+    if (j.result != 0x2a) return fail(name, "join into a closed game -> 0x{x}, want 0x2a", .{j.result});
+    return .{ .name = name, .status = .pass, .msg = msg("join that outlived its game refused (0x2a); game not relisted, character free", .{}) };
+}
+
+const JoinThenFree = struct {
+    gs: *FakeGS,
+    other: *rc.RealmClient,
+    result: u32 = 0xffff,
+    fn run(self: *JoinThenFree) void {
+        _ = net.usleep(200_000);
+        if (self.other.joinGame("countroom")) |j| self.result = j.result else |_| {}
+        _ = net.usleep(150_000);
+        self.gs.sendPlayerUpdateFor(7501, 0, false, "Counter", "CountAcct", 1, 1) catch {};
+    }
+};
+
+/// The count a join adds must be added to the count as it is NOW. The join wrote back the count it
+/// had read before waiting for its character, plus one, so a join that landed during the wait was
+/// erased from the list.
+fn scJoinCountNotStale() Result {
+    const name = "join_count_not_stale";
+    var gs = FakeGS{ .gsid = 0xAB11, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7500 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "CountHost", "Tally") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    seat(&gs, &host, "countroom", 7500, "CountHost", "Tally", 1) catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    if (!awaitListed(&host, "countroom", 1)) return fail(name, "host's arrival not reflected", .{});
+    var p = rc.RealmClient{};
+    defer p.close();
+    enterAs(&p, "CountAcct", "Counter") catch |e| return fail(name, "p: {s}", .{@errorName(e)});
+    seat(&gs, &p, "counthome", 7501, "CountAcct", "Counter", 1) catch |e| return fail(name, "p: {s}", .{@errorName(e)});
+    if (!awaitKey("realmd:charjoin:CountAcct/Counter", null, 2000)) return fail(name, "p never seated", .{});
+    var q = rc.RealmClient{};
+    defer q.close();
+    enterAs(&q, "CountAcctQ", "Quick") catch |e| return fail(name, "q: {s}", .{@errorName(e)});
+
+    var bg = JoinThenFree{ .gs = &gs, .other = &q };
+    const t = std.Thread.spawn(.{}, JoinThenFree.run, .{&bg}) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const j = p.joinGame("countroom") catch |e| {
+        t.join();
+        return fail(name, "{s}", .{@errorName(e)});
+    };
+    t.join();
+    if (bg.result != 0) return fail(name, "the join during the wait -> 0x{x}", .{bg.result});
+    if (j.result != 0) return fail(name, "the waiting join -> 0x{x}", .{j.result});
+    // Tally arrived, Quick and Counter are on their way: three.
+    if (!awaitListed(&host, "countroom", 3))
+        return fail(name, "list shows {?d} players, want 3 (a join made during the wait was overwritten)", .{listedPlayers(&host, "countroom")});
+    return .{ .name = name, .status = .pass, .msg = msg("a join made while another waited is still counted (3)", .{}) };
+}
+
+/// The same session joins the same game twice because the first attempt died at the loading
+/// screen. The engine notices the first attempt's socket is gone a moment later and reports it
+/// leaving, and that report was applied to the SECOND attempt's claim: the character then arrived
+/// in the game with nothing on the realm holding it, and a second login could take it elsewhere.
+fn scStaleLeaveKeepsRetake() Result {
+    const name = "stale_leave_keeps_retake";
+    var gs = FakeGS{ .gsid = 0xAB12, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7600 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "RetakeHost", "Holder") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    seat(&gs, &host, "retakeroom", 7600, "RetakeHost", "Holder", 1) catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    if ((host.createGame("retakeelse", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "second create refused", .{});
+
+    var p = rc.RealmClient{};
+    defer p.close();
+    enterAs(&p, "RetakeAcct", "Retaker") catch |e| return fail(name, "p: {s}", .{@errorName(e)});
+    const j1 = p.joinGame("retakeroom") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (j1.result != 0) return fail(name, "first attempt -> 0x{x}", .{j1.result});
+    const j2 = p.joinGame("retakeroom") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (j2.result != 0) return fail(name, "second attempt -> 0x{x}", .{j2.result});
+
+    // The engine drops the first attempt, then the second one arrives.
+    gs.sendPlayerUpdateFor(7600, 1, false, "Retaker", "RetakeAcct", 1, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    gs.sendPlayerUpdateFor(7600, 2, true, "Retaker", "RetakeAcct", 1, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = net.usleep(300_000);
+    var lb: [64]u8 = undefined;
+    const holder = redisGet("realmd:charlock:RetakeAcct/Retaker", &lb) orelse "nobody";
+    if (!std.mem.eql(u8, holder, "game:7600"))
+        return fail(name, "Retaker is in retakeroom but held by {s} (the first attempt's leave released the second's claim)", .{holder});
+
+    var again = rc.RealmClient{};
+    defer again.close();
+    enterAs(&again, "RetakeAcct", "Retaker") catch |e| return fail(name, "second login: {s}", .{@errorName(e)});
+    const dup = again.joinGame("retakeelse") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (dup.result != 0x2b) return fail(name, "second login took the seated character elsewhere -> 0x{x}, want 0x2b", .{dup.result});
+    return .{ .name = name, .status = .pass, .msg = msg("first attempt's leave did not release the retake; second login refused (0x2b)", .{}) };
+}
+
+/// A join withdrawn as abandoned can still arrive: a slow load, or an arrival report held up in
+/// the event queue. The server says the character IS in the game; the realm dropped that report
+/// because the claim was gone, and the seated character stayed free for anyone to take.
+fn scLateArrivalReclaims() Result {
+    const name = "late_arrival_reclaims";
+    var gs = FakeGS{ .gsid = 0xAB13, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7700 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "LateHost", "Early") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    seat(&gs, &host, "lateroom", 7700, "LateHost", "Early", 1) catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    if (!awaitListed(&host, "lateroom", 1)) return fail(name, "host's arrival not reflected", .{});
+    if ((host.createGame("lateelse", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "second create refused", .{});
+
+    var p = rc.RealmClient{};
+    defer p.close();
+    enterAs(&p, "LateAcct", "Slowpoke") catch |e| return fail(name, "p: {s}", .{@errorName(e)});
+    const j = p.joinGame("lateroom") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (j.result != 0) return fail(name, "join -> 0x{x}", .{j.result});
+    backdate("realmd:charjoin:LateAcct/Slowpoke", 120_000) catch |e| return fail(name, "backdate claim: {s}", .{@errorName(e)});
+    // The realm's lease pass withdraws it as abandoned.
+    if (!awaitKey("realmd:charlock:LateAcct/Slowpoke", null, 5000)) return fail(name, "the stale claim was never withdrawn", .{});
+
+    gs.sendPlayerUpdateFor(7700, 2, true, "Slowpoke", "LateAcct", 1, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitKey("realmd:charlock:LateAcct/Slowpoke", "game:7700", 2000))
+        return fail(name, "Slowpoke arrived in lateroom after its claim was withdrawn and nothing holds it", .{});
+    var again = rc.RealmClient{};
+    defer again.close();
+    enterAs(&again, "LateAcct", "Slowpoke") catch |e| return fail(name, "second login: {s}", .{@errorName(e)});
+    const dup = again.joinGame("lateelse") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (dup.result != 0x2b) return fail(name, "second login took the arrived character elsewhere -> 0x{x}, want 0x2b", .{dup.result});
+    return .{ .name = name, .status = .pass, .msg = msg("late arrival re-claimed the withdrawn character; second login refused (0x2b)", .{}) };
+}
+
+/// A game server that dies and never comes back under the same id never sends a close, and its
+/// games stay in the realm's index. The lease pass renewed the characters those games held for as
+/// long as the index kept them, which is the record TTL (six hours), not the five-minute lease.
+/// The per-game character set had no TTL at all.
+fn scDeadGsLeasesLapse() Result {
+    const name = "dead_gs_leases_lapse";
+    var gs = FakeGS{ .gsid = 0xAB14, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7800 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "DeadHost", "Ghosted") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    seat(&gs, &host, "deadroom", 7800, "DeadHost", "Ghosted", 1) catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    const lock = "realmd:charlock:DeadHost/Ghosted";
+    if (!awaitKey(lock, "game:7800", 2000) or !awaitKey("realmd:charjoin:DeadHost/Ghosted", null, 2000)) return fail(name, "never seated", .{});
+    const set_ttl = redisInt(&.{ "TTL", "realmd:gamechars:7800" }) orelse -3;
+
+    // The server dies: its record goes, no close is ever sent.
+    gs.stop();
+    // Stand in for four minutes of the five-minute lease having passed.
+    _ = redisInt(&.{ "PEXPIRE", lock, "60000" });
+    _ = net.usleep(1_500_000);
+    const left = redisInt(&.{ "PTTL", lock }) orelse -3;
+    if (left > 60_000 or set_ttl < 0) return fail(name, "lease of a character in a dead server's game renewed={} (PTTL {d}ms); realmd:gamechars:7800 TTL {d} (-1 = leaks forever)", .{ left > 60_000, left, set_ttl });
+    return .{ .name = name, .status = .pass, .msg = msg("dead server's leases left to lapse (PTTL {d}ms); character set has a TTL ({d}s)", .{ left, set_ttl }) };
 }
 
 /// A save is only durable if it is written under the right ACCOUNT — and the account reaches the
@@ -2219,6 +2473,8 @@ fn maybeStartRealmd() !?c_int {
     // builds are not used deliberately: this asserts the MECHANISM, and it must not start failing
     // the day someone corrects a real build number.
     _ = setenv("REALMD_CLIENT_VERSIONS", "1.0.0.7=e2e-old,1.0.0.8=e2e-new", 1);
+    // Lease passes every 300ms instead of every minute, so a scenario can watch one happen.
+    _ = setenv("REALMD_LEASE_RENEW_MS", "300", 1);
     std.debug.print("starting realmd: {s} (data_dir={s}, health={s})\n", .{ bin, data_dir, health });
 
     const pid = fork();
@@ -3107,6 +3363,11 @@ pub fn main() !void {
         scAbandonedJoinRetry(),
         scAbandonedJoinRelogin(),
         scNewCharPlaysAtOnce(),
+        scJoinIntoClosingGame(),
+        scJoinCountNotStale(),
+        scStaleLeaveKeepsRetake(),
+        scLateArrivalReclaims(),
+        scDeadGsLeasesLapse(),
     };
 
     if (child) |pid| {
