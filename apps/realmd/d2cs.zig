@@ -582,6 +582,11 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     const char_version = asked orelse hook.charVersion(acct, name, c.clientVersion()) orelse c.clientVersion();
     if (char_version.len != 0) _ = store.setCharVersion(acct, name, char_version);
     log.line(tag, "char create '{s}' class={d} engine={s} (account={s}) -> created", .{ name, class, char_version, acct });
+    // A created character is the logged-on one: NET_MCP_CLIENT_HandleCharCreation @0x435e10 goes
+    // straight to the lobby on success and never sends CHARLOGON for it. Without this the next
+    // create/join names whichever character was logged on before, or none.
+    c.setChar(name);
+    hook.charLogon(acct, name);
     w.putU32(0); // success
     finish(c, &w);
 }

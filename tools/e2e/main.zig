@@ -718,6 +718,66 @@ fn scDeleteInGame() Result {
     return .{ .name = name, .status = .pass, .msg = msg("delete of an in-game character refused (0x{x}); '{s}' still listed", .{ refused, char }) };
 }
 
+/// Log in, enter the realm and log on as `char` (created first), ready for MCP game traffic.
+fn enterAs(c: *rc.RealmClient, acct: []const u8, char: []const u8) !void {
+    try c.connectBnet();
+    try c.auth();
+    try c.login(acct);
+    try c.enterRealm();
+    try c.connectD2cs();
+    if ((try c.startup()) != 0) return error.StartupRefused;
+    const made = try c.charCreateFresh(1, 0x20, char);
+    if (made != 0 and made != 0x14) return error.CharCreateFailed; // 0x14: already there
+    if ((try c.charLogon(char)) != 0) return error.CharLogonFailed;
+}
+
+/// The player count the game list shows for `game`, or null if it is not listed.
+fn listedPlayers(c: *rc.RealmClient, game: []const u8) ?u8 {
+    var rows: [32]rc.GameEntry = undefined;
+    var dst: [2048]u8 = undefined;
+    const n = c.gameList(&rows, &dst) catch return null;
+    for (rows[0..n]) |g| {
+        if (std.mem.eql(u8, g.name, game)) return g.players;
+    }
+    return null;
+}
+
+/// Poll until the list shows `want` players for `game`. Game-server events are fire-and-forget.
+fn awaitListed(c: *rc.RealmClient, game: []const u8, want: u8) bool {
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 25) {
+        if (listedPlayers(c, game) == want) return true;
+        _ = net.usleep(25_000);
+    }
+    return false;
+}
+
+/// A character is the logged-on one from the moment it is created: the client goes straight to the
+/// lobby and never sends CHARLOGON for it. The realm kept the previous character (or none), so the
+/// first game a new character made was made for somebody else.
+fn scNewCharPlaysAtOnce() Result {
+    const name = "new_char_plays_at_once";
+    var gs = FakeGS{ .gsid = 0xAB0F, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7300 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    enterAs(&c, "FreshAcct", "OldChar") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const made = c.charCreateFresh(1, 0x20, "NewChar") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (made != 0) return fail(name, "create NewChar -> 0x{x}", .{made});
+
+    const cg = c.createGame("freshgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create game -> 0x{x}", .{cg.result});
+    const jg = c.joinGame("freshgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (jg.result != 0) return fail(name, "join game -> 0x{x}", .{jg.result});
+    const who = std.mem.sliceTo(&gs.join_char, 0);
+    if (!std.mem.eql(u8, who, "NewChar")) return fail(name, "game server was told '{s}' is joining, want 'NewChar'", .{who});
+
+    return .{ .name = name, .status = .pass, .msg = msg("new character created, then create+join as it straight away", .{}) };
+}
+
 /// A save is only durable if it is written under the right ACCOUNT — and the account reaches the
 /// game server in one place only: the JOINGAME the realm dispatches. Get that pairing wrong and
 /// nothing fails: the save lands at an address no login path reads, the server logs a success,
@@ -2842,6 +2902,7 @@ pub fn main() !void {
         scFriendsPersist(),
         scChatAcrossInstances(),
         scMultiInstance(),
+        scNewCharPlaysAtOnce(),
     };
 
     if (child) |pid| {
