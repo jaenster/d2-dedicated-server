@@ -72,6 +72,8 @@ pub const Layout = struct {
     /// friends_persist: the instance that writes, and the cold one that must read it back.
     friends_writer: Realmd,
     friends_cold: Realmd,
+    /// schema_bootstrap: instances started together against one old database.
+    boot: [4]Realmd,
 
     redis_container: Name,
     postgres_container: Name,
@@ -81,7 +83,7 @@ pub const Layout = struct {
     edge_dir: Name,
 
     /// Every port this run binds or tells a child to bind.
-    pub fn ports(self: *const Layout) [18]u16 {
+    pub fn ports(self: *const Layout) [26]u16 {
         return .{
             self.main.bnet,           self.main.health,
             self.redis,               self.postgres,
@@ -92,6 +94,10 @@ pub const Layout = struct {
             self.ad.bnet,             self.ad.health,
             self.friends_writer.bnet, self.friends_writer.health,
             self.friends_cold.bnet,   self.friends_cold.health,
+            self.boot[0].bnet,        self.boot[0].health,
+            self.boot[1].bnet,        self.boot[1].health,
+            self.boot[2].bnet,        self.boot[2].health,
+            self.boot[3].bnet,        self.boot[3].health,
         };
     }
 };
@@ -121,6 +127,12 @@ pub fn forBase(base: u16) Error!Layout {
         .ad = .{ .bnet = b + 20, .health = b + 21 },
         .friends_writer = .{ .bnet = b + 22, .health = b + 23 },
         .friends_cold = .{ .bnet = b + 24, .health = b + 25 },
+        .boot = .{
+            .{ .bnet = b + 30, .health = b + 31 },
+            .{ .bnet = b + 32, .health = b + 33 },
+            .{ .bnet = b + 34, .health = b + 35 },
+            .{ .bnet = b + 36, .health = b + 37 },
+        },
         .redis_container = Name.init("e2e-redis-{d}", .{b}),
         .postgres_container = Name.init("e2e-postgres-{d}", .{b}),
         .data_dir = Name.init("/tmp/e2e-realmd-{d}", .{b}),

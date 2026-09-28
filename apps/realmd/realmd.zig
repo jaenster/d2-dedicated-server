@@ -106,14 +106,15 @@ fn seedAccounts(spec: []const u8) void {
 }
 
 /// Whether any stored account carries the DB admin flag (cheap startup scan).
+fn ladderBootstrap() void {
+    const n = store.ladderRebuild(false);
+    if (n != 0) log.line("realmd", "ladder: derived the standing of {d} character(s) stored without one", .{n});
+}
+
+/// Asked of the store directly: walking the accounts into a buffer stopped at the first 256, so
+/// an admin further down the alphabet left the admin API off.
 fn anyDbAdmin() bool {
-    var names: [256][32]u8 = undefined;
-    const n = store.listAccounts(&names);
-    for (names[0..n]) |nm| {
-        const name = std.mem.sliceTo(&nm, 0);
-        if (store.accountIsAdmin(name)) return true;
-    }
-    return false;
+    return store.anyAdmin();
 }
 
 fn initStore(cfg: config.Config, io: anytype) void {
@@ -307,6 +308,11 @@ pub fn run(init: std.process.Init.Minimal) !void {
     // writes the same save twice rather than the wrong one.
     _ = std.Thread.spawn(.{}, charflush.run, .{}) catch |e|
         log.line("realmd", "WARNING character flush worker did not start: {s} — saves will stay in redis", .{@errorName(e)});
+    // Characters stored before their ladder standing was kept beside the save have none until
+    // their next save; derive them now, so they are on the boards from the start. Idempotent, and
+    // each write is fenced on the save it read, so instances doing it at once cannot disagree.
+    _ = std.Thread.spawn(.{}, ladderBootstrap, .{}) catch |e|
+        log.line("realmd", "WARNING ladder bootstrap did not start: {s} — older characters join the ladder on their next save", .{@errorName(e)});
 
     if (cfg.game_port != 0) {
         const game_fd = try net.listenTcp(cfg.bind, cfg.game_port);

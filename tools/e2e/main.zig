@@ -311,7 +311,7 @@ fn scLadder() Result {
 
     var entries: [256]rc.LadderEntry = undefined;
     var dst: [8192]u8 = undefined;
-    const cnt = c.ladderData(ladder_expansion_softcore, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cnt = c.ladderBoard(ladder_expansion_softcore, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     var king_rank: ?usize = null;
     var pawn_rank: ?usize = null;
     var king_level: u32 = 0;
@@ -352,7 +352,7 @@ fn scLadderExperience() Result {
 
     var entries: [256]rc.LadderEntry = undefined;
     var dst: [8192]u8 = undefined;
-    const cnt = c.ladderData(ladder_expansion_softcore, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cnt = c.ladderBoard(ladder_expansion_softcore, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     var ahead_rank: ?usize = null;
     var behind_rank: ?usize = null;
     var ahead_exp: u32 = 0;
@@ -414,7 +414,7 @@ fn scLadderBoards() Result {
     for (boards) |b| {
         var entries: [256]rc.LadderEntry = undefined;
         var dst: [8192]u8 = undefined;
-        const cnt = c.ladderData(b.t, &entries, &dst) catch |e| return fail(name, "type 0x{x}: {s}", .{ b.t, @errorName(e) });
+        const cnt = c.ladderBoard(b.t, &entries, &dst) catch |e| return fail(name, "type 0x{x}: {s}", .{ b.t, @errorName(e) });
         var got_buf: [512]u8 = undefined;
         var got = std.Io.Writer.fixed(&got_buf);
         for (entries[0..cnt]) |e| {
@@ -425,6 +425,476 @@ fn scLadderBoards() Result {
             return fail(name, "type 0x{x}: got [{s}] want [{s}]", .{ b.t, got.buffered(), b.want });
     }
     return .{ .name = name, .status = .pass, .msg = msg("3 boards hold only their own kind; hc 0x20, exp 0x40, grey only on a hardcore death", .{}) };
+}
+
+/// A realm client logged on through to d2cs, on the harness's realmd unless ports are given.
+fn d2csClient(c: *rc.RealmClient, acct: []const u8) !void {
+    try c.connectBnet();
+    try c.auth();
+    try c.login(acct);
+    try c.enterRealm();
+    try c.connectD2cs();
+    if ((c.startup() catch 1) != 0) return error.StartupFailed;
+}
+
+/// Letters-only fixture names (the realm refuses others silently): `prefix` + two letters for `i`.
+fn letterName(buf: []u8, prefix: []const u8, i: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}{c}{c}", .{ prefix, @as(u8, 'a') + @as(u8, @intCast(i / 26)), @as(u8, 'a') + @as(u8, @intCast(i % 26)) }) catch unreachable;
+}
+
+/// A board bigger than one packet has to reach the client whole. 40 rows are 1132 bytes, over
+/// the client's 1024-byte MCP receive buffer, whose queue drops such a packet outright; the realm
+/// used to send any board as one. CHARRANK is checked on the same characters: it answers with
+/// the character's page of its overall board, whatever case the name is typed in.
+fn scLadderManyRows() Result {
+    const name = "ladder_many_rows";
+    const rows = 40;
+    const accts = [_][]const u8{ "ManyRowsA", "ManyRowsB", "ManyRowsC", "ManyRowsD", "ManyRowsE" };
+    // Eight characters to an account, as a real one holds; the ladder is read across accounts.
+    for (accts) |acct| {
+        var reg = rc.RealmClient{};
+        defer reg.close();
+        d2csClient(&reg, acct) catch |e| return fail(name, "{s}: {s}", .{ acct, @errorName(e) });
+    }
+    var c = rc.RealmClient{};
+    defer c.close();
+    d2csClient(&c, accts[0]) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    for (0..rows) |i| {
+        const acct = accts[i % accts.len];
+        var nb: [16]u8 = undefined;
+        const cn = letterName(&nb, "ManyRow", i);
+        var d2s: [0x40]u8 = undefined;
+        const save = minimalD2s(&d2s, cn, 0, @intCast(99 - i)); // amazon, best first
+        d2s[0x24] = 0x40; // classic softcore ladder
+        const r = rc.storePutChar(acct, cn, save) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (r != 0) return fail(name, "save {s} result={d}", .{ cn, r });
+    }
+
+    var entries: [256]rc.LadderEntry = undefined;
+    var dst: [8192]u8 = undefined;
+    const cnt = c.ladderBoard(0x0a, &entries, &dst) catch |e| return fail(name, "classic softcore amazon board: {s}", .{@errorName(e)});
+    var got: usize = 0;
+    for (entries[0..cnt]) |e| {
+        if (!std.mem.startsWith(u8, e.name, "ManyRow")) continue;
+        var nb: [16]u8 = undefined;
+        const want = letterName(&nb, "ManyRow", got);
+        if (!std.mem.eql(u8, e.name, want)) return fail(name, "row {d} is {s}, want {s}", .{ got, e.name, want });
+        got += 1;
+    }
+    if (got != rows) return fail(name, "{d} of {d} rows arrived", .{ got, rows });
+
+    // The page the client asks for is the page it gets: rank 16 on, drawn where the reply says.
+    const p16 = c.ladderPage(0x0a, 16, &entries, &dst, 5000) catch |e| return fail(name, "page 16: {s}", .{@errorName(e)});
+    if (c.ladder_first_rank != 16 or p16 != 16) return fail(name, "page 16 came back as {d} rows from rank {d}", .{ p16, c.ladder_first_rank });
+    for (entries[0..p16], 0..) |e, i| {
+        var nb: [16]u8 = undefined;
+        const want = letterName(&nb, "ManyRow", 16 + i);
+        if (!std.mem.eql(u8, e.name, want)) return fail(name, "page 16 row {d} is {s}, want {s}", .{ i, e.name, want });
+    }
+    // Past the end there is nothing to fill: no reply, never the not-on-the-ladder popup.
+    if (c.ladderPage(0x0a, 48, &entries, &dst, 1000)) |n| {
+        return fail(name, "page 48 of a 40-row board answered with {d} rows", .{n});
+    } else |e| if (e != error.NoReply) return fail(name, "page 48: {s}", .{@errorName(e)});
+
+    // The overall board, for where the rank search should land.
+    const all = c.ladderBoard(0x09, &entries, &dst) catch |e| return fail(name, "classic softcore board: {s}", .{@errorName(e)});
+    const target = "ManyRowax";
+    var at: ?usize = null;
+    for (entries[0..all], 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, target)) at = i;
+    }
+    const k = at orelse return fail(name, "{s} not on the overall board", .{target});
+    const found = c.charRank(false, false, "manyrowAX", &entries, &dst) catch |e| return fail(name, "char rank: {s}", .{@errorName(e)});
+    if (found == 0) return fail(name, "char rank: {s} reported not on the ladder", .{target});
+    if (c.ladder_first_rank != k - k % 16) return fail(name, "char rank page starts at {d}, want {d}", .{ c.ladder_first_rank, k - k % 16 });
+    if (!std.mem.eql(u8, entries[k - c.ladder_first_rank].name, target)) return fail(name, "char rank row {d} is {s}", .{ k, entries[k - c.ladder_first_rank].name });
+    const nobody = c.charRank(false, false, "NobodyAtAll", &entries, &dst) catch |e| return fail(name, "char rank nobody: {s}", .{@errorName(e)});
+    if (nobody != 0) return fail(name, "a character nobody has was found on the ladder", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("{d}-row board arrived page by page, in order; page 16 on request; rank search lands on page {d}", .{ rows, c.ladder_first_rank }) };
+}
+
+/// Run SQL against this run's postgres (`db` names the database). The SQL must not contain `"`.
+fn psql(db: []const u8, sql: []const u8) bool {
+    return system(cmdZ("docker exec {s} psql -U realmd -d {s} -v ON_ERROR_STOP=1 -q -c \"{s}\" >/dev/null 2>&1", .{ run.postgres_container.get(), db, sql })) == 0;
+}
+
+fn hexOf(buf: []u8, bytes: []const u8) []const u8 {
+    const digits = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        buf[i * 2] = digits[b >> 4];
+        buf[i * 2 + 1] = digits[b & 0xf];
+    }
+    return buf[0 .. bytes.len * 2];
+}
+
+/// The ladder is the whole realm: an account past the first page of accounts ranks too, and a
+/// character only Postgres holds is read without being copied into redis. Redis runs noeviction,
+/// so a ladder that cached every save it read would fill it with the whole realm, until it
+/// refused the next game's save; and the account list used to stop at 256.
+fn scLadderWholeRealm() Result {
+    const name = "ladder_whole_realm";
+    if (!psql("realmd", "insert into accounts(name) select 'LadPad' || lpad(g::text, 3, '0') from generate_series(1, 300) g on conflict do nothing"))
+        return fail(name, "could not add the padding accounts", .{});
+    var d2s: [0x40]u8 = undefined;
+    const save = minimalD2s(&d2s, "WholeRealmPg", 1, 70); // sorceress
+    d2s[0x24] = 0x40 | 0x04; // classic hardcore ladder
+    var hex: [0x80]u8 = undefined;
+    if (!psql("realmd", msg("insert into accounts(name) values ('zzWholeRealm') on conflict do nothing; " ++
+        "insert into chars(account, name, d2s) values ('zzWholeRealm', 'WholeRealmPg', decode('{s}', 'hex')) on conflict do nothing", .{hexOf(&hex, save)})))
+        return fail(name, "could not add the postgres-only character", .{});
+
+    // Written straight into Postgres, as an operator would, so it has no standing until the
+    // repair derives one from its save.
+    var rx: [1 << 16]u8 = undefined;
+    const rb = net.httpRequest(HEALTH_PORT, "POST", "/admin/ladder/rebuild", ADMIN_TOKEN, "", &rx) catch |e| return fail(name, "rebuild {s}", .{@errorName(e)});
+    if (rb.status != 200) return fail(name, "rebuild status={d}", .{rb.status});
+    const al = net.httpRequest(HEALTH_PORT, "GET", "/admin/accounts", ADMIN_TOKEN, "", &rx) catch |e| return fail(name, "accounts {s}", .{@errorName(e)});
+    if (al.status != 200 or std.mem.indexOf(u8, al.body, "\"zzWholeRealm\"") == null)
+        return fail(name, "the admin account list stops before an account past 300 others (status {d}, {d} bytes)", .{ al.status, al.body.len });
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    d2csClient(&c, "WholeViewer") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var entries: [256]rc.LadderEntry = undefined;
+    var dst: [8192]u8 = undefined;
+    const cnt = c.ladderBoard(0x02, &entries, &dst) catch |e| return fail(name, "classic hardcore sorceress board: {s}", .{@errorName(e)});
+    var listed = false;
+    for (entries[0..cnt]) |e| {
+        if (std.mem.eql(u8, e.name, "WholeRealmPg")) listed = true;
+    }
+    if (!listed) return fail(name, "a character on an account past the first 256 is not on the ladder ({d} rows)", .{cnt});
+
+    var s = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    defer s.close();
+    const rep = s.cmd(&.{ "EXISTS", "realmd:char:zzWholeRealm:WholeRealmPg" }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    if (rep != .int or rep.int != 0) return fail(name, "reading the ladder copied a postgres-only save into redis", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("account past 300 others ranks; its save was not cached by the ladder read", .{}) };
+}
+
+fn saveReads() ?u64 {
+    var rx: [2048]u8 = undefined;
+    const r = net.httpRequest(HEALTH_PORT, "GET", "/admin/status", ADMIN_TOKEN, "", &rx) catch return null;
+    const key = "\"save_reads\":";
+    const at = std.mem.indexOf(u8, r.body, key) orelse return null;
+    var end = at + key.len;
+    while (end < r.body.len and r.body[end] >= '0' and r.body[end] <= '9') end += 1;
+    return std.fmt.parseInt(u64, r.body[at + key.len .. end], 10) catch null;
+}
+
+/// A character's row flags on a board, or null when it is not on it.
+fn boardFlags(c: *rc.RealmClient, board_type: u8, char: []const u8) !?u8 {
+    var entries: [256]rc.LadderEntry = undefined;
+    var dst: [8192]u8 = undefined;
+    const n = try c.ladderBoard(board_type, &entries, &dst);
+    for (entries[0..n]) |e| if (std.mem.eql(u8, e.name, char)) return e.flags;
+    return null;
+}
+
+/// Wait out the flush worker for a character the realm itself saved (upgrade, delete).
+fn awaitBoard(c: *rc.RealmClient, board_type: u8, char: []const u8, want_on: bool) !bool {
+    var waited: u32 = 0;
+    while (waited < 5000) : (waited += 250) {
+        if (((try boardFlags(c, board_type, char)) != null) == want_on) return true;
+        _ = net.usleep(250_000);
+    }
+    return false;
+}
+
+/// The boards are kept, not scanned: opening one reads no save, every board agrees with a scan of
+/// the saves, and the standings follow a character through what moves it between boards - a
+/// hardcore death, an expansion upgrade, the ladder bit going at a season's end, deletion.
+fn scLadderKept() Result {
+    const name = "ladder_kept";
+    const acct = "KeptAcct";
+    var c = rc.RealmClient{};
+    defer c.close();
+    d2csClient(&c, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const Put = struct {
+        fn char(n: []const u8, class: u8, status: u8) bool {
+            var d2s: [0x40]u8 = undefined;
+            const save = minimalD2s(&d2s, n, class, 50);
+            d2s[0x24] = status;
+            return (rc.storePutChar("KeptAcct", n, save) catch 1) == 0;
+        }
+    };
+    if (!Put.char("KeptHc", 4, 0x40 | 0x04)) return fail(name, "save KeptHc", .{});
+    if (!Put.char("KeptCls", 3, 0x40)) return fail(name, "save KeptCls", .{});
+    if (!Put.char("KeptSeason", 1, 0x40 | 0x20)) return fail(name, "save KeptSeason", .{});
+
+    const before = saveReads() orelse return fail(name, "/admin/status has no save_reads", .{});
+    var entries: [256]rc.LadderEntry = undefined;
+    var dst: [8192]u8 = undefined;
+    _ = c.ladderPage(ladder_expansion_softcore, 0, &entries, &dst, 5000) catch |e| return fail(name, "open board: {s}", .{@errorName(e)});
+    const after = saveReads() orelse return fail(name, "/admin/status has no save_reads", .{});
+    if (after != before) return fail(name, "opening one board read {d} saves", .{after - before});
+
+    const hc = (boardFlags(&c, 0x00, "KeptHc") catch |e| return fail(name, "{s}", .{@errorName(e)})) orelse return fail(name, "KeptHc not on the classic hardcore board", .{});
+    if (hc & 0x10 != 0) return fail(name, "KeptHc grey before dying", .{});
+    if (!Put.char("KeptHc", 4, 0x40 | 0x04 | 0x08)) return fail(name, "save KeptHc dead", .{});
+    const dead = (boardFlags(&c, 0x00, "KeptHc") catch |e| return fail(name, "{s}", .{@errorName(e)})) orelse return fail(name, "dead KeptHc left the board", .{});
+    if (dead & 0x10 == 0) return fail(name, "dead KeptHc is not grey", .{});
+
+    if ((c.charUpgrade("KeptCls") catch 1) != 0) return fail(name, "upgrade KeptCls", .{});
+    if (!(awaitBoard(&c, 0x1b, "KeptCls", true) catch false)) return fail(name, "upgraded KeptCls never reached the expansion board", .{});
+    if ((boardFlags(&c, 0x09, "KeptCls") catch null) != null) return fail(name, "upgraded KeptCls is still on the classic board", .{});
+
+    if ((boardFlags(&c, 0x1b, "KeptSeason") catch null) == null) return fail(name, "KeptSeason not on the expansion board", .{});
+    if (!Put.char("KeptSeason", 1, 0x20)) return fail(name, "save KeptSeason", .{}); // the season ended
+    if ((boardFlags(&c, 0x1b, "KeptSeason") catch null) != null) return fail(name, "a non-ladder KeptSeason is still on the board", .{});
+
+    if ((c.charDelete("KeptHc") catch 1) != 0) return fail(name, "delete KeptHc", .{});
+    if ((boardFlags(&c, 0x00, "KeptHc") catch null) != null) return fail(name, "deleted KeptHc is still on the board", .{});
+
+    var rx: [1024]u8 = undefined;
+    const chk = net.httpRequest(HEALTH_PORT, "GET", "/admin/ladder/check", ADMIN_TOKEN, "", &rx) catch |e| return fail(name, "check {s}", .{@errorName(e)});
+    if (chk.status != 200 or !std.mem.startsWith(u8, chk.body, "{\"boards\":28,\"mismatches\":0,"))
+        return fail(name, "kept boards disagree with a scan of the saves: {d} {s}", .{ chk.status, chk.body });
+    return .{ .name = name, .status = .pass, .msg = msg("0 save reads per board; all 28 boards match a scan; death, upgrade, season end and delete move the rows", .{}) };
+}
+
+/// The admin API stays on across restarts while any account holds the admin flag. That was
+/// decided by walking the accounts into a 256-entry buffer, so an admin further down the
+/// alphabet than that left the API off.
+fn scDbAdminPastFirstPage() Result {
+    const name = "db_admin_past_first_page";
+    const db = "admin_page";
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+    _ = psql("realmd", "drop database if exists admin_page");
+    if (!psql("realmd", "create database admin_page")) return fail(name, "create database", .{});
+    if (!psql(db, "create table accounts(name text primary key, pwhash bytea, is_admin boolean not null default false); " ++
+        "insert into accounts(name) select 'Pad' || lpad(g::text, 3, '0') from generate_series(1, 300) g; " ++
+        "insert into accounts(name, is_admin) values ('zzAdminLate', true)"))
+        return fail(name, "accounts", .{});
+    const envs = [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "AdminPage" },
+        .{ .name = "REALMD_PG_DSN", .value = cmdZ("postgres://realmd:realmd@127.0.0.1:{d}/{s}", .{ run.postgres, db }) },
+        .{ .name = "REALMD_ADMIN_TOKEN", .value = "" },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.boot[0].bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.boot[0].health) },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+    };
+    const pid = spawnRealmd(bin, &envs, run.boot[0].bnet) catch |e| return fail(name, "spawn {s}", .{@errorName(e)});
+    defer {
+        _ = kill(pid, 15);
+        _ = waitpid(pid, null, 0);
+    }
+    var rx: [1024]u8 = undefined;
+    const r = net.httpRequest(run.boot[0].health, "GET", "/admin/status", "", "", &rx) catch |e| return fail(name, "status {s}", .{@errorName(e)});
+    if (std.mem.indexOf(u8, r.body, "admin disabled") != null) return fail(name, "admin API off although zzAdminLate is an admin", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("an admin behind 300 accounts keeps the admin API on (status {d})", .{r.status}) };
+}
+
+/// The names of an account's characters in list order, comma-separated.
+fn listOrder(c: *rc.RealmClient, out: []u8) ![]const u8 {
+    var entries: [64]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const cl = try c.charList(&entries, &dst);
+    var w = std.Io.Writer.fixed(out);
+    for (entries[0..cl.count], 0..) |e, i| try w.print("{s}{s}", .{ if (i == 0) "" else ",", e.name });
+    return w.buffered();
+}
+
+fn importChar(acct: []const u8, char: []const u8) bool {
+    var d2s: [0x40]u8 = undefined;
+    const save = minimalD2s(&d2s, char, 2, 10);
+    var b64: [0x80]u8 = undefined;
+    const enc = std.base64.standard.Encoder.encode(&b64, save);
+    var rx: [1024]u8 = undefined;
+    const body = msg("{{\"account\":\"{s}\",\"char\":\"{s}\",\"d2s\":\"{s}\"}}", .{ acct, char, enc });
+    const r = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/import", ADMIN_TOKEN, body, &rx) catch return false;
+    return r.status == 200;
+}
+
+/// The character list is the char-select slot layout, so it has to be one order: creation order,
+/// the same through every instance, before and after a character's first save reaches Postgres.
+/// Characters an operator imports or copies used to reach Postgres only when the flush worker did,
+/// so until then they were listed by name and afterwards by flush time.
+fn scCharOrderAcrossInstances() Result {
+    const name = "char_order_two_instances";
+    const acct = "OrderAcct";
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+    const envs_a = [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "OrderA" },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.peer_a.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.peer_a.health) },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+    };
+    const a_pid = spawnRealmd(bin, &envs_a, run.peer_a.bnet) catch |e| return fail(name, "spawn A {s}", .{@errorName(e)});
+    const envs_b = [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = "OrderB" },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.peer_b.bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.peer_b.health) },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+    };
+    const b_pid = spawnRealmd(bin, &envs_b, run.peer_b.bnet) catch |e| {
+        _ = kill(a_pid, 15);
+        _ = waitpid(a_pid, null, 0);
+        return fail(name, "spawn B {s}", .{@errorName(e)});
+    };
+    defer {
+        _ = kill(a_pid, 15);
+        _ = kill(b_pid, 15);
+        _ = waitpid(a_pid, null, 0);
+        _ = waitpid(b_pid, null, 0);
+    }
+
+    var a = rc.RealmClient{ .bnet_port = run.peer_a.bnet, .d2cs_port = run.peer_a.bnet };
+    defer a.close();
+    d2csClient(&a, acct) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    for ([_][]const u8{ "Zulu", "alpha", "Mike" }) |cn| {
+        const r = a.charCreateFresh(0, 0x20, cn) catch |e| return fail(name, "create {s}: {s}", .{ cn, @errorName(e) });
+        if (r != 0) return fail(name, "create {s} result={d}", .{ cn, r });
+    }
+    // Imported out of name order, and listed at once, before the flush worker can move them.
+    if (!importChar(acct, "Echo") or !importChar(acct, "Bravo")) return fail(name, "import failed", .{});
+
+    var b = rc.RealmClient{ .bnet_port = run.peer_b.bnet, .d2cs_port = run.peer_b.bnet };
+    defer b.close();
+    d2csClient(&b, acct) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+
+    const Check = struct {
+        fn same(n: []const u8, x: *rc.RealmClient, y: *rc.RealmClient, want: []const u8, when: []const u8) ?Result {
+            var xb: [256]u8 = undefined;
+            var yb: [256]u8 = undefined;
+            const xs = listOrder(x, &xb) catch |e| return fail(n, "{s}: A list {s}", .{ when, @errorName(e) });
+            const ys = listOrder(y, &yb) catch |e| return fail(n, "{s}: B list {s}", .{ when, @errorName(e) });
+            if (!std.mem.eql(u8, xs, want)) return fail(n, "{s}: A lists [{s}], want [{s}]", .{ when, xs, want });
+            if (!std.mem.eql(u8, ys, want)) return fail(n, "{s}: B lists [{s}], want [{s}]", .{ when, ys, want });
+            return null;
+        }
+    };
+    if (Check.same(name, &a, &b, "Zulu,alpha,Mike,Echo,Bravo", "just imported")) |r| return r;
+    _ = net.usleep(2_500_000); // the flush worker's idle period is 1s
+    if (Check.same(name, &a, &b, "Zulu,alpha,Mike,Echo,Bravo", "after the flush")) |r| return r;
+    // Deleted and made again, a character is a new one: it goes last.
+    if ((a.charDelete("alpha") catch 1) != 0) return fail(name, "delete alpha failed", .{});
+    if ((a.charCreate(0, 0x20, "alpha") catch 1) != 0) return fail(name, "recreate alpha failed", .{});
+    if (Check.same(name, &a, &b, "Zulu,Mike,Echo,Bravo,alpha", "recreated")) |r| return r;
+    return .{ .name = name, .status = .pass, .msg = msg("creation order on both instances, before and after the flush; a recreated character goes last", .{}) };
+}
+
+/// fork+exec realmd without waiting for it: for instances that must start at the same moment.
+fn spawnRealmdNow(bin: [:0]const u8, envs: []const EnvVar) !c_int {
+    var saved: [24][512]u8 = undefined;
+    var had: [24]bool = undefined;
+    for (envs, 0..) |e, i| {
+        had[i] = false;
+        if (getenv(e.name)) |old| {
+            const v = std.mem.span(old);
+            @memcpy(saved[i][0..v.len], v);
+            saved[i][v.len] = 0;
+            had[i] = true;
+        }
+        _ = setenv(e.name, e.value, 1);
+    }
+    defer for (envs, 0..) |e, i| {
+        if (had[i]) {
+            const restored: [*:0]const u8 = @ptrCast(&saved[i]);
+            _ = setenv(e.name, restored, 1);
+        } else _ = unsetenv(e.name);
+    };
+    const pid = fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        const argv = [_:null]?[*:0]const u8{bin.ptr};
+        _ = execve(bin.ptr, &argv, environ);
+        std.process.exit(127);
+    }
+    return pid;
+}
+
+extern "c" fn time(t: ?*i64) i64;
+const WNOHANG = 1;
+
+/// realmd prepares its own schema, and on a production realm it does that against a database that
+/// already has characters in it, with several replicas starting at once. Every replica has to come
+/// up (two `create table if not exists` of the same new table race, and a replica that loses exits
+/// at boot), the existing characters have to get a stable order, and an instance starting while a
+/// query is running must not stall the players: its no-op ALTER used to queue for the table lock,
+/// and every character read queued behind it.
+fn scSchemaBootstrap() Result {
+    const name = "schema_bootstrap";
+    const db = "legacy_schema";
+    const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
+    _ = psql("realmd", "drop database if exists legacy_schema");
+    if (!psql("realmd", "create database legacy_schema")) return fail(name, "create database", .{});
+    // The schema as it was before character names were claimed and characters had a creation time.
+    if (!psql(db, "create table chars(account text not null, name text not null, d2s bytea not null, primary key(account, name)); " ++
+        "alter table chars add column version text not null default ''; " ++
+        "alter table chars add column metadata jsonb not null default '{}'::jsonb; " ++
+        "create table accounts(name text primary key, pwhash bytea, is_admin boolean not null default false)"))
+        return fail(name, "legacy schema", .{});
+    for ([_][]const u8{ "Zed", "bob", "Amy", "Carl" }) |cn| {
+        var d2s: [0x40]u8 = undefined;
+        var hex: [0x80]u8 = undefined;
+        const save = minimalD2s(&d2s, cn, 0, 5);
+        if (std.mem.eql(u8, cn, "Carl")) d2s[0x24] = 0x40 | 0x20; // a ladder character, from before standings were kept
+        if (!psql(db, msg("insert into chars(account, name, d2s) values ('LegacyAcct', '{s}', decode('{s}', 'hex'))", .{ cn, hexOf(&hex, save) })))
+            return fail(name, "insert {s}", .{cn});
+    }
+    // Saves are UPDATEs, which move rows around the heap: the unordered list followed them.
+    if (!psql(db, "update chars set d2s = d2s where name in ('Zed', 'Amy')")) return fail(name, "update", .{});
+
+    const dsn = cmdZ("postgres://realmd:realmd@127.0.0.1:{d}/{s}", .{ run.postgres, db });
+    var pids: [4]c_int = .{ -1, -1, -1, -1 };
+    defer for (pids) |p| {
+        if (p <= 0) continue;
+        _ = kill(p, 15);
+        _ = waitpid(p, null, 0);
+    };
+    const instances = [_][:0]const u8{ "BootA", "BootB", "BootC", "BootD" };
+    for (0..3) |i| {
+        const envs = [_]EnvVar{
+            .{ .name = "REALMD_INSTANCE", .value = instances[i] },
+            .{ .name = "REALMD_PG_DSN", .value = dsn },
+            .{ .name = "REALMD_BNET_PORT", .value = portZ(run.boot[i].bnet) },
+            .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.boot[i].health) },
+            .{ .name = "REALMD_GAME_PORT", .value = "0" },
+            .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+        };
+        pids[i] = spawnRealmdNow(bin, &envs) catch |e| return fail(name, "spawn {s}: {s}", .{ instances[i], @errorName(e) });
+    }
+    for (0..3) |i| {
+        if (!waitPort(run.boot[i].bnet, 15_000)) {
+            var st: c_int = 0;
+            const gone = waitpid(pids[i], &st, WNOHANG) == pids[i];
+            if (gone) pids[i] = -1;
+            return fail(name, "{s} did not come up{s}", .{ instances[i], if (gone) " (it exited: the schema bootstrap failed)" else "" });
+        }
+    }
+
+    var c = rc.RealmClient{ .bnet_port = run.boot[0].bnet, .d2cs_port = run.boot[0].bnet };
+    defer c.close();
+    d2csClient(&c, "LegacyAcct") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var ob: [256]u8 = undefined;
+    const order = listOrder(&c, &ob) catch |e| return fail(name, "list {s}", .{@errorName(e)});
+    if (!std.mem.eql(u8, order, "Amy,bob,Carl,Zed")) return fail(name, "existing characters list as [{s}], want [Amy,bob,Carl,Zed]", .{order});
+    // Stored before standings were kept, it has none; the instance derives it at start.
+    if (!(awaitBoard(&c, ladder_expansion_softcore, "Carl", true) catch false)) return fail(name, "a ladder character from the old schema never reached the board", .{});
+
+    // A long read on `chars` is running when another instance starts.
+    _ = system(cmdZ("docker exec {s} psql -U realmd -d {s} -q -c 'begin; select count(*) from chars; select pg_sleep(6); commit;' >/dev/null 2>&1 &", .{ run.postgres_container.get(), db }));
+    _ = net.usleep(1_000_000);
+    const envs_d = [_]EnvVar{
+        .{ .name = "REALMD_INSTANCE", .value = instances[3] },
+        .{ .name = "REALMD_PG_DSN", .value = dsn },
+        .{ .name = "REALMD_BNET_PORT", .value = portZ(run.boot[3].bnet) },
+        .{ .name = "REALMD_HEALTH_PORT", .value = portZ(run.boot[3].health) },
+        .{ .name = "REALMD_GAME_PORT", .value = "0" },
+        .{ .name = "REALMD_GAME_ADDR", .value = "127.0.0.1" },
+    };
+    pids[3] = spawnRealmdNow(bin, &envs_d) catch |e| return fail(name, "spawn {s}: {s}", .{ instances[3], @errorName(e) });
+    _ = net.usleep(1_000_000);
+    const t0 = time(null);
+    const again = listOrder(&c, &ob) catch |e| return fail(name, "list during the start {s}", .{@errorName(e)});
+    const took = time(null) - t0;
+    if (took > 1) return fail(name, "a character list took {d}s while an instance started: it queued behind the bootstrap's table lock", .{took});
+    if (!std.mem.eql(u8, again, "Amy,bob,Carl,Zed")) return fail(name, "listed [{s}] during the start", .{again});
+    if (!waitPort(run.boot[3].bnet, 15_000)) return fail(name, "{s} did not come up", .{instances[3]});
+    return .{ .name = name, .status = .pass, .msg = msg("3 instances started together on an old schema; legacy rows in name order; a 4th start did not stall reads", .{}) };
 }
 
 /// CHARUPGRADE has to actually convert the save. It used to ack success and change
@@ -3456,6 +3926,9 @@ pub fn main() !void {
         scLadder(),
         scLadderExperience(),
         scLadderBoards(),
+        scLadderManyRows(),
+        scLadderWholeRealm(),
+        scLadderKept(),
         scCharUpgrade(),
         scCharDelete(),
         scCharCopy(),
@@ -3477,6 +3950,9 @@ pub fn main() !void {
         scFriendsPersist(),
         scChatAcrossInstances(),
         scMultiInstance(),
+        scCharOrderAcrossInstances(),
+        scSchemaBootstrap(),
+        scDbAdminPastFirstPage(),
         scAbandonedJoinRetry(),
         scAbandonedJoinRelogin(),
         scNewCharPlaysAtOnce(),
