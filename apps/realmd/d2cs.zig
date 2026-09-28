@@ -425,8 +425,10 @@ fn enc14(w: *proto.Writer, v: u32) void {
 // from. RE'd from CHARSEL_ParseRealmCharList @0x43aab0 -> SAVEFILE_ParseSaveData @0x438ad0.
 // Offsets: [0..2] realm char count (14-bit), [2..13] equip slot1 (11, GRAPHIC codes),
 // [13] class+1 (parser subtracts CLASS_SORCERESS=1), [14..25] equip slot2 (11, color TRANSFORMS),
-// [25] level, [26..28] flags (14-bit; bit2=0x04 expansion, bit3=0x08 ladder/hardcore mix),
-// [28..30] field9 (14-bit), [30] act (0xFF->0), [31..33] two fields (0xFF->0), [33..36] guild tag.
+// [25] level, [26..28] flags (14-bit; low byte = .d2s status: 0x04 hardcore, 0x08 died,
+// 0x20 expansion; bits 8..12 = title progression),
+// [28..30] field9 (14-bit), [30] ladder (0xFF->0, see ladderByte), [31..33] two fields (0xFF->0),
+// [33..36] guild tag.
 // Every byte must stay non-zero (C-string); 14-bit ints set the high bit, "none" is 0xFF not 0x00.
 // Rendering: AllocCharSelectComponent @0x5066c0. Weapons are slot1[5]/[6]; unarmed (both 0xFF)
 // renders a valid naked character — real gear needs parsing .d2s items, not done yet.
@@ -437,6 +439,19 @@ fn putEquipSlot(w: *proto.Writer, app: []const u8) void {
         const b: u8 = if (k < app.len and app[k] != 0) app[k] else 0xFF;
         w.putU8(b);
     }
+}
+
+/// Statstring byte 30, the one thing the client reads to decide a character is ladder.
+///
+/// Not the 0x40 status bit: CharSel never tests that. SAVEFILE_ParseSaveData @0x438ad0 stores
+/// this byte (0xFF read as 0), DRAW_LocalCharsInSelectionScreen @0x4380f0 prints "LADDER
+/// CHARACTER" (string 0x2aaf) under any character where it is non-zero, and SelectCharHandler
+/// @0x439840 copies it into the launcher's isLadder, which the create-game screen reads. So a
+/// ladder character that sends 0xFF here is shown, and played, as a non-ladder one.
+///
+/// 0xFF rather than 0 for "not ladder" because the statstring is a C-string.
+fn ladderByte(status: u8) u8 {
+    return if ((status & STATUS_LADDER) != 0) 1 else 0xFF;
 }
 
 fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progression: u8, realm_count: u32, app1: []const u8, app2: []const u8, era: []const u8) void {
@@ -453,7 +468,7 @@ fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progressi
     const flags: u32 = (@as(u32, progression & 0x1f) << 8) | (status & 0x6C);
     enc14(w, flags);
     enc14(w, 0); // field9
-    w.putU8(0xFF); // act      (0xFF -> 0)
+    w.putU8(ladderByte(status));
     w.putU8(0xFF); // field_0x32f
     w.putU8(0xFF); // field_0x330
     // The guild tag, which on this realm is the character's engine. Two characters, so the
@@ -1208,4 +1223,42 @@ fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const name = r.getStr();
     log.line(tag, "char rank request '{s}' (client has no 0x16 handler; nothing to reply)", .{name});
+}
+
+fn statStringFor(buf: []u8, status: u8) []u8 {
+    var w = proto.Writer.init(buf);
+    writeStatString(&w, 1, 80, status, 5, 3, &.{}, &.{}, "14");
+    return w.slice();
+}
+
+test "a ladder character's statstring carries the ladder byte the char-select screen reads" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x83, 0x80, // realm char count 3
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // equip slot 1
+        0x02, // class + 1
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // equip slot 2
+        0x50, // level 80
+        0xE0, 0x8A, // flags: progression 5, status 0x60
+        0x80, 0x80, // field9
+        0x01, // ladder
+        0xFF, 0xFF,
+        '1', '4', // guild tag = engine
+    }, statStringFor(&buf, 0x60));
+}
+
+test "a non-ladder character's statstring leaves the ladder byte empty" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x83, 0x80,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x02,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x50,
+        0xA0, 0x8A, // flags: progression 5, status 0x20
+        0x80, 0x80,
+        0xFF, // not ladder
+        0xFF, 0xFF,
+        '1', '4',
+    }, statStringFor(&buf, 0x20));
 }
