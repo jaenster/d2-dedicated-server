@@ -450,6 +450,10 @@ fn putEquipSlot(w: *proto.Writer, app: []const u8) void {
 /// @0x439840 copies it into the launcher's isLadder, which the create-game screen reads. So a
 /// ladder character that sends 0xFF here is shown, and played, as a non-ladder one.
 ///
+/// The same on every engine this realm serves. D2Launch's CharSel stores it at +0x32e and draws
+/// the same line from it in 1.10f (@0x6fa13b40) and 1.13c (parse @0x6fa4c720, draw @0x6fa4b600);
+/// 1.09d and 1.06b, which predate the ladder, parse the statstring but never read the byte.
+///
 /// 0xFF rather than 0 for "not ladder" because the statstring is a C-string.
 fn ladderByte(status: u8) u8 {
     return if ((status & STATUS_LADDER) != 0) 1 else 0xFF;
@@ -594,6 +598,7 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     // on a realm that has not mapped its clients and means the character is unconstrained.
     // Order: what the request asked for, then what an extension says, then what the client is.
     // The request wins because it is the only one of the three that knows what the player picked.
+    store.recordCharCreated(acct, name);
     const asked = version.byEraCode(asked_era);
     const char_version = asked orelse hook.charVersion(acct, name, c.clientVersion()) orelse c.clientVersion();
     if (char_version.len != 0) _ = store.setCharVersion(acct, name, char_version);
@@ -1098,43 +1103,45 @@ fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
 // MCP_LADDERDATA (0x11). Request: [u8 ladder type][u16 first rank]. Which characters a type
 // names, and the reply's layout, are in ladder.zig. The whole board goes out in one reply from
 // rank 0 whatever page was asked for: it is capped at 200 rows, which is also all the client
-// draws, so a later page request is answered by rows the client already holds.
+// draws, so a later page request is answered by rows the client already holds. The reply is
+// several MCP packets, since one board is more than the client's 1024-byte receive buffer.
 //
 // An empty board gets no reply at all. The client has already cleared the board when it asked,
 // and the only empty form it understands is the rank search's "Player '<name>' is not on the
 // ladder." popup, which is wrong for a board nobody is on yet.
 
-/// Every character on the realm as a ladder row, unranked and unfiltered.
-fn collectLadder(out: []ladder_board.Entry) usize {
-    var n: usize = 0;
+/// The ranked rows of one board, from every character on the realm.
+///
+/// Every account, paged, rather than one buffer's worth: the accounts come back in name order, so
+/// a fixed buffer would keep everyone past its end off the ladder for good. The saves are read
+/// with `peekCharD2s`, which does not cache: this reads the whole realm.
+fn boardStandings(top: *ladder_board.Top) void {
     var accts: [256][32]u8 = undefined;
-    const na = store.listAccounts(&accts);
-    for (accts[0..na]) |acct_buf| {
-        const acct = std.mem.sliceTo(&acct_buf, 0);
-        if (acct.len == 0) continue;
-        var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
-        const nc = store.listChars(acct, &names);
-        for (names[0..nc]) |nm| {
-            if (n >= out.len) return n;
-            // Big enough to reach the attribute section of a played save; the header
-            // alone would give the level but never the experience.
-            var save: [8192]u8 = undefined;
-            const sz = store.getCharD2s(acct, nm.slice(), &save);
-            if (sz <= 0) continue;
-            out[n] = ladder_board.entryFromSave(nm.slice(), save[0..@intCast(sz)]) orelse continue;
-            n += 1;
+    var after: [32]u8 = .{0} ** 32;
+    while (true) {
+        const na = store.listAccountsAfter(std.mem.sliceTo(&after, 0), &accts);
+        if (na == 0) break;
+        for (accts[0..na]) |*acct_buf| {
+            const acct = std.mem.sliceTo(acct_buf, 0);
+            if (acct.len == 0) continue;
+            var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
+            const nc = store.listChars(acct, &names);
+            for (names[0..nc]) |nm| {
+                // Big enough to reach the attribute section of a played save; the header
+                // alone would give the level but never the experience.
+                var save: [8192]u8 = undefined;
+                const sz = store.peekCharD2s(acct, nm.slice(), &save);
+                if (sz == 0) continue;
+                top.offer(ladder_board.entryFromSave(nm.slice(), save[0..sz]) orelse continue);
+            }
         }
+        after = accts[na - 1];
     }
-    return n;
 }
 
-/// The ranked rows of one board.
-fn boardStandings(b: ladder_board.Board, out: *[ladder_board.max_entries]ladder_board.Entry) usize {
-    // Every board is a slice of the whole realm, so gather more than one board's worth before
-    // filtering; otherwise the first 200 characters listed would decide who can rank at all.
-    var all: [ladder_board.max_entries * 8]ladder_board.Entry = undefined;
-    const n = collectLadder(&all);
-    return ladder_board.standings(b, all[0..n], out);
+fn sendLadder(c: *DConn, ladder_type: u8, first_rank: u32, rows: []const ladder_board.Entry) void {
+    var buf: [ladder_board.max_reply]u8 = undefined;
+    queue(c, ladder_board.writeReply(&buf, ladder_type, first_rank, rows));
 }
 
 fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
@@ -1145,15 +1152,11 @@ fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "ladder data request type=0x{x} -> unknown board, ignored", .{ladder_type});
         return;
     };
-    var rows: [ladder_board.max_entries]ladder_board.Entry = undefined;
-    const n = boardStandings(b, &rows);
-    log.line(tag, "ladder data request type=0x{x} from={d} -> {d} entries", .{ ladder_type, first_rank, n });
-    if (n == 0) return;
-
-    var buf: [8192]u8 = undefined;
-    var w = startPacket(&buf, MCP_LADDERDATA);
-    ladder_board.writeRows(&w, ladder_type, 0, rows[0..n]);
-    finish(c, &w);
+    var top = ladder_board.Top{ .board = b };
+    boardStandings(&top);
+    log.line(tag, "ladder data request type=0x{x} from={d} -> {d} entries", .{ ladder_type, first_rank, top.n });
+    if (top.n == 0) return;
+    sendLadder(c, ladder_type, 0, top.slice());
 }
 
 // MCP_CHARUPGRADE (0x18). Request: cstr charname. This is the CharSel screen's
@@ -1203,19 +1206,13 @@ fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
     const name = r.getStr();
     const ladder_type = ladder_board.overallType(hardcore, expansion);
 
-    var rows: [ladder_board.max_entries]ladder_board.Entry = undefined;
-    const n = boardStandings(ladder_board.board(ladder_type).?, &rows);
-    const page = ladder_board.pageOf(rows[0..n], name);
+    var top = ladder_board.Top{ .board = ladder_board.board(ladder_type).? };
+    boardStandings(&top);
+    const rows = top.slice();
+    const page = ladder_board.pageOf(rows, name);
     log.line(tag, "char rank request '{s}' type=0x{x} -> {s}", .{ name, ladder_type, if (page == null) "not on the ladder" else "found" });
-
-    var buf: [8192]u8 = undefined;
-    var w = startPacket(&buf, MCP_LADDERDATA);
-    if (page) |p| {
-        ladder_board.writeRows(&w, ladder_type, p, rows[p..n]);
-    } else {
-        ladder_board.writeNotOnLadder(&w);
-    }
-    finish(c, &w);
+    // No rows is the not-on-the-ladder form.
+    if (page) |p| sendLadder(c, ladder_type, p, rows[p..]) else sendLadder(c, ladder_type, 0, &.{});
 }
 
 fn statStringFor(buf: []u8, status: u8) []u8 {

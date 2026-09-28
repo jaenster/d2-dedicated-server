@@ -75,6 +75,18 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
     return n;
 }
 
+/// Read a character's save without bringing it into the cache.
+///
+/// For readers that look at every character on the realm, like the ladder. `getCharD2s` caches
+/// what it reads from Postgres, and the cache has no eviction (a save is only safe once it is in
+/// redis, so redis runs `noeviction`): one ladder request through it would copy the whole realm
+/// into redis for good, until redis is full and refuses the next game's save.
+pub fn peekCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
+    const cached = redis.getCharD2s(account, charname, out);
+    if (cached != 0) return cached;
+    return pg.getCharD2s(account, charname, out);
+}
+
 /// Write the live character. Redis takes it and the character is marked dirty; the flush worker
 /// moves it to the store of record. The save is acknowledged once redis has it, so a game's save
 /// never waits on Postgres — which is the point of the cache, and why the dirty set has to be
@@ -314,7 +326,9 @@ pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []co
     if (getCharD2s(dst_account, dst_char, &probe) != 0) return false;
     if (!d2s.setName(buf[0..n], dst_char)) return false;
     d2s.fixChecksum(buf[0..n]);
-    return saveCharD2s(dst_account, dst_char, buf[0..n]);
+    if (!saveCharD2s(dst_account, dst_char, buf[0..n])) return false;
+    recordCharCreated(dst_account, dst_char);
+    return true;
 }
 
 /// Put a save file on an account under `name`.
@@ -338,7 +352,18 @@ pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8) bool
     @memcpy(buf[0..bytes.len], bytes);
     if (!d2s.setName(buf[0..bytes.len], name)) return false;
     d2s.fixChecksum(buf[0..bytes.len]);
-    return saveCharD2s(account, name, buf[0..bytes.len]);
+    if (!saveCharD2s(account, name, buf[0..bytes.len])) return false;
+    recordCharCreated(account, name);
+    return true;
+}
+
+/// Note that a character now exists, which fixes its place in the account's list.
+///
+/// Called after its first save, by everything that brings a character into existence. Best
+/// effort: a failure here costs only the character's slot until its save is flushed, and failing
+/// the creation over it would lose the character instead.
+pub fn recordCharCreated(account: []const u8, charname: []const u8) void {
+    _ = pg.recordCharCreated(account, charname);
 }
 
 /// Result of a classic -> expansion conversion.
@@ -395,6 +420,11 @@ pub fn deleteAccount(name: []const u8) bool {
 /// List account names for the admin API.
 pub fn listAccounts(names: [][32]u8) usize {
     return pg.listAccounts(names);
+}
+
+/// The next page of account names after `after`, for a caller that must see all of them.
+pub fn listAccountsAfter(after: []const u8, names: [][32]u8) usize {
+    return pg.listAccountsAfter(after, names);
 }
 
 /// Set/clear an account's admin flag (web-UI access).

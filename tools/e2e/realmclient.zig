@@ -52,6 +52,7 @@ const MCP_GAMELIST = 0x05;
 const MCP_GAMEINFO = 0x06;
 const MCP_CHARLOGON = 0x07;
 const MCP_LADDERDATA = 0x11;
+const MCP_CHARRANK = 0x16;
 const MCP_JOINGAME = 0x04;
 const MCP_CHARDELETE = 0x0a;
 const MCP_CHARLIST2 = 0x19;
@@ -107,7 +108,9 @@ fn mcpRecv(fd: Socket, buf: []u8) !struct { id: u8, body: []const u8 } {
     try net.readFull(fd, &hdr);
     const ln = net.rdU16(&hdr, 0);
     const id = hdr[2];
+    if (ln < 3) return error.McpShortPacket;
     const blen = ln - 3;
+    if (blen > buf.len) return error.McpPacketTooBig;
     try net.readFull(fd, buf[0..blen]);
     return .{ .id = id, .body = buf[0..blen] };
 }
@@ -232,6 +235,8 @@ pub const RealmClient = struct {
     lo: u32 = 0,
     hi: u32 = 0,
     rxbuf: [4096]u8 = undefined,
+    /// The first rank of the last ladder reply read.
+    ladder_first_rank: u32 = 0,
     unique_name_buf: [64]u8 = undefined,
     unique_name_len: usize = 0,
 
@@ -642,11 +647,51 @@ pub const AdInfo = struct {
         w.u8v(mode);
         w.u16v(0); // first rank
         try mcpSend(fd, MCP_LADDERDATA, w.slice());
-        const r = try mcpRecv(fd, &self.rxbuf);
-        if (r.id != MCP_LADDERDATA) return error.LadderBadId;
-        if (r.body.len < 7 or net.rdU16(r.body, 1) < 12) return 0; // empty ladder
-        const data = r.body[7..];
-        if (data.len < 12) return 0;
+        return self.readLadder(out, dst);
+    }
+
+    /// MCP_CHARRANK (0x16): where a character stands on its kind's overall board. The answer is a
+    /// ladder reply starting at the character's page (`ladder_first_rank`), or none.
+    pub fn charRank(self: *RealmClient, hardcore: bool, expansion: bool, char_name: []const u8, out: []LadderEntry, dst: []u8) !usize {
+        const fd = self.d2cs.?;
+        var body: [64]u8 = undefined;
+        if (char_name.len + 9 > body.len) return error.NameTooLong;
+        std.mem.writeInt(u32, body[0..4], @intFromBool(hardcore), .little);
+        std.mem.writeInt(u32, body[4..8], @intFromBool(expansion), .little);
+        @memcpy(body[8..][0..char_name.len], char_name);
+        body[8 + char_name.len] = 0;
+        try mcpSend(fd, MCP_CHARRANK, body[0 .. 9 + char_name.len]);
+        return self.readLadder(out, dst);
+    }
+
+    /// Read one ladder reply the way the client does: every packet must fit its 1024-byte receive
+    /// buffer (NET_MCP_CLIENT_ReadAndParsePacket @0x449b70; its queue drops a bigger one), and the
+    /// chunks are reassembled by their write offsets until the whole buffer is there
+    /// (NET_MCP_CLIENT_Incoming0x11 @0x44afc0). Returns 0 for the all-zero not-on-the-ladder form.
+    pub fn readLadder(self: *RealmClient, out: []LadderEntry, dst: []u8) !usize {
+        const fd = self.d2cs.?;
+        // A reply that never comes (a dropped board) is a failure to report, not a hang.
+        net.setRecvTimeout(fd, 5000);
+        defer net.setRecvTimeout(fd, 0);
+        var whole: [8192]u8 = undefined;
+        var total: usize = 0;
+        var filled: usize = 0;
+        while (true) {
+            const r = try mcpRecv(fd, &self.rxbuf);
+            if (r.id != MCP_LADDERDATA) return error.LadderBadId;
+            if (r.body.len + 3 > 0x400) return error.LadderPacketTooBigForClient;
+            if (r.body.len < 7) return error.LadderShort;
+            total = net.rdU16(r.body, 1);
+            const chunk = net.rdU16(r.body, 3);
+            const offset = net.rdU16(r.body, 5);
+            if (total == 0 and chunk == 0 and offset == 0) return 0; // not on the ladder
+            if (total < 12 or total > whole.len or offset + chunk > total or r.body.len != 7 + chunk) return error.LadderBadChunk;
+            @memcpy(whole[offset..][0..chunk], r.body[7..][0..chunk]);
+            filled = offset + chunk;
+            if (filled >= total) break;
+        }
+        const data = whole[0..total];
+        self.ladder_first_rank = net.rdU32(data, 0);
         const count = net.rdU32(data, 4);
         const entry_size = net.rdU32(data, 8);
         var off: usize = 12;

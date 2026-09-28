@@ -95,6 +95,25 @@ pub fn listAccounts(names: [][32]u8) usize {
     return count;
 }
 
+/// The next page of account names after `after` (empty: from the start), in name order. A caller
+/// that has to see every account pages through with the last name it got, so no account past a
+/// buffer's end is silently left out.
+pub fn listAccountsAfter(after: []const u8, names: [][32]u8) usize {
+    const p = ensurePool() orelse return 0;
+    var result = p.query("select name from accounts where name > $1 order by name limit $2", .{ after, @as(i64, @intCast(names.len)) }) catch return 0;
+    defer result.deinit();
+    var count: usize = 0;
+    while (result.next() catch null) |row| {
+        if (count >= names.len) continue; // drain the rest
+        const nm = row.get([]const u8, 0) catch continue;
+        if (nm.len == 0 or nm.len >= names[count].len) continue;
+        @memset(&names[count], 0);
+        @memcpy(names[count][0..nm.len], nm);
+        count += 1;
+    }
+    return count;
+}
+
 /// Set/clear the account's admin flag. False if there is no such account.
 pub fn setAdmin(name: []const u8, admin: bool) bool {
     var nb: [64]u8 = undefined;
@@ -298,7 +317,21 @@ fn ensurePool() ?*pg.Pool {
 }
 
 fn createSchema(p: *pg.Pool) !void {
-    _ = try p.exec(
+    // One transaction, serialised across every instance by an advisory lock. Replicas start
+    // together, and two `create table if not exists` of the same new table race in the catalog:
+    // the loser fails on pg_type's unique index, and realmd exits at boot on a store it could not
+    // prepare. Under the lock the second instance waits, then finds everything already there.
+    const conn = try p.acquire();
+    defer conn.release();
+    try conn.begin();
+    errdefer conn.rollback() catch {};
+    var locked = (try conn.row("select pg_advisory_xact_lock($1)", .{schema_lock_key})) orelse return error.NoLockRow;
+    try locked.deinit();
+    // Past the advisory lock, a DDL statement that cannot get its table lock fails instead of
+    // queueing: a queued ALTER holds up every later query on the table behind it, so one slow
+    // reader would stall the whole realm for as long as it ran. Failing costs a retry.
+    _ = try conn.exec("set local lock_timeout = '5s'", .{});
+    _ = try conn.exec(
         \\create table if not exists chars(
         \\  account text not null,
         \\  name text not null,
@@ -325,30 +358,30 @@ fn createSchema(p: *pg.Pool) !void {
     // startup, in the schema bootstrap, taking the realm down. This starts empty and only ever
     // grows, so it cannot fail on anything already there — and `claimCharName` checks `chars` too,
     // which is what covers the characters that predate it.
-    _ = try p.exec(
+    _ = try conn.exec(
         \\create table if not exists charnames(
         \\  lname text primary key,
         \\  account text not null,
         \\  name text not null
         \\)
     , .{});
-    _ = try p.exec("alter table chars add column if not exists version text not null default ''", .{});
-    _ = try p.exec("alter table chars add column if not exists metadata jsonb not null default '{}'::jsonb", .{});
+    try addCharsColumn(conn, "version", "text not null default ''");
+    try addCharsColumn(conn, "metadata", "jsonb not null default '{}'::jsonb");
     // When the row was first written, which is what orders an account's character list. `now()`
     // and not `clock_timestamp()`: a volatile default would stamp every EXISTING row as the column
     // is added, in whatever order the heap holds them; a stable one gives them all the same time,
     // so the name tie-break in `char_order` puts them in alphabetical order instead.
-    _ = try p.exec("alter table chars add column if not exists created timestamptz not null default now()", .{});
+    try addCharsColumn(conn, "created", "timestamptz not null default now()");
     // join password, player count + description (added separately so an existing table
     // migrates in place).
-    _ = try p.exec(
+    _ = try conn.exec(
         \\create table if not exists accounts(
         \\  name text primary key,
         \\  pwhash bytea,
         \\  is_admin boolean not null default false
         \\)
     , .{});
-    _ = try p.exec(
+    _ = try conn.exec(
         \\create table if not exists userdata(
         \\  account text not null,
         \\  key text not null,
@@ -356,7 +389,7 @@ fn createSchema(p: *pg.Pool) !void {
         \\  primary key(account, key)
         \\)
     , .{});
-    _ = try p.exec(
+    _ = try conn.exec(
         \\create table if not exists guilds(
         \\  name text primary key,
         \\  data bytea not null
@@ -366,7 +399,7 @@ fn createSchema(p: *pg.Pool) !void {
     // rather than a table per extension: an extension gets a namespace without getting DDL
     // rights, so nothing it stores can collide with the realm's own schema or with another
     // extension's. `value` is bytea because JSON is only one of the things people will keep here.
-    _ = try p.exec(
+    _ = try conn.exec(
         \\create table if not exists ext_kv(
         \\  ext text not null,
         \\  key text not null,
@@ -375,6 +408,27 @@ fn createSchema(p: *pg.Pool) !void {
         \\  primary key(ext, key)
         \\)
     , .{});
+    try conn.commit();
+}
+
+/// Postgres advisory-lock key for the schema bootstrap ("realmd", then a counter).
+const schema_lock_key: i64 = 0x7265616c6d640001;
+
+/// Add a column to `chars` unless it is already there.
+///
+/// Asked first rather than left to `add column if not exists`: that form takes the table's ACCESS
+/// EXCLUSIVE lock before it finds it has nothing to do, so every instance start would queue behind
+/// any running query on `chars`, and every character read after it would queue behind that.
+fn addCharsColumn(conn: *pg.Conn, comptime name: []const u8, comptime decl: []const u8) !void {
+    if (try conn.row(
+        "select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'chars' and column_name = $1",
+        .{name},
+    )) |found| {
+        var r = found;
+        try r.deinit();
+        return;
+    }
+    _ = try conn.exec("alter table chars add column if not exists " ++ name ++ " " ++ decl, .{});
 }
 
 // name sanitising
@@ -406,6 +460,26 @@ pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8)
         \\insert into chars(account, name, d2s) values ($1, $2, $3)
         \\on conflict (account, name) do update set d2s = excluded.d2s
     , .{ a, c, bytes }) catch return false;
+    return true;
+}
+
+/// Give a character that has just come into existence its row, and with it its `created` time,
+/// before its first save reaches here.
+///
+/// The save goes to redis and the flush worker moves it here later, so without this a character's
+/// creation time would be whenever the worker got to it: two characters made before a flush get
+/// their order from the order they are flushed in, and the list, which is the char-select slot
+/// layout, reshuffles when they land. An existing row is left alone.
+pub fn recordCharCreated(account: []const u8, charname: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    const p = ensurePool() orelse return false;
+    _ = p.exec(
+        \\insert into chars(account, name, d2s) values ($1, $2, ''::bytea)
+        \\on conflict (account, name) do nothing
+    , .{ a, c }) catch return false;
     return true;
 }
 
