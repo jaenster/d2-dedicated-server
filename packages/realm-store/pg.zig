@@ -1,7 +1,7 @@
 //! Postgres persistence backend — the durable store of record. Uses the vendored pure-Zig
 //! `pg.zig` client (no libpq, so the static-musl scratch image is preserved).
 //!
-//! Schema: chars(account, name, d2s, version, metadata), accounts(name, pwhash, is_admin),
+//! Schema: chars(account, name, d2s, version, metadata, created), accounts(name, pwhash, is_admin),
 //! userdata(account, key,
 //! value), guilds(name, data), ext_kv(ext, key, value). Nothing short-lived is here — sessions, games, routes and the
 //! fleet are in flight and belong to Redis; a Postgres copy would be a second answer to a
@@ -334,6 +334,11 @@ fn createSchema(p: *pg.Pool) !void {
     , .{});
     _ = try p.exec("alter table chars add column if not exists version text not null default ''", .{});
     _ = try p.exec("alter table chars add column if not exists metadata jsonb not null default '{}'::jsonb", .{});
+    // When the row was first written, which is what orders an account's character list. `now()`
+    // and not `clock_timestamp()`: a volatile default would stamp every EXISTING row as the column
+    // is added, in whatever order the heap holds them; a stable one gives them all the same time,
+    // so the name tie-break in `char_order` puts them in alphabetical order instead.
+    _ = try p.exec("alter table chars add column if not exists created timestamptz not null default now()", .{});
     // join password, player count + description (added separately so an existing table
     // migrates in place).
     _ = try p.exec(
@@ -470,11 +475,20 @@ pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
     return true;
 }
 
+/// How an account's characters are listed: oldest first, name breaking a tie.
+///
+/// The list is the character-select screen's layout — the client fills its slots in the order the
+/// characters arrive — so it has to come out the same every time. Without an ORDER BY it did not:
+/// every save is an UPDATE, which writes a new row version somewhere else in the heap, so a plain
+/// scan returned the characters in a different order after each game and moved them between slots.
+/// Creation order is the one order a save cannot change.
+pub const char_order = " order by created, lower(name), name";
+
 pub fn listChars(account: []const u8, names: []Name) usize {
     var ab: [64]u8 = undefined;
     const a = sanitize(account, &ab) orelse return 0;
     const p = ensurePool() orelse return 0;
-    var result = p.query("select name from chars where account = $1", .{a}) catch return 0;
+    var result = p.query("select name from chars where account = $1" ++ char_order, .{a}) catch return 0;
     defer result.deinit();
     var count: usize = 0;
     while (result.next() catch null) |row| {
@@ -600,7 +614,7 @@ pub fn listCharsFull(account: []const u8, out: []types.CharRec) usize {
     var ab: [64]u8 = undefined;
     const a = sanitize(account, &ab) orelse return 0;
     const p = ensurePool() orelse return 0;
-    var result = p.query("select name, version from chars where account = $1", .{a}) catch return 0;
+    var result = p.query("select name, version from chars where account = $1" ++ char_order, .{a}) catch return 0;
     defer result.deinit();
     var count: usize = 0;
     while (result.next() catch null) |row| {

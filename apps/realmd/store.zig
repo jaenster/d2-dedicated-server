@@ -104,24 +104,73 @@ fn caseEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-pub fn listChars(account: []const u8, names: []Name) usize {
-    var n = pg.listChars(account, names);
-    var cached: [max_chars]Name = undefined;
-    const m = redis.listChars(account, &cached);
-    for (cached[0..m]) |c| {
-        if (n >= names.len) break;
+/// Case-insensitive name order, raw bytes breaking a tie so no two distinct names compare equal.
+fn nameLess(_: void, a: Name, b: Name) bool {
+    const x = a.slice();
+    const y = b.slice();
+    for (x[0..@min(x.len, y.len)], y[0..@min(x.len, y.len)]) |p, q| {
+        const lp = if (p >= 'A' and p <= 'Z') p + 32 else p;
+        const lq = if (q >= 'A' and q <= 'Z') q + 32 else q;
+        if (lp != lq) return lp < lq;
+    }
+    if (x.len != y.len) return x.len < y.len;
+    return std.mem.order(u8, x, y) == .lt;
+}
+
+/// Append to `out[durable..]` the cached names `out[0..durable]` does not already hold, and return
+/// the new count.
+///
+/// The order of the list IS the layout of the character-select screen: the client appends realm
+/// characters in the order they arrive (SAVEFILE_ParseSaveData @0x438ad0 is handed a zero write
+/// time for them, which sorts every one to the end) and a slot is a position in that list. So the
+/// order has to be the same on every call. The durable part arrives in creation order; the cache's
+/// part is a redis set, whose members come back in whatever order its hash table holds them, so it
+/// is sorted by name here. Those are only characters whose first save has not been flushed yet,
+/// and they go after the rest because they are the newest.
+fn appendCacheOnly(
+    comptime T: type,
+    out: []T,
+    durable: usize,
+    cached: []Name,
+    comptime nameOf: fn (*const T) []const u8,
+    comptime make: fn (Name) T,
+) usize {
+    std.sort.pdq(Name, cached, {}, nameLess);
+    var n = durable;
+    for (cached) |c| {
+        if (n >= out.len) break;
         var seen = false;
-        for (names[0..n]) |have| {
-            if (caseEql(have.slice(), c.slice())) {
+        for (out[0..n]) |*have| {
+            if (caseEql(nameOf(have), c.slice())) {
                 seen = true;
                 break;
             }
         }
         if (seen) continue;
-        names[n] = c;
+        out[n] = make(c);
         n += 1;
     }
     return n;
+}
+
+fn nameOfName(n: *const Name) []const u8 {
+    return n.slice();
+}
+fn nameAsName(n: Name) Name {
+    return n;
+}
+fn nameOfRec(r: *const CharRec) []const u8 {
+    return r.name.slice();
+}
+fn nameAsRec(n: Name) CharRec {
+    return .{ .name = n };
+}
+
+pub fn listChars(account: []const u8, names: []Name) usize {
+    const n = pg.listChars(account, names);
+    var cached: [max_chars]Name = undefined;
+    const m = redis.listChars(account, &cached);
+    return appendCacheOnly(Name, names, n, cached[0..m], nameOfName, nameAsName);
 }
 
 /// The same list, with the engine each character belongs to.
@@ -131,23 +180,10 @@ pub fn listChars(account: []const u8, names: []Name) usize {
 /// worker to move its first save. An unknown version is no constraint, so the effect is that a
 /// brand-new character is briefly unrestricted rather than briefly unusable.
 pub fn listCharsFull(account: []const u8, out: []CharRec) usize {
-    var n = pg.listCharsFull(account, out);
+    const n = pg.listCharsFull(account, out);
     var cached: [max_chars]Name = undefined;
     const m = redis.listChars(account, &cached);
-    for (cached[0..m]) |c| {
-        if (n >= out.len) break;
-        var seen = false;
-        for (out[0..n]) |have| {
-            if (caseEql(have.name.slice(), c.slice())) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen) continue;
-        out[n] = .{ .name = c };
-        n += 1;
-    }
-    return n;
+    return appendCacheOnly(CharRec, out, n, cached[0..m], nameOfRec, nameAsRec);
 }
 
 /// Which engine a character belongs to, empty when nothing recorded one — every character created
@@ -787,4 +823,46 @@ pub fn chatPush(instance: u32, packet: []const u8) bool {
 
 pub fn chatPop(instance: u32, out: []u8) ?usize {
     return redis.chatPop(instance, out);
+}
+
+fn testName(s: []const u8) Name {
+    var n: Name = .{};
+    @memcpy(n.buf[0..s.len], s);
+    n.len = @intCast(s.len);
+    return n;
+}
+
+/// The merged list as one comma-separated string, so a test compares all of it at once.
+fn joinNames(buf: []u8, names: []const Name) []const u8 {
+    var pos: usize = 0;
+    for (names, 0..) |*n, i| {
+        if (i != 0) {
+            buf[pos] = ',';
+            pos += 1;
+        }
+        @memcpy(buf[pos..][0..n.len], n.slice());
+        pos += n.len;
+    }
+    return buf[0..pos];
+}
+
+fn mergeFor(buf: []u8, cache_order: []const []const u8) []const u8 {
+    var out: [max_chars]Name = undefined;
+    // The durable part, in the creation order the store of record hands back — deliberately
+    // not alphabetical, so a test can tell the merge kept it rather than re-sorting it.
+    out[0] = testName("Zeta");
+    out[1] = testName("alpha");
+    var cached: [max_chars]Name = undefined;
+    for (cache_order, 0..) |s, i| cached[i] = testName(s);
+    const n = appendCacheOnly(Name, &out, 2, cached[0..cache_order.len], nameOfName, nameAsName);
+    return joinNames(buf, out[0..n]);
+}
+
+test "the character list comes out the same whatever order the cache set returns" {
+    var a: [128]u8 = undefined;
+    var b: [128]u8 = undefined;
+    var c: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("Zeta,alpha,bravo,Mike", mergeFor(&a, &.{ "Mike", "ALPHA", "bravo" }));
+    try std.testing.expectEqualStrings("Zeta,alpha,bravo,Mike", mergeFor(&b, &.{ "bravo", "Mike", "ALPHA" }));
+    try std.testing.expectEqualStrings("Zeta,alpha,bravo,Mike", mergeFor(&c, &.{ "ALPHA", "bravo", "Mike" }));
 }
