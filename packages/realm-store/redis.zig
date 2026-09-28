@@ -1096,6 +1096,31 @@ fn parseGame(val: []const u8) ?GameRec {
 /// `SET ... KEEPTTL` so the game keeps the lease it already had — a join or a leave says
 /// nothing about how much longer the game should stay listed.
 pub fn setGamePlayers(gameid: u32, players: u16) bool {
+    // When the server's own count last replaced ours: a join claimed before this is no longer in it.
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamecounted:{d}", .{gameid}) catch return false;
+    const script = lua_now_ms ++
+        \\redis.call('SET', KEYS[1], string.format('%d', now_ms()), 'EX', 21600)
+        \\return 1
+    ;
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "EVAL", script, "1", key });
+    }
+    return rewriteGamePlayers(gameid, .{ .set = players });
+}
+
+/// Move a game's player count by `delta`, floored at zero. For a claim the realm withdraws: the
+/// game server never counted a player who never arrived, so only the realm's own bump comes back.
+pub fn adjustGamePlayers(gameid: u32, delta: i32) bool {
+    return rewriteGamePlayers(gameid, .{ .delta = delta });
+}
+
+const PlayerCount = union(enum) { set: u16, delta: i32 };
+
+fn rewriteGamePlayers(gameid: u32, count: PlayerCount) bool {
     var ik: [64]u8 = undefined;
     const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
 
@@ -1123,6 +1148,10 @@ pub fn setGamePlayers(gameid: u32, players: u16) bool {
         else => return false,
     };
     const rec = parseGame(val) orelse return false;
+    const players: u16 = switch (count) {
+        .set => |n| n,
+        .delta => |d| @intCast(std.math.clamp(@as(i64, rec.players) + d, 0, 0xFFFF)),
+    };
     var vb: [256]u8 = undefined;
     const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{
         rec.gameid, rec.gs_ip[0], rec.gs_ip[1],   rec.gs_ip[2], rec.gs_ip[3], rec.gs_port,
@@ -1455,30 +1484,133 @@ fn charLockKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 
     return std.fmt.bufPrint(buf, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch buf[0..0];
 }
 
-/// Take the character for `owner`. False if it is held at all — including by the same game.
-///
-/// A seat, not a game: the engine itself refuses a second client presenting the same character
-/// to the same game, so making the claim re-takeable by its own owner would have let the realm
-/// say yes to a join the engine then silently drops. The claim is strict.
-///
-/// Released when the player leaves, the game ends, or (a dead server) the lease expires.
-pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32) bool {
-    var kb: [96]u8 = undefined;
-    const key = charLockKey(&kb, account, charname);
-    if (key.len == 0) return false;
-    var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+/// How a join's claim on a character came out.
+pub const JoinClaim = union(enum) {
+    /// The character was free.
+    claimed,
+    /// It was held by a join that never arrived; that claim was withdrawn.
+    took_over: Withdrawn,
+    /// Somebody holds it.
+    held,
+};
 
+pub const Withdrawn = struct {
+    gameid: u32,
+    /// The join's bump is still in that game's player count: no count from its server has
+    /// replaced it since.
+    counted: bool,
+};
+
+/// Redis's clock in milliseconds, for scripts. One clock for every instance.
+const lua_now_ms =
+    \\local function now_ms()
+    \\  local t = redis.call('TIME')
+    \\  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+    \\end
+    \\
+;
+
+/// Claim a character for a join into `gameid`, recording the claim as PENDING until the game
+/// server reports the player arrived (`confirmGameChar`).
+///
+/// A pending claim is a join the realm authorised and nobody has seen complete. It is given up to
+/// a new join when the same realm session asks again (a client joins one game at a time, so its
+/// previous attempt is dead), or when its game reports arrivals and this one has not arrived within
+/// `grace_s`. Otherwise it is held exactly like a seated character.
+pub fn claimCharForJoin(account: []const u8, charname: []const u8, gameid: u32, session: u64, ttl_s: u32, grace_s: u32) JoinClaim {
+    var mb: [96]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return .held;
+    var lb: [128]u8 = undefined;
+    const lockkey = std.fmt.bufPrint(&lb, prefix ++ "charlock:{s}", .{member}) catch return .held;
+    var jb: [128]u8 = undefined;
+    const joinkey = std.fmt.bufPrint(&jb, prefix ++ "charjoin:{s}", .{member}) catch return .held;
+    var gb: [64]u8 = undefined;
+    const setkey = std.fmt.bufPrint(&gb, prefix ++ "gamechars:{d}", .{gameid}) catch return .held;
+    var ob: [32]u8 = undefined;
+    const owner = std.fmt.bufPrint(&ob, "game:{d}", .{gameid}) catch return .held;
+    var ib: [16]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return .held;
+    var sb: [24]u8 = undefined;
+    const sess = std.fmt.bufPrint(&sb, "{x}", .{session}) catch return .held;
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return .held;
+    var tb: [16]u8 = undefined;
+    const grace = std.fmt.bufPrint(&tb, "{d}", .{grace_s}) catch return .held;
+    // -1 held, 0 claimed, otherwise 2 * the gameid the pending claim was taken from, plus 1 when
+    // its bump is still in that game's count.
+    const script = lua_now_ms ++
+        \\local now = now_ms()
+        \\local function take()
+        \\  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[5])
+        \\  redis.call('SET', KEYS[2], ARGV[3] .. '|' .. ARGV[4] .. '|' .. string.format('%d', now), 'PX', ARGV[5])
+        \\  redis.call('SADD', KEYS[3], ARGV[2])
+        \\end
+        \\local holder = redis.call('GET', KEYS[1])
+        \\if not holder then take() return 0 end
+        \\local m = redis.call('GET', KEYS[2])
+        \\if not m then return -1 end
+        \\local g, s, at = string.match(m, '^(%d+)|([^|]*)|(%d+)$')
+        \\if not g or holder ~= ('game:' .. g) then return -1 end
+        \\local dead = (s == ARGV[4])
+        \\if not dead and redis.call('EXISTS', ARGV[7] .. 'gamearrived:' .. g) == 1 then
+        \\  dead = (now - tonumber(at)) > tonumber(ARGV[6]) * 1000
+        \\end
+        \\if not dead then return -1 end
+        \\redis.call('SREM', ARGV[7] .. 'gamechars:' .. g, ARGV[2])
+        \\local counted = tonumber(redis.call('GET', ARGV[7] .. 'gamecounted:' .. g) or '0')
+        \\take()
+        \\return tonumber(g) * 2 + ((counted < tonumber(at)) and 1 or 0)
+    ;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    // SET NX first; if it loses, take it anyway when the holder is already us.
-    const rep = command(s, &r, &.{ "SET", key, owner, "NX", "PX", px }) orelse return false;
+    const rep = command(s, &r, &.{ "EVAL", script, "3", lockkey, joinkey, setkey, owner, member, gid, sess, px, grace, prefix }) orelse return .held;
     return switch (rep) {
-        .status => true,
-        // A nil bulk is SET NX declining: somebody holds it, and that somebody may be the same
-        // game. Still a refusal — see above.
-        .bulk => |b| b != null,
+        .int => |v| if (v == 0) .claimed else if (v > 0) .{ .took_over = .{
+            .gameid = @intCast(@divTrunc(v, 2)),
+            .counted = @mod(v, 2) == 1,
+        } } else .held,
+        else => .held,
+    };
+}
+
+/// The game server reports this character arrived in `gameid`: its claim stops being pending, and
+/// the game is marked as one that reports arrivals. With no `account` (an older server) the member
+/// is matched by name, and only when that match is unambiguous.
+pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8, game_ttl_s: u32) bool {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    var ib: [16]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return false;
+    var tb: [16]u8 = undefined;
+    const ttl = std.fmt.bufPrint(&tb, "{d}", .{game_ttl_s}) catch return false;
+    const script =
+        \\redis.call('SET', ARGV[4] .. 'gamearrived:' .. ARGV[1], '1', 'EX', ARGV[5])
+        \\local member = nil
+        \\if ARGV[2] ~= '' then
+        \\  member = ARGV[2] .. '/' .. ARGV[3]
+        \\  if redis.call('SISMEMBER', KEYS[1], member) == 0 then return 0 end
+        \\else
+        \\  local n, sfx = 0, '/' .. ARGV[3]
+        \\  for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+        \\    if string.sub(m, -string.len(sfx)) == sfx then member = m n = n + 1 end
+        \\  end
+        \\  if n ~= 1 then return 0 end
+        \\end
+        \\local jk = ARGV[4] .. 'charjoin:' .. member
+        \\local v = redis.call('GET', jk)
+        \\if v and string.sub(v, 1, string.len(ARGV[1]) + 1) == ARGV[1] .. '|' then
+        \\  redis.call('DEL', jk)
+        \\  return 1
+        \\end
+        \\return 0
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, gid, account, charname, prefix, ttl }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
         else => false,
     };
 }
@@ -1619,25 +1751,6 @@ pub fn cacheCharIfAbsent(account: []const u8, charname: []const u8, bytes: []con
     return stored;
 }
 
-/// Remember that this game holds this character, so its locks can be released when it ends.
-///
-/// The game server reports a departure by character name only — it does not carry the account —
-/// so the realm has to keep the pairing itself. The set is keyed by game, which is also what
-/// makes closing a game able to free everything it held in one step.
-pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
-    var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
-    var mb: [96]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
-    const s = acquire();
-    defer release(s);
-    var r: Reader = undefined;
-    return switch (command(s, &r, &.{ "SADD", key, member }) orelse return false) {
-        .int, .status, .bulk => true,
-        else => false,
-    };
-}
-
 /// Free every character this game holds, and forget the pairing. Returns how many were freed.
 ///
 /// Each release is still owner-checked: a character whose lease lapsed and was taken by another
@@ -1652,25 +1765,36 @@ pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
         \\  local lk = ARGV[2] .. m
         \\  if redis.call('GET', lk) == ARGV[1] then
         \\    redis.call('DEL', lk)
+        \\    redis.call('DEL', ARGV[3] .. 'charjoin:' .. m)
         \\    n = n + 1
         \\  end
         \\end
         \\redis.call('DEL', KEYS[1])
+        \\redis.call('DEL', ARGV[3] .. 'gamearrived:' .. ARGV[4], ARGV[3] .. 'gamecounted:' .. ARGV[4])
         \\return n
     ;
+    var ib: [16]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return 0;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, prefix ++ "charlock:" }) orelse return 0;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, prefix ++ "charlock:", prefix, gid }) orelse return 0;
     return switch (rep) {
         .int => |v| @intCast(@max(v, 0)),
         else => 0,
     };
 }
 
-/// Renew the lease on every character this game holds. Returns how many were still ours.
+pub const LeasePass = struct {
+    renewed: usize = 0,
+    withdrawn: usize = 0,
+    /// Of those withdrawn, how many still had their join's bump in the game's player count.
+    uncount: usize = 0,
+};
+
+/// Renew the lease on every character this game holds.
 ///
-/// The claim is a LEASE, not a permanent lock: `lockChar` takes it with a TTL so a game server
+/// The claim is a LEASE, not a permanent lock: `claimCharForJoin` takes it with a TTL so a game server
 /// that dies without releasing cannot strand a character forever. That only works if something
 /// renews it while the game is genuinely alive — otherwise the opposite failure appears, and it is
 /// worse than the one the TTL prevents: the lease lapses under a running game, another game takes
@@ -1678,30 +1802,65 @@ pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
 ///
 /// Owner-checked per member for that same reason, and done in one script so a character cannot be
 /// taken between the check and the PEXPIRE.
-pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32) usize {
+///
+/// A pending claim in a game that reports arrivals, older than `grace_s`, is a join that never
+/// completed: it is withdrawn instead of renewed, so it cannot outlive its player for as long as
+/// the game runs.
+pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32, grace_s: u32) LeasePass {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .{};
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return 0;
-    const script =
-        \\local n = 0
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return .{};
+    var ib: [16]u8 = undefined;
+    const gid = std.fmt.bufPrint(&ib, "{d}", .{gameid}) catch return .{};
+    var tb: [16]u8 = undefined;
+    const grace = std.fmt.bufPrint(&tb, "{d}", .{grace_s}) catch return .{};
+    const script = lua_now_ms ++
+        \\local n, w, u = 0, 0, 0
+        \\local now = now_ms()
+        \\local arrived = redis.call('EXISTS', ARGV[4] .. 'gamearrived:' .. ARGV[5]) == 1
+        \\local counted = tonumber(redis.call('GET', ARGV[4] .. 'gamecounted:' .. ARGV[5]) or '0')
         \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
         \\  local lk = ARGV[3] .. m
         \\  if redis.call('GET', lk) == ARGV[1] then
-        \\    redis.call('PEXPIRE', lk, ARGV[2])
-        \\    n = n + 1
+        \\    local jk = ARGV[4] .. 'charjoin:' .. m
+        \\    local v = redis.call('GET', jk)
+        \\    local at = v and tonumber(string.match(v, '^' .. ARGV[5] .. '|[^|]*|(%d+)$'))
+        \\    if arrived and at and now - at > tonumber(ARGV[6]) * 1000 then
+        \\      redis.call('DEL', lk)
+        \\      redis.call('DEL', jk)
+        \\      redis.call('SREM', KEYS[1], m)
+        \\      w = w + 1
+        \\      if counted < at then u = u + 1 end
+        \\    else
+        \\      redis.call('PEXPIRE', lk, ARGV[2])
+        \\      n = n + 1
+        \\    end
         \\  end
         \\end
-        \\return n
+        \\return {n, w, u}
     ;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, px, prefix ++ "charlock:" }) orelse return 0;
-    return switch (rep) {
-        .int => |v| @intCast(@max(v, 0)),
-        else => 0,
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, px, prefix ++ "charlock:", prefix, gid, grace }) orelse return .{};
+    const len: usize = switch (rep) {
+        .array_len => |n| if (n <= 0) return .{} else @intCast(n),
+        else => return .{},
     };
+    var out: [3]usize = .{ 0, 0, 0 };
+    for (0..len) |i| {
+        const e = readReply(&r) orelse {
+            dropConn(s);
+            return .{};
+        };
+        const v: i64 = switch (e) {
+            .int => |x| x,
+            else => 0,
+        };
+        if (i < out.len) out[i] = @intCast(@max(v, 0));
+    }
+    return .{ .renewed = out[0], .withdrawn = out[1], .uncount = out[2] };
 }
 
 /// Free one character this game holds, matched by name because that is all a departure carries.
@@ -1717,18 +1876,20 @@ pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const 
     const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
     var lb: [128]u8 = undefined;
     const lockkey = std.fmt.bufPrint(&lb, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch return false;
+    var jb: [128]u8 = undefined;
+    const joinkey = std.fmt.bufPrint(&jb, prefix ++ "charjoin:{s}/{s}", .{ account, charname }) catch return false;
     // The lock is released only if this game still owns it — the same compare-and-swap every other
     // release does. A lapsed lease may already have been taken by somebody else, and a blind DEL
     // would free THEIR claim.
     const script =
         \\if redis.call('SREM', KEYS[1], ARGV[2]) == 0 then return 0 end
-        \\if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+        \\if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) redis.call('DEL', KEYS[3]) end
         \\return 1
     ;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "2", key, lockkey, owner, member }) orelse return false;
+    const rep = command(s, &r, &.{ "EVAL", script, "3", key, lockkey, joinkey, owner, member }) orelse return false;
     return switch (rep) {
         .int => |v| v == 1,
         else => false,
@@ -1762,14 +1923,14 @@ pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u
         \\end
         \\if n ~= 1 then return 0 end
         \\local lk = ARGV[2] .. hit
-        \\if redis.call('GET', lk) == ARGV[1] then redis.call('DEL', lk) end
+        \\if redis.call('GET', lk) == ARGV[1] then redis.call('DEL', lk) redis.call('DEL', ARGV[4] .. 'charjoin:' .. hit) end
         \\redis.call('SREM', KEYS[1], hit)
         \\return 1
     ;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, prefix ++ "charlock:", suffix }) orelse return false;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, prefix ++ "charlock:", suffix, prefix }) orelse return false;
     return switch (rep) {
         .int => |v| v == 1,
         else => false,

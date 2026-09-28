@@ -180,7 +180,12 @@ pub const FakeGS = struct {
     /// The full form: the character the change happened to rides along, which is how
     /// realmd learns who is in a game at all.
     pub fn sendPlayerUpdate(self: *FakeGS, gameid: u32, players: u32, joined: bool, char: []const u8, level: u32, class: u32) !void {
-        var b: [96]u8 = undefined;
+        try self.sendPlayerUpdateFor(gameid, players, joined, char, "", level, class);
+    }
+
+    /// As a current server reports it: the account rides along, so the realm names the seat exactly.
+    pub fn sendPlayerUpdateFor(self: *FakeGS, gameid: u32, players: u32, joined: bool, char: []const u8, account: []const u8, level: u32, class: u32) !void {
+        var b: [128]u8 = undefined;
         var w = net.Writer.init(b[8..]);
         w.u32v(if (joined) 1 else 2);
         w.u32v(gameid);
@@ -188,6 +193,7 @@ pub const FakeGS = struct {
         w.u32v(level);
         w.u32v(class);
         w.cstr(char);
+        if (account.len > 0) w.cstr(account);
         const total = 8 + w.slice().len;
         std.mem.writeInt(u16, b[0..2], @intCast(total), .little);
         std.mem.writeInt(u16, b[2..4], rc.GS_UPDATEGAMEINFO, .little);

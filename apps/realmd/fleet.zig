@@ -340,6 +340,8 @@ fn apply(typ: p.Type, body: []const u8) void {
                     _ = store.releaseGameCharByName(gameid, char);
                 }
             }
+            // The arrival turns the join's claim from pending into a seat.
+            if (flag == p.GAMEINFO_ENTER and char.len > 0) _ = store.confirmGameChar(gameid, acct, char);
         },
         .closegame => {
             if (body.len < 8) return;
@@ -379,7 +381,14 @@ pub fn renewCharLeases() void {
         _ = usleep(lease_renew_us);
         const n = state.snapshotGames(&games);
         var renewed: usize = 0;
-        for (games[0..n]) |g| renewed += store.renewGameCharLeases(g.gameid);
+        for (games[0..n]) |g| {
+            const pass = store.renewGameCharLeases(g.gameid);
+            renewed += pass.renewed;
+            if (pass.withdrawn == 0) continue;
+            // Joins that never arrived: their bump on the player count goes with them.
+            if (pass.uncount > 0) _ = state.global.adjustGamePlayers(g.gameid, -@as(i32, @intCast(pass.uncount)));
+            log.line("fleet", "game {d}: withdrew {d} claim(s) from joins that never arrived", .{ g.gameid, pass.withdrawn });
+        }
         if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
     }
 }

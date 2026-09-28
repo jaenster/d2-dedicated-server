@@ -752,6 +752,114 @@ fn awaitListed(c: *rc.RealmClient, game: []const u8, want: u8) bool {
     return false;
 }
 
+/// A join the realm authorised but that never reached the game (the client gave up at "Please
+/// wait") left the character claimed by that game, and counted in its list, for as long as the
+/// game lived. Every later create or join of that character was refused "Game is full".
+fn scAbandonedJoinRetry() Result {
+    const name = "abandoned_join_retry";
+    var gs = FakeGS{ .gsid = 0xAB0D, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7100 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "PhantomHost", "Hosty") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    if ((host.createGame("phantomroom", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "host create refused", .{});
+    if ((host.joinGame("phantomroom") catch return fail(name, "join", .{})).result != 0) return fail(name, "host join refused", .{});
+    gs.sendPlayerUpdateFor(7100, 1, true, "Hosty", "PhantomHost", 1, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitListed(&host, "phantomroom", 1)) return fail(name, "host's arrival not reflected", .{});
+
+    var stuck = rc.RealmClient{};
+    defer stuck.close();
+    enterAs(&stuck, "PhantomAcct", "StuckAma") catch |e| return fail(name, "stuck: {s}", .{@errorName(e)});
+    const j1 = stuck.joinGame("phantomroom") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (j1.result != 0) return fail(name, "first join result=0x{x}", .{j1.result});
+    // The client never arrives. The list counts it anyway, as it does any authorised join.
+    if (!awaitListed(&host, "phantomroom", 2)) return fail(name, "join not counted: {?d}", .{listedPlayers(&host, "phantomroom")});
+
+    // Back in the lobby, the same session makes its own game and joins it.
+    const cg = stuck.createGame("stuckown", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create after an abandoned join -> 0x{x}", .{cg.result});
+    const j2 = stuck.joinGame("stuckown") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (j2.result != 0) return fail(name, "join after an abandoned join -> 0x{x}, want 0 (0x2b = the character stayed claimed)", .{j2.result});
+    if (!awaitListed(&host, "phantomroom", 1))
+        return fail(name, "abandoned room still lists {?d} players, want 1", .{listedPlayers(&host, "phantomroom")});
+
+    // Once it has arrived, the seat is real: the same session cannot take the character elsewhere.
+    gs.sendPlayerUpdateFor(7101, 1, true, "StuckAma", "PhantomAcct", 1, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = net.usleep(200_000);
+    const j3 = stuck.joinGame("phantomroom") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (j3.result != 0x2b) return fail(name, "join while seated elsewhere -> 0x{x}, want 0x2b", .{j3.result});
+
+    return .{ .name = name, .status = .pass, .msg = msg("abandoned join released on retry; phantom count 2 -> 1; seated character still held (0x2b)", .{}) };
+}
+
+/// Shift a stored millisecond stamp back by `ms`, keeping its TTL: standing in for time passing.
+fn backdate(key: []const u8, ms: u64) !void {
+    var c = try gsstore.Client.connect(fakegs.redis_port);
+    defer c.close();
+    const val = switch (try c.cmd(&.{ "GET", key })) {
+        .bulk => |b| b orelse return error.Missing,
+        else => return error.Missing,
+    };
+    var copy: [96]u8 = undefined;
+    if (val.len > copy.len) return error.TooLong;
+    @memcpy(copy[0..val.len], val);
+    const v = copy[0..val.len];
+    // Either a bare stamp or "<gameid>|<session>|<stamp>": the stamp is always last.
+    const cut = if (std.mem.lastIndexOfScalar(u8, v, '|')) |i| i + 1 else 0;
+    const stamp = try std.fmt.parseInt(u64, v[cut..], 10);
+    var out: [128]u8 = undefined;
+    const nv = try std.fmt.bufPrint(&out, "{s}{d}", .{ v[0..cut], stamp - ms });
+    _ = try c.cmd(&.{ "SET", key, nv, "KEEPTTL" });
+}
+
+/// The same, when the player logs in again instead of retrying: a new session may not take a
+/// pending claim at once (that is also what a second login looks like), but once the join is
+/// well past the time it takes to arrive, in a game whose server reports arrivals, it is abandoned.
+fn scAbandonedJoinRelogin() Result {
+    const name = "abandoned_join_relogin";
+    var gs = FakeGS{ .gsid = 0xAB0E, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 7200 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var host = rc.RealmClient{};
+    defer host.close();
+    enterAs(&host, "RelogHost", "Hostess") catch |e| return fail(name, "host: {s}", .{@errorName(e)});
+    if ((host.createGame("relogroom", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "host create refused", .{});
+    if ((host.joinGame("relogroom") catch return fail(name, "join", .{})).result != 0) return fail(name, "host join refused", .{});
+    gs.sendPlayerUpdateFor(7200, 1, true, "Hostess", "RelogHost", 1, 1) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitListed(&host, "relogroom", 1)) return fail(name, "host's arrival not reflected", .{});
+    if ((host.createGame("relogfresh", "d") catch return fail(name, "create", .{})).result != 0) return fail(name, "second create refused", .{});
+
+    {
+        var first = rc.RealmClient{};
+        defer first.close();
+        enterAs(&first, "RelogAcct", "LostSorc") catch |e| return fail(name, "first login: {s}", .{@errorName(e)});
+        const j = first.joinGame("relogroom") catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (j.result != 0) return fail(name, "first join result=0x{x}", .{j.result});
+    }
+    if (!awaitListed(&host, "relogroom", 2)) return fail(name, "join not counted", .{});
+
+    var again = rc.RealmClient{};
+    defer again.close();
+    enterAs(&again, "RelogAcct", "LostSorc") catch |e| return fail(name, "second login: {s}", .{@errorName(e)});
+    const early = again.joinGame("relogfresh") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (early.result != 0x2b) return fail(name, "new session took a fresh pending claim -> 0x{x}, want 0x2b", .{early.result});
+
+    const past: u64 = 120_000;
+    backdate("realmd:charjoin:RelogAcct/LostSorc", past) catch |e| return fail(name, "backdate claim: {s}", .{@errorName(e)});
+    backdate("realmd:gamecounted:7200", past) catch |e| return fail(name, "backdate count: {s}", .{@errorName(e)});
+    const late = again.joinGame("relogfresh") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (late.result != 0) return fail(name, "join after the claim went stale -> 0x{x}, want 0", .{late.result});
+    if (!awaitListed(&host, "relogroom", 1))
+        return fail(name, "abandoned room still lists {?d} players, want 1", .{listedPlayers(&host, "relogroom")});
+
+    return .{ .name = name, .status = .pass, .msg = msg("fresh claim held against a new session (0x2b); stale one released; count 2 -> 1", .{}) };
+}
+
 /// A character is the logged-on one from the moment it is created: the client goes straight to the
 /// lobby and never sends CHARLOGON for it. The realm kept the previous character (or none), so the
 /// first game a new character made was made for somebody else.
@@ -2902,6 +3010,8 @@ pub fn main() !void {
         scFriendsPersist(),
         scChatAcrossInstances(),
         scMultiInstance(),
+        scAbandonedJoinRetry(),
+        scAbandonedJoinRelogin(),
         scNewCharPlaysAtOnce(),
     };
 

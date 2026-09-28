@@ -870,38 +870,40 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     // A character is in one game at a time. Checked HERE, upfront, because the game server's own
     // refusal answers nothing: the realm issues the join, the engine declines it silently, and the
-    // player sits at a loading screen until the client times out. Taking the lock IS the check —
-    // SET NX cannot report free and then be taken by someone else. Re-taking a character this same
-    // game already holds succeeds, so a client re-entering its own game is not shut out.
-    var job: [32]u8 = undefined;
-    const jowner = store.gameOwnerId(&job, g.gameid);
+    // player sits at a loading screen until the client times out. Taking the claim IS the check.
+    //
     // A seat is released when the player leaves, and the engine takes a moment to notice a socket
-    // has gone — so the character a client is bringing to its NEXT game can still be held by the
-    // one it just left. Wait for that to clear before refusing. A genuine second login waits the
-    // same moment and is then turned away, which costs it nothing it can perceive.
-    var claimed = store.lockChar(c.accountName(), c.charName(), jowner);
-    if (!claimed) {
+    // has gone, so the character a client is bringing to its NEXT game can still be held by the
+    // one it just left. Wait for that to clear before refusing.
+    var claim = store.claimCharForJoin(c.accountName(), c.charName(), g.gameid, c.session);
+    if (claim == .held) {
         var waited: u32 = 0;
         while (waited < seat_release_ms) : (waited += create_poll_ms) {
             sleepMs(create_poll_ms);
-            claimed = store.lockChar(c.accountName(), c.charName(), jowner);
-            if (claimed) break;
+            claim = store.claimCharForJoin(c.accountName(), c.charName(), g.gameid, c.session);
+            if (claim != .held) break;
         }
-        if (claimed and waited > 0)
+        if (claim != .held and waited > 0)
             log.line(tag, "join game '{s}' -> waited {d}ms for '{s}' to leave its last game", .{ name, waited, c.charName() });
     }
-    if (!claimed) {
-        var whob: [64]u8 = undefined;
-        const holder = store.charLockOwner(c.accountName(), c.charName(), &whob) orelse "another game";
-        // There is NO result code for "that character is already in a game" — the client's switch
-        // (OOG_PollJoinCreatePump @0x441770) has none, and an unlisted code falls to `default:`:
-        // no popup at all, the silent freeze this check exists to remove. "Game is Full." is the
-        // least-bad listed code: untrue here, but it refuses visibly. Replace it if a truer one
-        // is found.
-        log.line(tag, "join game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
-        return rejectJoin(c, &w, JOIN_FULL);
+    switch (claim) {
+        .claimed => {},
+        .took_over => |old| {
+            // The join it replaces never arrived, so the player it added to that game's count was
+            // never there.
+            if (old.counted) _ = state.global.adjustGamePlayers(old.gameid, -1);
+            log.line(tag, "join game '{s}' -> '{s}' never arrived in game {d}; that claim is withdrawn", .{ name, c.charName(), old.gameid });
+        },
+        .held => {
+            var whob: [64]u8 = undefined;
+            const holder = store.charLockOwner(c.accountName(), c.charName(), &whob) orelse "another game";
+            // There is NO result code for "that character is already in a game": the client's switch
+            // (OOG_PollJoinCreatePump @0x441770) has none, and an unlisted code falls to `default:`,
+            // no popup at all. "Game is Full." is the least-bad listed code: untrue, but visible.
+            log.line(tag, "join game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
+            return rejectJoin(c, &w, JOIN_FULL);
+        },
     }
-    _ = store.addGameChar(g.gameid, c.accountName(), c.charName());
     // Stage the character into the shared store before the game server goes looking. The server
     // reads redis and nothing else, so a character that has only ever been in postgres would come
     // back missing — this read is what promotes it, and it is a no-op once it is there.

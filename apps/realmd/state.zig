@@ -251,6 +251,20 @@ pub const State = struct {
         return false;
     }
 
+    /// Move a game's player count by `delta`, floored at zero.
+    pub fn adjustGamePlayers(st: *State, gameid: u32, delta: i32) bool {
+        if (shared) return store.adjustGamePlayers(gameid, delta);
+        st.lock.lock();
+        defer st.lock.unlock();
+        for (&st.games) |*g| {
+            if (g.in_use and g.gameid == gameid) {
+                g.players = @intCast(std.math.clamp(@as(i32, g.players) + delta, 0, 0xFFFF));
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Note that a game now exists, starting its clock. Called when realmd registers it.
     pub fn noteGameCreated(st: *State, gameid: u32) void {
         st.lock.lock();

@@ -587,7 +587,7 @@ pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64
 // character ownership
 // A character belongs to one game at a time; the lock records WHICH, so a second login can be
 // refused with a reason instead of silently dropped by the game server. Redis only — a lock not
-// shared enforces nothing across instances. On fs/pg `lockChar` just reports success.
+// shared enforces nothing across instances.
 
 /// How long a character stays claimed without a refresh. Long enough to outlive a slow join,
 /// short enough that a game server lost mid-session frees its characters within a game's length.
@@ -613,10 +613,6 @@ pub fn releaseCharName(account: []const u8, charname: []const u8) void {
 pub fn charInUse(account: []const u8, charname: []const u8) bool {
     var buf: [64]u8 = undefined;
     return charLockOwner(account, charname, &buf) != null;
-}
-
-pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
-    return redis.lockChar(account, charname, owner, char_lock_ttl_s);
 }
 
 pub fn refreshCharLock(account: []const u8, charname: []const u8, owner: []const u8) bool {
@@ -653,15 +649,34 @@ pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {
     return std.fmt.bufPrint(buf, "game:{d}", .{gameid}) catch buf[0..0];
 }
 
-pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
-    return redis.addGameChar(gameid, account, charname);
+/// How long a join may go unconfirmed in a game whose server reports arrivals before the realm
+/// treats it as abandoned. Well past the client's own give-up on a join that goes nowhere.
+pub const join_grace_s: u32 = 60;
+
+pub const JoinClaim = redis.JoinClaim;
+
+/// Claim the character for a join into `gameid` by realm session `session`. See
+/// `redis.claimCharForJoin` for when a claim left by a join that never arrived is taken over.
+pub fn claimCharForJoin(account: []const u8, charname: []const u8, gameid: u32, session: u64) JoinClaim {
+    return redis.claimCharForJoin(account, charname, gameid, session, char_lock_ttl_s, join_grace_s);
 }
 
-/// Renew the leases on every character a live game holds. The realm calls this on a timer for
-/// every game still in the index — see `fleet.renewCharLeases`.
-pub fn renewGameCharLeases(gameid: u32) usize {
+/// The game server saw this character arrive; its claim is no longer pending.
+pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
+    return redis.confirmGameChar(gameid, account, charname, game_ttl_s);
+}
+
+pub fn adjustGamePlayers(gameid: u32, delta: i32) bool {
+    return redis.adjustGamePlayers(gameid, delta);
+}
+
+pub const LeasePass = redis.LeasePass;
+
+/// Renew the leases on every character a live game holds, withdrawing joins that never arrived.
+/// The realm calls this on a timer for every game still in the index; see `fleet.renewCharLeases`.
+pub fn renewGameCharLeases(gameid: u32) LeasePass {
     var ob: [32]u8 = undefined;
-    return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s);
+    return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s, join_grace_s);
 }
 
 pub fn releaseGameChars(gameid: u32) usize {
