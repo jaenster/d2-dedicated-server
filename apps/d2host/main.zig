@@ -237,6 +237,8 @@ fn Binding(comptime version: d2version.Version) type {
     // body serve 1.10f's five-argument fpFindPlayerToken and 1.09d's three.
     comptime {
         assertReads(version, .fpFindPlayerToken, 2, "findPlayerToken reads game_id and account");
+        assertReads(version, .fpEnterGame, 2, "enterGame reads class and level");
+        assertReads(version, .fpLeaveGame, 11, "leaveGame reads the name at stack 5 and the account at 10");
         // The probe names no stack parameters at all, so the floor only binds a real handler —
         // and the two shapes read a different number of them.
         if (!probing)
@@ -432,7 +434,12 @@ fn Binding(comptime version: d2version.Version) type {
                     cb.stackArgs(spec.stack_args, .fpCloseGame),
                     closeGame,
                 ).shim),
-                .leave_game = stubFor(.fpLeaveGame, "pfLeaveGame"),
+                // Enter and leave are how the realm learns WHO is in a game: its join claim stays
+                // pending until the ENTER, and a LEAVE frees the character at once.
+                .leave_game = @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpLeaveGame),
+                    leaveGame,
+                ).shim),
                 // The one slot that is a real implementation rather than a report: it drives every join.
                 .get_database_character = if (probing) @ptrCast(&fastcall.Callback2(
                     cb.stackArgs(spec.stack_args, .fpGetDatabaseCharacter),
@@ -453,7 +460,10 @@ fn Binding(comptime version: d2version.Version) type {
                     saveDatabaseCharacter,
                 ).shim),
                 .server_log_message = @ptrCast(&serverLogMessage),
-                .enter_game = stubFor(.fpEnterGame, "pfEnterGame"),
+                .enter_game = @ptrCast(&fastcall.Callback2(
+                    cb.stackArgs(spec.stack_args, .fpEnterGame),
+                    enterGame,
+                ).shim),
                 .find_player_token = @ptrCast(&fastcall.Callback2(
                     cb.stackArgs(spec.stack_args, .fpFindPlayerToken),
                     findPlayerToken,
@@ -1026,6 +1036,9 @@ fn closeGame(ecx: usize, edx: usize) callconv(.c) usize {
     sayFmt("d2host: pfCloseGame — game {d} ended", .{gid});
     if (live_games > 0) live_games -= 1;
     health.games_destroyed +%= 1;
+    // Everyone the engine never reported leaving goes with the game, named.
+    arrivals.close(gid, {}, sendArrival);
+    _ = seats.releaseByGame(gid);
     if (realmConfigured() and gid != 0) {
         var c = std.mem.zeroes(proto.CloseGame);
         c.h = proto.header(.closegame, @sizeOf(proto.CloseGame), 0);
@@ -1033,6 +1046,83 @@ fn closeGame(ecx: usize, edx: usize) callconv(.c) usize {
         _ = store.pushEvent(std.mem.asBytes(&c), event_cap, event_ttl_s);
     }
     return 0;
+}
+
+/// Who is in each game, by name. Engine-thread only.
+var arrivals: seats.roster.Table = .{};
+
+/// Slot 0x14, `(wGameId, szCharName, wClass, dwLevel, dwReserved)`: the character is in the world.
+/// Called from `GAME_UpdateAllClients` (1.10f @0x6fc38d74) on the loading -> in-game transition,
+/// once the player unit exists. Same shape on every build we host.
+fn enterGame(ecx: usize, edx: usize, class: usize, level: usize) callconv(.c) usize {
+    const gid: u32 = @truncate(ecx & 0xffff);
+    const name = cstrAt(edx) orelse return 0;
+    arrivals.enter(gid, .{ .name = name, .class = @truncate(class), .level = @truncate(@min(level, 255)) }, {}, sendArrival);
+    return 0;
+}
+
+/// Slot 0x04, the character left: ECX = game data, EDX = game id, then class, level, experience,
+/// status, and the name at stack 5 and the account at stack 10. Counted at the call sites: 1.07
+/// @0x6fc62b25 (12 args), 1.10f `CLIENTS_RemoveClientFromGame` (13) and 1.14d `CleanUpClient`
+/// (18) agree on those two positions; the builds differ only in what trails them.
+fn leaveGame(
+    ecx: usize,
+    edx: usize,
+    class: usize,
+    level: usize,
+    exp_lo: usize,
+    exp_hi: usize,
+    status: usize,
+    name_ptr: usize,
+    save: usize,
+    save_flags: usize,
+    zero1: usize,
+    zero2: usize,
+    account_ptr: usize,
+) callconv(.c) usize {
+    _ = .{ ecx, exp_lo, exp_hi, status, save, save_flags, zero1, zero2, account_ptr };
+    const gid: u32 = @truncate(edx & 0xffff);
+    const name = cstrAt(name_ptr) orelse {
+        sayFmt("d2host: pfLeaveGame on game {d} with no readable name at 0x{x}", .{ gid, name_ptr });
+        return 0;
+    };
+    arrivals.leave(gid, .{ .name = name, .class = @truncate(class), .level = @truncate(@min(level, 255)) }, {}, sendArrival);
+    return 0;
+}
+
+extern "kernel32" fn IsBadReadPtr(p: *const anyopaque, n: usize) callconv(.winapi) i32;
+
+/// A character name the engine handed us, or null for anything that is not one.
+fn cstrAt(at: usize) ?[]const u8 {
+    if (at < 0x10000) return null;
+    const p: [*]const u8 = @ptrFromInt(at);
+    if (IsBadReadPtr(p, 16) != 0) return null;
+    const s = std.mem.sliceTo(p[0..16], 0);
+    return if (s.len == 0 or s.len > 15) null else s;
+}
+
+/// One named ENTER/LEAVE to the realm. The count is the arrived players, which is what the realm
+/// replaces its own count with.
+fn sendArrival(_: void, e: seats.roster.Event) void {
+    sayFmt("d2host: {s} '{s}' game {d}, {d} player(s)", .{ @tagName(e.kind), e.name(), e.gameid, e.players });
+    // Out of the game, so its seat may be recycled; the mapping stays for the last save.
+    if (e.kind == .leave) seats.release(e.name());
+    if (!realmConfigured() or e.gameid == 0) return;
+    var ab: [seats.max_account]u8 = undefined;
+    const acct = accountFor(e.name(), &ab) orelse "";
+    var buf: [proto.update_game_info_max]u8 = undefined;
+    const pkt = proto.encodeUpdateGameInfo(
+        &buf,
+        0,
+        if (e.kind == .enter) proto.GAMEINFO_ENTER else proto.GAMEINFO_LEAVE,
+        e.gameid,
+        e.players,
+        e.level,
+        e.class,
+        e.name(),
+        acct,
+    );
+    _ = store.pushEvent(pkt, event_cap, event_ttl_s);
 }
 
 /// Slot 0x54, `__fastcall(FILETIME *out)` — the one appended slot 1.13c and 1.14d call, and neither

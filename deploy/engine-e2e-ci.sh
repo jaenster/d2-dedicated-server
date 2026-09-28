@@ -89,7 +89,24 @@ if [ "$EXPECT" = world ]; then
 fi
 
 # The server's own account of the same run. A clean client result over a log full of halts usually
-# means the client gave up before the server reached the part that broke.
+# means the client gave up before the server reached the part that broke. The wait lets the server
+# notice the client is gone, so its named LEAVE is in the log too.
+[ "$EXPECT" = world ] && sleep 10
 $COMPOSE logs --no-log-prefix gs-engine > /tmp/gs-$TAG.log 2>&1 || true
 bash deploy/assert-gs-log-clean.sh /tmp/gs-$TAG.log || rc=1
+if [ "$EXPECT" = world ] && [ "$rc" = 0 ]; then
+    CHAR="Eng$(printf '%s' "$TAG" | tr '0123456789' 'abcdefghij')x"
+    bash deploy/assert-gs-named-arrivals.sh /tmp/gs-$TAG.log "$CHAR" || rc=1
+    # The realm's side: it took the arrival, and the departure freed the character. A game that
+    # has since closed took its arrival marker with it, so that one is only asked of a live game.
+    rkeys() { $COMPOSE exec -T redis redis-cli --scan --pattern "$1" 2>/dev/null; }
+    closed=0; grep -a -q 'pfCloseGame' /tmp/gs-$TAG.log && closed=1
+    if { [ "$closed" = 0 ] && [ -z "$(rkeys 'realmd:gamearrived:*')" ]; } ||
+       [ -n "$(rkeys "realmd:charlock:e2e$TAG/$CHAR")" ]; then
+        bad "realm did not record the arrival of $CHAR, or still holds it"
+        rc=1
+    else
+        ok "realm recorded the arrival and freed $CHAR"
+    fi
+fi
 exit $rc

@@ -26,6 +26,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Who has arrived in which game, for the realm's named ENTER/LEAVE.
+pub const roster = @import("roster.zig");
+
+test {
+    _ = roster;
+}
+
 const windows = struct {
     extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
 };

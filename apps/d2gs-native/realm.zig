@@ -78,11 +78,23 @@ const addr = struct {
     /// The same clients keyed by id, which is the list `CleanUpClient` walks.
     const client_by_id: u32 = 0x00536d40;
     const client_by_id_cs: u32 = 0x00536d14;
+    /// `SERVER_GetUnitStat(unit, stat, param)`, cdecl.
+    const get_unit_stat: u32 = 0x001948e4;
 };
 
 /// Client fields, as `CreateClient` 0x001a88f5 fills them.
 const client_id: u32 = 0x00;
+/// 0 init, 3 loading, 4 in game, 5 act change.
+const client_state: u32 = 0x04;
+const client_class: u32 = 0x08;
 const client_name: u32 = 0x0d;
+/// The player unit, null until the character has loaded.
+const client_player: u32 = 0x174;
+/// `pNext` in the game's own client list, the link `CleanUpClient` unlinks.
+const client_next_in_game: u32 = 0x4a8;
+/// `pGame->pClient`, the head of that list (count at `game_clients`).
+const game_client_list: u32 = 0x88;
+const stat_level: u32 = 12;
 const client_next_by_id: u32 = 0x4ac;
 const client_next_by_name: u32 = 0x4b0;
 const client_game: u32 = 0x1a8;
@@ -456,6 +468,9 @@ pub fn pump() void {
     for (&slots) |*s| {
         if (s.gameid == 0) continue;
         if (s.phase != .released and gameIsAlive(s.gameid)) continue;
+        // Everyone still listed leaves with the game, named, before the game itself goes.
+        arrivals.close(s.join_id, {}, sendArrival);
+        _ = seats.releaseByGame(s.join_id);
         sendCloseGame(s.join_id);
         note("d2gs-native: CLOSEGAME gameid={d} ({d} game(s) left)\n", .{ s.join_id, liveGames() - 1 });
         s.* = .{};
@@ -578,10 +593,8 @@ fn holdOne(s: *Slot) void {
     if (clients.* != s.last_clients) {
         s.last_clients = clients.*;
         note("d2gs-native: game {d} has {d} client(s), {d}ms in\n", .{ s.join_id, clients.*, nowMs() - s.held_since_ms });
-        // On every change, including back down to zero, which is the one realmd cannot work out
-        // for itself.
-        sendPlayers(s.join_id, clients.*);
     }
+    reportArrivals(s.join_id, game);
     // A brand-new game reports one client before it has any: `GAME_CreateGame` is given a null
     // client and still files a player record for it, which the engine drops again a tick or two
     // later. Taking that for a player is what let the reap collect a game the moment it was made —
@@ -888,24 +901,62 @@ fn onJoinGame(seq: u32, body: []const u8) void {
     _ = store.putReply(seq, std.mem.asBytes(&r), reply_ttl_s);
 }
 
-/// Tell the realm how many players a game holds now.
+/// Who is in each game, by name. Tick thread only.
+var arrivals: seats.roster.Table = .{};
+
+/// Report who has arrived in or left `game` since the last pass, by name. The game is LOCKED by
+/// the caller, which is what makes walking its client list safe.
 ///
-/// realmd increments its count on every join it authorises (`d2cs.zig` `g.players + 1`) and never
-/// decrements — it only ever sees the join request, not arrival/departure. Without this, a reused
-/// game name hit the engine's 8-player ceiling and every join was refused `0x2b` "game is full" with
-/// nobody in it. Sent as an absolute figure, never a delta, so a lost message can't drift it. Name
-/// left empty: realmd's roster ignores a blank one rather than filing a member. A GS that knows who
-/// arrived should send name + `GAMEINFO_ENTER`/`_LEAVE` instead.
-fn sendPlayers(gid: u16, players: u32) void {
-    var buf: [@sizeOf(p.UpdateGameInfo) + 1]u8 = undefined;
-    var r = std.mem.zeroes(p.UpdateGameInfo);
-    r.h = header(.updategameinfo, buf.len);
-    r.flag = p.GAMEINFO_UPDATE;
-    r.gameid = gid;
-    r.players = players;
-    @memcpy(buf[0..@sizeOf(p.UpdateGameInfo)], std.mem.asBytes(&r));
-    buf[@sizeOf(p.UpdateGameInfo)] = 0; // the empty character name
-    _ = store.pushEvent(&buf, event_cap, event_ttl_s);
+/// A client counts once it is in the world: state 4 (in game) or 5 (act change) with a player
+/// unit, the same transition at which the Windows engines call `fpEnterGame`. A client still
+/// loading is not there yet, and one that dies while loading was never there; the realm's
+/// pending grace handles that claim.
+fn reportArrivals(join_id: u16, game: u32) void {
+    const get_stat: *const fn (u32, u32, u32) callconv(.c) i32 = @ptrFromInt(image.at(addr.get_unit_stat));
+    var seen: [seats.roster.max_players]seats.roster.Seen = undefined;
+    var n: usize = 0;
+    var c = @as(*const u32, @ptrFromInt(game + game_client_list)).*;
+    while (c != 0 and n < seen.len) : (c = @as(*const u32, @ptrFromInt(c + client_next_in_game)).*) {
+        const state = @as(*const u32, @ptrFromInt(c + client_state)).*;
+        const player = @as(*const u32, @ptrFromInt(c + client_player)).*;
+        if (player == 0 or (state != 4 and state != 5)) continue;
+        const name_ptr: [*]const u8 = @ptrFromInt(c + client_name);
+        const level = get_stat(player, stat_level, 0);
+        seen[n] = .{
+            .name = std.mem.sliceTo(name_ptr[0..16], 0),
+            .class = @as(*const u8, @ptrFromInt(c + client_class)).*,
+            .level = @intCast(std.math.clamp(level, 0, 255)),
+        };
+        n += 1;
+    }
+    arrivals.reconcile(join_id, seen[0..n], {}, sendArrival);
+}
+
+/// One named ENTER/LEAVE to the realm, with the account when the realm told us it.
+///
+/// The count is the arrived players, not the engine's client count: that one includes clients
+/// still loading and the placeholder a fresh game files, and a join the realm counted that never
+/// arrives is the realm's to undo.
+fn sendArrival(_: void, e: seats.roster.Event) void {
+    var ab: [seats.max_account]u8 = undefined;
+    const acct = seats.accountForChar(e.name(), &ab) orelse "";
+    seqno +%= 1;
+    var buf: [p.update_game_info_max]u8 = undefined;
+    const pkt = p.encodeUpdateGameInfo(
+        &buf,
+        seqno,
+        if (e.kind == .enter) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE,
+        e.gameid,
+        e.players,
+        e.level,
+        e.class,
+        e.name(),
+        acct,
+    );
+    _ = store.pushEvent(pkt, event_cap, event_ttl_s);
+    // Out of the game, so its seat may be recycled; the mapping itself stays for the last save.
+    if (e.kind == .leave) seats.release(e.name());
+    note("d2gs-native: {s} \"{s}\" game {d}, {d} player(s)\n", .{ @tagName(e.kind), e.name(), e.gameid, e.players });
 }
 
 fn sendCloseGame(gid: u32) void {

@@ -231,6 +231,21 @@ for i in "${!ENGINES[@]}"; do
             if [ "${units:-0}" -gt 0 ] 2>/dev/null; then
                 ok "in game — ${pkts:-?} packets, $units units"
                 note="${pkts:-?} packets / $units units"
+                # The realm holds a join's claim as pending until the server names the arrival,
+                # and frees it on the named departure. A server that only counts heads leaves a
+                # player who abandoned a join locked out until the game closes.
+                if ! bash "$ROOT/deploy/assert-gs-named-arrivals.sh" "$log" "$char"; then
+                    verdict=UNNAMED; note="$note; arrival/departure not reported by name"
+                elif { ! grep -a -q 'pfCloseGame' "$log" &&
+                       [ -z "$(redis --scan --pattern 'realmd:gamearrived:*')" ]; } ||
+                     [ -n "$(redis --scan --pattern "realmd:charlock:$acct/$char")" ]; then
+                    # The realm's side of the same: it took the arrival (a closed game takes that
+                    # marker with it), and the departure freed the character.
+                    verdict=UNNAMED; note="$note; realm did not record the arrival or still holds $char"
+                    bad "$note"
+                else
+                    ok "realm recorded the arrival and freed $char on the leave"
+                fi
             else
                 verdict=EMPTY; note="reached the GS, world empty"
                 bad "$note"

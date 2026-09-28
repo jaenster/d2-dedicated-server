@@ -175,3 +175,59 @@ pub fn readCStr(body: []const u8, off: *usize) []const u8 {
 pub fn header(t: Type, size: u16, seqno: u32) Header {
     return .{ .size = size, .type = @intFromEnum(t), .seqno = seqno };
 }
+
+/// Room for the longest UPDATEGAMEINFO: the fixed part, a 15-letter name and a 31-letter account.
+pub const update_game_info_max = @sizeOf(UpdateGameInfo) + 16 + 32;
+
+/// One UPDATEGAMEINFO: the fixed part, then the character and the account as C-strings.
+/// `players` is the count after the change. Over-long strings are cut, never overrun.
+pub fn encodeUpdateGameInfo(
+    buf: *[update_game_info_max]u8,
+    seqno: u32,
+    flag: u32,
+    gameid: u32,
+    players: u32,
+    level: u32,
+    class: u32,
+    char: []const u8,
+    account: []const u8,
+) []const u8 {
+    var r = std.mem.zeroes(UpdateGameInfo);
+    r.flag = flag;
+    r.gameid = gameid;
+    r.players = players;
+    r.charlevel = level;
+    r.charclass = class;
+    var at: usize = @sizeOf(UpdateGameInfo);
+    const cn: usize = @min(char.len, 15);
+    @memcpy(buf[at..][0..cn], char[0..cn]);
+    buf[at + cn] = 0;
+    at += cn + 1;
+    const an: usize = @min(account.len, 31);
+    @memcpy(buf[at..][0..an], account[0..an]);
+    buf[at + an] = 0;
+    at += an + 1;
+    r.h = header(.updategameinfo, @intCast(at), seqno);
+    @memcpy(buf[0..@sizeOf(UpdateGameInfo)], std.mem.asBytes(&r));
+    return buf[0..at];
+}
+
+test "an UPDATEGAMEINFO carries the count, the character and the account" {
+    var buf: [update_game_info_max]u8 = undefined;
+    const out = encodeUpdateGameInfo(&buf, 7, GAMEINFO_ENTER, 42, 3, 12, 1, "Bob", "acct");
+    try std.testing.expectEqualSlices(u8, &.{
+        37, 0, 0x22, 0, 7, 0, 0, 0,
+        1, 0, 0, 0, 42, 0, 0, 0,
+        3, 0, 0, 0, 12, 0, 0, 0,
+        1, 0, 0, 0, 'B', 'o', 'b', 0,
+        'a', 'c', 'c', 't', 0,
+    }, out);
+}
+
+test "an over-long name is cut to what D2 allows" {
+    var buf: [update_game_info_max]u8 = undefined;
+    const out = encodeUpdateGameInfo(&buf, 1, GAMEINFO_LEAVE, 1, 0, 0, 0, "ABCDEFGHIJKLMNOPQRS", "");
+    try std.testing.expectEqual(@as(usize, @sizeOf(UpdateGameInfo) + 16 + 1), out.len);
+    var off: usize = 20;
+    try std.testing.expectEqualStrings("ABCDEFGHIJKLMNO", readCStr(out[HEADER_LEN..], &off));
+}
