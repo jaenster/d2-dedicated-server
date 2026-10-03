@@ -26,7 +26,6 @@ pub const Route = types.Route;
 pub const TokenRoute = types.TokenRoute;
 pub const max_chars = types.max_chars;
 
-
 // TTLs (seconds) for ephemeral records; 0 = no expiry. Games also get torn down
 // explicitly on CLOSEGAME / GS disconnect — the TTL is a backstop against leaks.
 var session_ttl_s: u32 = 3600; // 1h
@@ -289,7 +288,7 @@ pub fn copyChar(src_account: []const u8, src_char: []const u8, dst_account: []co
 ///
 /// It will not overwrite. An import that silently replaced a character would be the one operation
 /// here with no way back.
-pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8) bool {
+pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8, mode: u8) bool {
     if (!claimCharName(account, name)) return false;
     if (name.len == 0 or name.len > d2s.name_max) return false;
     if (bytes.len == 0 or bytes.len > max_d2s) return false;
@@ -301,8 +300,48 @@ pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8) bool
     var buf: [max_d2s]u8 = undefined;
     @memcpy(buf[0..bytes.len], bytes);
     if (!d2s.setName(buf[0..bytes.len], name)) return false;
-    d2s.fixChecksum(buf[0..bytes.len]);
+    if (!d2s.setMode(buf[0..bytes.len], mode)) return false; // also repairs the checksum
     return saveCharD2s(account, name, buf[0..bytes.len]);
+}
+
+/// The hardcore/ladder flags the account's most recently played character of the given expansion
+/// type carries, or null if it has none of that type. Reads headers only.
+pub fn accountDefaultMode(account: []const u8, expansion: bool) ?u8 {
+    var names: [max_chars]Name = [_]Name{.{}} ** max_chars;
+    const n = listChars(account, &names);
+    var bufs: [max_chars][1024]u8 = undefined;
+    var saves: [max_chars][]const u8 = undefined;
+    var m: usize = 0;
+    for (names[0..n]) |nm| {
+        const got = getCharD2s(account, nm.slice(), &bufs[m]);
+        if (got == 0) continue;
+        saves[m] = bufs[m][0..got];
+        m += 1;
+    }
+    return d2s.defaultMode(saves[0..m], expansion);
+}
+
+/// Result of a ladder flag change.
+pub const SetModeResult = enum { changed, unchanged, no_such_char, failed };
+
+/// Set a character's hardcore/ladder flags (and nothing else) through the normal save path, so
+/// the cache, the dirty mark and the durable row all follow. `before`/`after` report the status
+/// byte; `items` the item summary of the bytes written, for the audit line.
+pub fn setCharMode(account: []const u8, charname: []const u8, mode: u8, before: *u8, after: *u8, items: *d2s.Items) SetModeResult {
+    var buf: [max_d2s]u8 = undefined;
+    const n = getCharD2s(account, charname, &buf);
+    if (n == 0) return .no_such_char;
+    if (n == buf.len) return .failed;
+    const st = d2s.status(buf[0..n]) orelse return .failed;
+    before.* = st;
+    items.* = d2s.items(buf[0..n]);
+    if (st & d2s.mode_mask == mode & d2s.mode_mask) {
+        after.* = st;
+        return .unchanged;
+    }
+    if (!d2s.setMode(buf[0..n], mode)) return .failed;
+    after.* = d2s.status(buf[0..n]).?;
+    return if (saveCharD2s(account, charname, buf[0..n])) .changed else .failed;
 }
 
 /// Result of a classic -> expansion conversion.

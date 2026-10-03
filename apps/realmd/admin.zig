@@ -9,13 +9,21 @@
 //!   POST /admin/accounts     {"name","password"} -> create account
 //!   POST /admin/games/close  {"name"} (or ?name=) -> expire a game
 //!   POST /admin/chars/copy   {"src_account","src_char","dst_char"[,"dst_account"]} -> clone char
-//!   POST /admin/chars/import {"account","char","d2s":"<base64>"} -> put a save on an account
+//!   POST /admin/chars/import {"account","char","d2s":"<base64>"[,"ladder","hardcore","expansion"]}
+//!                            -> put a save on an account; unset modes follow the account's newest
+//!                               character of the same expansion type, never the uploaded save
+//!   POST /admin/chars/set-ladder {"account","char","ladder":bool[,"force":true]} -> flip ladder
+//!
+//! This listener is only reachable inside the cluster (ClusterIP, no ingress) and every call needs
+//! the admin token; nothing a player or a Discord command can reach calls into it.
 const std = @import("std");
 const net = @import("realm_infra").net;
 const fleet = @import("fleet.zig");
 const state = @import("state.zig");
 const store = @import("store.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
+const log = @import("realm_infra").log;
+const d2s = @import("d2s.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const b64 = std.base64.url_safe_no_pad;
@@ -347,7 +355,10 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
         return charsDelete(fd, req);
     } else if (std.mem.eql(u8, p, "/admin/chars/import")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
-        return charsImport(fd, req);
+        return charsImport(fd, req, auth.?.name);
+    } else if (std.mem.eql(u8, p, "/admin/chars/set-ladder")) {
+        if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return charsSetLadder(fd, req, auth.?.name);
     } else if (std.mem.eql(u8, p, "/admin/chars/copy")) {
         if (!is_post) return respond(fd, method_not_allowed, "{\"error\":\"method not allowed\"}");
         return charsCopy(fd, req);
@@ -409,7 +420,11 @@ fn gameservers(fd: net.Socket) void {
         const seg = std.fmt.bufPrint(buf[w..], "{s}{{\"gsid\":\"0x{x}\",\"addr\":\"{d}.{d}.{d}.{d}:{d}\",\"maxgame\":{d},\"live_games\":{d}}}", .{
             if (i == 0) "" else ",",
             g.gsid,
-            g.ip[0], g.ip[1], g.ip[2], g.ip[3], g.port,
+            g.ip[0],
+            g.ip[1],
+            g.ip[2],
+            g.ip[3],
+            g.port,
             g.maxgame,
             g.live,
         }) catch break;
@@ -449,8 +464,13 @@ fn games(fd: net.Socket) void {
                 g.name_slice(),
                 g.gameid,
                 g.gsid,
-                g.ip[0],   g.ip[1], g.ip[2], g.ip[3], g.port,
-                g.players, g.desc(),
+                g.ip[0],
+                g.ip[1],
+                g.ip[2],
+                g.ip[3],
+                g.port,
+                g.players,
+                g.desc(),
                 boolJson(g.status & 0x20 != 0),
                 boolJson(g.status & 0x04 != 0),
                 boolJson(g.status & 0x40 != 0),
@@ -502,12 +522,20 @@ fn charsCopy(fd: net.Socket, req: []const u8) void {
     }
 }
 
-// POST /admin/chars/import {"account","char","d2s":"<base64>"} — put a save file on an account.
+// POST /admin/chars/import {"account","char","d2s":"<base64>"[,"ladder":bool,"hardcore":bool,"expansion":bool]}
+// — put a save file on an account.
 //
 // Base64 because this is a JSON API and a .d2s is binary; standard alphabet with padding, which is
 // what every tool that will produce one emits. The realm rewrites the name and repairs the checksum
 // on the way in, so a save exported under one name lands correctly under another.
-fn charsImport(fd: net.Socket, req: []const u8) void {
+//
+// The mode is the caller's to state, not the file's. A ladder or hardcore bit that arrives inside
+// an uploaded save would decide which stash the character sees and which games it can join, so the
+// bits the caller leaves out come from the account's most recently played character of the same
+// expansion type (softcore non-ladder if there is none) and the file's own bits are discarded.
+// `expansion` defaults to the save's; true upgrades a classic save, false on a Lord of Destruction
+// save is refused because nothing can undo that.
+fn charsImport(fd: net.Socket, req: []const u8, caller: []const u8) void {
     const body = bodyOf(req);
     const account = jsonStr(body, "account") orelse return respond(fd, bad_request, "{\"error\":\"missing account\"}");
     const char = jsonStr(body, "char") orelse return respond(fd, bad_request, "{\"error\":\"missing char\"}");
@@ -519,10 +547,75 @@ fn charsImport(fd: net.Socket, req: []const u8) void {
     if (n > raw.len) return respond(fd, bad_request, "{\"error\":\"d2s too large\"}");
     dec.decode(raw[0..n], encoded) catch return respond(fd, bad_request, "{\"error\":\"d2s is not base64\"}");
 
-    if (!store.importChar(account, char, raw[0..n])) {
+    const st = d2s.status(raw[0..n]) orelse return respond(fd, conflict, "{\"error\":\"import failed (bad save, invalid name, or character exists)\"}");
+    var expansion = st & d2s.status_expansion != 0;
+    if (jsonOptBool(body, "expansion")) |want| {
+        if (!want and expansion) return respond(fd, bad_request, "{\"error\":\"cannot import an expansion save as classic\"}");
+        if (want and !expansion) {
+            d2s.setStatus(raw[0..n], st | d2s.status_expansion);
+            expansion = true;
+        }
+    }
+    const want_ladder = jsonOptBool(body, "ladder");
+    const want_hardcore = jsonOptBool(body, "hardcore");
+    var mode: u8 = store.accountDefaultMode(account, expansion) orelse 0;
+    if (want_ladder) |l| mode = if (l) mode | d2s.status_ladder else mode & ~d2s.status_ladder;
+    if (want_hardcore) |h| mode = if (h) mode | d2s.status_hardcore else mode & ~d2s.status_hardcore;
+
+    if (!store.importChar(account, char, raw[0..n], mode)) {
         return respond(fd, conflict, "{\"error\":\"import failed (bad save, invalid name, or character exists)\"}");
     }
+    const it = d2s.items(raw[0..n]);
+    log.line("admin", "chars/import by {s}: {s}/{s} expansion={} hardcore={} ladder={} (ladder {s}, hardcore {s}) items={d} digest={s}", .{
+        caller,                                          account,                                           char,
+        expansion,                                       mode & d2s.status_hardcore != 0,                   mode & d2s.status_ladder != 0,
+        if (want_ladder != null) "given" else "default", if (want_hardcore != null) "given" else "default", it.count orelse 0,
+        &it.digest,
+    });
     respond(fd, ok, "{\"imported\":true}");
+}
+
+// POST /admin/chars/set-ladder {"account","char","ladder":bool[,"force":true]} — set or clear a
+// character's ladder flag.
+//
+// Ladder is the status bit and nothing else (no season field, no column, no cache of its own), so
+// this is one save through the normal path: cache, dirty mark, durable row. It is also an item
+// transfer between two stash scopes, which is why it is an operator action only, why every call
+// leaves an audit line with the item count and digest, and why ladder -> non-ladder is refused
+// unless `force` is set. A character in a game is refused too: the game server holds it in memory
+// and would write the old flags back.
+fn charsSetLadder(fd: net.Socket, req: []const u8, caller: []const u8) void {
+    const body = bodyOf(req);
+    const account = jsonStr(body, "account") orelse return respond(fd, bad_request, "{\"error\":\"missing account\"}");
+    const char = jsonStr(body, "char") orelse return respond(fd, bad_request, "{\"error\":\"missing char\"}");
+    const want = jsonOptBool(body, "ladder") orelse return respond(fd, bad_request, "{\"error\":\"missing ladder (true or false)\"}");
+    const force = jsonBool(body, "force");
+    if (store.charInUse(account, char)) return respond(fd, conflict, "{\"error\":\"character is in a game\"}");
+
+    var cur: [store.max_d2s]u8 = undefined;
+    const n = store.getCharD2s(account, char, &cur);
+    if (n == 0) return respond(fd, not_found, "{\"error\":\"no such character\"}");
+    const had = (d2s.status(cur[0..n]) orelse 0) & d2s.status_ladder != 0;
+    if (had and !want and !force) {
+        log.line("admin", "chars/set-ladder by {s}: {s}/{s} ladder -> non-ladder REFUSED (no force)", .{ caller, account, char });
+        return respond(fd, conflict, "{\"error\":\"ladder to non-ladder needs force\"}");
+    }
+
+    const st = d2s.status(cur[0..n]).?;
+    const mode: u8 = (st & d2s.mode_mask & ~d2s.status_ladder) | (if (want) d2s.status_ladder else 0);
+    var before: u8 = 0;
+    var after: u8 = 0;
+    var it: d2s.Items = undefined;
+    const res = store.setCharMode(account, char, mode, &before, &after, &it);
+    log.line("admin", "chars/set-ladder by {s}: {s}/{s} ladder {} -> {} status 0x{x:0>2} -> 0x{x:0>2} items={d} digest={s} result={s}", .{
+        caller, account, char, had, want, before, after, it.count orelse 0, &it.digest, @tagName(res),
+    });
+    switch (res) {
+        .changed => respond(fd, ok, "{\"changed\":true}"),
+        .unchanged => respond(fd, ok, "{\"changed\":false}"),
+        .no_such_char => respond(fd, not_found, "{\"error\":\"no such character\"}"),
+        .failed => respond(fd, conflict, "{\"error\":\"save failed\"}"),
+    }
 }
 
 // POST /admin/chars/delete {"account","char"} — remove one character. The companion to
@@ -540,6 +633,23 @@ fn charsDelete(fd: net.Socket, req: []const u8) void {
     if (!store.deleteCharD2s(account, char)) return respond(fd, conflict, "{\"error\":\"delete failed\"}");
     store.releaseCharName(account, char);
     respond(fd, ok, "{\"deleted\":true}");
+}
+
+/// `"key": true|false` if present, null when the key is absent or holds anything else.
+fn jsonOptBool(body: []const u8, key: []const u8) ?bool {
+    var kbuf: [64]u8 = undefined;
+    if (key.len + 2 > kbuf.len) return null;
+    kbuf[0] = '"';
+    @memcpy(kbuf[1 .. 1 + key.len], key);
+    kbuf[1 + key.len] = '"';
+    const needle = kbuf[0 .. key.len + 2];
+    const ki = std.mem.indexOf(u8, body, needle) orelse return null;
+    const colon = std.mem.indexOfScalarPos(u8, body, ki + needle.len, ':') orelse return null;
+    var i = colon + 1;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t')) i += 1;
+    if (std.mem.startsWith(u8, body[i..], "true")) return true;
+    if (std.mem.startsWith(u8, body[i..], "false")) return false;
+    return null;
 }
 
 /// True if the flat JSON body has `"key": true`. Crude (no nesting), matches jsonStr.
@@ -604,4 +714,11 @@ fn closeGame(fd: net.Socket, path: []const u8, req: []const u8) void {
     if (name.len == 0) return respond(fd, bad_request, "{\"error\":\"missing name\"}");
     _ = state.global.closeGameByName(name);
     respond(fd, ok, "{\"closed\":true}");
+}
+
+test "jsonOptBool tells absent from false" {
+    try std.testing.expectEqual(@as(?bool, true), jsonOptBool("{\"ladder\": true}", "ladder"));
+    try std.testing.expectEqual(@as(?bool, false), jsonOptBool("{\"ladder\":false}", "ladder"));
+    try std.testing.expectEqual(@as(?bool, null), jsonOptBool("{\"char\":\"x\"}", "ladder"));
+    try std.testing.expectEqual(@as(?bool, null), jsonOptBool("{\"ladder\":\"yes\"}", "ladder"));
 }

@@ -26,6 +26,12 @@ pub const newSave = formats.d2s.newSave;
 pub const status_hardcore: u8 = 0x04;
 pub const status_died: u8 = 0x08;
 pub const status_expansion: u8 = 0x20;
+pub const status_ladder: u8 = 0x40;
+/// The two flags that decide which game a character can join and which shared stash it sees,
+/// besides expansion. Ladder is nothing but this bit: there is no season field in the save.
+pub const mode_mask: u8 = status_hardcore | status_ladder;
+/// Last-played time, u32 unix seconds. Written by the game on every save.
+pub const off_last_played = 0x30;
 
 /// The status flags byte, or null if the buffer is too short.
 pub fn status(data: []const u8) ?u8 {
@@ -36,6 +42,53 @@ pub fn status(data: []const u8) ?u8 {
 /// Overwrite the status flags byte. Does NOT fix the checksum.
 pub fn setStatus(data: []u8, v: u8) void {
     if (data.len > off_status) data[off_status] = v;
+}
+
+/// Set the hardcore/ladder flags to exactly `mode` (a subset of `mode_mask`), leave every other
+/// status bit alone and repair the checksum. False if the buffer is not a save.
+pub fn setMode(data: []u8, mode: u8) bool {
+    const st = status(data) orelse return false;
+    setStatus(data, (st & ~mode_mask) | (mode & mode_mask));
+    fixChecksum(data);
+    return true;
+}
+
+/// What a character's item section holds, for the audit line an operator action leaves behind:
+/// how many items the player's own list declares, and a digest of everything from that list to
+/// the end of the file (belt, corpse, mercenary, golem). Moving a character between ladder and
+/// non-ladder moves its items too, so the line has to be able to show they did not change.
+pub const Items = struct { count: ?u16, digest: [8]u8 };
+
+pub fn items(data: []const u8) Items {
+    var out = Items{ .count = null, .digest = [_]u8{'0'} ** 8 };
+    const gf = std.mem.indexOf(u8, data, "gf") orelse return out;
+    const sk = std.mem.indexOfPos(u8, data, gf + 2, "if") orelse return out;
+    const jm = sk + 32; // the skill section is "if" plus 30 bytes
+    if (jm + 4 > data.len or !std.mem.eql(u8, data[jm..][0..2], "JM")) return out;
+    out.count = std.mem.readInt(u16, data[jm + 2 ..][0..2], .little);
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data[jm..], &h, .{});
+    _ = std.fmt.bufPrint(&out.digest, "{x}", .{h[0..4]}) catch {};
+    return out;
+}
+
+/// The hardcore/ladder flags a new character on an account should get when the caller does not
+/// say: those of the account's most recently played character with the same expansion bit.
+/// `saves` are the account's saves (headers suffice). Null when none qualifies.
+pub fn defaultMode(saves: []const []const u8, expansion: bool) ?u8 {
+    var best: ?u8 = null;
+    var best_time: u32 = 0;
+    for (saves) |s| {
+        const st = status(s) orelse continue;
+        if (s.len < off_last_played + 4) continue;
+        if ((st & status_expansion != 0) != expansion) continue;
+        const t = std.mem.readInt(u32, s[off_last_played..][0..4], .little);
+        if (best == null or t >= best_time) {
+            best = st & mode_mask;
+            best_time = t;
+        }
+    }
+    return best;
 }
 
 // attributes ("gf" section)
@@ -155,4 +208,55 @@ test "libd2 writes a header this realm recognises" {
     try std.testing.expectEqualStrings("Freshie", std.mem.sliceTo(save[off_name..][0..16], 0));
     try std.testing.expectEqual(@as(u8, 0x21), status(&save).?); // expansion | mandatory
     try std.testing.expect(formats.d2s.verifyChecksum(&save));
+}
+
+test "setMode flips ladder, keeps the other bits and repairs the checksum" {
+    var save: [new_save_size]u8 = undefined;
+    try std.testing.expect(newSave(&save, "Wor", 3, 0x00, 0x12345678));
+    const before = status(&save).?;
+    try std.testing.expect(setMode(&save, status_ladder));
+    try std.testing.expectEqual(before | status_ladder, status(&save).?);
+    try std.testing.expect(formats.d2s.verifyChecksum(&save));
+    try std.testing.expect(setMode(&save, 0));
+    try std.testing.expectEqual(before, status(&save).?);
+    try std.testing.expect(formats.d2s.verifyChecksum(&save));
+}
+
+test "setMode never touches expansion or died" {
+    var save: [new_save_size]u8 = undefined;
+    try std.testing.expect(newSave(&save, "Wor", 3, status_expansion | status_died, 1));
+    try std.testing.expect(setMode(&save, status_ladder | status_hardcore));
+    const st = status(&save).?;
+    try std.testing.expect(st & status_expansion != 0 and st & status_died != 0);
+    try std.testing.expectEqual(status_ladder | status_hardcore, st & mode_mask);
+}
+
+test "items reads the count and digests the tail" {
+    var save = [_]u8{0} ** 120;
+    @memcpy(save[10..12], "gf");
+    @memcpy(save[40..42], "if");
+    @memcpy(save[72..74], "JM");
+    std.mem.writeInt(u16, save[74..76], 7, .little);
+    const a = items(&save);
+    try std.testing.expectEqual(@as(?u16, 7), a.count);
+    save[100] = 9;
+    const b = items(&save);
+    try std.testing.expect(!std.mem.eql(u8, &a.digest, &b.digest));
+    // a flag flip in the header leaves the item digest alone
+    save[0x24] ^= status_ladder;
+    try std.testing.expectEqualSlices(u8, &b.digest, &items(&save).digest);
+    try std.testing.expectEqual(@as(?u16, null), items(save[0..20]).count);
+}
+
+test "defaultMode follows the newest character of the same expansion type" {
+    var a: [new_save_size]u8 = undefined;
+    var b: [new_save_size]u8 = undefined;
+    var c: [new_save_size]u8 = undefined;
+    try std.testing.expect(newSave(&a, "Old", 0, status_ladder, 100)); // classic ladder, older
+    try std.testing.expect(newSave(&b, "New", 0, status_ladder | status_hardcore, 200)); // classic, newest
+    try std.testing.expect(newSave(&c, "Exp", 0, status_expansion, 300)); // expansion softcore, newest overall
+    const saves = [_][]const u8{ &a, &b, &c };
+    try std.testing.expectEqual(@as(?u8, status_ladder | status_hardcore), defaultMode(&saves, false));
+    try std.testing.expectEqual(@as(?u8, 0), defaultMode(&saves, true));
+    try std.testing.expectEqual(@as(?u8, null), defaultMode(saves[2..], false));
 }

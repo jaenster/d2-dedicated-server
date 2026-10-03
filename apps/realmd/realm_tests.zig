@@ -8,6 +8,7 @@ test {
     _ = @import("guilds.zig");
     _ = @import("friends.zig");
     _ = @import("d2s.zig");
+    _ = @import("admin.zig");
     _ = @import("proto.zig");
     _ = @import("fleet.zig");
     // Shared infrastructure every listener sits on.
