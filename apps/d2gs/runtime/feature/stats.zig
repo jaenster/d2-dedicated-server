@@ -172,13 +172,19 @@ const REFRESH_EVERY: u32 = 100;
 
 pub fn serverTick() void {
     ticks +%= 1;
+    // The rate by the clock, not every 100th tick: idle, the server ticks once a second, and a
+    // 100-tick gate left the gauge showing the last busy rate for a minute and a half.
+    const now = GetTickCount();
+    updateRate(now);
     if (ticks % REFRESH_EVERY != 0) return;
     for (&slots) |*s| {
         if (s.used == 0 or s.game == 0) continue;
         s.clients = readU32(s.game, GAME_CLIENTS);
         s.frame = readU32(s.game, GAME_FRAME);
     }
-    const now = GetTickCount();
+}
+
+fn updateRate(now: u32) void {
     const dt = now -% rate_last_ms;
     if (dt >= 1000) {
         const dticks = ticks -% rate_last_ticks;
