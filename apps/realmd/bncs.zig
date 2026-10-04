@@ -171,6 +171,10 @@ pub const Conn = struct {
     in_channel: bool = false,
     channel: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
     channel_len: u8 = 0,
+    /// The first channel this connection joined. The client draws it at the head of its channel
+    /// list by itself, so the list the realm answers leaves it out (channelList).
+    home: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
+    home_len: u8 = 0,
     user_flags: u32 = 0, // this account's chat flags (admin/operator) in the current channel
     // The client's SID_ENTERCHAT statstring (D2: encodes the char it's on). Captured
     // on enter, replayed to other members in EID_SHOWUSER/EID_JOIN so chat shows chars.
@@ -205,6 +209,9 @@ pub const Conn = struct {
         @memcpy(c.channel[0..n], name[0..n]);
         c.channel_len = n;
         c.in_channel = true;
+    }
+    fn homeName(c: *const Conn) []const u8 {
+        return c.home[0..c.home_len];
     }
     fn channelName(c: *Conn) []const u8 {
         return c.channel[0..c.channel_len];
@@ -736,16 +743,34 @@ fn isProductTag(b: []const u8) bool {
     return true;
 }
 
+/// The channels the realm offers, as SID_GETCHANNELLIST lists them.
+const public_channels = [_][]const u8{ default_channel, "Trade", "Hardcore" };
+
+/// The body of the channel list: every public channel but `home`. The 1.14d client builds its list
+/// from the first channel it joined (drawn first, always), the one it is in now, and then this list
+/// minus the one it is in now (UIMENU_CreateTcpIpGameList @0x440fc0; COMCALLBACK_HandleChannelError
+/// @0x4496b0 keeps both names). A home channel that is also in this list is therefore drawn twice
+/// as soon as the player is in another channel.
+fn channelListBody(buf: []u8, home: []const u8) []u8 {
+    var n: usize = 0;
+    for (public_channels) |name| {
+        if (std.ascii.eqlIgnoreCase(name, home)) continue;
+        if (n + name.len + 1 > buf.len) break;
+        @memcpy(buf[n..][0..name.len], name);
+        buf[n + name.len] = 0;
+        n += name.len + 1;
+    }
+    buf[n] = 0; // an empty string ends the list
+    return buf[0 .. n + 1];
+}
+
 fn onGetChannelList(c: *Conn, body: []const u8) void {
     // The body is the product the client is chatting as; its four bytes head the statstring.
     if (body.len >= 4 and isProductTag(body[0..4])) @memcpy(&c.product, body[0..4]);
+    var list: [128]u8 = undefined;
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_GETCHANNELLIST);
-    // Public channels offered in the channel-select UI. The home channel first.
-    w.putStr(default_channel); // "Diablo II"
-    w.putStr("Trade");
-    w.putStr("Hardcore");
-    w.putStr(""); // empty string terminates the list
+    w.putBytes(channelListBody(&list, c.homeName()));
     finish(c, &w);
 }
 
@@ -836,6 +861,12 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     log.line(tag, "join channel '{s}' as {s} (flags=0x{x})", .{ channel, acct, flags });
 
     c.setChannel(channel);
+    const first_join = c.home_len == 0;
+    if (first_join) {
+        const n: u8 = @intCast(@min(channel.len, chat.max_channel));
+        @memcpy(c.home[0..n], channel[0..n]);
+        c.home_len = n;
+    }
     _ = chat.joinShared(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
     chat.setGame(c.fd, ""); // back in the lobby: no longer in a game
 
@@ -1339,6 +1370,41 @@ fn onGetFileTime(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+/// The profile keys the client has fields for, and the longest value each may hold. Anything else a
+/// client names is neither read nor stored: the store is keyed by whatever string arrives, so an
+/// open key space would let any account fill it.
+const profile_keys = [_]struct { key: []const u8, max: usize }{
+    .{ .key = "profile\\sex", .max = 16 },
+    .{ .key = "profile\\age", .max = 8 },
+    .{ .key = "profile\\location", .max = 64 },
+    .{ .key = "profile\\description", .max = 200 },
+};
+
+fn profileKey(key: []const u8) ?usize {
+    for (profile_keys, 0..) |k, i| if (std.ascii.eqlIgnoreCase(k.key, key)) return i;
+    return null;
+}
+
+/// Accounts are one name whatever their case, and a profile is looked up by the name a list shows,
+/// which may be spelled otherwise than the logon was. Too long a name comes back empty.
+fn lowerName(out: []u8, name: []const u8) []const u8 {
+    if (name.len > out.len) return "";
+    return std.ascii.lowerString(out, name);
+}
+
+/// A profile value as it is kept: control characters dropped (a newline or an escape in a profile is
+/// drawn into other players' windows), cut at the field's length.
+fn cleanProfileValue(out: []u8, value: []const u8, max: usize) []const u8 {
+    var n: usize = 0;
+    for (value) |ch| {
+        if (ch < 0x20 or ch == 0x7f) continue;
+        if (n == max or n == out.len) break;
+        out[n] = ch;
+        n += 1;
+    }
+    return out[0..n];
+}
+
 // SID_READUSERDATA (0x26): C->S { u32 numAccounts, u32 numKeys, u32 reqId,
 // STRING[numAccounts] accounts, STRING[numKeys] keys }. Reply mirrors the
 // header then STRING[numAccounts*numKeys] values (account-major). Profile reads
@@ -1369,15 +1435,18 @@ fn onReadUserData(c: *Conn, tag: []const u8, body: []const u8) void {
     // for, and it does not fit in anything modest — size for it rather than truncate.
     var buf: [4 * 16 * 258 + 32]u8 = undefined;
     var w = startPacket(&buf, SID_READUSERDATA);
-    w.putU32(num_accounts);
-    w.putU32(num_keys);
+    // The counts are those of the strings that follow, so a request past the arrays answers what it
+    // got rather than a header that promises more than the body holds.
+    w.putU32(@intCast(na));
+    w.putU32(@intCast(nk));
     w.putU32(reqid);
     var ai: usize = 0;
     while (ai < na) : (ai += 1) {
         var ki: usize = 0;
         while (ki < nk) : (ki += 1) {
             var vbuf: [256]u8 = undefined;
-            const n = store.getUserData(accts[ai], keys[ki], &vbuf);
+            var ab: [state.max_name + 1]u8 = undefined;
+            const n = if (profileKey(keys[ki])) |k| store.getUserData(lowerName(&ab, accts[ai]), profile_keys[k].key, &vbuf) else 0;
             w.putStr(vbuf[0..n]);
         }
     }
@@ -1416,7 +1485,11 @@ fn onWriteUserData(c: *Conn, tag: []const u8, body: []const u8) void {
         while (ki < num_keys) : (ki += 1) {
             const val = r.getStr();
             if (ai < na and ki < nk and std.ascii.eqlIgnoreCase(accts[ai], c.accountName())) {
-                if (store.setUserData(accts[ai], keys[ki], val)) stored += 1;
+                if (profileKey(keys[ki])) |k| {
+                    var vb: [256]u8 = undefined;
+                    var ab: [state.max_name + 1]u8 = undefined;
+                    if (store.setUserData(lowerName(&ab, c.accountName()), profile_keys[k].key, cleanProfileValue(&vb, val, profile_keys[k].max))) stored += 1;
+                }
             }
         }
     }
@@ -1755,4 +1828,40 @@ test "a player gets no chat flags; only a configured chat op does" {
     try std.testing.expectEqual(@as(u32, 0), chatUserFlags("ops1,ops2", "jaenster"));
     try std.testing.expectEqual(FLAG_ADMIN | FLAG_OPERATOR, chatUserFlags("ops1, Jaenster", "jaenster"));
     try std.testing.expectEqual(@as(u32, 0), chatUserFlags("jaenster", ""));
+}
+
+test "the channel list leaves out the channel the client draws itself" {
+    var b: [128]u8 = undefined;
+    // before any join: everything
+    try std.testing.expectEqualSlices(u8, "Diablo II\x00Trade\x00Hardcore\x00\x00", channelListBody(&b, ""));
+    // the home channel is the client's to draw, whatever its case
+    try std.testing.expectEqualSlices(u8, "Trade\x00Hardcore\x00\x00", channelListBody(&b, "Diablo II"));
+    try std.testing.expectEqualSlices(u8, "Trade\x00Hardcore\x00\x00", channelListBody(&b, "diablo ii"));
+    // a home that is not a public channel takes nothing out
+    try std.testing.expectEqualSlices(u8, "Diablo II\x00Trade\x00Hardcore\x00\x00", channelListBody(&b, "private"));
+    // each channel once, and the list is terminated
+    var seen: usize = 0;
+    var it = std.mem.splitScalar(u8, channelListBody(&b, "Trade")[0 .. channelListBody(&b, "Trade").len - 1], 0);
+    while (it.next()) |name| {
+        if (name.len > 0) seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "a profile value loses control characters and is cut at its field" {
+    var b: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("Ede, NL", cleanProfileValue(&b, "Ede,\r\n\x1b NL\x00", 64));
+    try std.testing.expectEqualStrings("abcd", cleanProfileValue(&b, "abcdefgh", 4));
+    try std.testing.expectEqualStrings("", cleanProfileValue(&b, "\x01\x02", 4));
+}
+
+test "only the client's four profile fields are keys" {
+    try std.testing.expect(profileKey("profile\\sex") != null);
+    try std.testing.expect(profileKey("Profile\\Description") != null);
+    try std.testing.expect(profileKey("profile\\location") != null);
+    try std.testing.expect(profileKey("profile\\age") != null);
+    try std.testing.expect(profileKey("System\\Account Created") == null);
+    try std.testing.expect(profileKey("") == null);
+    var b: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("jaenster", lowerName(&b, "JaEnsTer"));
 }
