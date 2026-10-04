@@ -102,7 +102,23 @@ fn difficultyError(difficulty: u8, progression: u8, expansion: bool) ?u32 {
 /// A D2 game holds eight players; past that the engine's CreateClient refuses outright
 /// (`pGame->nClientsCount < 8`, D2Game/Game/Clients.cpp CreateClient @0x539a30). Turning
 /// a join away here means a clear "Game is Full." instead of a silent failure at the GS.
-const max_players_per_game: u16 = 8;
+const realm_proto = @import("realm_proto");
+const max_players_per_game: u16 = realm_proto.max_players_per_game;
+
+/// How many seats a game offers: what its creator chose, 1..8, and never more than the engine's
+/// own ceiling.
+fn seatLimit(max: u8) u32 {
+    return @min(max, max_players_per_game);
+}
+
+test "a game offers the seats its creator chose, never past eight" {
+    const t = std.testing;
+    try t.expectEqual(@as(u16, 8), max_players_per_game);
+    try t.expectEqual(@as(u32, 1), seatLimit(1));
+    try t.expectEqual(@as(u32, 4), seatLimit(4));
+    try t.expectEqual(@as(u32, 8), seatLimit(8));
+    try t.expectEqual(@as(u32, 8), seatLimit(200));
+}
 
 /// How long a join waits for a create that is still in flight for the same name, and how often it
 /// looks. Bounded: a client that waits is better than one told the game does not exist, but not at
@@ -696,7 +712,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const difficulty: u8 = @intCast(@min(@as(u32, 2), (create_flags >> 12) & 0x7));
     _ = r.getU8(); // unknown (1)
     _ = r.getU8(); // player difference
-    _ = r.getU8(); // max players
+    const max_players = realm_proto.gameMaxPlayers(r.getU8()); // max players
     const name = r.getStr();
     const pass = r.getStr();
     const desc = r.getStr();
@@ -804,7 +820,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // nowhere the realm can find it, and the client's very next packet is a JOINGAME for this name
     // — "game does not exist" right after reporting success. Fail the create instead; the GS reaps
     // the orphaned empty game on its own idle timer.
-    if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc)) {
+    if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc, max_players)) {
         store.releaseGameName(name);
         log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it: {s}", .{ name, rr.gameid, store.registerGameError() });
         return fail(c, &w, CREATE_ERROR_GENERIC);
@@ -925,13 +941,6 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "join game '{s}' (account={s}) -> difficulty {d} not unlocked (progression {d}) -> 0x{x}", .{ name, c.accountName(), g.difficulty, charProgression(c), why });
         return rejectJoin(c, &w, why);
     }
-    // The engine's CreateClient hard-refuses a ninth client, so a join that would exceed
-    // the cap is rejected while the client can still be told why. This is only trustworthy
-    // because the count now comes back down when players leave.
-    if (g.players >= max_players_per_game) {
-        log.line(tag, "join game '{s}' (account={s}) -> FULL ({d} players)", .{ name, c.accountName(), g.players });
-        return rejectJoin(c, &w, JOIN_FULL);
-    }
     // A character is in one game at a time. Checked HERE, upfront, because the game server's own
     // refusal answers nothing: the realm issues the join, the engine declines it silently, and the
     // player sits at a loading screen until the client times out. Taking the lock IS the check —
@@ -972,14 +981,23 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "join game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
         return rejectJoin(c, &w, JOIN_FULL);
     }
-    _ = store.addGameChar(g.gameid, c.accountName(), c.charName());
+    // The seat limit is enforced here, atomically, against every seat the game holds. The player
+    // count on the game record is no use for this: it carries the creator twice until the game
+    // server corrects it, and it is a snapshot two joins can both read before either takes the last
+    // seat. The engine's CreateClient refuses a client past the cap outright, so a join that would
+    // exceed it is turned away here, while the client can still be told why.
+    if (store.addGameChar(g.gameid, c.accountName(), c.charName(), seatLimit(g.max_players)) == .full) {
+        _ = store.unlockChar(c.accountName(), c.charName(), jowner);
+        log.line(tag, "join game '{s}' (account={s}) -> FULL (every seat taken or pending)", .{ name, c.accountName() });
+        return rejectJoin(c, &w, JOIN_FULL);
+    }
     // Stage the character into the shared store before the game server goes looking. The server
     // reads redis and nothing else, so a character that has only ever been in postgres would come
     // back missing — this read is what promotes it, and it is a no-op once it is there.
     warmChar(c.accountName(), c.charName());
     // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
     // both directions) as soon as the player is actually in the game.
-    if (!retaken) _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc());
+    if (!retaken) _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc(), g.max_players);
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
@@ -1121,7 +1139,7 @@ fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
     for (members[0..n]) |m| top_level = @max(top_level, m.level);
     w.putU8(top_level); // +0xb reference level
     w.putU8(0); // +0xc level difference: unrestricted
-    w.putU8(@intCast(max_players_per_game)); // +0xd max players
+    w.putU8(g.max_players); // +0xd max players: the creator's choice
     w.putU8(@intCast(n)); // +0xe player count — must match the strings below
 
     var i: usize = 0;

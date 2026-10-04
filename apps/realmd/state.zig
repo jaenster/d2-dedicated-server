@@ -79,6 +79,7 @@ pub const Game = struct {
     players: u16 = 0, // live player count for the join-screen list (the GS owns it)
     status: u8 = 0, // creator's .d2s status bits — what kind of game a joiner must match
     difficulty: u8 = 0, // 0 Normal, 1 Nightmare, 2 Hell
+    max_players: u8 = 8, // what the creator chose, 1..8
     password: [16]u8 = [_]u8{0} ** 16, // join password (empty = open game)
     pw_len: u8 = 0,
     description: [32]u8 = [_]u8{0} ** 32, // creator's blurb, shown beside the name
@@ -175,10 +176,10 @@ pub const State = struct {
     }
 
     /// Register (or replace, by name) a hosted game. Returns false if full.
-    pub fn registerGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8) bool {
+    pub fn registerGame(st: *State, name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, max_players: u8) bool {
         var kb: [max_key]u8 = undefined;
         const key = foldName(name, &kb);
-        if (shared) return store.registerGame(key, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description);
+        if (shared) return store.registerGame(key, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, max_players);
         st.lock.lock();
         defer st.lock.unlock();
         var slot: ?*Game = null;
@@ -200,6 +201,7 @@ pub const State = struct {
         g.players = players;
         g.status = status;
         g.difficulty = difficulty;
+        g.max_players = max_players;
         const pn: u8 = @intCast(@min(password.len, g.password.len));
         @memcpy(g.password[0..pn], password[0..pn]);
         g.pw_len = pn;
@@ -216,7 +218,7 @@ pub const State = struct {
         const key = foldName(name, &kb);
         if (shared) {
             const rec = store.findGame(key) orelse return null;
-            var g = Game{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status, .difficulty = rec.difficulty, .in_use = true };
+            var g = Game{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status, .difficulty = rec.difficulty, .max_players = rec.max_players, .in_use = true };
             const n: u8 = @intCast(@min(name.len, max_name));
             @memcpy(g.name[0..n], name[0..n]);
             g.name_len = n;

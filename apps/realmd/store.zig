@@ -470,8 +470,8 @@ pub fn registerGameError() []const u8 {
     return redis.game_register_error;
 }
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8) bool {
-    return redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, game_ttl_s);
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, max_players: u8) bool {
+    return redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, max_players, game_ttl_s);
 }
 
 /// Overwrite a hosted game's player count (UPDATEGAMEINFO from the GS that hosts it).
@@ -714,8 +714,8 @@ pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {
     return std.fmt.bufPrint(buf, "game:{d}", .{gameid}) catch buf[0..0];
 }
 
-pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
-    return redis.addGameChar(gameid, account, charname);
+pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: u32) redis.SeatResult {
+    return redis.addGameChar(gameid, account, charname, max);
 }
 
 /// One pass over a live game's seats: renew the confirmed ones, drop the ones that never arrived

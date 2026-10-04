@@ -1159,6 +1159,67 @@ fn scGameInfo() Result {
     return .{ .name = name, .status = .pass, .msg = msg("unknown=no-info; 2 players named+levelled, leave compacted to Frostie; desc '{s}'", .{d.description}) };
 }
 
+/// Opens a logged-in d2cs connection for `acct`, ready to create or join.
+fn openLobby(c: *rc.RealmClient, acct: []const u8) !void {
+    try c.connectBnet();
+    try c.auth();
+    try c.login(acct);
+    try c.enterRealm();
+    try c.connectD2cs();
+    if ((try c.startup()) != 0) return error.StartupFailed;
+}
+
+/// A game takes the players its creator chose and no more: the creator's own join is seat one, a
+/// join past the limit is refused with "Game is Full." (0x2b) and a zero address, and a refused
+/// join leaves the seat count where it was. Eight is the engine's ceiling, so a ninth is refused in
+/// a game that asked for eight.
+fn scGameMaxPlayers() Result {
+    const name = "game_max_players";
+    var gs = FakeGS{ .gsid = 0x4A11, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 9300 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    const Case = struct { game: []const u8, max: u8, seats: usize };
+    const cases = [_]Case{
+        .{ .game = "solo1", .max = 1, .seats = 1 },
+        .{ .game = "duo2", .max = 2, .seats = 2 },
+        .{ .game = "full8", .max = 8, .seats = 8 },
+    };
+    var clients: [9]rc.RealmClient = undefined;
+    for (&clients) |*cl| cl.* = .{};
+    defer for (&clients) |*cl| cl.close();
+
+    var round: usize = 0;
+    for (cases) |cs| {
+        // Every case uses its own accounts, so a seat held in one game cannot be what refuses a join in
+        // the next.
+        var abuf: [9][24]u8 = undefined;
+        var i: usize = 0;
+        while (i < cs.seats + 1) : (i += 1) {
+            const acct = std.fmt.bufPrint(&abuf[i], "Mp{d}x{d}", .{ round, i }) catch unreachable;
+            if (clients[i].d2cs != null) clients[i].close();
+            openLobby(&clients[i], acct) catch |e| return fail(name, "{s}: lobby for {s}: {s}", .{ cs.game, acct, @errorName(e) });
+        }
+        const cg = clients[0].createGameMax(cs.game, "d", cs.max) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (cg.result != 0) return fail(name, "{s}: create result={d}", .{ cs.game, cg.result });
+        i = 0;
+        while (i < cs.seats) : (i += 1) {
+            const j = clients[i].joinGame(cs.game) catch |e| return fail(name, "{s}", .{@errorName(e)});
+            if (j.result != 0) return fail(name, "{s}: join {d} of {d} -> 0x{x}, want 0", .{ cs.game, i + 1, cs.seats, j.result });
+        }
+        // Past the limit, twice: a refused join must not have taken a seat.
+        var extra: usize = 0;
+        while (extra < 2) : (extra += 1) {
+            const full = clients[cs.seats].joinGame(cs.game) catch |e| return fail(name, "{s}", .{@errorName(e)});
+            if (full.result != 0x2b) return fail(name, "{s}: join {d} of {d} -> 0x{x}, want 0x2b (game is full)", .{ cs.game, cs.seats + 1, cs.seats, full.result });
+            if (!std.mem.eql(u8, &full.ip, &[_]u8{ 0, 0, 0, 0 })) return fail(name, "{s}: a refused join carried address {any}, want zero", .{ cs.game, full.ip });
+        }
+        round += 1;
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("max 1: 2nd refused; max 2: 3rd refused; max 8: 9th refused (0x2b, zero address)", .{}) };
+}
+
 fn scJoinErrors() Result {
     const name = "join_error_codes";
     var gs = FakeGS{ .gsid = 0xE770, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 777 };
@@ -1192,21 +1253,7 @@ fn scJoinErrors() Result {
     const unnamed = c.createGame("", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (unnamed.result != 0x1e) return fail(name, "empty game name -> 0x{x}, want 0x1e (invalid game name)", .{unnamed.result});
 
-    // Eight is the engine's own ceiling (CreateClient refuses a ninth). Report a full game
-    // from the GS and the ninth join is turned away with "Game is Full." rather than being
-    // sent to a server that will drop it.
-    gs.sendUpdateGameInfo(777, 8, true) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    var full_result: u32 = 0;
-    var waited: u32 = 0;
-    while (waited < 2000) : (waited += 25) {
-        const j = c.joinGameWithPassword("pwgame", "letmein") catch |e| return fail(name, "{s}", .{@errorName(e)});
-        full_result = j.result;
-        if (full_result == 0x2b) break;
-        _ = net.usleep(25_000);
-    }
-    if (full_result != 0x2b) return fail(name, "join of a full game -> 0x{x}, want 0x2b (game is full)", .{full_result});
-
-    return .{ .name = name, .status = .pass, .msg = msg("missing=0x2a wrong-pw=0x29 ok=0 unnamed=0x1e full=0x2b", .{}) };
+    return .{ .name = name, .status = .pass, .msg = msg("missing=0x2a wrong-pw=0x29 ok=0 unnamed=0x1e", .{}) };
 }
 
 fn scFleetCapacity() Result {
@@ -3210,6 +3257,7 @@ pub fn main() !void {
         only("scSeatReleasedOnLeave", scSeatReleasedOnLeave),
         only("scUnconfirmedJoinRetaken", scUnconfirmedJoinRetaken),
         only("scJoinErrors", scJoinErrors),
+        only("scGameMaxPlayers", scGameMaxPlayers),
         only("scGameInfo", scGameInfo),
         only("scFleetCapacity", scFleetCapacity),
         only("scAdminApi", scAdminApi),

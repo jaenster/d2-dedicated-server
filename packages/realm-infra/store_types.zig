@@ -83,6 +83,9 @@ pub const GameRec = struct {
     /// 0 Normal, 1 Nightmare, 2 Hell. A character has to have progressed far enough to be
     /// allowed in, and the client has a specific message for each way that can fail.
     difficulty: u8 = 0,
+    /// Players the game takes: what the creator chose, 1..8. A record written before the
+    /// choice was kept reads back as 8.
+    max_players: u8 = 8,
     /// Game join password (empty = open game). Stored with the record so any realmd
     /// instance can validate a join. D2 passwords are short alphanumeric (no spaces).
     password: [16]u8 = [_]u8{0} ** 16,

@@ -1010,18 +1010,15 @@ pub fn expireSession(id: u64) void {
 
 // games (ephemeral, PX TTL, reverse indexed by id and by gs)
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, max_players: u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
     game_register_error = "";
     const safe = gameKey(name, &nb) orelse return regFail("name is empty, too long, or has characters outside printable ASCII");
 
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
-    var vb: [256]u8 = undefined;
-    // Fields: gameid ip port gsid players status difficulty <password> <description>. The password is a
-    // single token (may be empty); the description absorbs the rest, since it may
-    // contain spaces. Same encoding as the fs backend, so parseGame is shared in spirit.
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, status, difficulty, password, description }) catch return false;
+    var vb: [game_rec_max]u8 = undefined;
+    const body = formatGame(&vb, .{ .gameid = gameid, .gs_ip = gs_ip, .gs_port = gs_port, .gsid = gsid, .players = players, .status = status, .difficulty = difficulty, .max_players = max_players }, password, description) orelse return regFail("record does not fit");
     var ik: [64]u8 = undefined;
     const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
     var gb: [64]u8 = undefined;
@@ -1179,8 +1176,40 @@ pub fn findGame(name: []const u8) ?GameRec {
     return parseGame(val);
 }
 
-/// Decode the space-separated game record text.
-fn parseGame(val: []const u8) ?GameRec {
+const game_rec_max = 256;
+
+/// Encode a game record. Fields: gameid ip port gsid players status difficulty <password>
+/// <description>, space separated. The password is a single token (may be empty); the description
+/// absorbs the rest, since it may contain spaces. A game that takes fewer than eight players adds
+/// `\n#<max>` after the description; a record without it is byte for byte what it was before the
+/// cap was kept.
+fn formatGame(buf: []u8, rec: GameRec, password: []const u8, description: []const u8) ?[]const u8 {
+    // A newline in the description would read back as the start of the cap.
+    var db: [64]u8 = undefined;
+    const dn = @min(description.len, db.len);
+    for (description[0..dn], db[0..dn]) |c, *o| o.* = if (c == '\n') ' ' else c;
+    const ip = rec.gs_ip;
+    var head = std.fmt.bufPrint(buf, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{ rec.gameid, ip[0], ip[1], ip[2], ip[3], rec.gs_port, rec.gsid, rec.players, rec.status, rec.difficulty, password, db[0..dn] }) catch return null;
+    if (rec.max_players != 8) {
+        const cap = std.fmt.bufPrint(buf[head.len..], "\n#{d}", .{rec.max_players}) catch return null;
+        head = buf[0 .. head.len + cap.len];
+    }
+    return head;
+}
+
+/// Decode the game record text.
+fn parseGame(record: []const u8) ?GameRec {
+    var val = record;
+    var max_players: u8 = 8;
+    if (std.mem.lastIndexOfScalar(u8, val, '\n')) |nl| {
+        const line = val[nl + 1 ..];
+        if (line.len > 1 and line[0] == '#') {
+            if (std.fmt.parseInt(u8, line[1..], 10)) |m| {
+                if (m >= 1 and m <= 8) max_players = m;
+                val = val[0..nl];
+            } else |_| {}
+        }
+    }
     var it = std.mem.splitScalar(u8, val, ' ');
     const idtxt = it.next() orelse return null;
     const iptxt = it.next() orelse return null;
@@ -1195,7 +1224,7 @@ fn parseGame(val: []const u8) ?GameRec {
     if (i != 4) return null;
     const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
     const gsid: u32 = if (it.next()) |t| (std.fmt.parseInt(u32, t, 10) catch 0) else 0;
-    var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
+    var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid, .max_players = max_players };
     rec.players = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 0) else 0; // 5th
     rec.status = if (it.next()) |t| (std.fmt.parseInt(u8, t, 10) catch 0) else 0; // 6th
     rec.difficulty = if (it.next()) |t| (std.fmt.parseInt(u8, t, 10) catch 0) else 0; // 7th
@@ -1253,14 +1282,10 @@ fn updateGamePlayers(gameid: u32, set: ?u16, drop: u16) bool {
         .bulk => |b| b orelse return false,
         else => return false,
     };
-    const rec = parseGame(val) orelse return false;
-    const players: u16 = if (set) |p| p else rec.players -| drop;
-    var vb: [256]u8 = undefined;
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{
-        rec.gameid, rec.gs_ip[0], rec.gs_ip[1],   rec.gs_ip[2], rec.gs_ip[3], rec.gs_port,
-        rec.gsid,   players,      rec.status,     rec.difficulty,
-        rec.pw(),   rec.desc(),
-    }) catch return false;
+    var rec = parseGame(val) orelse return false;
+    rec.players = if (set) |p| p else rec.players -| drop;
+    var vb: [game_rec_max]u8 = undefined;
+    const body = formatGame(&vb, rec, rec.pw(), rec.desc()) orelse return false;
     return switch (command(s, &r, &.{ "SET", gamekey, body, "KEEPTTL" }) orelse return false) {
         .status, .bulk, .int => true,
         .array_len, .err => false,
@@ -1761,28 +1786,38 @@ pub fn cacheCharIfAbsent(account: []const u8, charname: []const u8, bytes: []con
 /// The game server reports a departure by character name only — it does not carry the account —
 /// so the realm has to keep the pairing itself. The set is keyed by game, which is also what
 /// makes closing a game able to free everything it held in one step.
-pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
+///
+/// `max` is the game's seat limit and is checked inside the same script that adds the seat, against
+/// every seat the game holds, so two joins racing for the last seat cannot both get it. A character
+/// already holding a seat is not counted against itself.
+pub const SeatResult = enum { taken, full, failed };
+
+pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: u32) SeatResult {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .failed;
     var pk: [64]u8 = undefined;
-    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
+    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return .failed;
     var sk: [64]u8 = undefined;
-    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return false;
+    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return .failed;
     var mb: [96]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return .failed;
     const script =
+        \\if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 and redis.call('SCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
         \\redis.call('SADD', KEYS[1], ARGV[1])
         \\local t = redis.call('TIME')
         \\redis.call('HSET', KEYS[2], ARGV[1], t[1] * 1000 + math.floor(t[2] / 1000))
         \\redis.call('HDEL', KEYS[3], ARGV[1])
         \\return 1
     ;
+    var xb: [16]u8 = undefined;
+    const mx = std.fmt.bufPrint(&xb, "{d}", .{max}) catch return .failed;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    return switch (command(s, &r, &.{ "EVAL", script, "3", key, pend, seen, member }) orelse return false) {
-        .int, .status, .bulk => true,
-        else => false,
+    return switch (command(s, &r, &.{ "EVAL", script, "3", key, pend, seen, member, mx }) orelse return .failed) {
+        .int => |v| if (v == 0) .full else .taken,
+        .status, .bulk => .taken,
+        else => .failed,
     };
 }
 
@@ -3275,9 +3310,9 @@ test "a restarted server's games release their characters, a live game's are kep
         _ = command(s, &r, &.{ "DEL", prefix ++ "charlock:orphan/Alive", prefix ++ "charlock:orphan/Stuck", prefix ++ "charlock:orphan/Other" });
     }
     try std.testing.expect(lockChar("orphan", "Alive", "game:10", 300));
-    try std.testing.expect(addGameChar(10, "orphan", "Alive"));
+    try std.testing.expect(addGameChar(10, "orphan", "Alive", 8) == .taken);
     try std.testing.expect(lockChar("orphan", "Stuck", "game:11", 300));
-    try std.testing.expect(addGameChar(11, "orphan", "Stuck"));
+    try std.testing.expect(addGameChar(11, "orphan", "Stuck", 8) == .taken);
     try std.testing.expect(lockChar("orphan", "Other", "someone-else", 300));
 
     // Other locks on the redis may belong to games that are gone too, so count only ours.
@@ -3331,7 +3366,7 @@ test "a join the server never confirmed is let go, and the character can be take
     testForget(gid, &.{"Ghost"});
     defer testForget(gid, &.{"Ghost"});
     try std.testing.expect(lockChar("acc", "Ghost", "game:910001", 60));
-    try std.testing.expect(addGameChar(gid, "acc", "Ghost"));
+    try std.testing.expect(addGameChar(gid, "acc", "Ghost", 8) == .taken);
     // Not yet past its time: left alone, and not renewed either.
     var sw = sweepGameSeats(gid, "game:910001", 300, 60_000, 240_000);
     try std.testing.expectEqual(@as(usize, 0), sw.renewed);
@@ -3354,7 +3389,7 @@ test "a confirmed seat is renewed and a leave clears the member set as well as t
     testForget(gid, &.{"Real"});
     defer testForget(gid, &.{"Real"});
     try std.testing.expect(lockChar("acc", "Real", "game:910003", 60));
-    try std.testing.expect(addGameChar(gid, "acc", "Real"));
+    try std.testing.expect(addGameChar(gid, "acc", "Real", 8) == .taken);
     try std.testing.expectEqual(@as(usize, 1), confirmGameChar(gid, "acc", "Real", "game:910003", 300, false));
     try std.testing.expect(!testIsMember(gid, "gamepend", "acc/Real"));
     _ = usleep(20_000);
@@ -3377,7 +3412,7 @@ test "a seat whose lock another game took is forgotten, not renewed" {
     testForget(gid, &.{"Moved"});
     defer testForget(gid, &.{"Moved"});
     try std.testing.expect(lockChar("acc", "Moved", "game:910004", 60));
-    try std.testing.expect(addGameChar(gid, "acc", "Moved"));
+    try std.testing.expect(addGameChar(gid, "acc", "Moved", 8) == .taken);
     _ = confirmGameChar(gid, "acc", "Moved", "game:910004", 300, false);
     try std.testing.expect(unlockChar("acc", "Moved", "game:910004"));
     try std.testing.expect(lockChar("acc", "Moved", "game:910005", 60));
@@ -3394,7 +3429,7 @@ test "a seat the server stopped reporting is released, but only for a server tha
     testForget(gid, &.{ "Quiet", "Loud" });
     defer testForget(gid, &.{ "Quiet", "Loud" });
     try std.testing.expect(lockChar("acc", "Quiet", "game:910006", 60));
-    try std.testing.expect(addGameChar(gid, "acc", "Quiet"));
+    try std.testing.expect(addGameChar(gid, "acc", "Quiet", 8) == .taken);
     // Confirmed by an enter notice: the server has never sent a presence notice for this game.
     _ = confirmGameChar(gid, "acc", "Quiet", "game:910006", 300, false);
     _ = usleep(20_000);
@@ -3403,7 +3438,7 @@ test "a seat the server stopped reporting is released, but only for a server tha
     try std.testing.expectEqual(@as(usize, 0), sw.unreported);
     // Now it does report, for somebody else; Quiet is not among them.
     try std.testing.expect(lockChar("acc", "Loud", "game:910006", 60));
-    try std.testing.expect(addGameChar(gid, "acc", "Loud"));
+    try std.testing.expect(addGameChar(gid, "acc", "Loud", 8) == .taken);
     _ = confirmGameChar(gid, "acc", "Loud", "game:910006", 300, true);
     _ = usleep(20_000);
     _ = confirmGameChar(gid, "acc", "Loud", "game:910006", 300, true);
@@ -3420,16 +3455,16 @@ test "an unconfirmed join is taken back out of the count only if the server has 
     const gid: u32 = 910007;
     testForget(gid, &.{ "Late", "Early" });
     defer testForget(gid, &.{ "Late", "Early" });
-    try std.testing.expect(registerGame("zz-seat-test", gid, .{ 127, 0, 0, 1 }, 4000, 1, 3, 0, 0, "", "", 60));
+    try std.testing.expect(registerGame("zz-seat-test", gid, .{ 127, 0, 0, 1 }, 4000, 1, 3, 0, 0, "", "", 8, 60));
     defer removeGameById(gid);
     try std.testing.expect(lockChar("acc", "Early", "game:910007", 60));
-    try std.testing.expect(addGameChar(gid, "acc", "Early"));
+    try std.testing.expect(addGameChar(gid, "acc", "Early", 8) == .taken);
     _ = usleep(20_000);
     // The server recounts after Early's join, so the count already says what is true.
     try std.testing.expect(setGamePlayers(gid, 2));
     _ = usleep(20_000);
     try std.testing.expect(lockChar("acc", "Late", "game:910007", 60));
-    try std.testing.expect(addGameChar(gid, "acc", "Late"));
+    try std.testing.expect(addGameChar(gid, "acc", "Late", 8) == .taken);
     _ = usleep(20_000);
     const sw = sweepGameSeats(gid, "game:910007", 300, 10, 240_000);
     try std.testing.expectEqual(@as(usize, 1), sw.unconfirmed);
@@ -3445,10 +3480,36 @@ test "the same game's unconfirmed seat can be taken back, a confirmed one cannot
     testForget(gid, &.{"Again"});
     defer testForget(gid, &.{"Again"});
     try std.testing.expect(lockChar("acc", "Again", "game:910008", 60));
-    try std.testing.expect(addGameChar(gid, "acc", "Again"));
+    try std.testing.expect(addGameChar(gid, "acc", "Again", 8) == .taken);
     try std.testing.expect(retakePendingChar(gid, "acc", "Again", "game:910008", 60));
     // A different game does not get to take it.
     try std.testing.expect(!retakePendingChar(910009, "acc", "Again", "game:910009", 60));
     _ = confirmGameChar(gid, "acc", "Again", "game:910008", 300, false);
     try std.testing.expect(!retakePendingChar(gid, "acc", "Again", "game:910008", 60));
+}
+
+test "a game record carries its cap after the description, and a full game's record is unchanged" {
+    var buf: [game_rec_max]u8 = undefined;
+    const full = formatGame(&buf, .{ .gameid = 3, .gs_ip = .{ 10, 0, 0, 1 }, .gs_port = 4100, .gsid = 9, .players = 2 }, "pw", "a b").?;
+    try std.testing.expectEqualStrings("3 10.0.0.1 4100 9 2 0 0 pw a b", full);
+    try std.testing.expectEqual(@as(u8, 8), parseGame(full).?.max_players);
+
+    var b4: [game_rec_max]u8 = undefined;
+    const four = formatGame(&b4, .{ .gameid = 3, .gs_ip = .{ 10, 0, 0, 1 }, .gs_port = 4100, .gsid = 9, .players = 2, .max_players = 4 }, "pw", "a b").?;
+    try std.testing.expectEqualStrings("3 10.0.0.1 4100 9 2 0 0 pw a b\n#4", four);
+    const g = parseGame(four).?;
+    try std.testing.expectEqual(@as(u8, 4), g.max_players);
+    try std.testing.expectEqualStrings("a b", g.desc());
+}
+
+test "the last seat goes to one join only" {
+    try testRedis();
+    const gid: u32 = 90_210;
+    testForget(gid, &.{});
+    defer testForget(gid, &.{});
+    try std.testing.expectEqual(SeatResult.taken, addGameChar(gid, "a", "One", 2));
+    try std.testing.expectEqual(SeatResult.taken, addGameChar(gid, "b", "Two", 2));
+    try std.testing.expectEqual(SeatResult.full, addGameChar(gid, "c", "Three", 2));
+    // A character already seated is not counted against itself.
+    try std.testing.expectEqual(SeatResult.taken, addGameChar(gid, "a", "One", 2));
 }

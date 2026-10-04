@@ -796,14 +796,19 @@ pub const AdInfo = struct {
     /// Create a game at a specific difficulty. It rides in bits 12-14 of the create flags
     /// (Normal 0, Nightmare 0x1000, Hell 0x2000).
     pub fn createGameDiff(self: *RealmClient, name: []const u8, desc: []const u8, difficulty: u2) !CreateResult {
-        return self.createGameFull(name, desc, "", @as(u32, difficulty) << 12);
+        return self.createGameFull(name, desc, "", @as(u32, difficulty) << 12, 8);
     }
 
     pub fn createGameWithPassword(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8) !CreateResult {
-        return self.createGameFull(name, desc, password, 0);
+        return self.createGameFull(name, desc, password, 0, 8);
     }
 
-    fn createGameFull(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8, flags: u32) !CreateResult {
+    /// Create a game that takes at most `max_players` players.
+    pub fn createGameMax(self: *RealmClient, name: []const u8, desc: []const u8, max_players: u8) !CreateResult {
+        return self.createGameFull(name, desc, "", 0, max_players);
+    }
+
+    fn createGameFull(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8, flags: u32, max_players: u8) !CreateResult {
         const fd = self.d2cs.?;
         var body: [128]u8 = undefined;
         var w = net.Writer.init(&body);
@@ -811,7 +816,7 @@ pub const AdInfo = struct {
         w.u32v(flags);
         w.u8v(1);
         w.u8v(0);
-        w.u8v(8); // max_players
+        w.u8v(max_players);
         w.cstr(name);
         w.cstr(password);
         w.cstr(desc);
