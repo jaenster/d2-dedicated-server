@@ -41,6 +41,7 @@ const cdkeydump = @import("runtime/cdkeydump.zig");
 const crash = @import("runtime/crash.zig");
 const memstat = @import("runtime/memstat.zig");
 const framepace = @import("runtime/framepace.zig");
+const clock = @import("clock");
 const tickstat = @import("runtime/tickstat.zig");
 
 /// A safety-check failure anywhere in this DLL logs where it happened and kills the
@@ -444,6 +445,14 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
         if (hasFlag("d2gs")) {
             log.print("d2gs: DLL_PROCESS_ATTACH (--d2gs)");
             log.hex("d2gs: Game.exe base=0x", @intFromPtr(GetModuleHandleA(null)));
+            // The game's GetTickCount and timeGetTime onto the process's millisecond clock (packages/clock),
+            // before any of its loops run: the server's 25 Hz gate and every tick difference to the millisecond.
+            {
+                const c = clock.install114d();
+                log.print(if (c.get_tick_count and c.time_get_time) "d2gs: clock: GetTickCount and timeGetTime count from the performance counter" else "d2gs: clock: a 1.14d import slot does not hold the system's function, not all redirected");
+                if (!c.get_tick_count) log.print("d2gs: clock: GetTickCount left to the system");
+                if (!c.time_get_time) log.print("d2gs: clock: timeGetTime left to the system");
+            }
             // Are we the dedicated GS process? --realm implies it (realm mode is meaningless
             // without a running server), so callers pass just `--realm` instead of pairing it
             // with --d2gs-boot. This one decision also gates the server_only features below.

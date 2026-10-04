@@ -14,7 +14,8 @@ const log = @import("../log.zig");
 const LAST_UPDATE_TICK: usize = 0x0088_3d58; // DWORD — logical frame time, carries the remainder
 const TIME_BETWEEN_FRAMES: usize = 0x0088_3d60; // DWORD — frame period, 40 ms at 25 fps
 
-extern "winmm" fn timeGetTime() callconv(.winapi) u32;
+// The game's timeGetTime is the process clock (packages/clock, installed at attach): read the same one.
+const clock = @import("clock");
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
 fn u32At(addr: usize) u32 {
@@ -39,7 +40,7 @@ pub fn sleepToNextFrame(fallback_ms: u32) void {
     }
     // The engine masks the clock to 31 bits before comparing, so match it or the arithmetic
     // disagrees with the accumulator once the tick count passes 0x7fffffff.
-    const now = timeGetTime() & 0x7fff_ffff;
+    const now = clock.timeGetTime() & 0x7fff_ffff;
     const due = (last +% period) & 0x7fff_ffff;
     const wait: u32 = if (due > now) due - now else 0;
     // Floor of 1 ms so a frame that is already due yields rather than spinning; ceiling of one

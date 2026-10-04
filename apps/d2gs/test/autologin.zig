@@ -9,7 +9,7 @@ const oog = @import("oog.zig");
 const bot = @import("../bot/bot.zig");
 const log = @import("../log.zig");
 
-extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
+const clock = @import("clock");
 
 var account: [64]u16 = undefined;
 var password: [64]u16 = undefined;
@@ -62,7 +62,7 @@ fn loginTask() void {
     log.print("autologin: entered realm with first char");
 
     enterGame();
-    log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
+    log.hex("autologin: script done — ms since dll-attach=0x", clock.tickCount() -% t_install);
 
     if (bot_enabled) _ = bot.runInline(bot_name_buf[0..bot_name_len]);
 }
@@ -106,13 +106,13 @@ fn createCharTask() void {
         log.print("autologin: create-character submitted")
     else
         log.print("autologin: create-character FAILED to drive the UI");
-    log.hex("autologin: script done — ms since dll-attach=0x", GetTickCount() -% t_install);
+    log.hex("autologin: script done — ms since dll-attach=0x", clock.tickCount() -% t_install);
 }
 
 /// Auto-login + CREATE a new character (then stop at char-select). class 0..6,
 /// status bits 0x20 expansion / 0x04 hardcore / 0x40 ladder.
 pub fn installCreateChar(acct: []const u8, pass: []const u8, name: []const u8, class: u8, status: u8) void {
-    t_install = GetTickCount();
+    t_install = clock.tickCount();
     toUtf16(&account, acct);
     toUtf16(&password, pass);
     toUtf16(&newchar_name, name);
@@ -124,7 +124,7 @@ pub fn installCreateChar(acct: []const u8, pass: []const u8, name: []const u8, c
 
 /// Auto-login + CREATE a game with the default name.
 pub fn install(acct: []const u8, pass: []const u8) void {
-    t_install = GetTickCount();
+    t_install = clock.tickCount();
     toUtf16(&account, acct);
     toUtf16(&password, pass);
     want_join = false;
@@ -134,7 +134,7 @@ pub fn install(acct: []const u8, pass: []const u8) void {
 
 /// Auto-login + JOIN an existing game by name.
 pub fn installJoin(acct: []const u8, pass: []const u8, game: []const u8) void {
-    t_install = GetTickCount();
+    t_install = clock.tickCount();
     toUtf16(&account, acct);
     toUtf16(&password, pass);
     var i: usize = 0;

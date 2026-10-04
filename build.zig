@@ -162,6 +162,9 @@ pub fn build(b: *std.Build) void {
     // As a module, not a relative import: the same file is the root of the `fastcall` module that
     // d2engine uses, and a file may belong to only one module.
     d2gs.root_module.addImport("fastcall", fastcall_mod);
+    // packages/clock — the process's millisecond clock.
+    const clock_mod = b.createModule(.{ .root_source_file = b.path("packages/clock/clock.zig") });
+    d2gs.root_module.addImport("clock", clock_mod);
     b.installArtifact(d2gs);
 
     // apps/d2host — the pre-1.14 shape of the same server: D2Game.dll driven as a library instead
@@ -398,6 +401,13 @@ pub fn build(b: *std.Build) void {
     // The extension surface is only type-checked where something declares the hooks; see the
     // realm-example comment above.
     test_step.dependOn(&realm_example.step);
+
+    const clock_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("packages/clock/clock.zig"),
+        .target = host,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(clock_tests).step);
 
     const realm_tests = b.addTest(.{
         .root_module = b.createModule(.{
