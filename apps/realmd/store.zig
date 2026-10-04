@@ -104,24 +104,48 @@ fn caseEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-pub fn listChars(account: []const u8, names: []Name) usize {
-    var n = pg.listChars(account, names);
-    var cached: [max_chars]Name = undefined;
-    const m = redis.listChars(account, &cached);
-    for (cached[0..m]) |c| {
+/// Fold the cache's names into the durable list, which arrives oldest first.
+///
+/// A name only the cache knows is a character whose first save has not flushed yet, so it is the
+/// newest there is and goes last. Among themselves they are put in name order — the cache's set
+/// has no order of its own, and a list that reshuffles between logins is exactly what this exists
+/// to prevent. Names already listed (any case) are skipped; whatever does not fit is dropped.
+fn mergeOldestFirst(names: []Name, durable: usize, cached: []const Name) usize {
+    var n = durable;
+    const first = n;
+    for (cached) |c| {
         if (n >= names.len) break;
         var seen = false;
         for (names[0..n]) |have| {
-            if (caseEql(have.slice(), c.slice())) {
-                seen = true;
-                break;
-            }
+            if (caseEql(have.slice(), c.slice())) seen = true;
         }
-        if (seen) continue;
-        names[n] = c;
-        n += 1;
+        if (!seen) {
+            names[n] = c;
+            n += 1;
+        }
     }
+    std.mem.sort(Name, names[first..n], {}, struct {
+        fn lt(_: void, x: Name, y: Name) bool {
+            return std.ascii.lessThanIgnoreCase(x.slice(), y.slice());
+        }
+    }.lt);
     return n;
+}
+
+/// In the order the characters were made, oldest first. The order is stored, so it holds across
+/// logins and across realm instances, and a request for the first sixteen of more gets the
+/// sixteen that sort first rather than whichever the store returned.
+pub fn listChars(account: []const u8, names: []Name) usize {
+    const n = pg.listChars(account, names);
+    var cached: [max_chars]Name = undefined;
+    const m = redis.listChars(account, &cached);
+    return mergeOldestFirst(names, n, cached[0..m]);
+}
+
+/// Record that the character was made now. Idempotent: a character that already has a row keeps
+/// its original stamp.
+pub fn markCreated(account: []const u8, charname: []const u8) void {
+    _ = pg.markCreated(account, charname);
 }
 
 /// The same list, with the engine each character belongs to.
@@ -802,4 +826,37 @@ pub fn chatPush(instance: u32, packet: []const u8) bool {
 
 pub fn chatPop(instance: u32, out: []u8) ?usize {
     return redis.chatPop(instance, out);
+}
+
+fn setName(n: *Name, v: []const u8) void {
+    @memcpy(n.buf[0..v.len], v);
+    n.len = @intCast(v.len);
+}
+
+test "mergeOldestFirst puts unflushed characters last, in name order" {
+    var names: [5]Name = [_]Name{.{}} ** 5;
+    setName(&names[0], "Old");
+    setName(&names[1], "Older");
+    var cached: [3]Name = .{ .{}, .{}, .{} };
+    setName(&cached[0], "zed");
+    setName(&cached[1], "OLD");
+    setName(&cached[2], "Amy");
+    const n = mergeOldestFirst(&names, 2, &cached);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("Old", names[0].slice());
+    try std.testing.expectEqualStrings("Older", names[1].slice());
+    try std.testing.expectEqualStrings("Amy", names[2].slice());
+    try std.testing.expectEqualStrings("zed", names[3].slice());
+}
+
+test "mergeOldestFirst drops the newest when the list is full" {
+    var names: [2]Name = [_]Name{.{}} ** 2;
+    setName(&names[0], "A");
+    setName(&names[1], "B");
+    var cached: [1]Name = .{.{}};
+    setName(&cached[0], "New");
+    const n = mergeOldestFirst(&names, 2, &cached);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("A", names[0].slice());
+    try std.testing.expectEqualStrings("B", names[1].slice());
 }

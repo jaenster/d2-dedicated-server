@@ -333,6 +333,9 @@ fn createSchema(p: *pg.Pool) !void {
         \\)
     , .{});
     _ = try p.exec("alter table chars add column if not exists version text not null default ''", .{});
+    // When the character was made, which is what orders the character list. Characters that
+    // predate the column all take the moment of the migration, so they tie and fall back to name.
+    _ = try p.exec("alter table chars add column if not exists created timestamptz not null default now()", .{});
     _ = try p.exec("alter table chars add column if not exists metadata jsonb not null default '{}'::jsonb", .{});
     // join password, player count + description (added separately so an existing table
     // migrates in place).
@@ -470,11 +473,31 @@ pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
     return true;
 }
 
+/// Oldest character first, as Battle.net listed them. Ties fall to name so the answer never
+/// depends on where Postgres happens to keep the rows.
+const char_order = " order by created asc, name asc";
+
+/// Stamp a character as made now, if it has no row yet. The insert is the same empty-bytes row the
+/// version stamp makes, and the flush fills the bytes in without touching the stamp, so the order
+/// is fixed at creation rather than whenever the first save reaches this table.
+pub fn markCreated(account: []const u8, charname: []const u8) bool {
+    var ab: [64]u8 = undefined;
+    var cb: [64]u8 = undefined;
+    const a = sanitize(account, &ab) orelse return false;
+    const c = sanitize(charname, &cb) orelse return false;
+    const p = ensurePool() orelse return false;
+    _ = p.exec(
+        \\insert into chars(account, name, d2s) values ($1, $2, ''::bytea)
+        \\on conflict (account, name) do nothing
+    , .{ a, c }) catch return false;
+    return true;
+}
+
 pub fn listChars(account: []const u8, names: []Name) usize {
     var ab: [64]u8 = undefined;
     const a = sanitize(account, &ab) orelse return 0;
     const p = ensurePool() orelse return 0;
-    var result = p.query("select name from chars where account = $1", .{a}) catch return 0;
+    var result = p.query("select name from chars where account = $1" ++ char_order, .{a}) catch return 0;
     defer result.deinit();
     var count: usize = 0;
     while (result.next() catch null) |row| {
@@ -600,7 +623,7 @@ pub fn listCharsFull(account: []const u8, out: []types.CharRec) usize {
     var ab: [64]u8 = undefined;
     const a = sanitize(account, &ab) orelse return 0;
     const p = ensurePool() orelse return 0;
-    var result = p.query("select name, version from chars where account = $1", .{a}) catch return 0;
+    var result = p.query("select name, version from chars where account = $1" ++ char_order, .{a}) catch return 0;
     defer result.deinit();
     var count: usize = 0;
     while (result.next() catch null) |row| {

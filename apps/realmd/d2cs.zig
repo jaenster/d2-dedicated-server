@@ -580,6 +580,7 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     // The request wins because it is the only one of the three that knows what the player picked.
     const asked = version.byEraCode(asked_era);
     const char_version = asked orelse hook.charVersion(acct, name, c.clientVersion()) orelse c.clientVersion();
+    store.markCreated(acct, name);
     if (char_version.len != 0) _ = store.setCharVersion(acct, name, char_version);
     log.line(tag, "char create '{s}' class={d} engine={s} (account={s}) -> created", .{ name, class, char_version, acct });
     // A successful create IS the character select: the client goes from the creation screen
