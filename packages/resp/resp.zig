@@ -20,6 +20,13 @@ pub const Reply = union(enum) {
     err: []const u8,
 };
 
+/// Whether an error reply says this node is no longer the master we meant to talk to: a replica
+/// refuses writes (`READONLY`) and one cut off from its master refuses everything (`MASTERDOWN`).
+/// Retrying on the same connection cannot succeed; it has to be dropped and dialled again.
+pub fn isWrongNode(err: []const u8) bool {
+    return std.mem.startsWith(u8, err, "READONLY") or std.mem.startsWith(u8, err, "MASTERDOWN");
+}
+
 /// What a parse attempt produced.
 pub const Parsed = union(enum) {
     /// A complete reply, and how many bytes of the input it consumed.
@@ -249,4 +256,12 @@ test "consumed lets replies be read back to back" {
     }
     try std.testing.expectEqual(@as(usize, 3), seen);
     try std.testing.expectEqual(wire.len, off);
+}
+
+test "only the replies of a node that is not the master are wrong-node errors" {
+    try std.testing.expect(isWrongNode("READONLY You can't write against a read only replica."));
+    try std.testing.expect(isWrongNode("MASTERDOWN Link with MASTER is down"));
+    try std.testing.expect(!isWrongNode("ERR unknown command"));
+    try std.testing.expect(!isWrongNode("WRONGTYPE Operation against a key"));
+    try std.testing.expect(!isWrongNode(""));
 }

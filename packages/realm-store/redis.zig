@@ -15,6 +15,7 @@ const net = @import("realm_infra").net;
 const Lock = @import("realm_infra").lock.Lock;
 const types = @import("realm_infra").types;
 const resp = @import("resp");
+const log = @import("realm_infra").log;
 
 const Name = types.Name;
 const GameRec = types.GameRec;
@@ -312,8 +313,28 @@ const Slot = struct {
 var slots = [_]Slot{.{}} ** POOL_N;
 var rotor = std.atomic.Value(u32).init(0);
 
+/// Set by `readReply` when the node answered READONLY or MASTERDOWN: the connection is to a node
+/// that is not the master (HAProxy does not close sessions of a server it marks down, so a
+/// connection opened while a replica was routed to stays on it). Per thread, because a thread
+/// holds one slot at a time. `acquire` clears it; `command`/`pipeline` retry on a fresh
+/// connection, and `release` drops the connection of any caller that did not.
+threadlocal var wrong_node: bool = false;
+
+/// One log line about a wrong-node connection. Silent under `zig test`, whose runner treats any
+/// stderr output as a failure.
+fn note(comptime fmt: []const u8, args: anytype) void {
+    if (@import("builtin").is_test) return;
+    log.line("redis", fmt, args);
+}
+
 /// Check out a connection. Always succeeds; the caller must release it.
 fn acquire() *Slot {
+    const s = acquireSlot();
+    wrong_node = false;
+    return s;
+}
+
+fn acquireSlot() *Slot {
     for (&slots) |*s| {
         if (s.lock.tryLock()) return s;
     }
@@ -325,6 +346,11 @@ fn acquire() *Slot {
 }
 
 fn release(s: *Slot) void {
+    if (wrong_node) {
+        wrong_node = false;
+        note("dropped a pooled connection to a node that is not the master", .{});
+        dropConn(s);
+    }
     s.lock.unlock();
 }
 
@@ -443,6 +469,7 @@ fn readReply(r: *Reader) ?Reply {
         switch (resp.parse(r.buf[r.pos..r.fill])) {
             .ok => |o| {
                 r.pos += o.consumed;
+                if (o.reply == .err and resp.isWrongNode(o.reply.err)) wrong_node = true;
                 return switch (o.reply) {
                     .status => |s| .{ .status = s },
                     .int => |v| .{ .int = v },
@@ -521,7 +548,20 @@ fn sendCommand(fd: net.Socket, args: []const []const u8) bool {
 /// header, with the parsed Reply. On any IO error the connection is dropped and
 /// null returned; caller re-locks and may retry on the fresh connection if it
 /// wants, but our ops simply treat a null as failure. Caller holds the slot.
+///
+/// A READONLY/MASTERDOWN reply means the pooled connection is to a node that is not the master:
+/// it is dropped and the command is sent once more on a fresh connection (the node refused it, so
+/// it did not run).
 fn command(s: *Slot, r: *Reader, args: []const []const u8) ?Reply {
+    const first = commandOnce(s, r, args);
+    if (!wrong_node) return first;
+    wrong_node = false;
+    note("{s}: node is not the master, retrying on a fresh connection", .{args[0]});
+    dropConn(s);
+    return commandOnce(s, r, args);
+}
+
+fn commandOnce(s: *Slot, r: *Reader, args: []const []const u8) ?Reply {
     const fd = ensureConn(s) orelse return null;
     r.* = .{ .fd = fd };
     if (!sendCommand(fd, args)) {
@@ -539,6 +579,15 @@ fn command(s: *Slot, r: *Reader, args: []const []const u8) ?Reply {
 /// all have to land but whose replies carry no value (callers needing a value use `command`).
 /// Every reply is consumed even on error, or the leftovers would desync the next caller.
 fn pipeline(s: *Slot, r: *Reader, cmds: []const []const []const u8) bool {
+    const first = pipelineOnce(s, r, cmds);
+    if (!wrong_node) return first;
+    wrong_node = false;
+    note("pipeline: node is not the master, retrying on a fresh connection", .{});
+    dropConn(s);
+    return pipelineOnce(s, r, cmds);
+}
+
+fn pipelineOnce(s: *Slot, r: *Reader, cmds: []const []const []const u8) bool {
     const fd = ensureConn(s) orelse return false;
     var c = CmdBuf{ .fd = fd };
     for (cmds) |args| c.add(args);
@@ -2872,4 +2921,44 @@ test "a reply split across several reads is reassembled" {
     var r = Reader{ .fd = p[0] };
     try std.testing.expectEqualStrings("abcdefghij", readReply(&r).?.bulk.?);
     t.join();
+}
+
+test "a READONLY reply drops the pooled connection and the command is retried on a fresh one" {
+    // Nothing listens on port 1, so the retry's dial fails: what the test sees is that the replica's
+    // connection was dropped (not kept for the next caller) and that the retry was attempted.
+    const saved_port = port;
+    port = 1;
+    defer port = saved_port;
+    const p = try fakePair();
+    defer net.closeSocket(p[1]);
+    const ro = "-READONLY You can't write against a read only replica.\r\n";
+    _ = std.c.write(p[1], ro, ro.len);
+    var slot = Slot{ .fd = p[0] };
+    const s = &slot;
+    wrong_node = false;
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "SET", "k", "v" });
+    try std.testing.expect(rep == null); // the retry could not connect, so there is no reply
+    try std.testing.expect(s.fd == null); // and the replica's connection is gone
+    try std.testing.expect(!wrong_node);
+}
+
+test "READONLY and MASTERDOWN mark the connection, other errors do not" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    defer net.closeSocket(p[1]);
+    wrong_node = false;
+    var r = Reader{ .fd = p[0] };
+    _ = std.c.write(p[1], "-ERR nope\r\n", 11);
+    try std.testing.expect(readReply(&r).? == .err);
+    try std.testing.expect(!wrong_node);
+    const md = "-MASTERDOWN Link with MASTER is down\r\n";
+    _ = std.c.write(p[1], md, md.len);
+    try std.testing.expect(readReply(&r).? == .err);
+    try std.testing.expect(wrong_node);
+    // A caller that never looked still hands back a connection that is not reused.
+    var slot = Slot{ .fd = null };
+    slot.lock.lock();
+    release(&slot);
+    try std.testing.expect(!wrong_node);
 }
