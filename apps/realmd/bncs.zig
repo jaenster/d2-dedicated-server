@@ -1017,7 +1017,18 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     const is_command = text.len > 0 and text[0] == '/';
     if (!c.in_channel and !is_command) return;
 
-    if (parseWhisper(text)) |w| {
+    var reply_buf: [chat.max_name]u8 = undefined;
+    var whisper = parseWhisper(text);
+    if (whisper == null) {
+        if (parseReply(text)) |msg| {
+            const target = chat.lastWhisperOf(c.fd, &reply_buf) orelse {
+                sendEvent(c, EID_ERROR, 0, "", "No one has whispered you.");
+                return;
+            };
+            whisper = .{ .target = target, .msg = msg };
+        }
+    }
+    if (whisper) |w| {
         // A recipient who squelched the sender never gets the whisper, but Battle.net
         // still shows the sender a normal "To <target>:" echo (no hint they're ignored).
         if (chat.fdOf(w.target)) |tfd| {
@@ -1032,7 +1043,7 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         // Local first — most whispers are between people on the same instance and cost nothing
         // extra. Only when nobody here answers to that name do we ask the rest of the realm,
         // which is the difference between "not logged on" and "not on THIS realmd".
-        var res = chat.whisperEx(w.target, bytes); // delivers unless target is in DND
+        var res = chat.whisperEx(w.target, acct, bytes); // delivers unless target is in DND
         if (!res.found) res = chat.whisperRemote(w.target, acct, bytes);
         if (!res.found) {
             sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
@@ -1116,6 +1127,12 @@ fn afterVerb(text: []const u8, verb: []const u8) ?[]const u8 {
 /// and /msg used to fall through and do nothing at all. The client compares them with
 /// stricmp, so this does too.
 const whisper_verbs = [_][]const u8{ "/w", "/whisper", "/m", "/msg" };
+
+/// "/r <text>" and "/reply <text>": the 1.14d client has no handler for them and forwards the
+/// line verbatim, so the realm answers the last person who whispered this connection.
+fn parseReply(text: []const u8) ?[]const u8 {
+    return afterVerb(text, "/r") orelse afterVerb(text, "/reply");
+}
 
 fn parseWhisper(text: []const u8) ?Whisper {
     for (whisper_verbs) |v| {
@@ -1232,6 +1249,7 @@ fn handleHelpCmd(c: *Conn, text: []const u8) bool {
     const lines = [_][]const u8{
         "Commands:",
         "  /w /whisper /m /msg <name> <text>  send a private message",
+        "  /r /reply <text>                   answer the last whisper",
         "  /f l|a|r|m|p|d                     friends: list, add, remove, message all, promote, demote",
         "  /away [message]                    set or clear an away reply",
         "  /dnd [message]                     block incoming whispers",
@@ -1297,7 +1315,7 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
                 if (chat.fdOf(f.nameSlice())) |tfd| {
                     if (chat.recipientIgnores(tfd, acct)) continue;
                 }
-                var res = chat.whisperEx(f.nameSlice(), bytes);
+                var res = chat.whisperEx(f.nameSlice(), acct, bytes);
                 if (!res.found) res = chat.whisperRemote(f.nameSlice(), acct, bytes);
                 if (res.found) sent += 1;
             }

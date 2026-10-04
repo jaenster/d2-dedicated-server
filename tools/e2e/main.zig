@@ -1639,6 +1639,24 @@ fn scChatCommands() Result {
         if (!got) return fail(name, "'{s}' did not arrive as a whisper", .{alias});
     }
 
+    // The client has no /r of its own and forwards it, so the realm answers the last whisperer.
+    const replies = [_][]const u8{ "/r", "/reply", "/R" };
+    for (replies) |verb| {
+        var buf: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{s} back{s}", .{ verb, verb }) catch return fail(name, "fmt", .{});
+        b.chatCommand(line) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+
+        var got = false;
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            const ev = a.readChatEvent() catch break;
+            if (ev.eid != rc.EID_WHISPER) continue;
+            got = std.mem.indexOf(u8, ev.text, "back") != null;
+            break;
+        }
+        if (!got) return fail(name, "'{s}' did not reach the last whisperer", .{verb});
+    }
+
     // /help is forwarded by the client because it cannot answer it; a blank reply is
     // indistinguishable from the command doing nothing.
     a.chatCommand("/help") catch |e| return fail(name, "A {s}", .{@errorName(e)});
@@ -1658,7 +1676,7 @@ fn scChatCommands() Result {
     a.chatCommand("/notacommand") catch |e| return fail(name, "A {s}", .{@errorName(e)});
     var told = false;
     i = 0;
-    while (i < 8) : (i += 1) {
+    while (i < 32) : (i += 1) {
         const ev = a.readChatEvent() catch break;
         if (ev.eid != rc.EID_ERROR) continue;
         told = std.mem.indexOf(u8, ev.text, "not a valid command") != null;
@@ -1666,7 +1684,7 @@ fn scChatCommands() Result {
     }
     if (!told) return fail(name, "an unknown command was not reported as one", .{});
 
-    return .{ .name = name, .status = .pass, .msg = msg("6 whisper aliases delivered, /help lists commands, unknown command reported", .{}) };
+    return .{ .name = name, .status = .pass, .msg = msg("6 whisper aliases and /r replies delivered, /help lists commands, unknown command reported", .{}) };
 }
 
 /// The chat lobby names people by CHARACTER and account: the 1.14d client splits a channel username

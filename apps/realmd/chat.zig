@@ -46,8 +46,16 @@ pub const Member = struct {
     ignores: [max_ignores][max_name]u8 = [_][max_name]u8{[_]u8{0} ** max_name} ** max_ignores,
     ignore_lens: [max_ignores]u8 = [_]u8{0} ** max_ignores,
     ignore_count: u8 = 0,
+    /// Who whispered this member last, by account name, so "/r" has someone to answer.
+    last_whisper: [max_name]u8 = [_]u8{0} ** max_name,
+    last_whisper_len: u8 = 0,
     send_lock: Lock = .{},
 
+    pub fn setLastWhisper(m: *Member, from: []const u8) void {
+        const n: u8 = @intCast(@min(from.len, max_name));
+        @memcpy(m.last_whisper[0..n], from[0..n]);
+        m.last_whisper_len = n;
+    }
     pub fn nameSlice(m: *const Member) []const u8 {
         return m.name[0..m.name_len];
     }
@@ -371,15 +379,29 @@ pub const WhisperResult = struct {
         return w.away[0..w.away_len];
     }
 };
-pub fn whisperEx(name: []const u8, bytes: []const u8) WhisperResult {
+pub fn whisperEx(name: []const u8, from: []const u8, bytes: []const u8) WhisperResult {
     reg.lock.lock();
     defer reg.lock.unlock();
     const m = findByNameLocked(name) orelse return .{};
     var res = WhisperResult{ .found = true, .dnd_len = m.dnd_len, .away_len = m.away_len };
     @memcpy(res.dnd[0..m.dnd_len], m.dndSlice());
     @memcpy(res.away[0..m.away_len], m.awaySlice());
-    if (m.dnd_len == 0) sendTo(m, bytes); // DND suppresses delivery
+    if (m.dnd_len == 0) { // DND suppresses delivery
+        m.setLastWhisper(from);
+        sendTo(m, bytes);
+    }
     return res;
+}
+
+/// The account that whispered `fd`'s member last, copied into `out`; null when nobody has.
+pub fn lastWhisperOf(fd: net.Socket, out: []u8) ?[]const u8 {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByFdLocked(fd) orelse return null;
+    if (m.last_whisper_len == 0) return null;
+    const n = @min(m.last_whisper_len, out.len);
+    @memcpy(out[0..n], m.last_whisper[0..n]);
+    return out[0..n];
 }
 
 /// The fd of an online member by name (for ops /kick), or null. The caller acts on
@@ -789,6 +811,7 @@ fn applyInbox(ev: []const u8) void {
             reg.lock.lock();
             defer reg.lock.unlock();
             const m = findByNameLocked(name) orelse return;
+            m.setLastWhisper(sender);
             sendTo(m, payload);
         },
         else => {},
