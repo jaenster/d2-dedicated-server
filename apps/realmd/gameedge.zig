@@ -19,9 +19,9 @@ const MIN_LOGON_BYTES: usize = TOKEN_OFFSET + 2;
 pub fn handle(fd: net.Socket, tag: []const u8) void {
     // Speak 0xAF00 (ack-only) for the GS we haven't dialled yet — the client needs a
     // connection-established packet to advance, but we can't route until we read its
-    // GAMELOGON token. The GS's own 0xAF01 (relayed once spliced) does the real flip
-    // to the compressed game phase; sending 0xAF00 here keeps the client in the raw
-    // handshake phase so that switch isn't duplicated/desynced.
+    // GAMELOGON token. This is the client's only greeting: the GS's own is dropped from the
+    // splice (see `pump`), as d2ingress does, because a second one reaches the client's
+    // handler again and the join never goes on.
     if (!net.writeAll(fd, &[_]u8{ 0xaf, 0x00 })) return;
 
     // Accumulate the client's first packet until the GAMELOGON token is readable.
@@ -65,14 +65,37 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     t.join();
 }
 
+/// How many leading bytes of the GS's first output are its 0xAF greeting frame: 2 for 0xAF00, else byte[1]+1 (the
+/// client's packet demux). 0 when `buf` does not begin with a complete one. The edge has already greeted the client
+/// (0xAF00, before the logon could be read), so the engine's own greeting must not reach it: a second one reaches
+/// the client's handler again and the join never goes on (d2ingress strips it the same way).
+fn greetingStripLen(buf: []const u8) usize {
+    if (buf.len < 2 or buf[0] != 0xaf) return 0;
+    const n: usize = if (buf[1] == 0) 2 else @as(usize, buf[1]) + 1;
+    return if (n <= buf.len) n else 0;
+}
+
+test "greetingStripLen: the engine's greeting is dropped, its payload kept" {
+    try std.testing.expectEqual(@as(usize, 2), greetingStripLen(&.{ 0xaf, 0x00 }));
+    try std.testing.expectEqual(@as(usize, 2), greetingStripLen(&.{ 0xaf, 0x00, 0x01, 0x02 }));
+    try std.testing.expectEqual(@as(usize, 0), greetingStripLen(&.{0xaf}));
+    try std.testing.expectEqual(@as(usize, 0), greetingStripLen(&.{ 0x01, 0xaf }));
+}
+
 const Splice = struct { cli: net.Socket, gs: net.Socket };
 
 fn pump(sp: *Splice, from: net.Socket, to: net.Socket) void {
     var buf: [16384]u8 = undefined;
+    var first = from == sp.gs; // the engine's greeting leads its first output only
     while (true) {
         const n = net.readSome(from, &buf);
         if (n == 0) break;
-        if (!net.writeAll(to, buf[0..n])) break;
+        var off: usize = 0;
+        if (first) {
+            first = false;
+            off = greetingStripLen(buf[0..n]);
+        }
+        if (off < n and !net.writeAll(to, buf[off..n])) break;
     }
     net.shutdownSocket(sp.cli);
     net.shutdownSocket(sp.gs);
