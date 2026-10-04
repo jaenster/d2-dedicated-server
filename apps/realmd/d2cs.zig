@@ -379,28 +379,54 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putU16(ret); // number returned in this packet
     var i: usize = 0;
     while (i < ret) : (i += 1) {
-        // Pull class@0x28, level@0x2b and the status byte@0x24 from the .d2s for
-        // the statstring the client's CharSel renders the list from.
-        var save: [1024]u8 = undefined;
-        const n = store.getCharD2s(c.accountName(), names[i].slice(), &save);
-        const class: u8 = if (n > 0x2b) save[0x28] else 1;
-        const level: u8 = if (n > 0x2b) save[0x2b] else 1;
-        const status: u8 = if (n > 0x24) save[0x24] else 0x20; // default to expansion
-        const progression: u8 = if (n > 0x25) save[0x25] else 0; // title (difficulty completed)
-        // The .d2s header carries the menu-composite appearance the game wrote on save:
-        // pAppearance1@0x88 = body-component graphic codes, pAppearance2@0x98 = color
-        // transforms (16 each; the statstring uses the first 11). Empty => naked preview.
-        const have_app = n > 0xA2;
-        const app1: []const u8 = if (have_app) save[0x88..0x93] else &.{};
-        const app2: []const u8 = if (have_app) save[0x98..0xA3] else &.{};
-
         w.putU32(0xFFFF_FFFF); // expiration — far future so it's NOT "expired"
         w.putStr(names[i].slice()); // character name
-        const era = eraCode(store.charVersion(c.accountName(), names[i].slice()).slice());
-        writeStatString(&w, class, level, status, progression, @intCast(total), app1, app2, era); // CharSel.cpp layout
+        writeCharStat(&w, c.accountName(), names[i].slice(), @intCast(total)); // CharSel.cpp layout
         w.putU8(0); // statstring C-string terminator
     }
     finish(c, &w);
+}
+
+/// A character's statstring, from the head of its .d2s: class@0x28, level@0x2b, status@0x24,
+/// progression@0x25 (the title, difficulty completed), and the menu-composite appearance the game
+/// wrote on save (pAppearance1@0x88 body-component graphic codes, pAppearance2@0x98 colour
+/// transforms, 16 each; the statstring uses the first 11). No appearance is a naked preview.
+fn writeCharStat(w: *proto.Writer, account: []const u8, charname: []const u8, realm_count: u32) void {
+    var save: [1024]u8 = undefined;
+    const n = store.getCharD2s(account, charname, &save);
+    writeCharStatFrom(w, account, charname, realm_count, save[0..n]);
+}
+
+fn writeCharStatFrom(w: *proto.Writer, account: []const u8, charname: []const u8, realm_count: u32, save: []const u8) void {
+    const n = save.len;
+    const class: u8 = if (n > 0x2b) save[0x28] else 1;
+    const level: u8 = if (n > 0x2b) save[0x2b] else 1;
+    const status: u8 = if (n > 0x24) save[0x24] else 0x20; // default to expansion
+    const progression: u8 = if (n > 0x25) save[0x25] else 0;
+    const have_app = n > 0xA2;
+    const app1: []const u8 = if (have_app) save[0x88..0x93] else &.{};
+    const app2: []const u8 = if (have_app) save[0x98..0xA3] else &.{};
+    const era = eraCode(store.charVersion(account, charname).slice());
+    writeStatString(w, class, level, status, progression, realm_count, app1, app2, era);
+}
+
+/// The statstring the lobby's user list draws a character from, as Battle.net sent it for a
+/// Diablo II user: the product tag, `realm,charname,` and then the same blob the character list
+/// carries (class, level, gear, flags). The client takes the portrait, class, level and realm out of
+/// it and draws an "unknown" user when the tag is missing. Null when the account has no such
+/// character.
+pub fn chatStat(out: []u8, tag: []const u8, realm: []const u8, account: []const u8, charname: []const u8) ?[]const u8 {
+    var save: [1024]u8 = undefined;
+    const n = store.getCharD2s(account, charname, &save);
+    if (n == 0) return null;
+    var w = proto.Writer.init(out);
+    w.putBytes(tag);
+    w.putBytes(realm);
+    w.putU8(',');
+    w.putBytes(charname);
+    w.putU8(',');
+    writeCharStatFrom(&w, account, charname, 1, save[0..n]);
+    return w.slice();
 }
 
 /// The two characters that stand for an engine in a character's guild tag.
@@ -1244,4 +1270,22 @@ fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const name = r.getStr();
     log.line(tag, "char rank request '{s}' (client has no 0x16 handler; nothing to reply)", .{name});
+}
+
+test "a chat statstring is the character list's blob behind the product tag, with no NUL in it" {
+    var b: [128]u8 = undefined;
+    var w = proto.Writer.init(&b);
+    w.putBytes("PX2D");
+    w.putBytes("TypeGuru");
+    w.putU8(',');
+    w.putBytes("Sorc");
+    w.putU8(',');
+    const at = w.pos;
+    writeStatString(&w, 1, 42, 0x20, 3, 1, &.{}, &.{}, "14");
+    const s = w.slice();
+    // what the client's parser reads after the second comma: class at 13, level at 25, the flags at 26
+    const blob = s[at..];
+    try std.testing.expectEqual(@as(u8, 2), blob[13]); // class + 1
+    try std.testing.expectEqual(@as(u8, 42), blob[25]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, s, 0) == null);
 }

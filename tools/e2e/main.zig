@@ -1109,10 +1109,6 @@ fn scFleetCapacity() Result {
     return .{ .name = name, .status = .pass, .msg = msg("spread a={d} b={d}, 3rd rejected (result={d})", .{ gs_a.creates, gs_b.creates, r3 }) };
 }
 
-/// The chat lobby has to name people by their CHARACTER. The 1.14d client splits a channel
-/// username on '*' and draws the part after it (COMCALLBACK_FormatChannelUserData @0x4471b0);
-/// realmd used to substitute the account name, which has no '*', so the list showed accounts
-/// and the client had no character to render at all.
 /// The slash commands the 1.14d client forwards. It intercepts a few locally (/fps,
 /// /players, /nopickup) but hands the rest to the realm verbatim, including whisper
 /// aliases realmd did not recognise and /help, which it cannot answer itself.
@@ -1373,7 +1369,7 @@ fn scConcurrentClients() Result {
     defer after.close();
     after.connectBnet() catch |e| return fail(name, "realm stopped accepting after the load: {s}", .{@errorName(e)});
     after.auth() catch |e| return fail(name, "auth after load: {s}", .{@errorName(e)});
-    after.login("StressAfter") catch |e| return fail(name, "login after load: {s}", .{@errorName(e)});
+    after.login("AfterLoad") catch |e| return fail(name, "login after load: {s}", .{@errorName(e)});
     after.enterChat() catch |e| return fail(name, "enterChat after load: {s}", .{@errorName(e)});
     after.joinChannel("Diablo II") catch |e| return fail(name, "joinChannel after load: {s}", .{@errorName(e)});
     after.setBnetTimeout(1500);
@@ -1385,7 +1381,10 @@ fn scConcurrentClients() Result {
     while (i < 64) : (i += 1) {
         const ev = after.readChatEvent() catch break;
         if (ev.eid != rc.EID_SHOWUSER) continue;
-        if (std.mem.indexOf(u8, ev.username, "Stress") != null) ghosts += 1;
+        if (std.mem.indexOf(u8, ev.username, "Stress") != null) {
+            std.debug.print("channel still lists '{s}'\n", .{ev.username});
+            ghosts += 1;
+        }
     }
     if (ghosts > 0) return fail(name, "{d} disconnected clients are still in the channel", .{ghosts});
 
@@ -1462,7 +1461,7 @@ fn scNameResolution() Result {
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.login("ResolveAcctA") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    a.enterChatAs("Clan*Amazon", "PX2D") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("Amazon", "TypeGuru,Amazon") catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.setBnetTimeout(2000);
 
@@ -1471,7 +1470,7 @@ fn scNameResolution() Result {
     b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.login("ResolveAcctB") catch |e| return fail(name, "B {s}", .{@errorName(e)});
-    b.enterChatAs("Clan*Necro", "PX2D") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChatAs("Necro", "TypeGuru,Necro") catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.setBnetTimeout(2000);
     _ = net.usleep(150_000);
@@ -1489,7 +1488,7 @@ fn scNameResolution() Result {
     if (!got) return fail(name, "a whisper to the character name never arrived", .{});
 
     // And by the full chat identity.
-    b.chatCommand("/w Clan*Amazon and again") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.chatCommand("/w Amazon*ResolveAcctA and again") catch |e| return fail(name, "B {s}", .{@errorName(e)});
     got = false;
     i = 0;
     while (i < 10) : (i += 1) {
@@ -1498,7 +1497,7 @@ fn scNameResolution() Result {
         got = std.mem.indexOf(u8, ev.text, "and again") != null;
         break;
     }
-    if (!got) return fail(name, "a whisper to the full clan*char identity never arrived", .{});
+    if (!got) return fail(name, "a whisper to the full char*account identity never arrived", .{});
 
     // /whois by character name has to find them too.
     b.chatCommand("/whois Amazon") catch |e| return fail(name, "B {s}", .{@errorName(e)});
@@ -1607,7 +1606,7 @@ fn scChatCommands() Result {
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.login("CmdAlice") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    a.enterChat() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("AliceChar", "TypeGuru,AliceChar") catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.setBnetTimeout(2000);
 
@@ -1670,6 +1669,9 @@ fn scChatCommands() Result {
     return .{ .name = name, .status = .pass, .msg = msg("6 whisper aliases delivered, /help lists commands, unknown command reported", .{}) };
 }
 
+/// The chat lobby names people by CHARACTER and account: the 1.14d client splits a channel username
+/// on '*' (COMCALLBACK_FormatChannelUserData @0x4471b0) and matches its own name and each row by
+/// the account after it.
 fn scLobbyCharNames() Result {
     const name = "lobby_char_names";
     const channel = "Diablo II";
@@ -1679,10 +1681,11 @@ fn scLobbyCharNames() Result {
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.login("CharAcctA") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    // What a real client asks to be known as: clan tag, '*', then the character.
-    a.enterChatAs("Clanny*Sorceress", "PX2D") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    if (!std.mem.eql(u8, a.uniqueName(), "Clanny*Sorceress"))
-        return fail(name, "ENTERCHAT unique name is '{s}', want the requested 'Clanny*Sorceress'", .{a.uniqueName()});
+    // What a real client asks to be known as: the bare character, and "<realm>,<character>". The realm
+    // answers with Battle.net's unique name for a Diablo II user, charname*account.
+    a.enterChatAs("Sorceress", "TypeGuru,Sorceress") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    if (!std.mem.eql(u8, a.uniqueName(), "Sorceress*CharAcctA"))
+        return fail(name, "ENTERCHAT unique name is '{s}', want 'Sorceress*CharAcctA'", .{a.uniqueName()});
     a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
 
     var b = rc.RealmClient{};
@@ -1690,7 +1693,7 @@ fn scLobbyCharNames() Result {
     b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.login("CharAcctB") catch |e| return fail(name, "B {s}", .{@errorName(e)});
-    b.enterChatAs("Clanny*Barbarian", "PX2D") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChatAs("Barbarian", "TypeGuru,Barbarian") catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.setBnetTimeout(2000);
     b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
 
@@ -1703,7 +1706,7 @@ fn scLobbyCharNames() Result {
     while (i < 12) : (i += 1) {
         const ev = b.readChatEvent() catch break;
         if (ev.eid != rc.EID_SHOWUSER and ev.eid != rc.EID_JOIN) continue;
-        if (std.mem.eql(u8, ev.username, "Clanny*Sorceress")) {
+        if (std.mem.eql(u8, ev.username, "Sorceress*CharAcctA")) {
             saw_a = true;
             break;
         }
@@ -1726,11 +1729,116 @@ fn scLobbyCharNames() Result {
     while (i < 8) : (i += 1) {
         const ev = b.readChatEvent() catch |e| return fail(name, "B no TALK ({s})", .{@errorName(e)});
         if (ev.eid != rc.EID_TALK) continue;
-        if (!std.mem.eql(u8, ev.username, "Clanny*Sorceress"))
-            return fail(name, "TALK came from '{s}', want 'Clanny*Sorceress'", .{ev.username});
-        return .{ .name = name, .status = .pass, .msg = msg("channel list and chat both name A 'Clanny*Sorceress' (character, not CharAcctA)", .{}) };
+        if (!std.mem.eql(u8, ev.username, "Sorceress*CharAcctA"))
+            return fail(name, "TALK came from '{s}', want 'Sorceress*CharAcctA'", .{ev.username});
+        return .{ .name = name, .status = .pass, .msg = msg("channel list and chat both name A 'Sorceress*CharAcctA' (character and account)", .{}) };
     }
     return fail(name, "B never received A's TALK", .{});
+}
+
+/// The next event of kind `eid` a client is sent within `tries` events; null when none comes.
+fn nextEvent(c: *rc.RealmClient, eid: u32, tries: usize) ?rc.ChatEvent {
+    var i: usize = 0;
+    while (i < tries) : (i += 1) {
+        const ev = c.readChatEvent() catch return null;
+        if (ev.eid == eid) return ev;
+    }
+    return null;
+}
+
+/// The whole SID_CHATEVENT sequence Battle.net sent a Diablo II client: on a join EID_CHANNEL
+/// (the channel's name in the TEXT) and an EID_SHOWUSER for every user in the channel, the joiner
+/// included, each named charname*account with the statstring the list is drawn from; EID_JOIN and
+/// EID_LEAVE to the others; talk from the speaker's name and NOT echoed back (the client draws its
+/// own); a whisper from the sender's name, echoed to the sender as EID_WHISPERSENT naming the
+/// target; EID_EMOTE to everyone including the speaker.
+fn scLobbyChatEvents() Result {
+    const name = "lobby_chat_events";
+    const channel = "Diablo II";
+    const name_a = "EvSorc*EvAcctA";
+    const name_b = "EvNecro*EvAcctB";
+    var save: [0x80]u8 = undefined;
+    _ = rc.storePutChar("EvAcctA", "EvSorc", d2sWithProgression(&save, "EvSorc", 1, 33, 0)) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+    _ = rc.storePutChar("EvAcctB", "EvNecro", d2sWithProgression(&save, "EvNecro", 2, 44, 0)) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("EvAcctA") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("EvSorc", "TypeGuru,EvSorc") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    if (!std.mem.eql(u8, a.uniqueName(), name_a)) return fail(name, "A's unique name is '{s}'", .{a.uniqueName()});
+    a.setBnetTimeout(1500);
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+
+    // The joiner is told the channel by its name in the text, and finds itself in the list.
+    const ch = nextEvent(&a, rc.EID_CHANNEL, 4) orelse return fail(name, "A got no EID_CHANNEL", .{});
+    if (!std.mem.eql(u8, ch.text, channel)) return fail(name, "EID_CHANNEL text is '{s}', want the channel's name", .{ch.text});
+    const self_a = nextEvent(&a, rc.EID_SHOWUSER, 4) orelse return fail(name, "A is not in its own user list", .{});
+    if (!std.mem.eql(u8, self_a.username, name_a)) return fail(name, "A's own row is '{s}', want '{s}'", .{ self_a.username, name_a });
+    if (!std.mem.startsWith(u8, self_a.text, "PX2DTypeGuru,EvSorc,"))
+        return fail(name, "A's statstring is '{s}', want PX2D + realm,character,", .{self_a.text});
+    // class + 1 at 13 of the blob after the second comma, level at 25
+    const blob = self_a.text["PX2DTypeGuru,EvSorc,".len..];
+    if (blob.len < 28 or blob[13] != 2 or blob[25] != 33) return fail(name, "A's statstring carries class {d} level {d}, want the saved 2/33", .{ blob[13], blob[25] });
+
+    var b = rc.RealmClient{};
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.login("EvAcctB") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChatAs("EvNecro", "TypeGuru,EvNecro") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.setBnetTimeout(1500);
+    b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+
+    // B sees the channel, then both users, itself among them.
+    if (nextEvent(&b, rc.EID_CHANNEL, 2) == null) return fail(name, "B got no EID_CHANNEL", .{});
+    var saw_a = false;
+    var saw_b = false;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const ev = nextEvent(&b, rc.EID_SHOWUSER, 3) orelse break;
+        if (std.mem.eql(u8, ev.username, name_a)) saw_a = true;
+        if (std.mem.eql(u8, ev.username, name_b)) saw_b = true;
+    }
+    if (!saw_a or !saw_b) return fail(name, "B's user list: saw A={any} B={any}", .{ saw_a, saw_b });
+
+    // A is told B joined, with B's statstring.
+    const jb = nextEvent(&a, rc.EID_JOIN, 4) orelse return fail(name, "A never saw B join", .{});
+    if (!std.mem.eql(u8, jb.username, name_b) or !std.mem.startsWith(u8, jb.text, "PX2D"))
+        return fail(name, "EID_JOIN was '{s}' / '{s}'", .{ jb.username, jb.text });
+
+    // Talk carries the speaker's name and is not sent back to the speaker.
+    a.chatCommand("hello there") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    const talk = nextEvent(&b, rc.EID_TALK, 4) orelse return fail(name, "B got no talk", .{});
+    if (!std.mem.eql(u8, talk.username, name_a) or !std.mem.eql(u8, talk.text, "hello there"))
+        return fail(name, "talk was '{s}': '{s}'", .{ talk.username, talk.text });
+    a.setBnetTimeout(400);
+    if (nextEvent(&a, rc.EID_TALK, 3) != null) return fail(name, "A's own talk was echoed back (the client draws it itself: it would show twice)", .{});
+    a.setBnetTimeout(1500);
+
+    // A whisper arrives from the sender's name; the sender's echo names the target.
+    a.chatCommand("/w EvNecro psst") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    const wh = nextEvent(&b, rc.EID_WHISPER, 4) orelse return fail(name, "B got no whisper", .{});
+    if (!std.mem.eql(u8, wh.username, name_a) or !std.mem.eql(u8, wh.text, "psst"))
+        return fail(name, "whisper was '{s}': '{s}'", .{ wh.username, wh.text });
+    const sent = nextEvent(&a, rc.EID_WHISPERSENT, 4) orelse return fail(name, "A got no EID_WHISPERSENT", .{});
+    if (!std.mem.eql(u8, sent.username, name_b) or !std.mem.eql(u8, sent.text, "psst"))
+        return fail(name, "the echo was '{s}': '{s}'", .{ sent.username, sent.text });
+
+    // An emote goes to everyone, the speaker too.
+    b.chatCommand("/me waves") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    const em_a = nextEvent(&a, rc.EID_EMOTE, 4) orelse return fail(name, "A got no emote", .{});
+    const em_b = nextEvent(&b, rc.EID_EMOTE, 4) orelse return fail(name, "B got no emote of its own", .{});
+    if (!std.mem.eql(u8, em_a.username, name_b) or !std.mem.eql(u8, em_a.text, "waves") or !std.mem.eql(u8, em_b.text, "waves"))
+        return fail(name, "emote was '{s}': '{s}'", .{ em_a.username, em_a.text });
+
+    // Leaving is announced by name.
+    b.leaveChat() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    const gone = nextEvent(&a, rc.EID_LEAVE, 4) orelse return fail(name, "A never saw B leave", .{});
+    if (!std.mem.eql(u8, gone.username, name_b)) return fail(name, "EID_LEAVE was '{s}'", .{gone.username});
+
+    return .{ .name = name, .status = .pass, .msg = msg("channel, own row, statstring, join/leave, talk, whisper (+sent), emote all as Battle.net sent them", .{}) };
 }
 
 fn scLobbyChatAtoB() Result {
@@ -2393,7 +2501,7 @@ fn scChatAcrossInstances() Result {
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.login("CrossAlice") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    a.enterChat() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("AliceChar", "TypeGuru,AliceChar") catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.setBnetTimeout(3000);
 
@@ -2413,7 +2521,7 @@ fn scChatAcrossInstances() Result {
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         const ev = b.readChatEvent() catch break;
-        if (ev.eid == rc.EID_SHOWUSER and std.mem.eql(u8, ev.username, "CrossAlice")) {
+        if (ev.eid == rc.EID_SHOWUSER and std.mem.eql(u8, ev.username, "AliceChar*CrossAlice")) {
             saw_alice = true;
             break;
         }
@@ -2448,7 +2556,21 @@ fn scChatAcrossInstances() Result {
     }
     if (!whispered) return fail(name, "A never received the whisper B sent from the other instance", .{});
 
-    return .{ .name = name, .status = .pass, .msg = msg("one channel across two instances: user list, talk and whisper all cross", .{}) };
+    // By the CHARACTER, which is what a player types and only the instance holding it can resolve.
+    b.chatCommand("/w AliceChar again") catch |e| return fail(name, "B whisper {s}", .{@errorName(e)});
+    whispered = false;
+    i = 0;
+    while (i < 12) : (i += 1) {
+        const ev = a.readChatEvent() catch break;
+        if (ev.eid == rc.EID_ERROR) return fail(name, "whisper to a character across instances refused: {s}", .{ev.text});
+        if (ev.eid == rc.EID_WHISPER and std.mem.eql(u8, ev.text, "again")) {
+            whispered = true;
+            break;
+        }
+    }
+    if (!whispered) return fail(name, "A never received the whisper addressed to its character from the other instance", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("one channel across two instances: user list, talk and whisper (by account and by character) all cross", .{}) };
 }
 
 fn scMultiInstance() Result {
@@ -2927,6 +3049,7 @@ pub fn main() !void {
         only("scCharCopy", scCharCopy),
         only("scLobbyChatAtoB", scLobbyChatAtoB),
         only("scLobbyCharNames", scLobbyCharNames),
+        only("scLobbyChatEvents", scLobbyChatEvents),
         only("scChatCommands", scChatCommands),
         only("scConcurrentClients", scConcurrentClients),
         only("scFriendsListLoad", scFriendsListLoad),

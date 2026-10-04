@@ -81,8 +81,10 @@ const EID_LEAVE = 0x03;
 const EID_WHISPER = 0x04;
 const EID_TALK = 0x05;
 const EID_CHANNEL = 0x07;
+const EID_WHISPERSENT = 0x0a;
 const EID_INFO = 0x12;
 const EID_ERROR = 0x13;
+const EID_EMOTE = 0x17;
 
 const default_channel = "Diablo II";
 const SID_LEAVECHAT = 0x10;
@@ -174,6 +176,9 @@ pub const Conn = struct {
     // on enter, replayed to other members in EID_SHOWUSER/EID_JOIN so chat shows chars.
     stat: [chat.max_stat]u8 = [_]u8{0} ** chat.max_stat,
     stat_len: u8 = 0,
+    // The product the client named in SID_GETCHANNELLIST, as it is on the wire (D2XP reads "PX2D"). It
+    // is the first four bytes of the statstring the user list is drawn from.
+    product: [4]u8 = .{ 'P', 'X', '2', 'D' },
     // The `clan*charname` the client asked to be known as in SID_ENTERCHAT.
     chat_name: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     chat_name_len: u8 = 0,
@@ -403,7 +408,7 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         SID_LOGONRESPONSE2 => onLogon(c, tag, body),
         SID_CREATEACCOUNT2 => onCreateAccount(c, tag, body),
         SID_ENTERCHAT => onEnterChat(c, tag, body),
-        SID_GETCHANNELLIST => onGetChannelList(c),
+        SID_GETCHANNELLIST => onGetChannelList(c, body),
         SID_JOINCHANNEL => onJoinChannel(c, tag, body),
         SID_CHATCOMMAND => onChatCommand(c, tag, body),
         SID_QUERYREALMS2 => onQueryRealms(c, tag),
@@ -629,28 +634,65 @@ fn onCreateAccount(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+/// How Battle.net named a Diablo II user in chat: `charname*account`. The character is what the
+/// lobby prints in front of a line of talk; the account after the '*' is the user's identity, the
+/// key the client matches its own name and each row of the channel list by (a name with no
+/// character is just the account, as it is for a client that never picked one). The client asks to
+/// be known as the bare character, so the realm adds the account; a name that already carries a
+/// '*' is taken as given.
+pub fn uniqueName(out: []u8, requested: []const u8, account: []const u8) []const u8 {
+    if (requested.len == 0 or std.ascii.eqlIgnoreCase(requested, account)) return truncated(out, account);
+    if (std.mem.indexOfScalar(u8, requested, '*') != null) return truncated(out, requested);
+    const room = if (out.len > account.len + 1) out.len - account.len - 1 else 0;
+    const ch = requested[0..@min(requested.len, room)];
+    if (ch.len == 0) return truncated(out, account);
+    @memcpy(out[0..ch.len], ch);
+    out[ch.len] = '*';
+    @memcpy(out[ch.len + 1 ..][0..account.len], account);
+    return out[0 .. ch.len + 1 + account.len];
+}
+
+fn truncated(out: []u8, s: []const u8) []const u8 {
+    const n = @min(s.len, out.len);
+    @memcpy(out[0..n], s[0..n]);
+    return out[0..n];
+}
+
+/// The character in a chat name: what comes before the '*'.
+fn charOfName(name: []const u8) []const u8 {
+    return if (std.mem.indexOfScalar(u8, name, '*')) |i| name[0..i] else name;
+}
+
 fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
-    // SID_ENTERCHAT C->S: (STRING) requested-username (empty; we use the account),
-    // (STRING) statstring (D2: the char the client is on). Capture the statstring so
-    // we can replay it to other members when this user joins a channel.
+    // SID_ENTERCHAT C->S: (STRING) username, (STRING) statstring. A D2 client sends the character
+    // it is on and "<realm>,<character>"; the realm answers with the unique name and the statstring
+    // every other client will draw this user from.
     var r = proto.Reader.init(body);
-    // The requested username is NOT decoration: for D2 it arrives as `clan*charname`, and
-    // the channel list draws the part after the '*' as the character. Discarding it and
-    // substituting the account name is why the lobby showed accounts instead of characters.
     const requested = r.getStr();
-    if (requested.len > 0) c.setChatName(requested);
-    c.setStat(r.getStr());
+    const client_stat = r.getStr();
     const acct = c.accountName();
+
+    var nb: [state.max_name + 1]u8 = undefined;
+    c.setChatName(uniqueName(&nb, requested, acct));
+    const char = charOfName(c.chatName());
+
+    // The client's own statstring has no product tag and no character data, so the list would draw
+    // an unknown user; the realm builds the real one from the character's save.
+    const realm_end = std.mem.indexOfScalar(u8, client_stat, ',') orelse client_stat.len;
+    const realm = if (realm_end > 0) client_stat[0..realm_end] else "Realm";
+    var sb: [chat.max_stat]u8 = undefined;
+    const stat = d2cs.chatStat(&sb, &c.product, realm, acct, char) orelse client_stat;
+    c.setStat(stat);
     log.line(tag, "enter chat as {s} (chat name '{s}', stat {d}B)", .{ acct, c.chatName(), c.stat_len });
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_ENTERCHAT);
     w.putStr(c.chatName()); // unique name — the identity the client adopts for itself
-    w.putStr(c.statSlice()); // statstring (echo the client's own)
+    w.putStr(c.statSlice());
     w.putStr(acct); // account name
     finish(c, &w);
     // NOTE: do not push a SID_CHATEVENT here. The D2 realm lobby is not a chat
     // channel and an unsolicited channel-join event corrupts its control state
-    // (crash in D2WINMAIN_SetControlDisabled). Chat-flag enums live in protocol.zig.
+    // (crash in D2WINMAIN_SetControlDisabled). The channel is announced when the client joins one.
 }
 
 // SID_LEAVECHAT (0x10): the client is leaving the channel. It used to be accepted and
@@ -688,7 +730,15 @@ fn onNotifyJoin(c: *Conn, tag: []const u8, body: []const u8) void {
     log.line(tag, "{s} joined game '{s}'", .{ c.accountName(), game_name });
 }
 
-fn onGetChannelList(c: *Conn) void {
+/// Four printable characters: a product tag and not stray bytes that would end up in a statstring.
+fn isProductTag(b: []const u8) bool {
+    for (b) |ch| if (ch < 0x21 or ch > 0x7e or ch == ',') return false;
+    return true;
+}
+
+fn onGetChannelList(c: *Conn, body: []const u8) void {
+    // The body is the product the client is chatting as; its four bytes head the statstring.
+    if (body.len >= 4 and isProductTag(body[0..4])) @memcpy(&c.product, body[0..4]);
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_GETCHANNELLIST);
     // Public channels offered in the channel-select UI. The home channel first.
@@ -787,9 +837,13 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     _ = chat.joinShared(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
     chat.setGame(c.fd, ""); // back in the lobby: no longer in a game
 
-    // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
-    // then list existing members, then announce the join to everyone else.
-    sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), channel, "");
+    // What Battle.net sent on a join, in its order. EID_CHANNEL carries the CHANNEL flags and puts
+    // the channel's name in the TEXT: the client prints "You have joined channel: <text>" and titles
+    // the user list "<text> (n)" from it. Then EID_SHOWUSER for everyone already in, the joiner
+    // among them: the client finds its own name in that list to put it in front of its own talk, and
+    // counts the header from the rows it is given. Then EID_JOIN to everyone else.
+    sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), "", channel);
+    sendEvent(c, EID_SHOWUSER, flags, c.chatName(), c.statSlice());
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
     chat.forEachRemoteInChannel(channel, &ctx, showRemoteUserCb);
@@ -931,7 +985,7 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         // still shows the sender a normal "To <target>:" echo (no hint they're ignored).
         if (chat.fdOf(w.target)) |tfd| {
             if (chat.recipientIgnores(tfd, acct)) {
-                sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg);
+                sendEvent(c, EID_WHISPERSENT, c.user_flags, w.target, w.msg);
                 return;
             }
         }
@@ -947,9 +1001,11 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
             sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
             return;
         }
-        // Echo to sender (D2 shows "To <target>: msg"), then surface the target's
+        // Echo to sender as EID_WHISPERSENT (the client prints "You whisper to <target>: msg"; an
+        // EID_WHISPER would read as the target whispering to them), then surface the target's
         // away/DND auto-reply if they set one (DND also suppressed delivery above).
-        sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg);
+        var db: [chat.max_name]u8 = undefined;
+        sendEvent(c, EID_WHISPERSENT, c.user_flags, chat.displayOf(w.target, &db) orelse w.target, w.msg);
         var rb: [192]u8 = undefined;
         if (res.dnd_len > 0) {
             const s = std.fmt.bufPrint(&rb, "{s} is unavailable ({s})", .{ w.target, res.dndSlice() }) catch return;
@@ -968,6 +1024,10 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     }
     if (handleHelpCmd(c, text)) return;
     if (hook.chatCommand(c, tag, text)) return;
+    if (afterVerb(text, "/me") orelse afterVerb(text, "/emote")) |what| {
+        emote(c, tag, what);
+        return;
+    }
     if (text.len > 0 and text[0] == '/') {
         // An unknown command must never reach the channel — typing a typo should not say
         // it out loud. It used to answer with an empty INFO line, which looks to the
@@ -990,6 +1050,17 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     // Named the same way the channel list names them, or the client cannot match a
     // line of chat to the row it came from.
     broadcastEvent(c, EID_TALK, c.user_flags, c.chatName(), text);
+}
+
+/// "/me <text>": an action, shown to the whole channel as `*name text*` — to the speaker as well,
+/// because unlike talk the client does not draw its own.
+fn emote(c: *Conn, tag: []const u8, what: []const u8) void {
+    if (what.len == 0) return;
+    const acct = c.accountName();
+    if (!hook.chatSay(c, acct, c.channelName(), what)) return;
+    log.line(tag, "{s} emotes: {s}", .{ acct, what });
+    sendEvent(c, EID_EMOTE, c.user_flags, c.chatName(), what);
+    broadcastEvent(c, EID_EMOTE, c.user_flags, c.chatName(), what);
 }
 
 const Whisper = struct { target: []const u8, msg: []const u8 };
@@ -1618,4 +1689,59 @@ fn onNewsInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU32(0); // entry timestamp; 0 = this entry is the MOTD
     w.putStr(motd); // MOTD text (NUL-terminated)
     finish(c, &w);
+}
+
+test "a Diablo II user is named charname*account" {
+    var b: [state.max_name + 1]u8 = undefined;
+    try std.testing.expectEqualStrings("Sorc*jaenster", uniqueName(&b, "Sorc", "jaenster"));
+    // no character, or the account itself: just the account
+    try std.testing.expectEqualStrings("jaenster", uniqueName(&b, "", "jaenster"));
+    try std.testing.expectEqualStrings("jaenster", uniqueName(&b, "JAENSTER", "jaenster"));
+    // already a chat name: taken as given
+    try std.testing.expectEqualStrings("Sorc*other", uniqueName(&b, "Sorc*other", "jaenster"));
+    // a name that cannot fit gives up characters, never the account
+    var small: [12]u8 = undefined;
+    try std.testing.expectEqualStrings("Sor*jaenster", uniqueName(&small, "Sorceress", "jaenster"));
+    try std.testing.expectEqualStrings("Sorc", charOfName("Sorc*jaenster"));
+    try std.testing.expectEqualStrings("jaenster", charOfName("jaenster"));
+}
+
+/// The body of a SID_CHATEVENT as the client's dispatcher reads it: eid, flags, ping, ip, account
+/// number, registration authority, then the user name and the text.
+fn expectEvent(pkt: []const u8, eid: u32, flags: u32, user: []const u8, text: []const u8) !void {
+    try std.testing.expectEqual(@as(u8, 0xff), pkt[0]);
+    try std.testing.expectEqual(@as(u8, SID_CHATEVENT), pkt[1]);
+    try std.testing.expectEqual(@as(u16, @intCast(pkt.len)), std.mem.readInt(u16, pkt[2..4], .little));
+    const body = pkt[4..];
+    try std.testing.expectEqual(eid, std.mem.readInt(u32, body[0..4], .little));
+    try std.testing.expectEqual(flags, std.mem.readInt(u32, body[4..8], .little));
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 16, body[8..24]);
+    try std.testing.expectEqualStrings(user, std.mem.sliceTo(body[24..], 0));
+    try std.testing.expectEqualStrings(text, std.mem.sliceTo(body[24 + user.len + 1 ..], 0));
+    try std.testing.expectEqual(@as(usize, 24 + user.len + 1 + text.len + 1), body.len);
+}
+
+test "the events of a join are encoded as the client reads them" {
+    var b: [512]u8 = undefined;
+    // EID_CHANNEL: the channel's NAME is the text; the user field is empty. The client titles its
+    // user list and prints "You have joined channel: ..." from the text.
+    try expectEvent(buildChatEvent(&b, EID_CHANNEL, 1, "", "Diablo II"), 7, 1, "", "Diablo II");
+    // EID_SHOWUSER / EID_JOIN: the chat name, and the statstring as the text
+    const stat = "PX2DUSEast,Sorc,\x84\x80";
+    try expectEvent(buildChatEvent(&b, EID_SHOWUSER, 0x02, "Sorc*jaenster", stat), 1, 2, "Sorc*jaenster", stat);
+    try expectEvent(buildChatEvent(&b, EID_JOIN, 0, "Sorc*jaenster", stat), 2, 0, "Sorc*jaenster", stat);
+    try expectEvent(buildChatEvent(&b, EID_LEAVE, 0, "Sorc*jaenster", ""), 3, 0, "Sorc*jaenster", "");
+    // talk and whispers carry the speaker's chat name; a whisper echoed to its sender names the target
+    try expectEvent(buildChatEvent(&b, EID_TALK, 0, "Sorc*jaenster", "hello"), 5, 0, "Sorc*jaenster", "hello");
+    try expectEvent(buildChatEvent(&b, EID_WHISPER, 0, "Sorc*jaenster", "psst"), 4, 0, "Sorc*jaenster", "psst");
+    try expectEvent(buildChatEvent(&b, EID_WHISPERSENT, 0, "Necro*other", "psst"), 0x0a, 0, "Necro*other", "psst");
+    try expectEvent(buildChatEvent(&b, EID_EMOTE, 0, "Sorc*jaenster", "waves"), 0x17, 0, "Sorc*jaenster", "waves");
+    try expectEvent(buildChatEvent(&b, EID_INFO, 0, "", "hi"), 0x12, 0, "", "hi");
+    try expectEvent(buildChatEvent(&b, EID_ERROR, 0, "", "no"), 0x13, 0, "", "no");
+}
+
+test "a product tag is four printable characters" {
+    try std.testing.expect(isProductTag("PX2D"));
+    try std.testing.expect(!isProductTag("P,2D"));
+    try std.testing.expect(!isProductTag("P\x002D"));
 }

@@ -142,6 +142,7 @@ fn dec14(b0: u8, b1: u8) u16 {
 
 pub const ChatEvent = struct {
     eid: u32,
+    flags: u32 = 0,
     username: []const u8, // slice into RealmClient.rxbuf (valid until next recv)
     text: []const u8,
 };
@@ -153,8 +154,10 @@ pub const EID_LEAVE = 0x03;
 pub const EID_WHISPER = 0x04;
 pub const EID_TALK = 0x05;
 pub const EID_CHANNEL = 0x07;
+pub const EID_WHISPERSENT = 0x0a;
 pub const EID_INFO = 0x12;
 pub const EID_ERROR = 0x13;
+pub const EID_EMOTE = 0x17;
 
 /// Reply to MCP_CREATEGAME / MCP_JOINGAME. Named rather than anonymous so the
 /// no-password wrappers can forward the password-carrying versions' return value.
@@ -537,7 +540,7 @@ pub const AdInfo = struct {
         const tstart = off;
         while (off < b.len and b[off] != 0) off += 1;
         const text = b[tstart..off];
-        return .{ .eid = eid, .username = username, .text = text };
+        return .{ .eid = eid, .flags = net.rdU32(b, 4), .username = username, .text = text };
     }
 
     /// Give bnet reads a deadline so a missing event fails instead of hanging.
