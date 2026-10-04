@@ -1754,6 +1754,36 @@ fn scLobbyCharNames() Result {
     return fail(name, "B never received A's TALK", .{});
 }
 
+/// A character named like its account (case aside) used to be left out of its chat name: the realm took
+/// the request for a client with no character, the statstring lookup missed and the lobby drew a user it
+/// could not parse as a character (a brown-robed figure under the account name). The name and the
+/// statstring both have to carry the character, whose class and level the list is drawn from.
+fn scLobbyCharNamedLikeAccount() Result {
+    const name = "lobby_char_named_like_account";
+    const channel = "Diablo II";
+    var save: [0x80]u8 = undefined;
+    _ = rc.storePutChar("samename", "Samename", d2sWithProgression(&save, "Samename", 0, 41, 0)) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("samename") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("Samename", "beta,Samename") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    if (!std.mem.eql(u8, a.uniqueName(), "Samename*samename"))
+        return fail(name, "unique name is '{s}', want 'Samename*samename'", .{a.uniqueName()});
+    a.setBnetTimeout(1500);
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    const own = nextEvent(&a, rc.EID_SHOWUSER, 6) orelse return fail(name, "A is not in its own user list", .{});
+    const head = "PX2Dbeta,Samename,";
+    if (!std.mem.startsWith(u8, own.text, head))
+        return fail(name, "statstring is '{s}', want PX2D + realm,character,", .{own.text});
+    const blob = own.text[head.len..];
+    if (blob.len < 28 or blob[13] != 1 or blob[25] != 41)
+        return fail(name, "statstring carries class+1 {d} level {d}, want 1 and 41", .{ if (blob.len > 13) blob[13] else 0, if (blob.len > 25) blob[25] else 0 });
+    return .{ .name = name, .status = .pass, .msg = msg("a character named like its account is named and drawn as the character (class and level in its statstring)", .{}) };
+}
+
 /// The next event of kind `eid` a client is sent within `tries` events; null when none comes.
 fn nextEvent(c: *rc.RealmClient, eid: u32, tries: usize) ?rc.ChatEvent {
     var i: usize = 0;
@@ -3067,6 +3097,7 @@ pub fn main() !void {
         only("scCharCopy", scCharCopy),
         only("scLobbyChatAtoB", scLobbyChatAtoB),
         only("scLobbyCharNames", scLobbyCharNames),
+        only("scLobbyCharNamedLikeAccount", scLobbyCharNamedLikeAccount),
         only("scLobbyChatEvents", scLobbyChatEvents),
         only("scChatCommands", scChatCommands),
         only("scConcurrentClients", scConcurrentClients),

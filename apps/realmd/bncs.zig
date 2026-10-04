@@ -651,6 +651,11 @@ fn onCreateAccount(c: *Conn, tag: []const u8, body: []const u8) void {
 pub fn uniqueName(out: []u8, requested: []const u8, account: []const u8) []const u8 {
     if (requested.len == 0 or std.ascii.eqlIgnoreCase(requested, account)) return truncated(out, account);
     if (std.mem.indexOfScalar(u8, requested, '*') != null) return truncated(out, requested);
+    return withCharacter(out, requested, account);
+}
+
+/// `character*account`, with the character cut to what room the account leaves.
+fn withCharacter(out: []u8, requested: []const u8, account: []const u8) []const u8 {
     const room = if (out.len > account.len + 1) out.len - account.len - 1 else 0;
     const ch = requested[0..@min(requested.len, room)];
     if (ch.len == 0) return truncated(out, account);
@@ -671,6 +676,20 @@ fn charOfName(name: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, name, '*')) |i| name[0..i] else name;
 }
 
+/// The character in a client's own statstring, `<realm>,<character>`: what is between the first comma and
+/// the next, or the end. Null when there is none or it could not be a character's name.
+fn statChar(stat: []const u8) ?[]const u8 {
+    const comma = std.mem.indexOfScalar(u8, stat, ',') orelse return null;
+    const rest = stat[comma + 1 ..];
+    const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+    const ch = rest[0..end];
+    if (ch.len == 0 or ch.len > 15) return null;
+    for (ch) |c| {
+        if (c < 0x21 or c > 0x7e or c == '*' or c == ',') return null;
+    }
+    return ch;
+}
+
 fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
     // SID_ENTERCHAT C->S: (STRING) username, (STRING) statstring. A D2 client sends the character
     // it is on and "<realm>,<character>"; the realm answers with the unique name and the statstring
@@ -681,7 +700,13 @@ fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
     const acct = c.accountName();
 
     var nb: [state.max_name + 1]u8 = undefined;
-    c.setChatName(uniqueName(&nb, requested, acct));
+    // A character named like its account (case aside) asks to be known as the account, which the
+    // realm cannot tell from a client with no character. The statstring the client sends says which
+    // character it is on, so that decides: without it the character was left out of the name, the
+    // statstring lookup missed and the lobby drew a user it could not parse as a character.
+    const as_account = requested.len == 0 or std.ascii.eqlIgnoreCase(requested, acct);
+    const unique = if (as_account) (if (statChar(client_stat)) |ch| withCharacter(&nb, ch, acct) else uniqueName(&nb, requested, acct)) else uniqueName(&nb, requested, acct);
+    c.setChatName(unique);
     const char = charOfName(c.chatName());
 
     // The client's own statstring has no product tag and no character data, so the list would draw
@@ -1800,6 +1825,15 @@ fn onNewsInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU32(0); // entry timestamp; 0 = this entry is the MOTD
     w.putStr(motd); // MOTD text (NUL-terminated)
     finish(c, &w);
+}
+
+test "a character named like its account is still named charname*account" {
+    var b: [state.max_name + 1]u8 = undefined;
+    try std.testing.expectEqualStrings("Gravlabs*gravlabs", withCharacter(&b, statChar("beta,Gravlabs").?, "gravlabs"));
+    try std.testing.expect(statChar("beta") == null);
+    try std.testing.expect(statChar("beta,") == null);
+    try std.testing.expect(statChar("beta,a*b") == null);
+    try std.testing.expectEqualStrings("Sorc", statChar("TypeGuru,Sorc,extra").?);
 }
 
 test "a Diablo II user is named charname*account" {
