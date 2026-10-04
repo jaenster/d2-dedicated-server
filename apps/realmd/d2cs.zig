@@ -773,6 +773,18 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // after a successful create, and that path has the same check plus a code that says the true
     // thing (0x73 / 0x74) — so an ineligible character is still turned away, one packet later.
     log.line(tag, "create game '{s}' desc='{s}' diff={d} status=0x{x:0>2} (flags=0x{x})", .{ name, desc, difficulty, status, create_flags });
+    // The creator is about to be sent straight into this game, and a character is in one game at a
+    // time: if another still holds it (after the moment the engine needs to free a seat the player
+    // just left), refuse here rather than leave an empty game behind a join that will be turned away.
+    {
+        var hb: [64]u8 = undefined;
+        var waited: u32 = 0;
+        while (store.charLockOwner(c.accountName(), c.charName(), &hb) != null and waited < seat_release_ms) : (waited += create_poll_ms) sleepMs(create_poll_ms);
+        if (store.charLockOwner(c.accountName(), c.charName(), &hb)) |holder| {
+            log.line(tag, "create game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
+            return fail(c, &w, CREATE_ERROR_GENERIC);
+        }
+    }
     // Claim the name BEFORE dispatching. A game is only recorded once the server accepts the
     // create, and in that gap a second client asking for the same name is told it is free, loses
     // the race at the server, and is then left with nothing to join — the failure that fails

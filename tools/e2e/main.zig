@@ -1020,6 +1020,44 @@ fn scSeatReleasedOnLeave() Result {
     return .{ .name = name, .status = .pass, .msg = msg("leave freed the lock and the member, count 1 -> 0, rejoin accepted", .{}) };
 }
 
+/// A character is in one game at a time, so a create by a character another game still holds is
+/// refused instead of leaving an empty game behind a join that would be turned away. Once the game
+/// server reports the leave, the same character can create again.
+fn scCreateWhileHeld() Result {
+    const name = "create_while_held";
+    const acct = "HeldGuy";
+    const char = "Anchor";
+    const gid: u32 = 0x4E1D;
+
+    var gs = FakeGS{ .gsid = 0x4E1D, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = gid };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    openLobby(&c, acct) catch |e| return fail(name, "lobby {s}", .{@errorName(e)});
+    if ((c.charCreateFresh(1, 0x20, char) catch 1) != 0) return fail(name, "could not create '{s}'", .{char});
+    if ((c.charLogon(char) catch 1) != 0) return fail(name, "could not log on as '{s}'", .{char});
+
+    const first = c.createGame("heldfirst", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (first.result != 0) return fail(name, "first create result={d}", .{first.result});
+    const joined = c.joinGame("heldfirst") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (joined.result != 0) return fail(name, "join result=0x{x}", .{joined.result});
+    gs.sendSeatNotice(gid, 1, 1, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = net.usleep(200_000);
+
+    const refused = c.createGame("heldsecond", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (refused.result == 0) return fail(name, "a create by a character another game holds was accepted", .{});
+    if (gs.creates != 1) return fail(name, "the refused create reached the game server (creates={d})", .{gs.creates});
+
+    gs.sendSeatNotice(gid, 0, 2, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = net.usleep(300_000);
+    const again = c.createGame("heldthird", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (again.result != 0) return fail(name, "create after the leave refused: result={d}", .{again.result});
+    return .{ .name = name, .status = .pass, .msg = msg("create refused while another game held the character (result={d}), accepted after the leave", .{refused.result}) };
+}
+
 /// A join the player never completed must not lock them out of asking again, nor count twice.
 fn scUnconfirmedJoinRetaken() Result {
     const name = "unconfirmed_join_retaken";
@@ -3437,6 +3475,7 @@ pub fn main() !void {
         only("scGamePopulation", scGamePopulation),
         only("scSeatReleasedOnLeave", scSeatReleasedOnLeave),
         only("scUnconfirmedJoinRetaken", scUnconfirmedJoinRetaken),
+        only("scCreateWhileHeld", scCreateWhileHeld),
         only("scJoinErrors", scJoinErrors),
         only("scGameMaxPlayers", scGameMaxPlayers),
         only("scGameInfo", scGameInfo),
