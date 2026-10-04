@@ -605,6 +605,62 @@ fn scCreateCharThenGame() Result {
     return .{ .name = name, .status = .pass, .msg = msg("first game after create names '{s}' of '{s}' to the GS", .{ jc, ja }) };
 }
 
+/// A refused logon leaves the connection with nothing: a realm session, a game list, a game
+/// cannot be had on it, and the realm closes it. The same for an MCP connection whose startup was
+/// refused. (Both used to go on serving: a refused logon still named the account on the
+/// connection, and SID_LOGONREALMEX minted a session for it.)
+fn scRejectedLogonGated() Result {
+    const name = "rejected_logon_gated";
+    const acct = "GatedAcct";
+    var gs = FakeGS{ .gsid = 0xABD0, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 45 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+
+    // an account with a password
+    {
+        var a = rc.RealmClient{};
+        defer a.close();
+        a.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        a.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        const made = a.createAccount(acct, "right-password") catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (made != 0) return fail(name, "create account result={d}", .{made});
+    }
+
+    // a wrong password: refused, and the realm logon on the same connection gets nothing
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const res = c.loginPwResult(acct, "wrong-password") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res == 0) return fail(name, "a wrong password was accepted", .{});
+    c.setBnetTimeout(2000);
+    if (c.enterRealm()) |_| {
+        if (c.sessionId() != 0) return fail(name, "SID_LOGONREALMEX minted session {d} after a refused logon", .{c.sessionId()});
+    } else |_| {} // the connection was closed: what we want
+
+    // an MCP connection whose startup is refused cannot create or join
+    var m = rc.RealmClient{};
+    defer m.close();
+    m.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    m.lo = 0x0bad_5e55;
+    m.hi = 0x0bad_5e55;
+    m.account = acct;
+    const st = m.startup() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (st == 0) return fail(name, "a made-up session was accepted", .{});
+    const cg = m.createGame("gatedgame", "d");
+    if (cg) |r| if (r.result == 0) return fail(name, "created a game after a refused startup", .{}) else {} else |_| {}
+    if (gs.creates != 0) return fail(name, "the GS was asked to create a game ({d})", .{gs.creates});
+
+    // and one that never started up at all
+    var n = rc.RealmClient{};
+    defer n.close();
+    n.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const jg = n.joinGame("gatedgame");
+    if (jg) |r| if (r.result == 0) return fail(name, "joined a game without a startup", .{}) else {} else |_| {}
+    if (gs.joins != 0) return fail(name, "the GS was told of a join ({d})", .{gs.joins});
+    return .{ .name = name, .status = .pass, .msg = msg("refused logon: no realm session; refused or missing startup: no create, no join", .{}) };
+}
+
 /// The store refuses a save built from bytes it has since moved past.
 ///
 /// This is the mechanism that makes a rollback impossible rather than merely unlikely. Every other
@@ -2861,6 +2917,7 @@ pub fn main() !void {
         only("scCreateAccountRealAuth", scCreateAccountRealAuth),
         only("scCharCreate", scCharCreate),
         only("scCreateCharThenGame", scCreateCharThenGame),
+        only("scRejectedLogonGated", scRejectedLogonGated),
         only("scCharVersion", scCharVersion),
         only("scClassicChar", scClassicChar),
         only("scLadder", scLadder),

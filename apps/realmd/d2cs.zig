@@ -165,6 +165,10 @@ pub const DConn = struct {
     // that learned it, so it comes back off the session at startup rather than off the wire.
     client_version: [state.max_version]u8 = [_]u8{0} ** state.max_version,
     client_version_len: u8 = 0,
+    /// Set by a successful MCP_STARTUP and by nothing else; every other command needs it. `drop`
+    /// closes the connection once the current packet is answered.
+    authed: bool = false,
+    drop: bool = false,
 
     /// Empty when the realm could not name the client's engine, which reads as no constraint.
     pub fn clientVersion(c: *const DConn) []const u8 {
@@ -266,8 +270,10 @@ fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: b
                 if (len - off < plen) break; // wait for the rest
                 dispatch(&c, tag, acc[off + 2], acc[off + 3 .. off + plen]);
                 off += plen;
+                if (c.drop) break;
             }
         }
+        if (c.drop) break;
         if (off > 0) {
             std.mem.copyForwards(u8, acc[0 .. len - off], acc[off..len]);
             len -= off;
@@ -290,6 +296,11 @@ fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: b
 pub var trace_packets: bool = false;
 
 fn dispatch(c: *DConn, tag: []const u8, id: u8, body: []const u8) void {
+    if (!c.authed and id != MCP_STARTUP) {
+        log.line(tag, "MCP 0x{x:0>2} before a startup; dropping the connection", .{id});
+        c.drop = true;
+        return;
+    }
     if (!hook.mcpPacket(c, id, body)) return; // an extension took it
     if (trace_packets) {
         log.line(tag, "rx MCP 0x{x:0>2} ({d} bytes)", .{ id, body.len });
@@ -344,6 +355,8 @@ fn onStartup(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "startup session={d} -> UNKNOWN (rejected)", .{sid});
     }
 
+    c.authed = result == 0x00;
+    if (!c.authed) c.drop = true;
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, MCP_STARTUP);
     w.putU32(result);

@@ -124,12 +124,30 @@ const SID_RESETPASSWORD = 0x5a; // request password reset (notify)
 const SID_CHANGEEMAIL = 0x5b; // change account email (notify)
 const SID_REPORTCRASH = 0x5d; // crash dump upload (notify)
 
-// Token generator. These tokens aren't security-relevant (we don't verify
-// them), they just need to be distinct per connection. A counter stepped by an
-// odd constant gives a full-period non-repeating sequence.
+// The server token is the logon's challenge: the password proof hashes it, so a token an attacker
+// can predict lets a captured proof be replayed on a later connection. It comes from the OS's
+// entropy. Should that ever fail, the counter keeps tokens distinct, and the failure is logged.
+extern "c" fn getentropy(buf: [*]u8, len: usize) c_int;
 var token_ctr = std.atomic.Value(u32).init(0x1234abcd);
 fn nextToken() u32 {
+    var b: [4]u8 = undefined;
+    if (getentropy(&b, b.len) == 0) return std.mem.readInt(u32, &b, .little);
+    log.line("bncs", "no entropy for a server token; falling back to a counter", .{});
     return token_ctr.fetchAdd(0x9e3779b1, .monotonic);
+}
+
+/// What a connection may send before it has logged on: the version check, the logon itself,
+/// account creation and recovery, and the housekeeping the login screen does. Everything else
+/// needs a logged-on account.
+fn allowedBeforeLogon(id: u8) bool {
+    return switch (id) {
+        SID_NULL, SID_PING, SID_AUTH_INFO, SID_AUTH_CHECK, SID_LOGONRESPONSE2, SID_LOGONRESPONSE,
+        SID_AUTHACCOUNTLOGON, SID_CREATEACCOUNT2, SID_CHANGEPASSWORD, SID_RESETPASSWORD,
+        SID_GETFILETIME, SID_NETGAMEPORT, SID_CLIENTID2, SID_LOCALEINFO, SID_REPORTCRASH,
+        SID_STARTVERSIONING, SID_REPORTVERSION, SID_CDKEY3, SID_NEWS_INFO, SID_CHECKAD,
+        SID_DISPLAYAD, SID_CLICKAD, SID_QUERYADURL => true,
+        else => false,
+    };
 }
 
 pub const Conn = struct {
@@ -144,6 +162,10 @@ pub const Conn = struct {
     client_token: u32 = 0,
     account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     account_len: u8 = 0,
+    /// Set by a successful logon and by nothing else. Every command past the login screen checks
+    /// it (allowedBeforeLogon); `drop` closes the connection once the current packet is answered.
+    authed: bool = false,
+    drop: bool = false,
     in_channel: bool = false,
     channel: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
     channel_len: u8 = 0,
@@ -322,7 +344,9 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
             if (len - off < plen) break; // wait for the rest
             dispatch(&c, tag, acc[off + 1], acc[off + 4 .. off + plen]);
             off += plen;
+            if (c.drop) break;
         }
+        if (c.drop) break;
         if (off > 0) {
             std.mem.copyForwards(u8, acc[0 .. len - off], acc[off..len]);
             len -= off;
@@ -362,6 +386,11 @@ pub var trace_packets: bool = false;
 pub var modern_challenge: bool = false;
 
 fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
+    if (!c.authed and !allowedBeforeLogon(id)) {
+        log.line(tag, "SID 0x{x:0>2} before a logon; dropping the connection", .{id});
+        c.drop = true;
+        return;
+    }
     if (!hook.bncsPacket(c, id, body)) return; // an extension took it
     if (trace_packets) {
         log.line(tag, "rx SID 0x{x:0>2} ({d} bytes)", .{ id, body.len });
@@ -501,13 +530,17 @@ const LOGON_BAD_PASSWORD: u32 = 2;
 fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     c.client_token = r.getU32();
-    const server_token = r.getU32(); // client echoes the token we sent
+    const echoed = r.getU32(); // the client echoes the token we sent
     var got: [20]u8 = undefined;
     @memcpy(&got, r.take20());
     const acct = r.getStr();
     c.setAccount(acct);
 
-    const result = logonResult(c, server_token, got);
+    // The proof is checked against the token THIS connection was given, never the one the client
+    // says it was given: trusting the echo would let a proof captured elsewhere be replayed.
+    const result = if (echoed != c.server_token) LOGON_BAD_PASSWORD else logonResult(c, c.server_token, got);
+    c.authed = result == LOGON_OK;
+    if (!c.authed) c.drop = true;
     if (result == LOGON_OK) friends.setOnline(acct); // presence for friends online-status
     hook.accountLogin(acct, result == LOGON_OK);
     log.line(tag, "logon account={s} -> result={d}", .{ acct, result });
@@ -1446,10 +1479,12 @@ fn onChangePassword(c: *Conn, tag: []const u8, body: []const u8) void {
         // logged in as that account, so that is what is required.
         var verified = false;
         if (has_pw) {
-            const expect = xsha1.doubleHash(client_token, server_token, stored);
-            verified = std.mem.eql(u8, &expect, &old_proof);
+            // against this connection's token, not the echoed one: a captured proof must not replay
+            const expect = xsha1.doubleHash(client_token, c.server_token, stored);
+            verified = server_token == c.server_token and std.mem.eql(u8, &expect, &old_proof);
         } else {
-            verified = c.account_len != 0 and std.ascii.eqlIgnoreCase(c.accountName(), user);
+            // logged on, not merely named: a refused logon leaves the name on the connection
+            verified = c.authed and std.ascii.eqlIgnoreCase(c.accountName(), user);
             if (!verified) log.line(tag, "changepassword '{s}' refused: password-less and this connection is not logged in as it", .{user});
         }
         if (verified) ok = store.setAccountPassword(user, new_hash);
