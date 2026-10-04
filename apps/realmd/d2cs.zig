@@ -790,6 +790,29 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+/// The client sends `-1` for a game created with the password field left empty, and the realm keeps
+/// that as it came; a join arriving by a link or the launcher carries an empty password instead. Both
+/// spellings mean an open game, and an open game lets anyone in whatever the joiner typed.
+fn joinPasswordOk(stored: []const u8, supplied: []const u8) bool {
+    if (stored.len == 0 or std.mem.eql(u8, stored, "-1")) return true;
+    return std.mem.eql(u8, stored, supplied);
+}
+
+test "a game created with an empty password is open to a join with an empty or any password" {
+    try std.testing.expect(joinPasswordOk("-1", ""));
+    try std.testing.expect(joinPasswordOk("-1", "-1"));
+    try std.testing.expect(joinPasswordOk("", "-1"));
+    try std.testing.expect(joinPasswordOk("", ""));
+    try std.testing.expect(joinPasswordOk("-1", "stale"));
+}
+
+test "a passworded game needs exactly its password" {
+    try std.testing.expect(joinPasswordOk("Pw1", "Pw1"));
+    try std.testing.expect(!joinPasswordOk("Pw1", ""));
+    try std.testing.expect(!joinPasswordOk("Pw1", "-1"));
+    try std.testing.expect(!joinPasswordOk("Pw1", "pw1"));
+}
+
 fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
@@ -821,8 +844,8 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     const g = game.?;
     // Reject a wrong password for a passworded game (open games have pw_len == 0).
-    if (g.pw_len > 0 and !std.mem.eql(u8, g.pw(), join_pass)) {
-        log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD", .{ name, c.accountName() });
+    if (!joinPasswordOk(g.pw(), join_pass)) {
+        log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD (game has {d} chars, join sent {d})", .{ name, c.accountName(), g.pw_len, join_pass.len });
         return rejectJoin(c, &w, JOIN_BAD_PASSWORD);
     }
     if (hook.gameJoin(c.accountName(), c.charName(), name)) |result| {
