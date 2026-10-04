@@ -944,6 +944,13 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // one it just left. Wait for that to clear before refusing. A genuine second login waits the
     // same moment and is then turned away, which costs it nothing it can perceive.
     var claimed = store.lockChar(c.accountName(), c.charName(), jowner);
+    // The same player asking again for this very game, whose earlier attempt never got in: that
+    // attempt's seat is theirs to take back, and it is already in the count.
+    const retaken = !claimed and store.retakePendingChar(g.gameid, c.accountName(), c.charName());
+    if (retaken) {
+        claimed = true;
+        log.line(tag, "join game '{s}' (account={s}) -> took over the unconfirmed seat of '{s}'", .{ name, c.accountName(), c.charName() });
+    }
     if (!claimed) {
         var waited: u32 = 0;
         while (waited < seat_release_ms) : (waited += create_poll_ms) {
@@ -972,7 +979,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     warmChar(c.accountName(), c.charName());
     // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
     // both directions) as soon as the player is actually in the game.
-    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc());
+    if (!retaken) _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc());
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.

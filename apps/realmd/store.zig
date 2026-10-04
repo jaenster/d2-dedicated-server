@@ -480,6 +480,10 @@ pub fn setGamePlayers(gameid: u32, players: u16) bool {
     return redis.setGamePlayers(gameid, players);
 }
 
+pub fn dropGamePlayers(gameid: u32, n: u16) bool {
+    return redis.dropGamePlayers(gameid, n);
+}
+
 pub fn findGame(name: []const u8) ?GameRec {
     return redis.findGame(name);
 }
@@ -654,8 +658,26 @@ pub fn charInUse(account: []const u8, charname: []const u8) bool {
     return charLockOwner(account, charname, &buf) != null;
 }
 
+/// How long a join's claim holds a character before the game server has confirmed the player is
+/// in. Long enough for a slow load, short enough that a join whose client never arrived does not
+/// keep the character from its next one.
+pub const seat_pending_s: u32 = 60;
+
+/// How long a seat may go unreported by a game server that reports its players before the realm
+/// stops carrying it. Longer than the server holds a leave notice back for the player's last save
+/// (150 s), so a leave that is merely waiting is never overtaken.
+pub const seat_unreported_s: u32 = 240;
+
+/// Take a character for a join. The claim is short until the game server confirms the player is in
+/// (`confirmGameChar`) — see `seat_pending_s`.
 pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
-    return redis.lockChar(account, charname, owner, char_lock_ttl_s);
+    return redis.lockChar(account, charname, owner, seat_pending_s);
+}
+
+/// A client asking again for the game it already has an unconfirmed seat in.
+pub fn retakePendingChar(gameid: u32, account: []const u8, charname: []const u8) bool {
+    var ob: [32]u8 = undefined;
+    return redis.retakePendingChar(gameid, account, charname, gameOwnerId(&ob, gameid), seat_pending_s);
 }
 
 pub fn refreshCharLock(account: []const u8, charname: []const u8, owner: []const u8) bool {
@@ -696,11 +718,18 @@ pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool 
     return redis.addGameChar(gameid, account, charname);
 }
 
-/// Renew the leases on every character a live game holds. The realm calls this on a timer for
-/// every game still in the index — see `fleet.renewCharLeases`.
-pub fn renewGameCharLeases(gameid: u32) usize {
+/// One pass over a live game's seats: renew the confirmed ones, drop the ones that never arrived
+/// and, for a server that reports presence, the ones it stopped reporting. The realm calls this on
+/// a timer for every game still in the index — see `fleet.renewCharLeases`.
+pub fn sweepGameSeats(gameid: u32) redis.SeatSweep {
     var ob: [32]u8 = undefined;
-    return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s);
+    return redis.sweepGameSeats(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s, seat_pending_s * 1000, seat_unreported_s * 1000);
+}
+
+/// The game server says this player is in the game. `account` is empty when it could not say.
+pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8, present: bool) usize {
+    var ob: [32]u8 = undefined;
+    return redis.confirmGameChar(gameid, account, charname, gameOwnerId(&ob, gameid), char_lock_ttl_s, present);
 }
 
 /// Free the characters held by games the realm no longer lists (a game server that restarted or was

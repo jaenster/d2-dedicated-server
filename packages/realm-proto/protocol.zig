@@ -160,6 +160,11 @@ pub const UpdateGameInfo = extern struct {
 pub const GAMEINFO_UPDATE: u32 = 0;
 pub const GAMEINFO_ENTER: u32 = 1;
 pub const GAMEINFO_LEAVE: u32 = 2;
+/// A player the server still has in the game, repeated every half minute while they are there. It
+/// is how the realm tells a seat the server stands behind from one whose leave notice was lost:
+/// a seat nobody reports any more is released after a bounded time. `players` is the server's own
+/// count of the game, so the notice also puts a drifted count right.
+pub const GAMEINFO_PRESENT: u32 = 3;
 
 /// Read the i-th null-terminated string from a packet body, starting at `off`.
 /// Returns the slice (without the null) and advances `off` past the terminator.

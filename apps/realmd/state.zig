@@ -251,6 +251,23 @@ pub const State = struct {
         return false;
     }
 
+    /// Take `n` off a game's count, for joins the realm counted ahead of the server that never
+    /// completed. Never goes below zero.
+    pub fn dropGamePlayers(st: *State, gameid: u32, n: u16) void {
+        if (shared) {
+            _ = store.dropGamePlayers(gameid, n);
+            return;
+        }
+        st.lock.lock();
+        defer st.lock.unlock();
+        for (&st.games) |*g| {
+            if (g.in_use and g.gameid == gameid) {
+                g.players -|= n;
+                return;
+            }
+        }
+    }
+
     /// Note that a game now exists, starting its clock. Called when realmd registers it.
     pub fn noteGameCreated(st: *State, gameid: u32) void {
         st.lock.lock();

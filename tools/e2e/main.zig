@@ -945,6 +945,136 @@ fn scGamePopulation() Result {
     return .{ .name = name, .status = .pass, .msg = msg("players 1 -> 4 -> 1 from the GS; description '{s}' survived", .{final.description}) };
 }
 
+/// A player who leaves a game is free to join it again at once, and the game's count follows.
+///
+/// The realm held the seat for as long as the game lived when the leave did not clear it, and a
+/// join whose client never arrived the same way: the character was then "held by game:N" for good,
+/// the game's member set kept the lock renewed, and the list kept counting a player who was gone.
+fn scSeatReleasedOnLeave() Result {
+    const name = "seat_released_on_leave";
+    const acct = "SeatGuy";
+    const char = "Rider";
+    const gid: u32 = 0x5EA7;
+
+    var gs = FakeGS{ .gsid = 0x5EA7, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = gid };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    if ((c.charCreateFresh(1, 0x20, char) catch 1) != 0) return fail(name, "could not create '{s}'", .{char});
+    if ((c.charLogon(char) catch 1) != 0) return fail(name, "could not log on as '{s}'", .{char});
+
+    var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    defer rcl.close();
+    var gcb: [64]u8 = undefined;
+    const gamechars = std.fmt.bufPrint(&gcb, "realmd:gamechars:{d}", .{gid}) catch unreachable;
+    const lockkey = "realmd:charlock:" ++ acct ++ "/" ++ char;
+
+    const cg = c.createGame("seatgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    const jg = c.joinGame("seatgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
+    gs.sendSeatNotice(gid, 1, 1, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+
+    const findRow = struct {
+        fn f(list: []const rc.GameEntry) ?rc.GameEntry {
+            for (list) |g| {
+                if (std.mem.eql(u8, g.name, "seatgame")) return g;
+            }
+            return null;
+        }
+    }.f;
+    var rows: [8]rc.GameEntry = undefined;
+    var dst: [512]u8 = undefined;
+    if (!awaitPlayers(&c, &rows, &dst, findRow, 1)) return fail(name, "count did not settle at 1 after the enter", .{});
+    const held = rcl.cmd(&.{ "GET", lockkey }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    if (held != .bulk or held.bulk == null) return fail(name, "the character is not held while it is in the game", .{});
+
+    // The leave. Nothing else is sent: the lock, the member and the count all have to follow it.
+    gs.sendSeatNotice(gid, 0, 2, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitPlayers(&c, &rows, &dst, findRow, 0)) return fail(name, "count did not fall to 0 after the leave", .{});
+    var freed = false;
+    var waited: u32 = 0;
+    while (waited < 1000) : (waited += 25) {
+        const l = rcl.cmd(&.{ "GET", lockkey }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+        const m = rcl.cmd(&.{ "SISMEMBER", gamechars, acct ++ "/" ++ char }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+        if (l == .bulk and l.bulk == null and m == .int and m.int == 0) {
+            freed = true;
+            break;
+        }
+        _ = net.usleep(25_000);
+    }
+    if (!freed) return fail(name, "after the leave the lock or the game's member set still held the character", .{});
+
+    // And it can go straight back in.
+    const again = c.joinGame("seatgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (again.result != 0) return fail(name, "rejoin after a leave refused: result=0x{x}", .{again.result});
+    return .{ .name = name, .status = .pass, .msg = msg("leave freed the lock and the member, count 1 -> 0, rejoin accepted", .{}) };
+}
+
+/// A join the player never completed must not lock them out of asking again, nor count twice.
+fn scUnconfirmedJoinRetaken() Result {
+    const name = "unconfirmed_join_retaken";
+    const acct = "GhostGuy";
+    const char = "Stray";
+    const gid: u32 = 0x6057;
+
+    var gs = FakeGS{ .gsid = 0x6057, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = gid };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    if ((c.charCreateFresh(1, 0x20, char) catch 1) != 0) return fail(name, "could not create '{s}'", .{char});
+    if ((c.charLogon(char) catch 1) != 0) return fail(name, "could not log on as '{s}'", .{char});
+
+    const cg = c.createGame("strayjoin", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    const first = c.joinGame("strayjoin") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (first.result != 0) return fail(name, "first join result=0x{x}", .{first.result});
+
+    const findRow = struct {
+        fn f(list: []const rc.GameEntry) ?rc.GameEntry {
+            for (list) |g| {
+                if (std.mem.eql(u8, g.name, "strayjoin")) return g;
+            }
+            return null;
+        }
+    }.f;
+    var rows: [8]rc.GameEntry = undefined;
+    var dst: [512]u8 = undefined;
+    var n = c.gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const before = (findRow(rows[0..n]) orelse return fail(name, "game missing from the list", .{})).players;
+
+    // The client never reaches the game server: no enter notice. It asks again, and is not shut out
+    // by its own earlier attempt.
+    const second = c.joinGame("strayjoin") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (second.result != 0) return fail(name, "second join refused by the first's seat: result=0x{x}", .{second.result});
+    n = c.gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const after = (findRow(rows[0..n]) orelse return fail(name, "game missing from the list", .{})).players;
+    if (after != before) return fail(name, "asking again counted a second player: {d} -> {d}", .{ before, after });
+
+    // Once the server confirms the player, the seat is real and nothing takes it over.
+    gs.sendSeatNotice(gid, 1, 1, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitPlayers(&c, &rows, &dst, findRow, 1)) return fail(name, "count did not settle at 1", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("an unconfirmed seat was taken back on the second ask; count stayed {d}", .{after}) };
+}
+
 /// Poll the game list until 'popgame' reports `want` players. UPDATEGAMEINFO is fire-and-
 /// forget, so there is no reply to wait on — only the effect to observe.
 fn awaitPlayers(
@@ -3077,6 +3207,8 @@ pub fn main() !void {
         only("scSaveFence", scSaveFence),
         only("scRealmUniqueNames", scRealmUniqueNames),
         only("scGamePopulation", scGamePopulation),
+        only("scSeatReleasedOnLeave", scSeatReleasedOnLeave),
+        only("scUnconfirmedJoinRetaken", scUnconfirmedJoinRetaken),
         only("scJoinErrors", scJoinErrors),
         only("scGameInfo", scGameInfo),
         only("scFleetCapacity", scFleetCapacity),

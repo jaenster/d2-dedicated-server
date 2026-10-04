@@ -336,6 +336,11 @@ fn apply(typ: p.Type, body: []const u8) void {
             // therefore releases nothing when it cannot tell them apart, and the seat waits for
             // the game-close sweep, which needs no names at all.
             const acct = if (off < body.len) p.readCStr(body, &off) else "";
+            // The seat becomes real once the server says the player is in, and stays so for as long
+            // as the server keeps saying it. Without the account it is matched by name, which only
+            // ever keeps a lock.
+            if ((flag == p.GAMEINFO_ENTER or flag == p.GAMEINFO_PRESENT) and char.len > 0)
+                _ = store.confirmGameChar(gameid, acct, char, flag == p.GAMEINFO_PRESENT);
             if (flag == p.GAMEINFO_LEAVE and char.len > 0) {
                 if (acct.len > 0) {
                     _ = store.releaseGameCharExact(gameid, acct, char);
@@ -359,12 +364,14 @@ fn apply(typ: p.Type, body: []const u8) void {
     }
 }
 
-/// How often the realm renews the leases on characters in live games, and the bound on how many
-/// games one pass covers. A minute against a five-minute lease leaves four missed passes of slack.
-const lease_renew_us: c_uint = 60 * 1_000_000;
+/// How often the realm goes over the seats of live games, and the bound on how many games one pass
+/// covers. Short enough that a join that never completed is given up within a pass of its own
+/// timeout; the lease it renews is five minutes.
+const lease_renew_us: c_uint = 20 * 1_000_000;
 const lease_pass_games = 256;
 
-/// Renew every live game's character leases, forever.
+/// Go over every live game's seats, forever: renew the leases of players the game server stands
+/// behind, and let go of the rest.
 ///
 /// The claim a join takes is a LEASE with a TTL, so a game server that dies cannot strand a
 /// character. Nothing renewed it, which turns that safety into the opposite defect — and a worse
@@ -376,17 +383,33 @@ const lease_pass_games = 256;
 /// game only stays in this index while its server is still heartbeating — a server that dies has
 /// its games expired on the spot, so nothing renews them and they lapse on schedule. Liveness still
 /// comes from the server; the realm only carries it.
+///
+/// What it renews is only what the server has confirmed. A join the realm authorised is a seat
+/// nobody has seen anyone sit in, and renewing it as long as the game lives is what kept a player
+/// out of their own character after a join that never reached the server. Such a seat is dropped
+/// when its short lease is up, together with the player the realm had counted for it.
 pub fn renewCharLeases() void {
     var games: [lease_pass_games]state.GameInfo = undefined;
+    var passes: u32 = 0;
     while (true) {
         _ = usleep(lease_renew_us);
+        passes +%= 1;
         const n = state.snapshotGames(&games);
         var renewed: usize = 0;
-        for (games[0..n]) |g| renewed += store.renewGameCharLeases(g.gameid);
+        for (games[0..n]) |g| {
+            const sw = store.sweepGameSeats(g.gameid);
+            renewed += sw.renewed;
+            if (sw.unconfirmed > 0) {
+                state.global.dropGamePlayers(g.gameid, @intCast(@min(sw.unconfirmed, 0xFFFF)));
+                log.line("fleet", "game {d}: {d} join(s) never reached the game server, seat(s) released", .{ g.gameid, sw.unconfirmed });
+            }
+            if (sw.unreported > 0)
+                log.line("fleet", "game {d}: {d} seat(s) the game server no longer reports, released", .{ g.gameid, sw.unreported });
+        }
         // A server that was reaped (stopped heartbeating) had its game records expired without a close.
         const freed = store.releaseOrphanCharLocks();
         if (freed > 0) log.line("fleet", "freed {d} character lock(s) held by games that are gone", .{freed});
-        if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
+        if (renewed > 0 and passes % 3 == 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
     }
 }
 

@@ -195,6 +195,25 @@ pub const FakeGS = struct {
         try self.emit(b[0..total]);
     }
 
+    /// A player notice that names the account too, the way the real game server sends them. `flag` is
+    /// the realm's UPDATEGAMEINFO flag: 1 enter, 2 leave, 3 still present.
+    pub fn sendSeatNotice(self: *FakeGS, gameid: u32, players: u32, flag: u32, char: []const u8, account: []const u8) !void {
+        var b: [128]u8 = undefined;
+        var w = net.Writer.init(b[8..]);
+        w.u32v(flag);
+        w.u32v(gameid);
+        w.u32v(players);
+        w.u32v(10);
+        w.u32v(1);
+        w.cstr(char);
+        w.cstr(account);
+        const total = 8 + w.slice().len;
+        std.mem.writeInt(u16, b[0..2], @intCast(total), .little);
+        std.mem.writeInt(u16, b[2..4], rc.GS_UPDATEGAMEINFO, .little);
+        std.mem.writeInt(u32, b[4..8], 0, .little);
+        try self.emit(b[0..total]);
+    }
+
     /// Report a game ending, freeing whatever characters it still held.
     pub fn sendCloseGame(self: *FakeGS, gameid: u32) !void {
         var b: [12]u8 = undefined;

@@ -468,6 +468,9 @@ pub fn build(b: *std.Build) void {
         // Saves the store refused, kept until it takes them. Pure logic, and the difference
         // between a redis blip costing a delay and it costing a player's session.
         .{ "packages/gs-store/savequeue.zig", false, false },
+        // Which players this server still has in its games, repeated to the realm so a seat whose
+        // leave notice was lost does not outlive the player.
+        .{ "packages/gs-store/presence.zig", false, false },
         // The engine callback contract: its layout asserts are the point, and they fire at
         // compile time on any target, so they are worth checking here and not only in the DLL.
         .{ "packages/d2engine/d2engine.zig", false, false },

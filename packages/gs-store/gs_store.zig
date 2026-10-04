@@ -7,6 +7,7 @@
 const std = @import("std");
 const resp = @import("resp");
 const savequeue = @import("savequeue.zig");
+pub const presence = @import("presence.zig");
 
 const SOCKET = usize;
 const INVALID_SOCKET: SOCKET = ~@as(usize, 0);
