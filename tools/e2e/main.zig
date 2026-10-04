@@ -571,6 +571,40 @@ fn scCreateJoinGame() Result {
     return .{ .name = name, .status = .pass, .msg = msg("create+join ok create-token={d} join-token={d} gs_ip=127.0.0.1 (creates={d} joins={d})", .{ cg.token, jg.token, gs.creates, gs.joins }) };
 }
 
+/// A character just created is the one the next game is for. The client goes from the creation
+/// screen straight to the lobby without an MCP_CHARLOGON, so the realm has to take the create as
+/// the selection — or the first game names an empty character to the game server.
+fn scCreateCharThenGame() Result {
+    const name = "create_char_then_game";
+    const acct = "FirstGameAcct";
+    const char = "FirstGamer";
+    var gs = FakeGS{ .gsid = 0xABCE, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 43 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const res = c.charCreateFresh(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res != 0) return fail(name, "create char result=0x{x}", .{res});
+    // No charLogon here, exactly as the game client does it.
+    const cg = c.createGame("firstgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create game result={d}", .{cg.result});
+    if (gs.joins == 0) return fail(name, "FakeGS saw no join notify", .{});
+    const jc = std.mem.sliceTo(&gs.join_char, 0);
+    const ja = std.mem.sliceTo(&gs.join_account, 0);
+    if (!std.mem.eql(u8, jc, char)) return fail(name, "GS was told char='{s}' want '{s}'", .{ jc, char });
+    if (!std.ascii.eqlIgnoreCase(ja, acct)) return fail(name, "GS was told account='{s}' want '{s}'", .{ ja, acct });
+    return .{ .name = name, .status = .pass, .msg = msg("first game after create names '{s}' of '{s}' to the GS", .{ jc, ja }) };
+}
+
 /// The store refuses a save built from bytes it has since moved past.
 ///
 /// This is the mechanism that makes a rollback impossible rather than merely unlikely. Every other
@@ -2785,6 +2819,15 @@ fn resetFixtures() void {
     }
 }
 
+/// `E2E_ONLY=scName[,scName...]` runs just those scenarios; the rest report as skipped.
+fn only(comptime id: []const u8, comptime run: fn () Result) Result {
+    const want = envOr("E2E_ONLY", "");
+    if (want.len == 0) return run();
+    var it = std.mem.splitScalar(u8, want, ',');
+    while (it.next()) |w| if (std.mem.eql(u8, std.mem.trim(u8, w, " "), id)) return run();
+    return .{ .name = id, .status = .skip, .msg = "not in E2E_ONLY" };
+}
+
 pub fn main() !void {
     // A whole run can be moved off the default ports. Without this, a stray realm server
     // on 6112 quietly becomes the system under test.
@@ -2799,49 +2842,50 @@ pub fn main() !void {
     resetFixtures();
 
     const results = [_]Result{
-        scLogin(),
-        scMcpOn6112(),
-        scCharListStatstring(),
-        scCreateJoinGame(),
-        scSaveAccountKey(),
-        scDeleteInGame(),
-        scSaveFence(),
-        scRealmUniqueNames(),
-        scGamePopulation(),
-        scJoinErrors(),
-        scGameInfo(),
-        scFleetCapacity(),
-        scAdminApi(),
-        scMultiGameOneGs(),
-        scD2ingressTokenTranslate(),
-        scEmbeddedGameEdge(),
-        scCreateAccountRealAuth(),
-        scCharCreate(),
-        scCharVersion(),
-        scClassicChar(),
-        scLadder(),
-        scLadderExperience(),
-        scCharUpgrade(),
-        scCharDelete(),
-        scCharCopy(),
-        scLobbyChatAtoB(),
-        scLobbyCharNames(),
-        scChatCommands(),
-        scConcurrentClients(),
-        scFriendsListLoad(),
-        scNameResolution(),
-        scLeaveChannel(),
-        scDifficultyGate(),
-        scClassicGameFlags(),
-        scHardcoreGameFlags(),
-        scLadderGameFlags(),
-        scNonLadderGameFlags(),
-        scGetFileTime(),
-        scBannerAd(),
-        scSaveDurability(),
-        scFriendsPersist(),
-        scChatAcrossInstances(),
-        scMultiInstance(),
+        only("scLogin", scLogin),
+        only("scMcpOn6112", scMcpOn6112),
+        only("scCharListStatstring", scCharListStatstring),
+        only("scCreateJoinGame", scCreateJoinGame),
+        only("scSaveAccountKey", scSaveAccountKey),
+        only("scDeleteInGame", scDeleteInGame),
+        only("scSaveFence", scSaveFence),
+        only("scRealmUniqueNames", scRealmUniqueNames),
+        only("scGamePopulation", scGamePopulation),
+        only("scJoinErrors", scJoinErrors),
+        only("scGameInfo", scGameInfo),
+        only("scFleetCapacity", scFleetCapacity),
+        only("scAdminApi", scAdminApi),
+        only("scMultiGameOneGs", scMultiGameOneGs),
+        only("scD2ingressTokenTranslate", scD2ingressTokenTranslate),
+        only("scEmbeddedGameEdge", scEmbeddedGameEdge),
+        only("scCreateAccountRealAuth", scCreateAccountRealAuth),
+        only("scCharCreate", scCharCreate),
+        only("scCreateCharThenGame", scCreateCharThenGame),
+        only("scCharVersion", scCharVersion),
+        only("scClassicChar", scClassicChar),
+        only("scLadder", scLadder),
+        only("scLadderExperience", scLadderExperience),
+        only("scCharUpgrade", scCharUpgrade),
+        only("scCharDelete", scCharDelete),
+        only("scCharCopy", scCharCopy),
+        only("scLobbyChatAtoB", scLobbyChatAtoB),
+        only("scLobbyCharNames", scLobbyCharNames),
+        only("scChatCommands", scChatCommands),
+        only("scConcurrentClients", scConcurrentClients),
+        only("scFriendsListLoad", scFriendsListLoad),
+        only("scNameResolution", scNameResolution),
+        only("scLeaveChannel", scLeaveChannel),
+        only("scDifficultyGate", scDifficultyGate),
+        only("scClassicGameFlags", scClassicGameFlags),
+        only("scHardcoreGameFlags", scHardcoreGameFlags),
+        only("scLadderGameFlags", scLadderGameFlags),
+        only("scNonLadderGameFlags", scNonLadderGameFlags),
+        only("scGetFileTime", scGetFileTime),
+        only("scBannerAd", scBannerAd),
+        only("scSaveDurability", scSaveDurability),
+        only("scFriendsPersist", scFriendsPersist),
+        only("scChatAcrossInstances", scChatAcrossInstances),
+        only("scMultiInstance", scMultiInstance),
     };
 
     if (child) |pid| {
