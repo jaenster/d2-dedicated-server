@@ -853,38 +853,39 @@ fn ticketKey(buf: []u8, account: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "ticket:{s}", .{account}) catch null;
 }
 
+/// The outstanding tickets of an account are a list, newest last: several clients of one player start
+/// together, each with a ticket of its own, and none may overwrite another's before it is redeemed.
+/// The list is capped, and its expiry follows the newest ticket.
 pub fn putLoginTicket(account: []const u8, ticket: []const u8, ttl_s: u32) bool {
     var kb: [128]u8 = undefined;
     const key = ticketKey(&kb, account) orelse return false;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = if (ttl_s > 0) blk: {
-        var pb: [16]u8 = undefined;
-        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
-        break :blk command(s, &r, &.{ "SET", key, ticket, "PX", px });
-    } else command(s, &r, &.{ "SET", key, ticket });
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const script =
+        \\redis.call('RPUSH', KEYS[1], ARGV[1])
+        \\redis.call('LTRIM', KEYS[1], -32, -1)
+        \\if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+        \\return 1
+    ;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, ticket, px });
     return switch (rep orelse return false) {
         .status, .bulk, .int => true,
         .array_len, .err => false,
     };
 }
 
-/// Read and consume a ticket in one round trip. One-shot on purpose: a ticket that can be redeemed
-/// twice is a password with a short expiry, and the point of it is that it is not one.
+/// Read and consume the oldest outstanding ticket in one round trip. One-shot on purpose: a ticket
+/// that can be redeemed twice is a password with a short expiry, and the point of it is that it is not one.
 pub fn takeLoginTicket(account: []const u8, out: []u8) usize {
     var kb: [128]u8 = undefined;
     const key = ticketKey(&kb, account) orelse return 0;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    // GETDEL is 6.2+; on an older server the script is the portable form of the same thing.
-    const script =
-        \\local v = redis.call('GET', KEYS[1])
-        \\if v then redis.call('DEL', KEYS[1]) end
-        \\return v
-    ;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key }) orelse return 0;
+    const rep = command(s, &r, &.{ "LPOP", key }) orelse return 0;
     const bulk = switch (rep) {
         .bulk => |b| b orelse return 0,
         else => return 0,
@@ -892,6 +893,48 @@ pub fn takeLoginTicket(account: []const u8, out: []u8) usize {
     const n = @min(bulk.len, out.len);
     @memcpy(out[0..n], bulk[0..n]);
     return n;
+}
+
+/// The account's outstanding tickets, oldest first, each in a slot of `out`. Nothing is consumed.
+pub fn listLoginTickets(account: []const u8, out: [][32]u8, lens: []u8) usize {
+    var kb: [128]u8 = undefined;
+    const key = ticketKey(&kb, account) orelse return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "LRANGE", key, "0", "-1" }) orelse return 0;
+    const count = switch (rep) {
+        .array_len => |n| if (n <= 0) return 0 else @as(usize, @intCast(n)),
+        else => return 0,
+    };
+    var filled: usize = 0;
+    for (0..count) |_| {
+        const er = readReply(&r) orelse break;
+        const t = switch (er) {
+            .bulk => |b| b orelse continue,
+            else => break,
+        };
+        if (filled >= out.len or filled >= lens.len or t.len > out[filled].len) continue;
+        @memcpy(out[filled][0..t.len], t);
+        lens[filled] = @intCast(t.len);
+        filled += 1;
+    }
+    return filled;
+}
+
+/// Consume this very ticket if it is outstanding for the account. Only the one presented is spent, so
+/// a wrong guess costs nobody else's login.
+pub fn redeemLoginTicket(account: []const u8, ticket: []const u8) bool {
+    var kb: [128]u8 = undefined;
+    const key = ticketKey(&kb, account) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "LREM", key, "1", ticket }) orelse return false;
+    return switch (rep) {
+        .int => |n| n > 0,
+        else => false,
+    };
 }
 
 pub fn expireSession(id: u64) void {

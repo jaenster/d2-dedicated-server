@@ -425,6 +425,16 @@ pub fn takeLoginTicket(account: []const u8, out: []u8) usize {
     return redis.takeLoginTicket(account, out);
 }
 
+/// The account's outstanding tickets, oldest first. Nothing is consumed.
+pub fn listLoginTickets(account: []const u8, out: [][32]u8, lens: []u8) usize {
+    return redis.listLoginTickets(account, out, lens);
+}
+
+/// Consume `ticket` if it is one of the account's outstanding tickets.
+pub fn redeemLoginTicket(account: []const u8, ticket: []const u8) bool {
+    return redis.redeemLoginTicket(account, ticket);
+}
+
 pub fn expireSession(id: u64) void {
     redis.expireSession(id);
 }
