@@ -39,6 +39,22 @@ extern "kernel32" fn AddVectoredExceptionHandler(
     handler: *const fn (*EXCEPTION_POINTERS) callconv(.winapi) i32,
 ) callconv(.winapi) ?*anyopaque;
 
+extern "kernel32" fn GetModuleHandleExA(flags: u32, addr: usize, out: *?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetModuleFileNameA(m: ?*anyopaque, buf: [*]u8, n: u32) callconv(.winapi) u32;
+
+/// Names the module an address lies in and its load base, so the fault maps to a symbol offset.
+fn logModule(prefix: []const u8, addr: usize) void {
+    var m: ?*anyopaque = null;
+    if (GetModuleHandleExA(0x4 | 0x2, addr, &m) == 0 or m == null) {
+        log.hex(prefix, 0);
+        return;
+    }
+    var buf: [260]u8 = undefined;
+    const n = GetModuleFileNameA(m, &buf, buf.len);
+    log.hex(prefix, @intFromPtr(m.?));
+    if (n > 0) log.print(buf[0..n]);
+}
+
 fn handler(info: *EXCEPTION_POINTERS) callconv(.winapi) i32 {
     const rec = info.ExceptionRecord;
     // Only fatal exceptions (>= 0xC0000000): access violations, etc. Skip the
@@ -56,6 +72,7 @@ fn handler(info: *EXCEPTION_POINTERS) callconv(.winapi) i32 {
             const ctx = @intFromPtr(c);
             const esp = ctxU32(ctx, CTX_ESP);
             log.hex("crash: eip=0x", ctxU32(ctx, CTX_EIP));
+            logModule("crash: eip module base=0x", ctxU32(ctx, CTX_EIP));
             log.hex("crash: esp=0x", esp);
             log.hex("crash: ebp=0x", ctxU32(ctx, CTX_EBP));
             log.hex("crash: eax=0x", ctxU32(ctx, CTX_EAX));
