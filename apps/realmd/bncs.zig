@@ -42,15 +42,15 @@ pub var d2cs_ip: [4]u8 = .{ 127, 0, 0, 1 };
 pub var d2cs_port: u16 = 6112;
 
 // Comma-separated account names that get Battle.net-admin + operator flags in chat
-// (the "@"/Blizzard-rep style ops). Set from REALMD_ADMINS. Case-insensitive.
+// (the "@"/Blizzard-rep style ops). Set from REALMD_CHAT_OPS. Case-insensitive.
 pub var admin_accounts: []const u8 = "";
 
 const FLAG_OPERATOR: u32 = @intFromEnum(protocol.ChatUserFlag.operator);
 const FLAG_ADMIN: u32 = @intFromEnum(protocol.ChatUserFlag.bnet_admin);
 
-fn isAdmin(account: []const u8) bool {
-    if (admin_accounts.len == 0 or account.len == 0) return false;
-    var it = std.mem.tokenizeScalar(u8, admin_accounts, ',');
+fn accountListed(list: []const u8, account: []const u8) bool {
+    if (list.len == 0 or account.len == 0) return false;
+    var it = std.mem.tokenizeScalar(u8, list, ',');
     while (it.next()) |a| {
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, a, " "), account)) return true;
     }
@@ -816,6 +816,14 @@ fn showRemoteUserCb(ctx: *const ShowUserCtx, rm: chat.RemoteMember) void {
     sendEvent(ctx.c, EID_SHOWUSER, rm.flags, rm.display, rm.stat);
 }
 
+/// The chat flags of a user in a public channel: none, unless the account is a configured chat op.
+/// Never earned by being first in the channel: the client draws any user with the operator flag as a
+/// "Moderator" with the moderator portrait (ComCallback @0x446d90 skips the character data when
+/// flag 2 is set), so a player would lose their class, gear and title gender.
+fn chatUserFlags(ops: []const u8, account: []const u8) u32 {
+    return if (accountListed(ops, account)) FLAG_ADMIN | FLAG_OPERATOR else 0;
+}
+
 fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     _ = r.getU32(); // flags
@@ -823,13 +831,7 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     if (channel.len == 0) channel = default_channel;
     const acct = c.accountName();
 
-    // Compute this user's chat flags: configured admins always; the FIRST person in
-    // an otherwise-empty channel becomes its operator (typical Battle.net behaviour).
-    var flags: u32 = 0;
-    if (isAdmin(acct)) flags |= FLAG_ADMIN | FLAG_OPERATOR;
-    // Realm-wide, not per-instance: counting only our own members would hand the operator badge
-    // to the first person on every replica, so a busy channel would have as many ops as instances.
-    if (chat.countInChannelShared(channel) == 0) flags |= FLAG_OPERATOR;
+    const flags = chatUserFlags(admin_accounts, acct);
     c.user_flags = flags;
     log.line(tag, "join channel '{s}' as {s} (flags=0x{x})", .{ channel, acct, flags });
 
@@ -1744,4 +1746,13 @@ test "a product tag is four printable characters" {
     try std.testing.expect(isProductTag("PX2D"));
     try std.testing.expect(!isProductTag("P,2D"));
     try std.testing.expect(!isProductTag("P\x002D"));
+}
+
+test "a player gets no chat flags; only a configured chat op does" {
+    // Being first in a channel is not a reason: the client turns any operator into a "Moderator"
+    // and drops the character's portrait and title gender
+    try std.testing.expectEqual(@as(u32, 0), chatUserFlags("", "jaenster"));
+    try std.testing.expectEqual(@as(u32, 0), chatUserFlags("ops1,ops2", "jaenster"));
+    try std.testing.expectEqual(FLAG_ADMIN | FLAG_OPERATOR, chatUserFlags("ops1, Jaenster", "jaenster"));
+    try std.testing.expectEqual(@as(u32, 0), chatUserFlags("jaenster", ""));
 }

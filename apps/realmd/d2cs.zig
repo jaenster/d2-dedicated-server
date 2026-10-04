@@ -1289,3 +1289,108 @@ test "a chat statstring is the character list's blob behind the product tag, wit
     try std.testing.expectEqual(@as(u8, 42), blob[25]);
     try std.testing.expect(std.mem.indexOfScalar(u8, s, 0) == null);
 }
+
+/// The user-list fields the 1.14d client reads out of a chat statstring (ComCallback @0x446d90):
+/// the same offsets as the character list, after the product tag and "realm,charname,".
+const ChatUser = struct {
+    class: u8,
+    level: u8,
+    hardcore: bool,
+    expansion: bool,
+    ladder: bool,
+    progression: u8,
+
+    /// How many titles the character has earned, by the client's own thresholds (ComCallback
+    /// @0x447d00): 0 = none. Classic steps at 4/8/12, expansion at 5/10/15.
+    fn titleLevel(u: ChatUser) u8 {
+        const p = u.progression;
+        if (u.expansion) return if (p < 5) 0 else if (p < 10) 1 else if (p < 15) 2 else 3;
+        return if (p < 4) 0 else if (p < 8) 1 else if (p < 12) 2 else 3;
+    }
+};
+
+fn parseChatStat(s: []const u8) !ChatUser {
+    if (!std.mem.eql(u8, s[0..4], "PX2D")) return error.NoTag;
+    var i: usize = 4;
+    var commas: u8 = 0;
+    while (commas < 2) : (i += 1) {
+        if (s[i] == ',') commas += 1;
+    }
+    const blob = s[i..];
+    var flags: u32 = 0;
+    flags = (blob[26] & 0x7f) | (@as(u32, blob[27] & 0x7f) << 7);
+    return .{
+        .class = blob[13] - 1,
+        .level = blob[25],
+        .hardcore = flags & 0x04 != 0,
+        .expansion = flags & 0x20 != 0,
+        .ladder = flags & 0x40 != 0,
+        .progression = @intCast((flags >> 8) & 0x1f),
+    };
+}
+
+fn statFor(out: []u8, class: u8, level: u8, status: u8, progression: u8) []const u8 {
+    var w = proto.Writer.init(out);
+    w.putBytes("PX2D");
+    w.putBytes("realm");
+    w.putU8(',');
+    w.putBytes("Char");
+    w.putU8(',');
+    writeStatString(&w, class, level, status, progression, 1, &.{}, &.{}, "14");
+    return w.slice();
+}
+
+test "a chat statstring carries the character's class, level, mode and title progression" {
+    var b: [128]u8 = undefined;
+    const Case = struct { class: u8, level: u8, status: u8, prog: u8, hc: bool, xp: bool, ladder: bool, title: u8 };
+    const cases = [_]Case{
+        // a level-99 expansion sorceress who has finished Hell: the title of the owner's character
+        .{ .class = 1, .level = 99, .status = 0x28, .prog = 15, .hc = false, .xp = true, .ladder = false, .title = 3 },
+        // a fresh classic softcore amazon
+        .{ .class = 0, .level = 1, .status = 0x00, .prog = 0, .hc = false, .xp = false, .ladder = false, .title = 0 },
+        // expansion hardcore ladder, Nightmare done
+        .{ .class = 4, .level = 75, .status = 0x64, .prog = 5, .hc = true, .xp = true, .ladder = true, .title = 1 },
+        // classic softcore, Nightmare and Hell opened but not finished
+        .{ .class = 3, .level = 60, .status = 0x00, .prog = 8, .hc = false, .xp = false, .ladder = false, .title = 2 },
+        // classic finished, expansion needs 15 for the same title
+        .{ .class = 5, .level = 90, .status = 0x00, .prog = 12, .hc = false, .xp = false, .ladder = false, .title = 3 },
+        .{ .class = 5, .level = 90, .status = 0x20, .prog = 12, .hc = false, .xp = true, .ladder = false, .title = 2 },
+        .{ .class = 6, .level = 30, .status = 0x24, .prog = 4, .hc = true, .xp = true, .ladder = false, .title = 0 },
+    };
+    for (cases) |c| {
+        const s = statFor(&b, c.class, c.level, c.status, c.prog);
+        try std.testing.expect(std.mem.indexOfScalar(u8, s, 0) == null);
+        const u = try parseChatStat(s);
+        try std.testing.expectEqual(c.class, u.class);
+        try std.testing.expectEqual(c.level, u.level);
+        try std.testing.expectEqual(c.hc, u.hardcore);
+        try std.testing.expectEqual(c.xp, u.expansion);
+        try std.testing.expectEqual(c.ladder, u.ladder);
+        try std.testing.expectEqual(c.prog, u.progression);
+        try std.testing.expectEqual(c.title, u.titleLevel());
+    }
+}
+
+test "a save's header is read into the statstring, gear or none" {
+    var save = [_]u8{0} ** 0xB0;
+    save[0x24] = 0x28; // expansion, died bit
+    save[0x25] = 15;
+    save[0x28] = 1; // sorceress
+    save[0x2b] = 99;
+    var b: [128]u8 = undefined;
+    var w = proto.Writer.init(&b);
+    w.putBytes("PX2Drealm,Char,");
+    const at = w.pos;
+    // no store behind it: the era tag comes from writeCharStatFrom's store lookup, so build the
+    // same fields from the header the way it does
+    writeStatString(&w, save[0x28], save[0x2b], save[0x24], save[0x25], 1, &.{}, &.{}, "");
+    const blob = w.slice()[at..];
+    // no gear: all 0xFF in both slots, which the client draws as a naked character
+    for (blob[2..13]) |x| try std.testing.expectEqual(@as(u8, 0xFF), x);
+    for (blob[14..25]) |x| try std.testing.expectEqual(@as(u8, 0xFF), x);
+    const u = try parseChatStat(w.slice());
+    try std.testing.expectEqual(@as(u8, 1), u.class);
+    try std.testing.expectEqual(@as(u8, 99), u.level);
+    try std.testing.expectEqual(@as(u8, 15), u.progression);
+    try std.testing.expect(u.expansion and !u.hardcore);
+}

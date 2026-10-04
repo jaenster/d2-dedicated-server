@@ -17,9 +17,13 @@ pub const Config = struct {
     /// Realm advertised to clients (what bnetd hands back as the realm address).
     realm_name: []const u8 = "TypeGuru",
     realm_addr: []const u8 = "127.0.0.1",
-    /// Comma-separated account names granted Battle.net-admin + channel-operator flags
-    /// in chat (the realm's ops). Case-insensitive. Empty = no admins.
+    /// Comma-separated realm-account names allowed into the admin API and web UI
+    /// (REALMD_ADMINS). Case-insensitive. Empty = none.
     admins: []const u8 = "",
+    /// Comma-separated realm-account names shown as Battle.net admins/operators in chat
+    /// (REALMD_CHAT_OPS). Case-insensitive. Empty = nobody: the client draws an operator with the
+    /// moderator portrait instead of their character, so this is never derived from `admins`.
+    chat_ops: []const u8 = "",
     /// Banner ad shown above the chat window: the file the client downloads over BNFTP
     /// (so it must sit in <data_dir>/bnftp/) and the URL a click opens. The client only
     /// shows an ad when it gets BOTH, so either one empty means no ads.
@@ -213,6 +217,7 @@ pub fn fromEnv() Config {
     c.game_port = envPort("REALMD_GAME_PORT", c.game_port);
     if (env("REALMD_REALM_NAME")) |v| c.realm_name = v;
     if (env("REALMD_ADMINS")) |v| c.admins = v;
+    if (env("REALMD_CHAT_OPS")) |v| c.chat_ops = v;
     if (env("REALMD_AD_FILE")) |v| c.ad_file = v;
     if (env("REALMD_AD_URL")) |v| c.ad_url = v;
     if (env("REALMD_REALM_ADDR")) |v| c.realm_addr = v;
