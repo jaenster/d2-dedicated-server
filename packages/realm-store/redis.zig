@@ -2821,3 +2821,55 @@ test "several tickets of one account live side by side and each is spent once" {
     try std.testing.expect(redeemLoginTicket(acct, "fresh001"));
     try std.testing.expect(!redeemLoginTicket(acct, "oldformat"));
 }
+
+/// A connected local pair standing in for the redis socket: the test writes the "server" side.
+fn fakePair() ![2]net.Socket {
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPair;
+    return fds;
+}
+
+extern "c" fn usleep(usec: c_uint) c_int;
+
+fn sendThenClose(fd: net.Socket, parts: []const []const u8) void {
+    for (parts) |p| {
+        _ = std.c.write(fd, p.ptr, p.len);
+        _ = usleep(20_000);
+    }
+    net.closeSocket(fd);
+}
+
+test "a reply cut off by a closed connection is an error, not a panic" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    const t = try std.Thread.spawn(.{}, sendThenClose, .{ p[1], &[_][]const u8{"$10\r\nabc"} });
+    var r = Reader{ .fd = p[0] };
+    try std.testing.expect(readReply(&r) == null);
+    t.join();
+}
+
+test "a closed connection with nothing sent is an error" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    net.closeSocket(p[1]);
+    var r = Reader{ .fd = p[0] };
+    try std.testing.expect(readReply(&r) == null);
+}
+
+test "a lone CRLF where a reply should start is an error, not a panic" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    const t = try std.Thread.spawn(.{}, sendThenClose, .{ p[1], &[_][]const u8{"\r\n"} });
+    var r = Reader{ .fd = p[0] };
+    try std.testing.expect(readReply(&r) == null);
+    t.join();
+}
+
+test "a reply split across several reads is reassembled" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    const t = try std.Thread.spawn(.{}, sendThenClose, .{ p[1], &[_][]const u8{ "$1", "0\r\nabc", "defghij", "\r", "\n" } });
+    var r = Reader{ .fd = p[0] };
+    try std.testing.expectEqualStrings("abcdefghij", readReply(&r).?.bulk.?);
+    t.join();
+}
