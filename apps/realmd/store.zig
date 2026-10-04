@@ -564,20 +564,24 @@ pub fn takeGsReply(seq: u32, out: []u8) ?usize {
 
 /// Pick the least-loaded game server with room and reserve a slot on it, atomically.
 /// Null when every server is full, which the caller reports differently from an empty fleet.
-pub fn pickAndReserveGs() ?u32 {
-    return redis.pickAndReserveGs();
+pub fn pickAndReserveGs(exclude: []const u32) ?u32 {
+    return redis.pickAndReserveGs(exclude);
 }
 
 /// The same pick, restricted to servers publishing `key=value`. Null when none of the ones that
 /// match has room, which is a different answer from "the fleet is full".
-pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8) ?u32 {
-    return redis.pickAndReserveGsMatching(key, value);
+pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8, exclude: []const u32) ?u32 {
+    return redis.pickAndReserveGsMatching(key, value, exclude);
 }
 
 /// Reserve a slot on one named server, for a caller that chose it rather than asking us to.
 /// False when that server is gone or has no room — the choice still has to survive the race.
 pub fn reserveGs(gsid: u32) bool {
     return redis.reserveGs(gsid);
+}
+
+pub fn dropGsRequest(gsid: u32, packet: []const u8) bool {
+    return redis.dropGsRequest(gsid, packet);
 }
 
 /// Give back a slot whose create did not happen.

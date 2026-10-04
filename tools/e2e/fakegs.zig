@@ -31,6 +31,12 @@ pub const FakeGS = struct {
     next_gameid: ?u32 = null, // if set, hand out incrementing ids
     /// Answer every create with this instead of success. 0 = accept.
     refuse_create_with: u32 = 0,
+    /// Leave the queue unread for this long after start, as a dead or frozen server does: its record
+    /// is in the store (it outlives the server for a while) and nobody answers.
+    answer_after_ms: u32 = 0,
+    /// Games this server publishes as already running, so a pick that prefers the least loaded
+    /// server leaves it for the other.
+    extra_live: u32 = 0,
 
     registered: bool = false,
     creates: u32 = 0,
@@ -63,7 +69,7 @@ pub const FakeGS = struct {
         @memcpy(v[0..4], &self.ip);
         std.mem.writeInt(u16, v[4..6], self.gs_port, .little);
         std.mem.writeInt(u32, v[6..10], self.maxgame, .little);
-        std.mem.writeInt(u32, v[10..14], live, .little);
+        std.mem.writeInt(u32, v[10..14], live + self.extra_live, .little);
         v[14] = 0; // not full
         _ = try c.cmd(&.{ "SET", k, &v, "PX", "90000" });
         var ib: [16]u8 = undefined;
@@ -91,7 +97,13 @@ pub const FakeGS = struct {
         var qk: [64]u8 = undefined;
         const queue = key(&qk, "realmd:gsq:{x}", .{self.gsid});
         var live: u32 = 0;
+        var asleep_ms: u32 = 0;
         while (!self.stop_flag) {
+            if (asleep_ms < self.answer_after_ms) {
+                _ = net.usleep(5_000);
+                asleep_ms += 5;
+                continue;
+            }
             const rep = c.cmd(&.{ "LPOP", queue }) catch break;
             const packet = switch (rep) {
                 .bulk => |b| b orelse {

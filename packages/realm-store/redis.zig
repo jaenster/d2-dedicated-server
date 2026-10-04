@@ -2477,6 +2477,36 @@ pub fn popGsEvent(out: []u8) ?usize {
     };
 }
 
+/// How many servers one placement can rule out.
+pub const max_exclude = 64;
+
+/// Hex ids, comma separated; the pick scripts wrap the list in commas so a whole id is matched.
+fn excludeList(buf: *[max_exclude * 9]u8, exclude: []const u32) []const u8 {
+    var n: usize = 0;
+    for (exclude[0..@min(exclude.len, max_exclude)]) |g| {
+        const part = std.fmt.bufPrint(buf[n..], "{s}{x}", .{ if (n == 0) "" else ",", g }) catch break;
+        n += part.len;
+    }
+    return buf[0..n];
+}
+
+/// Take back a request nobody has read yet. A server that did not answer in time may be down or
+/// asleep, and the request would otherwise sit in its queue until it comes back and be served to a
+/// client that has long gone (and then collide with the retry). True when it was still queued.
+pub fn dropGsRequest(gsid: u32, packet: []const u8) bool {
+    var kb: [64]u8 = undefined;
+    const key = gsQueueKey(&kb, gsid);
+    if (key.len == 0) return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "LREM", key, "0", packet }) orelse return false;
+    return switch (rep) {
+        .int => |n| n > 0,
+        else => false,
+    };
+}
+
 /// Choose a game server for a new game and reserve a slot on it, in one indivisible step.
 ///
 /// Selecting and then reserving as two operations is a read-modify-write across instances: two
@@ -2489,12 +2519,16 @@ pub fn popGsEvent(out: []u8) ?usize {
 ///
 /// Returns the chosen server's id, or null when every server is full — which is a real answer, not
 /// a failure, and the caller has a different thing to tell the player for each.
-pub fn pickAndReserveGs() ?u32 {
+///
+/// Servers in `exclude` never qualify: they are the ones that already failed this very request, and
+/// without it a retry after a refusal would pick the same least-loaded server again.
+pub fn pickAndReserveGs(exclude: []const u32) ?u32 {
     const script =
+        \\local ex = ',' .. ARGV[1] .. ','
         \\local best, bestload
         \\for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
         \\  local rec = redis.call('GET', KEYS[2] .. id)
-        \\  if rec and #rec >= 15 then
+        \\  if rec and #rec >= 15 and not string.find(ex, ',' .. id .. ',', 1, true) then
         \\    local function u32(o)
         \\      return string.byte(rec,o) + string.byte(rec,o+1)*256
         \\           + string.byte(rec,o+2)*65536 + string.byte(rec,o+3)*16777216
@@ -2523,7 +2557,8 @@ pub fn pickAndReserveGs() ?u32 {
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:" }) orelse return null;
+    var exb: [max_exclude * 9]u8 = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:", excludeList(&exb, exclude) }) orelse return null;
     return switch (rep) {
         .bulk => |b| blk: {
             const v = b orelse break :blk null;
@@ -2543,13 +2578,14 @@ pub fn pickAndReserveGs() ?u32 {
 /// A server that does not publish the label at all does not match, deliberately: the alternative
 /// is that one unlabelled server answers every request, which is exactly the mis-routing this
 /// exists to prevent.
-pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8) ?u32 {
+pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8, exclude: []const u32) ?u32 {
     const script =
         \\local want = '\n' .. ARGV[1] .. '=' .. ARGV[2] .. '\n'
+        \\local ex = ',' .. ARGV[3] .. ','
         \\local best, bestload
         \\for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
         \\  local rec = redis.call('GET', KEYS[2] .. id)
-        \\  if rec and #rec >= 15 then
+        \\  if rec and #rec >= 15 and not string.find(ex, ',' .. id .. ',', 1, true) then
         \\    local function u32(o)
         \\      return string.byte(rec,o) + string.byte(rec,o+1)*256
         \\           + string.byte(rec,o+2)*65536 + string.byte(rec,o+3)*16777216
@@ -2576,7 +2612,8 @@ pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8) ?u32 {
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:", key, value }) orelse return null;
+    var exb: [max_exclude * 9]u8 = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:", key, value, excludeList(&exb, exclude) }) orelse return null;
     return switch (rep) {
         .bulk => |b| blk: {
             const v = b orelse break :blk null;

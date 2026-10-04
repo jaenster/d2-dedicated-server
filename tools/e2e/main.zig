@@ -1286,6 +1286,69 @@ fn scFleetCapacity() Result {
     return .{ .name = name, .status = .pass, .msg = msg("spread a={d} b={d}, 3rd rejected (result={d})", .{ gs_a.creates, gs_b.creates, r3 }) };
 }
 
+/// A server that answers a create with a refusal (a draining machine, one shutting down) is not the
+/// end of the create while another server can host the game.
+fn scRefusedServerFallsBack() Result {
+    const name = "refused_server_falls_back";
+    // The refusing server is the less loaded one, so it is the first pick.
+    var gs_a = FakeGS{ .gsid = 0xAA1, .ip = .{ 127, 0, 0, 2 }, .refuse_create_with = 0x77, .next_gameid = 100 };
+    var gs_b = FakeGS{ .gsid = 0xBB1, .ip = .{ 127, 0, 0, 3 }, .extra_live = 1, .next_gameid = 200 };
+    gs_a.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs_a.stop();
+    gs_b.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs_b.stop();
+    if (!gs_a.isRegistered() or !gs_b.isRegistered()) return fail(name, "both FakeGS must register", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("RefusedGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const r = (c.createGame("refgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)})).result;
+    if (r != 0) return fail(name, "create must succeed on the second server (result={d})", .{r});
+    if (gs_a.creates != 1) return fail(name, "the less loaded server must have been asked first (a={d})", .{gs_a.creates});
+    if (gs_b.creates != 1) return fail(name, "the game must land on the other server (b={d})", .{gs_b.creates});
+    return .{ .name = name, .status = .pass, .msg = msg("refusal from a={d} then hosted on b={d}", .{ gs_a.creates, gs_b.creates }) };
+}
+
+/// A server that never answers (dead, but its record has not expired yet) costs one timeout, not the
+/// create: the request is taken back and the next server hosts the game.
+fn scSilentServerFallsBack() Result {
+    const name = "silent_server_falls_back";
+    var gs_a = FakeGS{ .gsid = 0xAA2, .ip = .{ 127, 0, 0, 2 }, .answer_after_ms = 600_000, .next_gameid = 100 };
+    var gs_b = FakeGS{ .gsid = 0xBB2, .ip = .{ 127, 0, 0, 3 }, .extra_live = 1, .next_gameid = 200 };
+    gs_a.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs_a.stop();
+    gs_b.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs_b.stop();
+    if (!gs_a.isRegistered() or !gs_b.isRegistered()) return fail(name, "both FakeGS must register", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("SilentGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const r = (c.createGame("silentgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)})).result;
+    if (r != 0) return fail(name, "create must succeed on the live server (result={d})", .{r});
+    if (gs_b.creates != 1) return fail(name, "the game must land on the live server (b={d})", .{gs_b.creates});
+
+    var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    defer rcl.close();
+    var kb: [64]u8 = undefined;
+    const qk = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gs_a.gsid}) catch unreachable;
+    const len = rcl.cmd(&.{ "LLEN", qk }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    if (len != .int or len.int != 0) return fail(name, "the silent server's request must be taken back, or it creates a stale game when it revives", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("silent a skipped (queue emptied), hosted on b", .{}) };
+}
+
 /// The slash commands the 1.14d client forwards. It intercepts a few locally (/fps,
 /// /players, /nopickup) but hands the rest to the realm verbatim, including whisper
 /// aliases realmd did not recognise and /help, which it cannot answer itself.
@@ -2878,7 +2941,7 @@ fn scMultiInstance() Result {
     const cg = a.createGame("fleetgame", "d") catch |e| return fail(name, "A create {s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "A create result={d}", .{cg.result});
     // ...and confirm B's admin API lists it (shared-store snapshotGames, not A's memory).
-    var rxbuf: [4096]u8 = undefined;
+    var rxbuf: [16384]u8 = undefined;
     const lg = net.httpRequest(17118, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "B admin games {s}", .{@errorName(e)});
     if (lg.status != 200) return fail(name, "B admin games status={d}", .{lg.status});
     if (std.mem.indexOf(u8, lg.body, "fleetgame") == null)
@@ -3260,6 +3323,8 @@ pub fn main() !void {
         only("scGameMaxPlayers", scGameMaxPlayers),
         only("scGameInfo", scGameInfo),
         only("scFleetCapacity", scFleetCapacity),
+        only("scRefusedServerFallsBack", scRefusedServerFallsBack),
+        only("scSilentServerFallsBack", scSilentServerFallsBack),
         only("scAdminApi", scAdminApi),
         only("scMultiGameOneGs", scMultiGameOneGs),
         only("scD2ingressTokenTranslate", scD2ingressTokenTranslate),
