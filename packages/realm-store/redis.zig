@@ -855,7 +855,8 @@ fn ticketKey(buf: []u8, account: []const u8) ?[]const u8 {
 
 /// The outstanding tickets of an account are a list, newest last: several clients of one player start
 /// together, each with a ticket of its own, and none may overwrite another's before it is redeemed.
-/// The list is capped, and its expiry follows the newest ticket.
+/// The list is capped, and its expiry follows the newest ticket. A key left by the single-ticket format
+/// (a string) is replaced.
 pub fn putLoginTicket(account: []const u8, ticket: []const u8, ttl_s: u32) bool {
     var kb: [128]u8 = undefined;
     const key = ticketKey(&kb, account) orelse return false;
@@ -865,6 +866,7 @@ pub fn putLoginTicket(account: []const u8, ticket: []const u8, ttl_s: u32) bool 
     var pb: [16]u8 = undefined;
     const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const script =
+        \\if redis.call('TYPE', KEYS[1]).ok ~= 'list' then redis.call('DEL', KEYS[1]) end
         \\redis.call('RPUSH', KEYS[1], ARGV[1])
         \\redis.call('LTRIM', KEYS[1], -32, -1)
         \\if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
@@ -2733,4 +2735,89 @@ pub fn chatPop(instance: u32, out: []u8) ?usize {
         },
         else => null,
     };
+}
+
+// Tests that need a real redis run only when REALM_TEST_REDIS names one (host:port), and only against
+// a server that carries the marker key below, so that a test never writes into a realm's own redis.
+// Create the marker on a throwaway server with: SET realmd:test-instance 1
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+fn testRedis() !void {
+    const addr = getenv("REALM_TEST_REDIS") orelse return error.SkipZigTest;
+    init(std.mem.span(addr));
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", prefix ++ "test-instance" }) orelse return error.SkipZigTest;
+    switch (rep) {
+        .bulk => |b| if (b == null) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+}
+
+test "several tickets of one account live side by side and each is spent once" {
+    try testRedis();
+    const acct = "ticket-test-acc";
+    var kb: [128]u8 = undefined;
+    const key = ticketKey(&kb, acct).?;
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "DEL", key });
+    }
+    defer {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "DEL", key });
+    }
+
+    var tickets: [16][8]u8 = undefined;
+    for (&tickets, 0..) |*t, i| {
+        _ = std.fmt.bufPrint(t, "tkt{d:0>5}", .{i}) catch unreachable;
+        try std.testing.expect(putLoginTicket(acct, t, 300));
+    }
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        const rep = command(s, &r, &.{ "PTTL", key }).?;
+        try std.testing.expect(rep.int > 0 and rep.int <= 300_000);
+    }
+    // A wrong ticket fails and spends nobody else's.
+    try std.testing.expect(!redeemLoginTicket(acct, "nope0000"));
+    // In a scrambled order, every one succeeds, once.
+    var prng = std.Random.DefaultPrng.init(0x7d2);
+    var order: [16]usize = undefined;
+    for (&order, 0..) |*o, i| o.* = i;
+    prng.random().shuffle(usize, &order);
+    for (order) |i| try std.testing.expect(redeemLoginTicket(acct, &tickets[i]));
+    for (order) |i| try std.testing.expect(!redeemLoginTicket(acct, &tickets[i]));
+
+    // The list holds 32: the oldest of 40 are dropped, and takeLoginTicket pops the oldest left.
+    for (0..40) |i| {
+        var t: [8]u8 = undefined;
+        _ = std.fmt.bufPrint(&t, "cap{d:0>5}", .{i}) catch unreachable;
+        try std.testing.expect(putLoginTicket(acct, &t, 300));
+    }
+    try std.testing.expect(!redeemLoginTicket(acct, "cap00007"));
+    var out: [32]u8 = undefined;
+    const n = takeLoginTicket(acct, &out);
+    try std.testing.expectEqualStrings("cap00008", out[0..n]);
+    var left: usize = 0;
+    while (takeLoginTicket(acct, &out) != 0) left += 1;
+    try std.testing.expectEqual(@as(usize, 31), left);
+
+    // A key left by the single-ticket format is replaced, not an error.
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "SET", key, "oldformat" });
+    }
+    try std.testing.expect(putLoginTicket(acct, "fresh001", 300));
+    try std.testing.expect(redeemLoginTicket(acct, "fresh001"));
+    try std.testing.expect(!redeemLoginTicket(acct, "oldformat"));
 }
