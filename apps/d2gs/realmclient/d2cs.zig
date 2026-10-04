@@ -371,12 +371,20 @@ fn handleJoinGame(seq: u32, body: []const u8) void {
 /// Creating a game hands work to the tick loop and waits for it. Calling it FROM the tick means
 /// the tick cannot advance to do that work, so every create returns 0 — which presents as the
 /// server refusing perfectly good requests, with nothing in the log to say why.
+///
+/// It blocks in the store (BLPOP, on a connection of its own) rather than polling: a poll every
+/// 20 ms was most of an idle server's CPU under wine, and a blocking pop hands a request over the
+/// moment it is queued.
 fn queueThreadMain(_: ?*anyopaque) callconv(.winapi) u32 {
     while (true) {
-        pumpQueue();
-        Sleep(20);
+        var buf: [1024]u8 = undefined;
+        const n = redis.waitRequest(gsid, &buf, queue_wait_s);
+        if (n > 0) handleRequest(buf[0..n]);
     }
 }
+
+/// How long one blocking pop waits before it asks again.
+const queue_wait_s: u32 = 5;
 
 var queue_thread_started = false;
 
@@ -391,6 +399,12 @@ pub fn pumpQueue() void {
     if (!redis.enabled() or gsid == 0) return;
     var buf: [1024]u8 = undefined;
     const n = redis.popRequest(gsid, &buf);
+    handleRequest(buf[0..n]);
+}
+
+fn handleRequest(msg: []const u8) void {
+    const n = msg.len;
+    const buf = msg;
     if (n < p.HEADER_LEN) return;
     const size = std.mem.readInt(u16, buf[0..2], .little);
     const typ = std.mem.readInt(u16, buf[2..4], .little);
