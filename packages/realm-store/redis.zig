@@ -1780,6 +1780,47 @@ pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
     };
 }
 
+/// Free every character lock held by a game the realm no longer lists.
+///
+/// A lock's owner is `game:<id>` and the game's record is what the realm lists, kept alive by the
+/// game server's own heartbeat. A game server that restarted or was reaped takes its records with
+/// it without a CLOSEGAME ever arriving, so what its games held would otherwise stay claimed until
+/// the lease ran out. A game with a record is live and keeps its locks; only a lock whose game has
+/// no record is freed, and a lock another game has since taken is left alone. The per-game member
+/// set goes with it. Owners that are not `game:<id>` are never touched.
+/// Returns how many locks were freed.
+pub const orphan_charlock_script =
+    \\local n = 0
+    \\local cur = '0'
+    \\repeat
+    \\  local res = redis.call('SCAN', cur, 'MATCH', ARGV[1] .. 'charlock:*', 'COUNT', 500)
+    \\  cur = res[1]
+    \\  for _, k in ipairs(res[2]) do
+    \\    local o = redis.call('GET', k)
+    \\    if o and string.sub(o, 1, 5) == 'game:' then
+    \\      local id = tonumber(string.sub(o, 6))
+    \\      if id and redis.call('EXISTS', ARGV[1] .. 'game:byid:' .. string.format('%x', id)) == 0 then
+    \\        redis.call('DEL', k)
+    \\        redis.call('SREM', ARGV[1] .. 'gamechars:' .. string.sub(o, 6), string.sub(k, #ARGV[1] + 10))
+    \\        n = n + 1
+    \\      end
+    \\    end
+    \\  end
+    \\until cur == '0'
+    \\return n
+;
+
+pub fn releaseOrphanCharLocks() usize {
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", orphan_charlock_script, "0", prefix }) orelse return 0;
+    return switch (rep) {
+        .int => |v| @intCast(@max(v, 0)),
+        else => 0,
+    };
+}
+
 /// Renew the lease on every character this game holds. Returns how many were still ours.
 ///
 /// The claim is a LEASE, not a permanent lock: `lockChar` takes it with a TTL so a game server
@@ -2987,4 +3028,41 @@ test "a game name with spaces and capitals keys to a folded, storable key" {
     try std.testing.expectEqualStrings("jan3", gameKey("Jan3", &nb).?);
     try std.testing.expect(gameKey("", &nb) == null);
     try std.testing.expect(gameKey("a\nb", &nb) == null);
+}
+
+test "a restarted server's games release their characters, a live game's are kept" {
+    try testRedis();
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        // game 10 (hex a) is live and has a record; game 11 (hex b) lost its server and has none
+        _ = command(s, &r, &.{ "SET", prefix ++ "game:byid:a", "live" });
+        _ = command(s, &r, &.{ "DEL", prefix ++ "game:byid:b" });
+    }
+    defer {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "DEL", prefix ++ "game:byid:a", prefix ++ "gamechars:10", prefix ++ "gamechars:11" });
+        _ = command(s, &r, &.{ "DEL", prefix ++ "charlock:orphan/Alive", prefix ++ "charlock:orphan/Stuck", prefix ++ "charlock:orphan/Other" });
+    }
+    try std.testing.expect(lockChar("orphan", "Alive", "game:10", 300));
+    try std.testing.expect(addGameChar(10, "orphan", "Alive"));
+    try std.testing.expect(lockChar("orphan", "Stuck", "game:11", 300));
+    try std.testing.expect(addGameChar(11, "orphan", "Stuck"));
+    try std.testing.expect(lockChar("orphan", "Other", "someone-else", 300));
+
+    // Other locks on the redis may belong to games that are gone too, so count only ours.
+    try std.testing.expect(releaseOrphanCharLocks() >= 1);
+
+    var ob: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("game:10", charLockOwner("orphan", "Alive", &ob).?);
+    try std.testing.expect(charLockOwner("orphan", "Stuck", &ob) == null);
+    try std.testing.expectEqualStrings("someone-else", charLockOwner("orphan", "Other", &ob).?);
+    // the freed character can be taken by its next game
+    try std.testing.expect(lockChar("orphan", "Stuck", "game:10", 300));
+    // nothing of ours left to free on a second pass
+    _ = releaseOrphanCharLocks();
+    try std.testing.expect(charLockOwner("orphan", "Stuck", &ob) != null);
 }

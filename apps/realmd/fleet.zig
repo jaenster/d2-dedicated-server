@@ -304,7 +304,10 @@ fn apply(typ: p.Type, body: []const u8) void {
             if (body.len < 14) return;
             const gsid = std.mem.readInt(u32, body[4..8], .little);
             state.global.expireGamesByGs(gsid);
-            log.line("fleet", "game server 0x{x} started; its stale games expired", .{gsid});
+            // The games it hosted are gone and never sent CLOSEGAME: their characters are free now,
+            // not when the lease runs out. Games on other servers still have records and are kept.
+            const freed = store.releaseOrphanCharLocks();
+            log.line("fleet", "game server 0x{x} started; its stale games expired, {d} character lock(s) freed", .{ gsid, freed });
         },
         .updategameinfo => {
             // The server is the only party that sees players leave, so its count replaces ours
@@ -380,6 +383,9 @@ pub fn renewCharLeases() void {
         const n = state.snapshotGames(&games);
         var renewed: usize = 0;
         for (games[0..n]) |g| renewed += store.renewGameCharLeases(g.gameid);
+        // A server that was reaped (stopped heartbeating) had its game records expired without a close.
+        const freed = store.releaseOrphanCharLocks();
+        if (freed > 0) log.line("fleet", "freed {d} character lock(s) held by games that are gone", .{freed});
         if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
     }
 }

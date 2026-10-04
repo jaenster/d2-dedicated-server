@@ -703,6 +703,12 @@ pub fn renewGameCharLeases(gameid: u32) usize {
     return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s);
 }
 
+/// Free the characters held by games the realm no longer lists (a game server that restarted or was
+/// reaped never closes them), leaving every live game's locks alone.
+pub fn releaseOrphanCharLocks() usize {
+    return redis.releaseOrphanCharLocks();
+}
+
 pub fn releaseGameChars(gameid: u32) usize {
     var ob: [32]u8 = undefined;
     const owner = gameOwnerId(&ob, gameid);
