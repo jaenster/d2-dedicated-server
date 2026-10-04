@@ -20,6 +20,13 @@ pub const Reply = union(enum) {
     err: []const u8,
 };
 
+/// Whether an error reply says this node is no longer the master we meant to talk to: a replica
+/// refuses writes (`READONLY`) and one cut off from its master refuses everything (`MASTERDOWN`).
+/// Retrying on the same connection cannot succeed; it has to be dropped and dialled again.
+pub fn isWrongNode(err: []const u8) bool {
+    return std.mem.startsWith(u8, err, "READONLY") or std.mem.startsWith(u8, err, "MASTERDOWN");
+}
+
 /// What a parse attempt produced.
 pub const Parsed = union(enum) {
     /// A complete reply, and how many bytes of the input it consumed.
@@ -48,6 +55,9 @@ pub fn parse(in: []const u8) Parsed {
     // Tolerate a bare \n as well as \r\n: the framing is defined with \r\n, but accepting both
     // costs nothing and a reply is never ambiguous either way.
     const end = if (nl > 0 and in[nl - 1] == '\r') nl - 1 else nl;
+    // The type byte must sit before the terminator. A bare "\n" or "\r\n" has none; slicing past
+    // the type byte would then run start > end.
+    if (end < 1) return .invalid;
     const line = in[1..end]; // past the type byte
     const after = nl + 1;
 
@@ -61,13 +71,19 @@ pub fn parse(in: []const u8) Parsed {
         '$' => blk: {
             const n = std.fmt.parseInt(i64, line, 10) catch break :blk .invalid;
             if (n < 0) break :blk .{ .ok = .{ .reply = .{ .bulk = null }, .consumed = after } };
+            // A declared length near maxInt would overflow the sums below.
+            if (n > std.math.maxInt(u32)) break :blk .invalid;
             const len: usize = @intCast(n);
             // The payload plus its own CRLF must all be present before this reply is complete.
             if (in.len < after + len + 1) break :blk .need_more;
+            // +2 for the trailing CRLF, or +1 if the peer sent a bare \n. A lone \r at the very
+            // end is the first half of a CRLF: wait for the rest rather than claim a byte that
+            // is not there.
+            const tail: usize = if (in[after + len] == '\r') 2 else 1;
+            if (in.len < after + len + tail) break :blk .need_more;
             break :blk .{ .ok = .{
                 .reply = .{ .bulk = in[after..][0..len] },
-                // +2 for the trailing CRLF, or +1 if the peer sent a bare \n.
-                .consumed = after + len + @as(usize, if (in[after + len] == '\r') 2 else 1),
+                .consumed = after + len + tail,
             } };
         },
         '*' => blk: {
@@ -125,6 +141,31 @@ fn writeCrlf(buf: []u8) usize {
 }
 
 // tests
+
+test "parse never slices past the input" {
+    try std.testing.expectEqual(Parsed.need_more, parse(""));
+    try std.testing.expectEqual(Parsed.invalid, parse("\n"));
+    try std.testing.expectEqual(Parsed.invalid, parse("\r\n"));
+    try std.testing.expectEqual(Parsed.invalid, parse("\r\n+OK\r\n"));
+    try std.testing.expectEqual(Parsed.need_more, parse("+"));
+    try std.testing.expectEqual(Parsed.need_more, parse("$"));
+    try std.testing.expectEqual(Parsed.need_more, parse("+OK"));
+    try std.testing.expectEqual(Parsed.need_more, parse("+OK\r"));
+    try std.testing.expectEqual(Parsed.need_more, parse("$5\r\nhel"));
+    try std.testing.expectEqual(Parsed.need_more, parse("$5\r\nhello"));
+    try std.testing.expectEqual(Parsed.need_more, parse("$5\r\nhello\r"));
+    try std.testing.expectEqual(Parsed.invalid, parse("$99999999999999\r\n"));
+    try std.testing.expectEqual(Parsed.invalid, parse("$9223372036854775807\r\n"));
+    // A truncated array: the header parses, the elements are the caller's next reads.
+    switch (parse("*3\r\n$1\r\na\r\n")) {
+        .ok => |o| try std.testing.expectEqual(@as(i64, 3), o.reply.array_len),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(Parsed.need_more, parse("*3"));
+    // Every prefix of a valid reply is need_more or ok, never a panic.
+    const full = "$5\r\nhello\r\n";
+    for (0..full.len) |i| _ = parse(full[0..i]);
+}
 
 test "encode is the exact length it promises" {
     var buf: [64]u8 = undefined;
@@ -215,4 +256,12 @@ test "consumed lets replies be read back to back" {
     }
     try std.testing.expectEqual(@as(usize, 3), seen);
     try std.testing.expectEqual(wire.len, off);
+}
+
+test "only the replies of a node that is not the master are wrong-node errors" {
+    try std.testing.expect(isWrongNode("READONLY You can't write against a read only replica."));
+    try std.testing.expect(isWrongNode("MASTERDOWN Link with MASTER is down"));
+    try std.testing.expect(!isWrongNode("ERR unknown command"));
+    try std.testing.expect(!isWrongNode("WRONGTYPE Operation against a key"));
+    try std.testing.expect(!isWrongNode(""));
 }

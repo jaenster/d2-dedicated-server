@@ -95,6 +95,14 @@ readiness = stores reachable + a game server published + not draining), `REALMD_
 `/readyz` on ≥1 published game server), `REALMD_LOG_JSON` (JSON log lines),
 `REALMD_SHUTDOWN_GRACE_MS` (SIGTERM drain window before exit).
 
+## Profiles
+
+SID_READUSERDATA / SID_WRITEUSERDATA carry the four fields of the client's profile page
+(`profile\sex`, `profile\age`, `profile\location`, `profile\description`; other keys are neither
+stored nor read), kept per account (lower case) in the store. Values lose control characters and are cut
+at 16, 8, 64 and 200 bytes. A client writes only its own logon account; the write is silently ignored
+for any other. Anyone may read anyone's.
+
 ## Run
 
 ```

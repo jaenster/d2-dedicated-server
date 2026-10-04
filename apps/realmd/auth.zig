@@ -109,15 +109,22 @@ pub fn issueTicket(account: []const u8, ttl_s: u32, out: *[ticket_max]u8) ?[]con
     return ticket;
 }
 
-/// Consume the outstanding ticket for this account and check the request against it.
+/// Consume the outstanding ticket of this account that the request proves, if there is one.
 ///
-/// Consuming happens whether or not the hash matches, and that is deliberate: a ticket that
-/// survives a wrong guess is a ticket that can be guessed at.
+/// An account may hold several tickets at once (several clients started together), so the request
+/// is checked against each and only the matching ticket is spent. A wrong hash spends nothing:
+/// a ticket is `ticket_max` symbols of an unguessable alphabet, so guessing one is not made
+/// feasible by the lack of a penalty.
 pub fn redeemTicket(req: Request) bool {
-    var buf: [ticket_max]u8 = undefined;
-    const n = store.takeLoginTicket(req.account, &buf);
-    if (n == 0) return false;
-    return verify(passwordHash(buf[0..n]), req);
+    var tickets: [32][ticket_max]u8 = undefined;
+    var lens: [32]u8 = undefined;
+    const n = store.listLoginTickets(req.account, &tickets, &lens);
+    for (0..n) |i| {
+        const t = tickets[i][0..lens[i]];
+        if (!verify(passwordHash(t), req)) continue;
+        return store.redeemLoginTicket(req.account, t);
+    }
+    return false;
 }
 
 test "verify accepts the hash the client would have sent, and nothing else" {

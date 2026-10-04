@@ -31,6 +31,12 @@ pub const FakeGS = struct {
     next_gameid: ?u32 = null, // if set, hand out incrementing ids
     /// Answer every create with this instead of success. 0 = accept.
     refuse_create_with: u32 = 0,
+    /// Leave the queue unread for this long after start, as a dead or frozen server does: its record
+    /// is in the store (it outlives the server for a while) and nobody answers.
+    answer_after_ms: u32 = 0,
+    /// Games this server publishes as already running, so a pick that prefers the least loaded
+    /// server leaves it for the other.
+    extra_live: u32 = 0,
 
     registered: bool = false,
     creates: u32 = 0,
@@ -63,7 +69,7 @@ pub const FakeGS = struct {
         @memcpy(v[0..4], &self.ip);
         std.mem.writeInt(u16, v[4..6], self.gs_port, .little);
         std.mem.writeInt(u32, v[6..10], self.maxgame, .little);
-        std.mem.writeInt(u32, v[10..14], live, .little);
+        std.mem.writeInt(u32, v[10..14], live + self.extra_live, .little);
         v[14] = 0; // not full
         _ = try c.cmd(&.{ "SET", k, &v, "PX", "90000" });
         var ib: [16]u8 = undefined;
@@ -91,7 +97,13 @@ pub const FakeGS = struct {
         var qk: [64]u8 = undefined;
         const queue = key(&qk, "realmd:gsq:{x}", .{self.gsid});
         var live: u32 = 0;
+        var asleep_ms: u32 = 0;
         while (!self.stop_flag) {
+            if (asleep_ms < self.answer_after_ms) {
+                _ = net.usleep(5_000);
+                asleep_ms += 5;
+                continue;
+            }
             const rep = c.cmd(&.{ "LPOP", queue }) catch break;
             const packet = switch (rep) {
                 .bulk => |b| b orelse {
@@ -188,6 +200,25 @@ pub const FakeGS = struct {
         w.u32v(level);
         w.u32v(class);
         w.cstr(char);
+        const total = 8 + w.slice().len;
+        std.mem.writeInt(u16, b[0..2], @intCast(total), .little);
+        std.mem.writeInt(u16, b[2..4], rc.GS_UPDATEGAMEINFO, .little);
+        std.mem.writeInt(u32, b[4..8], 0, .little);
+        try self.emit(b[0..total]);
+    }
+
+    /// A player notice that names the account too, the way the real game server sends them. `flag` is
+    /// the realm's UPDATEGAMEINFO flag: 1 enter, 2 leave, 3 still present.
+    pub fn sendSeatNotice(self: *FakeGS, gameid: u32, players: u32, flag: u32, char: []const u8, account: []const u8) !void {
+        var b: [128]u8 = undefined;
+        var w = net.Writer.init(b[8..]);
+        w.u32v(flag);
+        w.u32v(gameid);
+        w.u32v(players);
+        w.u32v(10);
+        w.u32v(1);
+        w.cstr(char);
+        w.cstr(account);
         const total = 8 + w.slice().len;
         std.mem.writeInt(u16, b[0..2], @intCast(total), .little);
         std.mem.writeInt(u16, b[2..4], rc.GS_UPDATEGAMEINFO, .little);

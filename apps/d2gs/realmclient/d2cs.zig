@@ -21,6 +21,7 @@ const log = @import("../log.zig");
 
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn CreateThread(a: ?*anyopaque, st: usize, f: *const fn (?*anyopaque) callconv(.winapi) u32, p_: ?*anyopaque, fl: u32, id: ?*u32) callconv(.winapi) ?*anyopaque;
 
 /// Game capacity this GS advertises. Set by start().
@@ -163,6 +164,11 @@ fn takeGameId(name: []const u8) ?u32 {
 /// tick thread.
 pub fn onGameDestroyed(name: []const u8) void {
     const gid = takeGameId(name) orelse return;
+    {
+        presence_lock.lock();
+        defer presence_lock.unlock();
+        presence.dropGame(gid);
+    }
     var r = std.mem.zeroes(p.CloseGame);
     r.h = p.header(.closegame, @sizeOf(p.CloseGame), nextSeq());
     r.gameid = gid;
@@ -185,9 +191,32 @@ pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []co
     // dropping the account here would lose exactly that save — the entry just becomes reusable.
     if (!joined and char.len > 0) joinctx.release(char);
     const gid = peekGameId(name) orelse return;
-    var buf: [@sizeOf(p.UpdateGameInfo) + 24]u8 = undefined;
+    var buf: [info_max]u8 = undefined;
+    // The account too, when we know it. Without it the realm has to free a departing player's
+    // character seat by NAME, and names are unique only per account here — two "Bob"s in one game
+    // and it frees the wrong one, out from under somebody still playing. Empty when unknown, which
+    // the realm reads as "cannot be sure" and leaves the seat for the game-close sweep.
+    var ab: [joinctx.max_account]u8 = undefined;
+    const acct = joinctx.accountForChar(char, &ab) orelse "";
+    const total = buildGameInfo(&buf, if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE, gid, players, level, class, char, acct);
+    // Kept for the periodic repeat, so a notice lost on the way to the realm is put right by the next
+    // one.
+    {
+        presence_lock.lock();
+        defer presence_lock.unlock();
+        if (char.len > 0) {
+            if (joined) presence.enter(gid, acct, char, level, class) else presence.leave(gid, char);
+        }
+    }
+    emit(buf[0..total]);
+}
+
+const info_max = @sizeOf(p.UpdateGameInfo) + 24 + 40;
+
+/// UPDATEGAMEINFO: the fixed part, then the character and the account as cstrs.
+fn buildGameInfo(buf: *[info_max]u8, flag: u32, gid: u32, players: u32, level: u32, class: u32, char: []const u8, acct: []const u8) usize {
     var r = std.mem.zeroes(p.UpdateGameInfo);
-    r.flag = if (joined) p.GAMEINFO_ENTER else p.GAMEINFO_LEAVE;
+    r.flag = flag;
     r.gameid = gid;
     r.players = players;
     r.charlevel = level;
@@ -197,23 +226,38 @@ pub fn onPlayersChanged(name: []const u8, players: u32, joined: bool, char: []co
     // smallest type that holds it — here u5 — and then `@sizeOf(UpdateGameInfo) + n` is u5
     // arithmetic that overflows at 32, so every character whose name is 4 or more letters
     // long panicked this thread on the way into a game.
-    const n: usize = @min(char.len, buf.len - @sizeOf(p.UpdateGameInfo) - 1);
+    const n: usize = @min(char.len, 23);
     @memcpy(buf[@sizeOf(p.UpdateGameInfo)..][0..n], char[0..n]);
     buf[@sizeOf(p.UpdateGameInfo) + n] = 0; // cstr terminator
     var total = @sizeOf(p.UpdateGameInfo) + n + 1;
-    // The account too, when we know it. Without it the realm has to free a departing player's
-    // character seat by NAME, and names are unique only per account here — two "Bob"s in one game
-    // and it frees the wrong one, out from under somebody still playing. Empty when unknown, which
-    // the realm reads as "cannot be sure" and leaves the seat for the game-close sweep.
-    var ab: [joinctx.max_account]u8 = undefined;
-    const acct = joinctx.accountForChar(char, &ab) orelse "";
-    const an: usize = @min(acct.len, buf.len - total - 1);
+    const an: usize = @min(acct.len, 32);
     @memcpy(buf[total..][0..an], acct[0..an]);
     buf[total + an] = 0;
     total += an + 1;
     const hdr = p.header(.updategameinfo, @intCast(total), nextSeq());
     @memcpy(buf[0..@sizeOf(p.Header)], std.mem.asBytes(&hdr));
-    emit(buf[0..total]);
+    return total;
+}
+
+var presence: redis.presence.Table = .{};
+var presence_lock: Lock = .{};
+
+/// Say again who is in the games, once per `presence.interval_ms`. Called from the server's tick.
+fn repeatPresence() void {
+    var out: [redis.presence.capacity][info_max]u8 = undefined;
+    var lens: [redis.presence.capacity]usize = undefined;
+    var n: usize = 0;
+    {
+        presence_lock.lock();
+        defer presence_lock.unlock();
+        if (!presence.due(GetTickCount64())) return;
+        for (&presence.items) |*e| {
+            if (!e.used) continue;
+            lens[n] = buildGameInfo(&out[n], p.GAMEINFO_PRESENT, e.gameid, presence.countIn(e.gameid), e.level, e.class, e.charName(), e.accountName());
+            n += 1;
+        }
+    }
+    for (0..n) |i| emit(out[i][0..lens[i]]);
 }
 
 /// CREATEGAMEREQ: ladder/expansion/difficulty/hardcore byte flags, then
@@ -327,12 +371,20 @@ fn handleJoinGame(seq: u32, body: []const u8) void {
 /// Creating a game hands work to the tick loop and waits for it. Calling it FROM the tick means
 /// the tick cannot advance to do that work, so every create returns 0 — which presents as the
 /// server refusing perfectly good requests, with nothing in the log to say why.
+///
+/// It blocks in the store (BLPOP, on a connection of its own) rather than polling: a poll every
+/// 20 ms was most of an idle server's CPU under wine, and a blocking pop hands a request over the
+/// moment it is queued.
 fn queueThreadMain(_: ?*anyopaque) callconv(.winapi) u32 {
     while (true) {
-        pumpQueue();
-        Sleep(20);
+        var buf: [1024]u8 = undefined;
+        const n = redis.waitRequest(gsid, &buf, queue_wait_s);
+        if (n > 0) handleRequest(buf[0..n]);
     }
 }
+
+/// How long one blocking pop waits before it asks again.
+const queue_wait_s: u32 = 5;
 
 var queue_thread_started = false;
 
@@ -347,6 +399,12 @@ pub fn pumpQueue() void {
     if (!redis.enabled() or gsid == 0) return;
     var buf: [1024]u8 = undefined;
     const n = redis.popRequest(gsid, &buf);
+    handleRequest(buf[0..n]);
+}
+
+fn handleRequest(msg: []const u8) void {
+    const n = msg.len;
+    const buf = msg;
     if (n < p.HEADER_LEN) return;
     const size = std.mem.readInt(u16, buf[0..2], .little);
     const typ = std.mem.readInt(u16, buf[2..4], .little);
@@ -387,6 +445,7 @@ fn publish() void {
 /// blinks out of the fleet, rarely enough that it is not a store round trip per frame.
 pub fn heartbeat() void {
     if (!redis.enabled() or gsid == 0) return;
+    repeatPresence();
     // Wrapping subtraction: GetTickCount rolls over about every 49 days, and a server that has
     // been up that long must not stop reporting itself.
     if (registered and GetTickCount() -% last_publish_ms < heartbeat_ttl_s * 1000 / 3) return;

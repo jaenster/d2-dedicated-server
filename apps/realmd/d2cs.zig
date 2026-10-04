@@ -102,7 +102,23 @@ fn difficultyError(difficulty: u8, progression: u8, expansion: bool) ?u32 {
 /// A D2 game holds eight players; past that the engine's CreateClient refuses outright
 /// (`pGame->nClientsCount < 8`, D2Game/Game/Clients.cpp CreateClient @0x539a30). Turning
 /// a join away here means a clear "Game is Full." instead of a silent failure at the GS.
-const max_players_per_game: u16 = 8;
+const realm_proto = @import("realm_proto");
+const max_players_per_game: u16 = realm_proto.max_players_per_game;
+
+/// How many seats a game offers: what its creator chose, 1..8, and never more than the engine's
+/// own ceiling.
+fn seatLimit(max: u8) u32 {
+    return @min(max, max_players_per_game);
+}
+
+test "a game offers the seats its creator chose, never past eight" {
+    const t = std.testing;
+    try t.expectEqual(@as(u16, 8), max_players_per_game);
+    try t.expectEqual(@as(u32, 1), seatLimit(1));
+    try t.expectEqual(@as(u32, 4), seatLimit(4));
+    try t.expectEqual(@as(u32, 8), seatLimit(8));
+    try t.expectEqual(@as(u32, 8), seatLimit(200));
+}
 
 /// How long a join waits for a create that is still in flight for the same name, and how often it
 /// looks. Bounded: a client that waits is better than one told the game does not exist, but not at
@@ -165,6 +181,10 @@ pub const DConn = struct {
     // that learned it, so it comes back off the session at startup rather than off the wire.
     client_version: [state.max_version]u8 = [_]u8{0} ** state.max_version,
     client_version_len: u8 = 0,
+    /// Set by a successful MCP_STARTUP and by nothing else; every other command needs it. `drop`
+    /// closes the connection once the current packet is answered.
+    authed: bool = false,
+    drop: bool = false,
 
     /// Empty when the realm could not name the client's engine, which reads as no constraint.
     pub fn clientVersion(c: *const DConn) []const u8 {
@@ -266,8 +286,10 @@ fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: b
                 if (len - off < plen) break; // wait for the rest
                 dispatch(&c, tag, acc[off + 2], acc[off + 3 .. off + plen]);
                 off += plen;
+                if (c.drop) break;
             }
         }
+        if (c.drop) break;
         if (off > 0) {
             std.mem.copyForwards(u8, acc[0 .. len - off], acc[off..len]);
             len -= off;
@@ -290,6 +312,11 @@ fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: b
 pub var trace_packets: bool = false;
 
 fn dispatch(c: *DConn, tag: []const u8, id: u8, body: []const u8) void {
+    if (!c.authed and id != MCP_STARTUP) {
+        log.line(tag, "MCP 0x{x:0>2} before a startup; dropping the connection", .{id});
+        c.drop = true;
+        return;
+    }
     if (!hook.mcpPacket(c, id, body)) return; // an extension took it
     if (trace_packets) {
         log.line(tag, "rx MCP 0x{x:0>2} ({d} bytes)", .{ id, body.len });
@@ -344,6 +371,8 @@ fn onStartup(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "startup session={d} -> UNKNOWN (rejected)", .{sid});
     }
 
+    c.authed = result == 0x00;
+    if (!c.authed) c.drop = true;
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, MCP_STARTUP);
     w.putU32(result);
@@ -366,28 +395,54 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putU16(ret); // number returned in this packet
     var i: usize = 0;
     while (i < ret) : (i += 1) {
-        // Pull class@0x28, level@0x2b and the status byte@0x24 from the .d2s for
-        // the statstring the client's CharSel renders the list from.
-        var save: [1024]u8 = undefined;
-        const n = store.getCharD2s(c.accountName(), names[i].slice(), &save);
-        const class: u8 = if (n > 0x2b) save[0x28] else 1;
-        const level: u8 = if (n > 0x2b) save[0x2b] else 1;
-        const status: u8 = if (n > 0x24) save[0x24] else 0x20; // default to expansion
-        const progression: u8 = if (n > 0x25) save[0x25] else 0; // title (difficulty completed)
-        // The .d2s header carries the menu-composite appearance the game wrote on save:
-        // pAppearance1@0x88 = body-component graphic codes, pAppearance2@0x98 = color
-        // transforms (16 each; the statstring uses the first 11). Empty => naked preview.
-        const have_app = n > 0xA2;
-        const app1: []const u8 = if (have_app) save[0x88..0x93] else &.{};
-        const app2: []const u8 = if (have_app) save[0x98..0xA3] else &.{};
-
         w.putU32(0xFFFF_FFFF); // expiration — far future so it's NOT "expired"
         w.putStr(names[i].slice()); // character name
-        const era = eraCode(store.charVersion(c.accountName(), names[i].slice()).slice());
-        writeStatString(&w, class, level, status, progression, @intCast(total), app1, app2, era); // CharSel.cpp layout
+        writeCharStat(&w, c.accountName(), names[i].slice(), @intCast(total)); // CharSel.cpp layout
         w.putU8(0); // statstring C-string terminator
     }
     finish(c, &w);
+}
+
+/// A character's statstring, from the head of its .d2s: class@0x28, level@0x2b, status@0x24,
+/// progression@0x25 (the title, difficulty completed), and the menu-composite appearance the game
+/// wrote on save (pAppearance1@0x88 body-component graphic codes, pAppearance2@0x98 colour
+/// transforms, 16 each; the statstring uses the first 11). No appearance is a naked preview.
+fn writeCharStat(w: *proto.Writer, account: []const u8, charname: []const u8, realm_count: u32) void {
+    var save: [1024]u8 = undefined;
+    const n = store.getCharD2s(account, charname, &save);
+    writeCharStatFrom(w, account, charname, realm_count, save[0..n]);
+}
+
+fn writeCharStatFrom(w: *proto.Writer, account: []const u8, charname: []const u8, realm_count: u32, save: []const u8) void {
+    const n = save.len;
+    const class: u8 = if (n > 0x2b) save[0x28] else 1;
+    const level: u8 = if (n > 0x2b) save[0x2b] else 1;
+    const status: u8 = if (n > 0x24) save[0x24] else 0x20; // default to expansion
+    const progression: u8 = if (n > 0x25) save[0x25] else 0;
+    const have_app = n > 0xA2;
+    const app1: []const u8 = if (have_app) save[0x88..0x93] else &.{};
+    const app2: []const u8 = if (have_app) save[0x98..0xA3] else &.{};
+    const era = eraCode(store.charVersion(account, charname).slice());
+    writeStatString(w, class, level, status, progression, realm_count, app1, app2, era);
+}
+
+/// The statstring the lobby's user list draws a character from, as Battle.net sent it for a
+/// Diablo II user: the product tag, `realm,charname,` and then the same blob the character list
+/// carries (class, level, gear, flags). The client takes the portrait, class, level and realm out of
+/// it and draws an "unknown" user when the tag is missing. Null when the account has no such
+/// character.
+pub fn chatStat(out: []u8, tag: []const u8, realm: []const u8, account: []const u8, charname: []const u8) ?[]const u8 {
+    var save: [1024]u8 = undefined;
+    const n = store.getCharD2s(account, charname, &save);
+    if (n == 0) return null;
+    var w = proto.Writer.init(out);
+    w.putBytes(tag);
+    w.putBytes(realm);
+    w.putU8(',');
+    w.putBytes(charname);
+    w.putU8(',');
+    writeCharStatFrom(&w, account, charname, 1, save[0..n]);
+    return w.slice();
 }
 
 /// The two characters that stand for an engine in a character's guild tag.
@@ -580,8 +635,15 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     // The request wins because it is the only one of the three that knows what the player picked.
     const asked = version.byEraCode(asked_era);
     const char_version = asked orelse hook.charVersion(acct, name, c.clientVersion()) orelse c.clientVersion();
+    store.markCreated(acct, name);
     if (char_version.len != 0) _ = store.setCharVersion(acct, name, char_version);
     log.line(tag, "char create '{s}' class={d} engine={s} (account={s}) -> created", .{ name, class, char_version, acct });
+    // A successful create IS the character select: the client goes from the creation screen
+    // straight to the lobby and never sends MCP_CHARLOGON for the new character. Without this the
+    // connection has no active character, so the first game it creates or joins names an empty
+    // one to the game server; only a reconnect, which does select it, got it right.
+    c.setChar(name);
+    hook.charLogon(acct, name);
     w.putU32(0); // success
     finish(c, &w);
 }
@@ -634,6 +696,14 @@ fn joinStatusError(game: u8, joiner: u8) ?u32 {
     return null;
 }
 
+/// Whether the logged-on character could join `g` — the join's own status and difficulty checks, so
+/// the list shows exactly the games a join would not turn away for being the wrong kind. Battle.net
+/// listed only those: a classic character never saw expansion games, nor a softcore one hardcore.
+fn gameOpenTo(status: u8, difficulty: u8, joiner: u8, progression: u8) bool {
+    if (joinStatusError(status, joiner) != null) return false;
+    return difficultyError(difficulty, progression, (joiner & STATUS_EXPANSION) != 0) == null;
+}
+
 /// A game name the realm will accept. The client offers "Invalid Game Name" as a distinct
 /// error, so an empty or oversized name should get it rather than being pushed to a GS
 /// that will refuse it for reasons we'd then have to describe as "Server Down".
@@ -650,7 +720,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const difficulty: u8 = @intCast(@min(@as(u32, 2), (create_flags >> 12) & 0x7));
     _ = r.getU8(); // unknown (1)
     _ = r.getU8(); // player difference
-    _ = r.getU8(); // max players
+    const max_players = realm_proto.gameMaxPlayers(r.getU8()); // max players
     const name = r.getStr();
     const pass = r.getStr();
     const desc = r.getStr();
@@ -703,6 +773,18 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // after a successful create, and that path has the same check plus a code that says the true
     // thing (0x73 / 0x74) — so an ineligible character is still turned away, one packet later.
     log.line(tag, "create game '{s}' desc='{s}' diff={d} status=0x{x:0>2} (flags=0x{x})", .{ name, desc, difficulty, status, create_flags });
+    // The creator is about to be sent straight into this game, and a character is in one game at a
+    // time: if another still holds it (after the moment the engine needs to free a seat the player
+    // just left), refuse here rather than leave an empty game behind a join that will be turned away.
+    {
+        var hb: [64]u8 = undefined;
+        var waited: u32 = 0;
+        while (store.charLockOwner(c.accountName(), c.charName(), &hb) != null and waited < seat_release_ms) : (waited += create_poll_ms) sleepMs(create_poll_ms);
+        if (store.charLockOwner(c.accountName(), c.charName(), &hb)) |holder| {
+            log.line(tag, "create game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
+            return fail(c, &w, CREATE_ERROR_GENERIC);
+        }
+    }
     // Claim the name BEFORE dispatching. A game is only recorded once the server accepts the
     // create, and in that gap a second client asking for the same name is told it is free, loses
     // the race at the server, and is then left with nothing to join — the failure that fails
@@ -758,9 +840,9 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // nowhere the realm can find it, and the client's very next packet is a JOINGAME for this name
     // — "game does not exist" right after reporting success. Fail the create instead; the GS reaps
     // the orphaned empty game on its own idle timer.
-    if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc)) {
+    if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc, max_players)) {
         store.releaseGameName(name);
-        log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it", .{ name, rr.gameid });
+        log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it: {s}", .{ name, rr.gameid, store.registerGameError() });
         return fail(c, &w, CREATE_ERROR_GENERIC);
     }
     // The game record now owns the name and is what a duplicate create is refused against, so the
@@ -788,6 +870,29 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putU16(0); // unknown
     w.putU32(0); // result: success
     finish(c, &w);
+}
+
+/// The client sends `-1` for a game created with the password field left empty, and the realm keeps
+/// that as it came; a join arriving by a link or the launcher carries an empty password instead. Both
+/// spellings mean an open game, and an open game lets anyone in whatever the joiner typed.
+fn joinPasswordOk(stored: []const u8, supplied: []const u8) bool {
+    if (stored.len == 0 or std.mem.eql(u8, stored, "-1")) return true;
+    return std.mem.eql(u8, stored, supplied);
+}
+
+test "a game created with an empty password is open to a join with an empty or any password" {
+    try std.testing.expect(joinPasswordOk("-1", ""));
+    try std.testing.expect(joinPasswordOk("-1", "-1"));
+    try std.testing.expect(joinPasswordOk("", "-1"));
+    try std.testing.expect(joinPasswordOk("", ""));
+    try std.testing.expect(joinPasswordOk("-1", "stale"));
+}
+
+test "a passworded game needs exactly its password" {
+    try std.testing.expect(joinPasswordOk("Pw1", "Pw1"));
+    try std.testing.expect(!joinPasswordOk("Pw1", ""));
+    try std.testing.expect(!joinPasswordOk("Pw1", "-1"));
+    try std.testing.expect(!joinPasswordOk("Pw1", "pw1"));
 }
 
 fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
@@ -821,8 +926,8 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     const g = game.?;
     // Reject a wrong password for a passworded game (open games have pw_len == 0).
-    if (g.pw_len > 0 and !std.mem.eql(u8, g.pw(), join_pass)) {
-        log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD", .{ name, c.accountName() });
+    if (!joinPasswordOk(g.pw(), join_pass)) {
+        log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD (game has {d} chars, join sent {d})", .{ name, c.accountName(), g.pw_len, join_pass.len });
         return rejectJoin(c, &w, JOIN_BAD_PASSWORD);
     }
     if (hook.gameJoin(c.accountName(), c.charName(), name)) |result| {
@@ -856,13 +961,6 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "join game '{s}' (account={s}) -> difficulty {d} not unlocked (progression {d}) -> 0x{x}", .{ name, c.accountName(), g.difficulty, charProgression(c), why });
         return rejectJoin(c, &w, why);
     }
-    // The engine's CreateClient hard-refuses a ninth client, so a join that would exceed
-    // the cap is rejected while the client can still be told why. This is only trustworthy
-    // because the count now comes back down when players leave.
-    if (g.players >= max_players_per_game) {
-        log.line(tag, "join game '{s}' (account={s}) -> FULL ({d} players)", .{ name, c.accountName(), g.players });
-        return rejectJoin(c, &w, JOIN_FULL);
-    }
     // A character is in one game at a time. Checked HERE, upfront, because the game server's own
     // refusal answers nothing: the realm issues the join, the engine declines it silently, and the
     // player sits at a loading screen until the client times out. Taking the lock IS the check —
@@ -875,6 +973,13 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // one it just left. Wait for that to clear before refusing. A genuine second login waits the
     // same moment and is then turned away, which costs it nothing it can perceive.
     var claimed = store.lockChar(c.accountName(), c.charName(), jowner);
+    // The same player asking again for this very game, whose earlier attempt never got in: that
+    // attempt's seat is theirs to take back, and it is already in the count.
+    const retaken = !claimed and store.retakePendingChar(g.gameid, c.accountName(), c.charName());
+    if (retaken) {
+        claimed = true;
+        log.line(tag, "join game '{s}' (account={s}) -> took over the unconfirmed seat of '{s}'", .{ name, c.accountName(), c.charName() });
+    }
     if (!claimed) {
         var waited: u32 = 0;
         while (waited < seat_release_ms) : (waited += create_poll_ms) {
@@ -896,14 +1001,23 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "join game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
         return rejectJoin(c, &w, JOIN_FULL);
     }
-    _ = store.addGameChar(g.gameid, c.accountName(), c.charName());
+    // The seat limit is enforced here, atomically, against every seat the game holds. The player
+    // count on the game record is no use for this: it carries the creator twice until the game
+    // server corrects it, and it is a snapshot two joins can both read before either takes the last
+    // seat. The engine's CreateClient refuses a client past the cap outright, so a join that would
+    // exceed it is turned away here, while the client can still be told why.
+    if (store.addGameChar(g.gameid, c.accountName(), c.charName(), seatLimit(g.max_players)) == .full) {
+        _ = store.unlockChar(c.accountName(), c.charName(), jowner);
+        log.line(tag, "join game '{s}' (account={s}) -> FULL (every seat taken or pending)", .{ name, c.accountName() });
+        return rejectJoin(c, &w, JOIN_FULL);
+    }
     // Stage the character into the shared store before the game server goes looking. The server
     // reads redis and nothing else, so a character that has only ever been in postgres would come
     // back missing — this read is what promotes it, and it is a no-op once it is there.
     warmChar(c.accountName(), c.charName());
     // Optimistic bump so the list reacts to this join right away; the GS corrects it (in
     // both directions) as soon as the player is actually in the game.
-    _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc());
+    if (!retaken) _ = state.global.registerGame(name, g.gameid, g.gs_ip, g.gs_port, g.gsid, g.players + 1, g.status, g.difficulty, g.pw(), g.desc(), g.max_players);
     // The client connects to the GS directly using the IP in the game record, so
     // any realmd instance can serve a join. Best-effort notify the GS that owns this
     // game (by its fleet id) so it can prefetch the joining account's character.
@@ -939,10 +1053,15 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     const reqid = r.getU16();
     var games: [64]state.GameInfo = undefined;
     const n = state.snapshotGames(&games);
-    log.line(tag, "game list (reqid={d}) -> {d} game(s)", .{ reqid, n });
 
     const acct = c.accountName();
+    // Nothing to compare against until a character is on: the list is then unfiltered.
+    const have_char = c.charName().len > 0;
+    const joiner: u8 = if (have_char) charStatus(c) else 0;
+    const progression: u8 = if (have_char) charProgression(c) else 0;
+    var shown: usize = 0;
     for (games[0..n]) |g| {
+        if (have_char and !gameOpenTo(g.status, g.difficulty, joiner, progression)) continue;
         // An extension decides what this player is shown — a private league's games, a staging
         // game, a lobby scoped to a channel. Hiding is cosmetic: a player who knows the name can
         // still attempt the join, and gameJoin is where that is actually refused.
@@ -958,7 +1077,9 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
         w.putStr(g.name_slice()); // +0xc game name (shown in the list)
         w.putStr(g.desc()); // description the creator typed
         finish(c, &w);
+        shown += 1;
     }
+    log.line(tag, "game list (reqid={d}) char=0x{x:0>2} -> {d} of {d} game(s) open to it", .{ reqid, joiner, shown, n });
     // End-of-list marker: token == -2 -> SetD2GSJoinResult(0x33) -> RefreshGameListDisplay().
     var tbuf: [16]u8 = undefined;
     var tw = startPacket(&tbuf, MCP_GAMELIST);
@@ -1030,6 +1151,14 @@ fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     };
     const g = game;
+    // A game the list would not have shown is not described either.
+    if (c.charName().len > 0 and !gameOpenTo(g.status, g.difficulty, charStatus(c), charProgression(c))) {
+        log.line(tag, "game info '{s}' -> not open to this character", .{name});
+        w.putU32(0xFFFF_FFFF);
+        w.zeros(8);
+        finish(c, &w);
+        return;
+    }
 
     var members: [state.max_members]state.Member = undefined;
     const n = state.global.gameMembers(g.gameid, &members);
@@ -1045,7 +1174,7 @@ fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
     for (members[0..n]) |m| top_level = @max(top_level, m.level);
     w.putU8(top_level); // +0xb reference level
     w.putU8(0); // +0xc level difference: unrestricted
-    w.putU8(@intCast(max_players_per_game)); // +0xd max players
+    w.putU8(g.max_players); // +0xd max players: the creator's choice
     w.putU8(@intCast(n)); // +0xe player count — must match the strings below
 
     var i: usize = 0;
@@ -1201,4 +1330,127 @@ fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const name = r.getStr();
     log.line(tag, "char rank request '{s}' (client has no 0x16 handler; nothing to reply)", .{name});
+}
+
+test "a chat statstring is the character list's blob behind the product tag, with no NUL in it" {
+    var b: [128]u8 = undefined;
+    var w = proto.Writer.init(&b);
+    w.putBytes("PX2D");
+    w.putBytes("TypeGuru");
+    w.putU8(',');
+    w.putBytes("Sorc");
+    w.putU8(',');
+    const at = w.pos;
+    writeStatString(&w, 1, 42, 0x20, 3, 1, &.{}, &.{}, "14");
+    const s = w.slice();
+    // what the client's parser reads after the second comma: class at 13, level at 25, the flags at 26
+    const blob = s[at..];
+    try std.testing.expectEqual(@as(u8, 2), blob[13]); // class + 1
+    try std.testing.expectEqual(@as(u8, 42), blob[25]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, s, 0) == null);
+}
+
+/// The user-list fields the 1.14d client reads out of a chat statstring (ComCallback @0x446d90):
+/// the same offsets as the character list, after the product tag and "realm,charname,".
+const ChatUser = struct {
+    class: u8,
+    level: u8,
+    hardcore: bool,
+    expansion: bool,
+    ladder: bool,
+    progression: u8,
+
+    /// How many titles the character has earned, by the client's own thresholds (ComCallback
+    /// @0x447d00): 0 = none. Classic steps at 4/8/12, expansion at 5/10/15.
+    fn titleLevel(u: ChatUser) u8 {
+        const p = u.progression;
+        if (u.expansion) return if (p < 5) 0 else if (p < 10) 1 else if (p < 15) 2 else 3;
+        return if (p < 4) 0 else if (p < 8) 1 else if (p < 12) 2 else 3;
+    }
+};
+
+fn parseChatStat(s: []const u8) !ChatUser {
+    if (!std.mem.eql(u8, s[0..4], "PX2D")) return error.NoTag;
+    var i: usize = 4;
+    var commas: u8 = 0;
+    while (commas < 2) : (i += 1) {
+        if (s[i] == ',') commas += 1;
+    }
+    const blob = s[i..];
+    var flags: u32 = 0;
+    flags = (blob[26] & 0x7f) | (@as(u32, blob[27] & 0x7f) << 7);
+    return .{
+        .class = blob[13] - 1,
+        .level = blob[25],
+        .hardcore = flags & 0x04 != 0,
+        .expansion = flags & 0x20 != 0,
+        .ladder = flags & 0x40 != 0,
+        .progression = @intCast((flags >> 8) & 0x1f),
+    };
+}
+
+fn statFor(out: []u8, class: u8, level: u8, status: u8, progression: u8) []const u8 {
+    var w = proto.Writer.init(out);
+    w.putBytes("PX2D");
+    w.putBytes("realm");
+    w.putU8(',');
+    w.putBytes("Char");
+    w.putU8(',');
+    writeStatString(&w, class, level, status, progression, 1, &.{}, &.{}, "14");
+    return w.slice();
+}
+
+test "a chat statstring carries the character's class, level, mode and title progression" {
+    var b: [128]u8 = undefined;
+    const Case = struct { class: u8, level: u8, status: u8, prog: u8, hc: bool, xp: bool, ladder: bool, title: u8 };
+    const cases = [_]Case{
+        // a level-99 expansion sorceress who has finished Hell: the title of the owner's character
+        .{ .class = 1, .level = 99, .status = 0x28, .prog = 15, .hc = false, .xp = true, .ladder = false, .title = 3 },
+        // a fresh classic softcore amazon
+        .{ .class = 0, .level = 1, .status = 0x00, .prog = 0, .hc = false, .xp = false, .ladder = false, .title = 0 },
+        // expansion hardcore ladder, Nightmare done
+        .{ .class = 4, .level = 75, .status = 0x64, .prog = 5, .hc = true, .xp = true, .ladder = true, .title = 1 },
+        // classic softcore, Nightmare and Hell opened but not finished
+        .{ .class = 3, .level = 60, .status = 0x00, .prog = 8, .hc = false, .xp = false, .ladder = false, .title = 2 },
+        // classic finished, expansion needs 15 for the same title
+        .{ .class = 5, .level = 90, .status = 0x00, .prog = 12, .hc = false, .xp = false, .ladder = false, .title = 3 },
+        .{ .class = 5, .level = 90, .status = 0x20, .prog = 12, .hc = false, .xp = true, .ladder = false, .title = 2 },
+        .{ .class = 6, .level = 30, .status = 0x24, .prog = 4, .hc = true, .xp = true, .ladder = false, .title = 0 },
+    };
+    for (cases) |c| {
+        const s = statFor(&b, c.class, c.level, c.status, c.prog);
+        try std.testing.expect(std.mem.indexOfScalar(u8, s, 0) == null);
+        const u = try parseChatStat(s);
+        try std.testing.expectEqual(c.class, u.class);
+        try std.testing.expectEqual(c.level, u.level);
+        try std.testing.expectEqual(c.hc, u.hardcore);
+        try std.testing.expectEqual(c.xp, u.expansion);
+        try std.testing.expectEqual(c.ladder, u.ladder);
+        try std.testing.expectEqual(c.prog, u.progression);
+        try std.testing.expectEqual(c.title, u.titleLevel());
+    }
+}
+
+test "a save's header is read into the statstring, gear or none" {
+    var save = [_]u8{0} ** 0xB0;
+    save[0x24] = 0x28; // expansion, died bit
+    save[0x25] = 15;
+    save[0x28] = 1; // sorceress
+    save[0x2b] = 99;
+    var b: [128]u8 = undefined;
+    var w = proto.Writer.init(&b);
+    w.putBytes("PX2Drealm,Char,");
+    const at = w.pos;
+    // no store behind it: the era tag comes from writeCharStatFrom's store lookup, so build the
+    // same fields from the header the way it does
+    writeStatString(&w, save[0x28], save[0x2b], save[0x24], save[0x25], 1, &.{}, &.{}, "");
+    const blob = w.slice()[at..];
+    // no gear: all 0xFF in both slots, which the client draws as a naked character
+    for (blob[2..13]) |x| try std.testing.expectEqual(@as(u8, 0xFF), x);
+    for (blob[14..25]) |x| try std.testing.expectEqual(@as(u8, 0xFF), x);
+    const u = try parseChatStat(w.slice());
+    try std.testing.expectEqual(@as(u8, 1), u.class);
+    try std.testing.expectEqual(@as(u8, 99), u.level);
+    try std.testing.expectEqual(@as(u8, 15), u.progression);
+    try std.testing.expect(u.expansion and !u.hardcore);
 }

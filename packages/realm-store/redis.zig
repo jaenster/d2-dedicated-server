@@ -15,6 +15,7 @@ const net = @import("realm_infra").net;
 const Lock = @import("realm_infra").lock.Lock;
 const types = @import("realm_infra").types;
 const resp = @import("resp");
+const log = @import("realm_infra").log;
 
 const Name = types.Name;
 const GameRec = types.GameRec;
@@ -312,8 +313,28 @@ const Slot = struct {
 var slots = [_]Slot{.{}} ** POOL_N;
 var rotor = std.atomic.Value(u32).init(0);
 
+/// Set by `readReply` when the node answered READONLY or MASTERDOWN: the connection is to a node
+/// that is not the master (HAProxy does not close sessions of a server it marks down, so a
+/// connection opened while a replica was routed to stays on it). Per thread, because a thread
+/// holds one slot at a time. `acquire` clears it; `command`/`pipeline` retry on a fresh
+/// connection, and `release` drops the connection of any caller that did not.
+threadlocal var wrong_node: bool = false;
+
+/// One log line about a wrong-node connection. Silent under `zig test`, whose runner treats any
+/// stderr output as a failure.
+fn note(comptime fmt: []const u8, args: anytype) void {
+    if (@import("builtin").is_test) return;
+    log.line("redis", fmt, args);
+}
+
 /// Check out a connection. Always succeeds; the caller must release it.
 fn acquire() *Slot {
+    const s = acquireSlot();
+    wrong_node = false;
+    return s;
+}
+
+fn acquireSlot() *Slot {
     for (&slots) |*s| {
         if (s.lock.tryLock()) return s;
     }
@@ -325,6 +346,11 @@ fn acquire() *Slot {
 }
 
 fn release(s: *Slot) void {
+    if (wrong_node) {
+        wrong_node = false;
+        note("dropped a pooled connection to a node that is not the master", .{});
+        dropConn(s);
+    }
     s.lock.unlock();
 }
 
@@ -443,6 +469,7 @@ fn readReply(r: *Reader) ?Reply {
         switch (resp.parse(r.buf[r.pos..r.fill])) {
             .ok => |o| {
                 r.pos += o.consumed;
+                if (o.reply == .err and resp.isWrongNode(o.reply.err)) wrong_node = true;
                 return switch (o.reply) {
                     .status => |s| .{ .status = s },
                     .int => |v| .{ .int = v },
@@ -521,7 +548,20 @@ fn sendCommand(fd: net.Socket, args: []const []const u8) bool {
 /// header, with the parsed Reply. On any IO error the connection is dropped and
 /// null returned; caller re-locks and may retry on the fresh connection if it
 /// wants, but our ops simply treat a null as failure. Caller holds the slot.
+///
+/// A READONLY/MASTERDOWN reply means the pooled connection is to a node that is not the master:
+/// it is dropped and the command is sent once more on a fresh connection (the node refused it, so
+/// it did not run).
 fn command(s: *Slot, r: *Reader, args: []const []const u8) ?Reply {
+    const first = commandOnce(s, r, args);
+    if (!wrong_node) return first;
+    wrong_node = false;
+    note("{s}: node is not the master, retrying on a fresh connection", .{args[0]});
+    dropConn(s);
+    return commandOnce(s, r, args);
+}
+
+fn commandOnce(s: *Slot, r: *Reader, args: []const []const u8) ?Reply {
     const fd = ensureConn(s) orelse return null;
     r.* = .{ .fd = fd };
     if (!sendCommand(fd, args)) {
@@ -539,6 +579,15 @@ fn command(s: *Slot, r: *Reader, args: []const []const u8) ?Reply {
 /// all have to land but whose replies carry no value (callers needing a value use `command`).
 /// Every reply is consumed even on error, or the leftovers would desync the next caller.
 fn pipeline(s: *Slot, r: *Reader, cmds: []const []const []const u8) bool {
+    const first = pipelineOnce(s, r, cmds);
+    if (!wrong_node) return first;
+    wrong_node = false;
+    note("pipeline: node is not the master, retrying on a fresh connection", .{});
+    dropConn(s);
+    return pipelineOnce(s, r, cmds);
+}
+
+fn pipelineOnce(s: *Slot, r: *Reader, cmds: []const []const []const u8) bool {
     const fd = ensureConn(s) orelse return false;
     var c = CmdBuf{ .fd = fd };
     for (cmds) |args| c.add(args);
@@ -575,11 +624,21 @@ fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
 /// A game name reduced to the key it is stored under. LOWERCASED: Battle.net treats game names
 /// case-insensitively ("Jan" == "jan"), so a case-preserving key would split CREATEGAME and
 /// JOINGAME onto two different records for what the player sees as one game.
+///
+/// Spaces and punctuation are kept: Battle.net game names have them ("D09 Over Up"), and a redis
+/// key is binary safe. Only what cannot be typed is refused: control bytes and anything outside
+/// printable ASCII.
 fn gameKey(name: []const u8, out: []u8) ?[]const u8 {
-    const safe = sanitize(name, out) orelse return null;
-    for (out[0..safe.len]) |*c| c.* = std.ascii.toLower(c.*);
-    return out[0..safe.len];
+    if (name.len == 0 or name.len >= out.len) return null;
+    for (name, 0..) |c, i| {
+        if (c < 0x20 or c > 0x7e) return null;
+        out[i] = std.ascii.toLower(c);
+    }
+    return out[0..name.len];
 }
+
+/// Why the last `registerGame` on this thread returned false, for the caller's log line.
+pub threadlocal var game_register_error: []const u8 = "";
 
 // characters (durable)
 
@@ -853,38 +912,41 @@ fn ticketKey(buf: []u8, account: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, prefix ++ "ticket:{s}", .{account}) catch null;
 }
 
+/// The outstanding tickets of an account are a list, newest last: several clients of one player start
+/// together, each with a ticket of its own, and none may overwrite another's before it is redeemed.
+/// The list is capped, and its expiry follows the newest ticket. A key left by the single-ticket format
+/// (a string) is replaced.
 pub fn putLoginTicket(account: []const u8, ticket: []const u8, ttl_s: u32) bool {
     var kb: [128]u8 = undefined;
     const key = ticketKey(&kb, account) orelse return false;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = if (ttl_s > 0) blk: {
-        var pb: [16]u8 = undefined;
-        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
-        break :blk command(s, &r, &.{ "SET", key, ticket, "PX", px });
-    } else command(s, &r, &.{ "SET", key, ticket });
+    var pb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const script =
+        \\if redis.call('TYPE', KEYS[1]).ok ~= 'list' then redis.call('DEL', KEYS[1]) end
+        \\redis.call('RPUSH', KEYS[1], ARGV[1])
+        \\redis.call('LTRIM', KEYS[1], -32, -1)
+        \\if tonumber(ARGV[2]) > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+        \\return 1
+    ;
+    const rep = command(s, &r, &.{ "EVAL", script, "1", key, ticket, px });
     return switch (rep orelse return false) {
         .status, .bulk, .int => true,
         .array_len, .err => false,
     };
 }
 
-/// Read and consume a ticket in one round trip. One-shot on purpose: a ticket that can be redeemed
-/// twice is a password with a short expiry, and the point of it is that it is not one.
+/// Read and consume the oldest outstanding ticket in one round trip. One-shot on purpose: a ticket
+/// that can be redeemed twice is a password with a short expiry, and the point of it is that it is not one.
 pub fn takeLoginTicket(account: []const u8, out: []u8) usize {
     var kb: [128]u8 = undefined;
     const key = ticketKey(&kb, account) orelse return 0;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    // GETDEL is 6.2+; on an older server the script is the portable form of the same thing.
-    const script =
-        \\local v = redis.call('GET', KEYS[1])
-        \\if v then redis.call('DEL', KEYS[1]) end
-        \\return v
-    ;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key }) orelse return 0;
+    const rep = command(s, &r, &.{ "LPOP", key }) orelse return 0;
     const bulk = switch (rep) {
         .bulk => |b| b orelse return 0,
         else => return 0,
@@ -892,6 +954,48 @@ pub fn takeLoginTicket(account: []const u8, out: []u8) usize {
     const n = @min(bulk.len, out.len);
     @memcpy(out[0..n], bulk[0..n]);
     return n;
+}
+
+/// The account's outstanding tickets, oldest first, each in a slot of `out`. Nothing is consumed.
+pub fn listLoginTickets(account: []const u8, out: [][32]u8, lens: []u8) usize {
+    var kb: [128]u8 = undefined;
+    const key = ticketKey(&kb, account) orelse return 0;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "LRANGE", key, "0", "-1" }) orelse return 0;
+    const count = switch (rep) {
+        .array_len => |n| if (n <= 0) return 0 else @as(usize, @intCast(n)),
+        else => return 0,
+    };
+    var filled: usize = 0;
+    for (0..count) |_| {
+        const er = readReply(&r) orelse break;
+        const t = switch (er) {
+            .bulk => |b| b orelse continue,
+            else => break,
+        };
+        if (filled >= out.len or filled >= lens.len or t.len > out[filled].len) continue;
+        @memcpy(out[filled][0..t.len], t);
+        lens[filled] = @intCast(t.len);
+        filled += 1;
+    }
+    return filled;
+}
+
+/// Consume this very ticket if it is outstanding for the account. Only the one presented is spent, so
+/// a wrong guess costs nobody else's login.
+pub fn redeemLoginTicket(account: []const u8, ticket: []const u8) bool {
+    var kb: [128]u8 = undefined;
+    const key = ticketKey(&kb, account) orelse return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "LREM", key, "1", ticket }) orelse return false;
+    return switch (rep) {
+        .int => |n| n > 0,
+        else => false,
+    };
 }
 
 pub fn expireSession(id: u64) void {
@@ -906,17 +1010,15 @@ pub fn expireSession(id: u64) void {
 
 // games (ephemeral, PX TTL, reverse indexed by id and by gs)
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, max_players: u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
-    const safe = gameKey(name, &nb) orelse return false;
+    game_register_error = "";
+    const safe = gameKey(name, &nb) orelse return regFail("name is empty, too long, or has characters outside printable ASCII");
 
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
-    var vb: [256]u8 = undefined;
-    // Fields: gameid ip port gsid players status difficulty <password> <description>. The password is a
-    // single token (may be empty); the description absorbs the rest, since it may
-    // contain spaces. Same encoding as the fs backend, so parseGame is shared in spirit.
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{ gameid, gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port, gsid, players, status, difficulty, password, description }) catch return false;
+    var vb: [game_rec_max]u8 = undefined;
+    const body = formatGame(&vb, .{ .gameid = gameid, .gs_ip = gs_ip, .gs_port = gs_port, .gsid = gsid, .players = players, .status = status, .difficulty = difficulty, .max_players = max_players }, password, description) orelse return regFail("record does not fit");
     var ik: [64]u8 = undefined;
     const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
     var gb: [64]u8 = undefined;
@@ -934,7 +1036,7 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
     var r: Reader = undefined;
     // The record, both reverse indexes (by id, by gs) and the global name set snapshotGames
     // enumerates — four writes that all have to land for a game to be findable, in one trip.
-    return if (has_ttl) pipeline(s, &r, &.{
+    const ok = if (has_ttl) pipeline(s, &r, &.{
         &.{ "SET", gamekey, body, "PX", px },
         &.{ "SET", idkey, safe, "PX", px },
         &.{ "SADD", gskey, safe },
@@ -945,6 +1047,13 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
         &.{ "SADD", gskey, safe },
         &.{ "SADD", prefix ++ "games", safe },
     });
+    if (!ok) game_register_error = "redis connection failed or a write was answered with an error";
+    return ok;
+}
+
+fn regFail(why: []const u8) bool {
+    game_register_error = why;
+    return false;
 }
 
 /// Enumerate active games for /admin/games: read the global name set, fetch each record.
@@ -1022,7 +1131,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
         };
         if (n >= out.len) continue;
         const rec = parseGame(val) orelse continue;
-        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status };
+        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status, .difficulty = rec.difficulty };
         ng.setDesc(rec.desc());
         const gname = names[i][0..nlen[i]];
         const cl: u8 = @intCast(@min(gname.len, ng.name.len));
@@ -1067,8 +1176,40 @@ pub fn findGame(name: []const u8) ?GameRec {
     return parseGame(val);
 }
 
-/// Decode the space-separated game record text.
-fn parseGame(val: []const u8) ?GameRec {
+const game_rec_max = 256;
+
+/// Encode a game record. Fields: gameid ip port gsid players status difficulty <password>
+/// <description>, space separated. The password is a single token (may be empty); the description
+/// absorbs the rest, since it may contain spaces. A game that takes fewer than eight players adds
+/// `\n#<max>` after the description; a record without it is byte for byte what it was before the
+/// cap was kept.
+fn formatGame(buf: []u8, rec: GameRec, password: []const u8, description: []const u8) ?[]const u8 {
+    // A newline in the description would read back as the start of the cap.
+    var db: [64]u8 = undefined;
+    const dn = @min(description.len, db.len);
+    for (description[0..dn], db[0..dn]) |c, *o| o.* = if (c == '\n') ' ' else c;
+    const ip = rec.gs_ip;
+    var head = std.fmt.bufPrint(buf, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{ rec.gameid, ip[0], ip[1], ip[2], ip[3], rec.gs_port, rec.gsid, rec.players, rec.status, rec.difficulty, password, db[0..dn] }) catch return null;
+    if (rec.max_players != 8) {
+        const cap = std.fmt.bufPrint(buf[head.len..], "\n#{d}", .{rec.max_players}) catch return null;
+        head = buf[0 .. head.len + cap.len];
+    }
+    return head;
+}
+
+/// Decode the game record text.
+fn parseGame(record: []const u8) ?GameRec {
+    var val = record;
+    var max_players: u8 = 8;
+    if (std.mem.lastIndexOfScalar(u8, val, '\n')) |nl| {
+        const line = val[nl + 1 ..];
+        if (line.len > 1 and line[0] == '#') {
+            if (std.fmt.parseInt(u8, line[1..], 10)) |m| {
+                if (m >= 1 and m <= 8) max_players = m;
+                val = val[0..nl];
+            } else |_| {}
+        }
+    }
     var it = std.mem.splitScalar(u8, val, ' ');
     const idtxt = it.next() orelse return null;
     const iptxt = it.next() orelse return null;
@@ -1083,7 +1224,7 @@ fn parseGame(val: []const u8) ?GameRec {
     if (i != 4) return null;
     const gs_port: u16 = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 4000) else 4000;
     const gsid: u32 = if (it.next()) |t| (std.fmt.parseInt(u32, t, 10) catch 0) else 0;
-    var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid };
+    var rec = GameRec{ .gameid = gameid, .gs_ip = ip, .gs_port = gs_port, .gsid = gsid, .max_players = max_players };
     rec.players = if (it.next()) |t| (std.fmt.parseInt(u16, t, 10) catch 0) else 0; // 5th
     rec.status = if (it.next()) |t| (std.fmt.parseInt(u8, t, 10) catch 0) else 0; // 6th
     rec.difficulty = if (it.next()) |t| (std.fmt.parseInt(u8, t, 10) catch 0) else 0; // 7th
@@ -1096,6 +1237,25 @@ fn parseGame(val: []const u8) ?GameRec {
 /// `SET ... KEEPTTL` so the game keeps the lease it already had — a join or a leave says
 /// nothing about how much longer the game should stay listed.
 pub fn setGamePlayers(gameid: u32, players: u16) bool {
+    if (!updateGamePlayers(gameid, players, 0)) return false;
+    // When the server last said what the count is. A join the realm counted ahead of the server
+    // (see `sweepGameSeats`) is only still in the count if it happened after this.
+    var ck: [64]u8 = undefined;
+    const counted = std.fmt.bufPrint(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return true;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    _ = command(s, &r, &.{ "EVAL", "local t = redis.call('TIME') redis.call('SET', KEYS[1], t[1] * 1000 + math.floor(t[2] / 1000), 'PX', 21600000)", "1", counted });
+    return true;
+}
+
+/// Take `n` off a game's player count, never below zero. For a join the realm counted ahead of the
+/// server and that the player never completed.
+pub fn dropGamePlayers(gameid: u32, n: u16) bool {
+    return updateGamePlayers(gameid, null, n);
+}
+
+fn updateGamePlayers(gameid: u32, set: ?u16, drop: u16) bool {
     var ik: [64]u8 = undefined;
     const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
 
@@ -1122,13 +1282,10 @@ pub fn setGamePlayers(gameid: u32, players: u16) bool {
         .bulk => |b| b orelse return false,
         else => return false,
     };
-    const rec = parseGame(val) orelse return false;
-    var vb: [256]u8 = undefined;
-    const body = std.fmt.bufPrint(&vb, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{
-        rec.gameid, rec.gs_ip[0], rec.gs_ip[1],   rec.gs_ip[2], rec.gs_ip[3], rec.gs_port,
-        rec.gsid,   players,      rec.status,     rec.difficulty,
-        rec.pw(),   rec.desc(),
-    }) catch return false;
+    var rec = parseGame(val) orelse return false;
+    rec.players = if (set) |p| p else rec.players -| drop;
+    var vb: [game_rec_max]u8 = undefined;
+    const body = formatGame(&vb, rec, rec.pw(), rec.desc()) orelse return false;
     return switch (command(s, &r, &.{ "SET", gamekey, body, "KEEPTTL" }) orelse return false) {
         .status, .bulk, .int => true,
         .array_len, .err => false,
@@ -1621,21 +1778,251 @@ pub fn cacheCharIfAbsent(account: []const u8, charname: []const u8, bytes: []con
 
 /// Remember that this game holds this character, so its locks can be released when it ends.
 ///
+/// The seat starts out PENDING: the realm has authorised the join, and nothing yet says the
+/// player reached the game. A pending seat is not renewed, so if the client never arrives the seat
+/// lapses on its own instead of being carried for as long as the game lives — see `sweepGameSeats`.
+/// The game server's enter notice makes it a real seat (`confirmGameChar`).
+///
 /// The game server reports a departure by character name only — it does not carry the account —
 /// so the realm has to keep the pairing itself. The set is keyed by game, which is also what
 /// makes closing a game able to free everything it held in one step.
-pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
+///
+/// `max` is the game's seat limit and is checked inside the same script that adds the seat, against
+/// every seat the game holds, so two joins racing for the last seat cannot both get it. A character
+/// already holding a seat is not counted against itself.
+pub const SeatResult = enum { taken, full, failed };
+
+pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: u32) SeatResult {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .failed;
+    var pk: [64]u8 = undefined;
+    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return .failed;
+    var sk: [64]u8 = undefined;
+    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return .failed;
     var mb: [96]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return .failed;
+    const script =
+        \\if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 and redis.call('SCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
+        \\redis.call('SADD', KEYS[1], ARGV[1])
+        \\local t = redis.call('TIME')
+        \\redis.call('HSET', KEYS[2], ARGV[1], t[1] * 1000 + math.floor(t[2] / 1000))
+        \\redis.call('HDEL', KEYS[3], ARGV[1])
+        \\return 1
+    ;
+    var xb: [16]u8 = undefined;
+    const mx = std.fmt.bufPrint(&xb, "{d}", .{max}) catch return .failed;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    return switch (command(s, &r, &.{ "SADD", key, member }) orelse return false) {
-        .int, .status, .bulk => true,
+    return switch (command(s, &r, &.{ "EVAL", script, "3", key, pend, seen, member, mx }) orelse return .failed) {
+        .int => |v| if (v == 0) .full else .taken,
+        .status, .bulk => .taken,
+        else => .failed,
+    };
+}
+
+/// A client asking again for the very game it already has a pending seat in takes that seat over
+/// instead of being refused by it. Only the same game's own pending seat qualifies: the engine
+/// seats one client per character per game, so the earlier attempt cannot also arrive, and the
+/// player has already given up on it. A seat the game server confirmed is never taken over.
+pub fn retakePendingChar(gameid: u32, account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32) bool {
+    var pk: [64]u8 = undefined;
+    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
+    var mb: [96]u8 = undefined;
+    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    var kb: [128]u8 = undefined;
+    const lockkey = charLockKey(&kb, account, charname);
+    if (lockkey.len == 0) return false;
+    var tb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const script =
+        \\if redis.call('HEXISTS', KEYS[1], ARGV[2]) == 0 then return 0 end
+        \\if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+        \\local t = redis.call('TIME')
+        \\redis.call('HSET', KEYS[1], ARGV[2], t[1] * 1000 + math.floor(t[2] / 1000))
+        \\redis.call('PEXPIRE', KEYS[2], ARGV[3])
+        \\return 1
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", pend, lockkey, owner, member, px }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
         else => false,
     };
+}
+
+/// The game server says this character is in the game: the seat is real from here on, and the
+/// lease is renewed for as long as the server keeps saying so.
+///
+/// `account` empty means the server could not name it, and the seat is matched by character name
+/// alone, touching every match — the safe direction, since confirming a seat only keeps a lock.
+/// `present` marks the game as one whose server sends these notices, which is what lets
+/// `sweepGameSeats` expire seats the server stopped reporting. A server that never sends them is
+/// never judged by their absence. Returns how many seats were confirmed.
+pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32, present: bool) usize {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
+    var pk: [64]u8 = undefined;
+    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return 0;
+    var sk: [64]u8 = undefined;
+    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return 0;
+    var gk: [64]u8 = undefined;
+    const guard = std.fmt.bufPrint(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return 0;
+    var mb: [96]u8 = undefined;
+    const member = if (account.len > 0) (std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return 0) else "";
+    var sb: [64]u8 = undefined;
+    const suffix = std.fmt.bufPrint(&sb, "/{s}", .{charname}) catch return 0;
+    var tb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return 0;
+    const script =
+        \\local t = redis.call('TIME')
+        \\local now = t[1] * 1000 + math.floor(t[2] / 1000)
+        \\local function touch(m)
+        \\  redis.call('HDEL', KEYS[2], m)
+        \\  local lk = ARGV[2] .. m
+        \\  local o = redis.call('GET', lk)
+        \\  if not o then
+        \\    redis.call('SET', lk, ARGV[1], 'PX', ARGV[3])
+        \\    o = ARGV[1]
+        \\  end
+        \\  if o == ARGV[1] then
+        \\    redis.call('SADD', KEYS[1], m)
+        \\    redis.call('PEXPIRE', lk, ARGV[3])
+        \\    redis.call('HSET', KEYS[3], m, now)
+        \\    return 1
+        \\  end
+        \\  return 0
+        \\end
+        \\if ARGV[6] == '1' then redis.call('SET', KEYS[4], '1', 'PX', ARGV[7]) end
+        \\if ARGV[4] ~= '' then return touch(ARGV[4]) end
+        \\local n = 0
+        \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+        \\  if string.sub(m, -string.len(ARGV[5])) == ARGV[5] then n = n + touch(m) end
+        \\end
+        \\return n
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "4", key, pend, seen, guard, owner, prefix ++ "charlock:", px, member, suffix, if (present) "1" else "0", presence_marker_px }) orelse return 0;
+    return switch (rep) {
+        .int => |v| @intCast(@max(v, 0)),
+        else => 0,
+    };
+}
+
+/// How long the "this game's server reports presence" marker outlives its last notice.
+const presence_marker_px = "21600000";
+
+pub const SeatSweep = struct {
+    /// Confirmed seats whose lease was extended.
+    renewed: usize = 0,
+    /// Pending seats given up on that the game's player count still included.
+    unconfirmed: usize = 0,
+    /// Confirmed seats the game's server stopped reporting.
+    unreported: usize = 0,
+};
+
+/// One pass over a live game's seats. Returns what it did.
+///
+/// The claim is a LEASE, not a permanent lock: `lockChar` takes it with a TTL so a game server
+/// that dies without releasing cannot strand a character forever. That only works if something
+/// renews it while the game is genuinely alive — otherwise the opposite failure appears, and it is
+/// worse than the one the TTL prevents: the lease lapses under a running game, another game takes
+/// the character, and two games hold one character with neither able to release the other's.
+///
+/// But renewing everything a game ever authorised is the third failure: a join whose client never
+/// arrived is renewed for as long as the game lives, and locks the player out of their own
+/// character. So:
+///   - a confirmed seat is renewed;
+///   - a pending seat is not, and is dropped once it has been pending for `pending_ms`;
+///   - when the game's server reports presence, a confirmed seat unreported for `unreported_ms`
+///     is released, which bounds a lost leave notice;
+///   - a seat whose lock is no longer this game's is forgotten.
+/// Every release is owner-checked, in one script, so a character another game has since taken is
+/// never freed by this one.
+pub fn sweepGameSeats(gameid: u32, owner: []const u8, ttl_s: u32, pending_ms: u32, unreported_ms: u32) SeatSweep {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .{};
+    var pk: [64]u8 = undefined;
+    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return .{};
+    var sk: [64]u8 = undefined;
+    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return .{};
+    var gk: [64]u8 = undefined;
+    const guard = std.fmt.bufPrint(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return .{};
+    var ck: [64]u8 = undefined;
+    const counted = std.fmt.bufPrint(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return .{};
+    var tb: [16]u8 = undefined;
+    const px = std.fmt.bufPrint(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return .{};
+    var pb: [16]u8 = undefined;
+    const pms = std.fmt.bufPrint(&pb, "{d}", .{pending_ms}) catch return .{};
+    var ub: [16]u8 = undefined;
+    const ums = std.fmt.bufPrint(&ub, "{d}", .{unreported_ms}) catch return .{};
+    const script =
+        \\local t = redis.call('TIME')
+        \\local now = t[1] * 1000 + math.floor(t[2] / 1000)
+        \\local watched = redis.call('EXISTS', KEYS[4]) == 1
+        \\local lastcount = tonumber(redis.call('GET', KEYS[5])) or 0
+        \\local renewed, unconfirmed, unreported = 0, 0, 0
+        \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+        \\  local lk = ARGV[2] .. m
+        \\  local since = tonumber(redis.call('HGET', KEYS[2], m))
+        \\  if since then
+        \\    if now - since > tonumber(ARGV[4]) then
+        \\      if redis.call('GET', lk) == ARGV[1] then redis.call('DEL', lk) end
+        \\      redis.call('SREM', KEYS[1], m)
+        \\      redis.call('HDEL', KEYS[2], m)
+        \\      redis.call('HDEL', KEYS[3], m)
+        \\      if since > lastcount then unconfirmed = unconfirmed + 1 end
+        \\    end
+        \\  elseif redis.call('GET', lk) ~= ARGV[1] then
+        \\    redis.call('SREM', KEYS[1], m)
+        \\    redis.call('HDEL', KEYS[3], m)
+        \\  else
+        \\    local last = tonumber(redis.call('HGET', KEYS[3], m))
+        \\    if watched and last and now - last > tonumber(ARGV[5]) then
+        \\      redis.call('DEL', lk)
+        \\      redis.call('SREM', KEYS[1], m)
+        \\      redis.call('HDEL', KEYS[3], m)
+        \\      unreported = unreported + 1
+        \\    else
+        \\      if watched and not last then redis.call('HSET', KEYS[3], m, now) end
+        \\      redis.call('PEXPIRE', lk, ARGV[3])
+        \\      renewed = renewed + 1
+        \\    end
+        \\  end
+        \\end
+        \\return {renewed, unconfirmed, unreported}
+    ;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "5", key, pend, seen, guard, counted, owner, prefix ++ "charlock:", px, pms, ums }) orelse return .{};
+    const n = switch (rep) {
+        .array_len => |nn| nn,
+        else => return .{},
+    };
+    if (n != 3) {
+        dropConn(s);
+        return .{};
+    }
+    var out: [3]usize = .{ 0, 0, 0 };
+    for (&out) |*o| {
+        const er = readReply(&r) orelse {
+            dropConn(s);
+            return .{};
+        };
+        switch (er) {
+            .int => |v| o.* = @intCast(@max(v, 0)),
+            else => {
+                dropConn(s);
+                return .{};
+            },
+        }
+    }
+    return .{ .renewed = out[0], .unconfirmed = out[1], .unreported = out[2] };
 }
 
 /// Free every character this game holds, and forget the pairing. Returns how many were freed.
@@ -1646,6 +2033,14 @@ pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool 
 pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
     var kb: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
+    var pk: [64]u8 = undefined;
+    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return 0;
+    var sk: [64]u8 = undefined;
+    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return 0;
+    var gk: [64]u8 = undefined;
+    const guard = std.fmt.bufPrint(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return 0;
+    var ck: [64]u8 = undefined;
+    const counted = std.fmt.bufPrint(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return 0;
     const script =
         \\local n = 0
         \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
@@ -1655,49 +2050,57 @@ pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
         \\    n = n + 1
         \\  end
         \\end
-        \\redis.call('DEL', KEYS[1])
+        \\redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])
         \\return n
     ;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, prefix ++ "charlock:" }) orelse return 0;
+    const rep = command(s, &r, &.{ "EVAL", script, "5", key, pend, seen, guard, counted, owner, prefix ++ "charlock:" }) orelse return 0;
     return switch (rep) {
         .int => |v| @intCast(@max(v, 0)),
         else => 0,
     };
 }
 
-/// Renew the lease on every character this game holds. Returns how many were still ours.
+/// Free every character lock held by a game the realm no longer lists.
 ///
-/// The claim is a LEASE, not a permanent lock: `lockChar` takes it with a TTL so a game server
-/// that dies without releasing cannot strand a character forever. That only works if something
-/// renews it while the game is genuinely alive — otherwise the opposite failure appears, and it is
-/// worse than the one the TTL prevents: the lease lapses under a running game, another game takes
-/// the character, and two games hold one character with neither able to release the other's.
-///
-/// Owner-checked per member for that same reason, and done in one script so a character cannot be
-/// taken between the check and the PEXPIRE.
-pub fn renewGameCharLeases(gameid: u32, owner: []const u8, ttl_s: u32) usize {
-    var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
-    var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return 0;
-    const script =
-        \\local n = 0
-        \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
-        \\  local lk = ARGV[3] .. m
-        \\  if redis.call('GET', lk) == ARGV[1] then
-        \\    redis.call('PEXPIRE', lk, ARGV[2])
-        \\    n = n + 1
-        \\  end
-        \\end
-        \\return n
-    ;
+/// A lock's owner is `game:<id>` and the game's record is what the realm lists, kept alive by the
+/// game server's own heartbeat. A game server that restarted or was reaped takes its records with
+/// it without a CLOSEGAME ever arriving, so what its games held would otherwise stay claimed until
+/// the lease ran out. A game with a record is live and keeps its locks; only a lock whose game has
+/// no record is freed, and a lock another game has since taken is left alone. The per-game member
+/// set goes with it. Owners that are not `game:<id>` are never touched.
+/// Returns how many locks were freed.
+pub const orphan_charlock_script =
+    \\local n = 0
+    \\local cur = '0'
+    \\repeat
+    \\  local res = redis.call('SCAN', cur, 'MATCH', ARGV[1] .. 'charlock:*', 'COUNT', 500)
+    \\  cur = res[1]
+    \\  for _, k in ipairs(res[2]) do
+    \\    local o = redis.call('GET', k)
+    \\    if o and string.sub(o, 1, 5) == 'game:' then
+    \\      local id = tonumber(string.sub(o, 6))
+    \\      if id and redis.call('EXISTS', ARGV[1] .. 'game:byid:' .. string.format('%x', id)) == 0 then
+    \\        redis.call('DEL', k)
+    \\        local m = string.sub(k, #ARGV[1] + 10)
+    \\        redis.call('SREM', ARGV[1] .. 'gamechars:' .. string.sub(o, 6), m)
+    \\        redis.call('HDEL', ARGV[1] .. 'gamepend:' .. string.sub(o, 6), m)
+    \\        redis.call('HDEL', ARGV[1] .. 'gameseen:' .. string.sub(o, 6), m)
+    \\        n = n + 1
+    \\      end
+    \\    end
+    \\  end
+    \\until cur == '0'
+    \\return n
+;
+
+pub fn releaseOrphanCharLocks() usize {
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, px, prefix ++ "charlock:" }) orelse return 0;
+    const rep = command(s, &r, &.{ "EVAL", orphan_charlock_script, "0", prefix }) orelse return 0;
     return switch (rep) {
         .int => |v| @intCast(@max(v, 0)),
         else => 0,
@@ -1720,7 +2123,13 @@ pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const 
     // The lock is released only if this game still owns it — the same compare-and-swap every other
     // release does. A lapsed lease may already have been taken by somebody else, and a blind DEL
     // would free THEIR claim.
+    var pk: [64]u8 = undefined;
+    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
+    var sk: [64]u8 = undefined;
+    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return false;
     const script =
+        \\redis.call('HDEL', KEYS[3], ARGV[2])
+        \\redis.call('HDEL', KEYS[4], ARGV[2])
         \\if redis.call('SREM', KEYS[1], ARGV[2]) == 0 then return 0 end
         \\if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
         \\return 1
@@ -1728,7 +2137,7 @@ pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const 
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "2", key, lockkey, owner, member }) orelse return false;
+    const rep = command(s, &r, &.{ "EVAL", script, "4", key, lockkey, pend, seen, owner, member }) orelse return false;
     return switch (rep) {
         .int => |v| v == 1,
         else => false,
@@ -1764,12 +2173,18 @@ pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u
         \\local lk = ARGV[2] .. hit
         \\if redis.call('GET', lk) == ARGV[1] then redis.call('DEL', lk) end
         \\redis.call('SREM', KEYS[1], hit)
+        \\redis.call('HDEL', KEYS[2], hit)
+        \\redis.call('HDEL', KEYS[3], hit)
         \\return 1
     ;
+    var pk: [64]u8 = undefined;
+    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
+    var sk2: [64]u8 = undefined;
+    const seen = std.fmt.bufPrint(&sk2, prefix ++ "gameseen:{d}", .{gameid}) catch return false;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "1", key, owner, prefix ++ "charlock:", suffix }) orelse return false;
+    const rep = command(s, &r, &.{ "EVAL", script, "3", key, pend, seen, owner, prefix ++ "charlock:", suffix }) orelse return false;
     return switch (rep) {
         .int => |v| v == 1,
         else => false,
@@ -2062,6 +2477,36 @@ pub fn popGsEvent(out: []u8) ?usize {
     };
 }
 
+/// How many servers one placement can rule out.
+pub const max_exclude = 64;
+
+/// Hex ids, comma separated; the pick scripts wrap the list in commas so a whole id is matched.
+fn excludeList(buf: *[max_exclude * 9]u8, exclude: []const u32) []const u8 {
+    var n: usize = 0;
+    for (exclude[0..@min(exclude.len, max_exclude)]) |g| {
+        const part = std.fmt.bufPrint(buf[n..], "{s}{x}", .{ if (n == 0) "" else ",", g }) catch break;
+        n += part.len;
+    }
+    return buf[0..n];
+}
+
+/// Take back a request nobody has read yet. A server that did not answer in time may be down or
+/// asleep, and the request would otherwise sit in its queue until it comes back and be served to a
+/// client that has long gone (and then collide with the retry). True when it was still queued.
+pub fn dropGsRequest(gsid: u32, packet: []const u8) bool {
+    var kb: [64]u8 = undefined;
+    const key = gsQueueKey(&kb, gsid);
+    if (key.len == 0) return false;
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "LREM", key, "0", packet }) orelse return false;
+    return switch (rep) {
+        .int => |n| n > 0,
+        else => false,
+    };
+}
+
 /// Choose a game server for a new game and reserve a slot on it, in one indivisible step.
 ///
 /// Selecting and then reserving as two operations is a read-modify-write across instances: two
@@ -2074,12 +2519,16 @@ pub fn popGsEvent(out: []u8) ?usize {
 ///
 /// Returns the chosen server's id, or null when every server is full — which is a real answer, not
 /// a failure, and the caller has a different thing to tell the player for each.
-pub fn pickAndReserveGs() ?u32 {
+///
+/// Servers in `exclude` never qualify: they are the ones that already failed this very request, and
+/// without it a retry after a refusal would pick the same least-loaded server again.
+pub fn pickAndReserveGs(exclude: []const u32) ?u32 {
     const script =
+        \\local ex = ',' .. ARGV[1] .. ','
         \\local best, bestload
         \\for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
         \\  local rec = redis.call('GET', KEYS[2] .. id)
-        \\  if rec and #rec >= 15 then
+        \\  if rec and #rec >= 15 and not string.find(ex, ',' .. id .. ',', 1, true) then
         \\    local function u32(o)
         \\      return string.byte(rec,o) + string.byte(rec,o+1)*256
         \\           + string.byte(rec,o+2)*65536 + string.byte(rec,o+3)*16777216
@@ -2108,7 +2557,8 @@ pub fn pickAndReserveGs() ?u32 {
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:" }) orelse return null;
+    var exb: [max_exclude * 9]u8 = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:", excludeList(&exb, exclude) }) orelse return null;
     return switch (rep) {
         .bulk => |b| blk: {
             const v = b orelse break :blk null;
@@ -2128,13 +2578,14 @@ pub fn pickAndReserveGs() ?u32 {
 /// A server that does not publish the label at all does not match, deliberately: the alternative
 /// is that one unlabelled server answers every request, which is exactly the mis-routing this
 /// exists to prevent.
-pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8) ?u32 {
+pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8, exclude: []const u32) ?u32 {
     const script =
         \\local want = '\n' .. ARGV[1] .. '=' .. ARGV[2] .. '\n'
+        \\local ex = ',' .. ARGV[3] .. ','
         \\local best, bestload
         \\for _, id in ipairs(redis.call('SMEMBERS', KEYS[1])) do
         \\  local rec = redis.call('GET', KEYS[2] .. id)
-        \\  if rec and #rec >= 15 then
+        \\  if rec and #rec >= 15 and not string.find(ex, ',' .. id .. ',', 1, true) then
         \\    local function u32(o)
         \\      return string.byte(rec,o) + string.byte(rec,o+1)*256
         \\           + string.byte(rec,o+2)*65536 + string.byte(rec,o+3)*16777216
@@ -2161,7 +2612,8 @@ pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8) ?u32 {
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
-    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:", key, value }) orelse return null;
+    var exb: [max_exclude * 9]u8 = undefined;
+    const rep = command(s, &r, &.{ "EVAL", script, "2", prefix ++ "gs", prefix ++ "gs:", key, value, excludeList(&exb, exclude) }) orelse return null;
     return switch (rep) {
         .bulk => |b| blk: {
             const v = b orelse break :blk null;
@@ -2690,4 +3142,411 @@ pub fn chatPop(instance: u32, out: []u8) ?usize {
         },
         else => null,
     };
+}
+
+// Tests that need a real redis run only when REALM_TEST_REDIS names one (host:port), and only against
+// a server that carries the marker key below, so that a test never writes into a realm's own redis.
+// Create the marker on a throwaway server with: SET realmd:test-instance 1
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+fn testRedis() !void {
+    const addr = getenv("REALM_TEST_REDIS") orelse return error.SkipZigTest;
+    init(std.mem.span(addr));
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "GET", prefix ++ "test-instance" }) orelse return error.SkipZigTest;
+    switch (rep) {
+        .bulk => |b| if (b == null) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+}
+
+test "several tickets of one account live side by side and each is spent once" {
+    try testRedis();
+    const acct = "ticket-test-acc";
+    var kb: [128]u8 = undefined;
+    const key = ticketKey(&kb, acct).?;
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "DEL", key });
+    }
+    defer {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "DEL", key });
+    }
+
+    var tickets: [16][8]u8 = undefined;
+    for (&tickets, 0..) |*t, i| {
+        _ = std.fmt.bufPrint(t, "tkt{d:0>5}", .{i}) catch unreachable;
+        try std.testing.expect(putLoginTicket(acct, t, 300));
+    }
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        const rep = command(s, &r, &.{ "PTTL", key }).?;
+        try std.testing.expect(rep.int > 0 and rep.int <= 300_000);
+    }
+    // A wrong ticket fails and spends nobody else's.
+    try std.testing.expect(!redeemLoginTicket(acct, "nope0000"));
+    // In a scrambled order, every one succeeds, once.
+    var prng = std.Random.DefaultPrng.init(0x7d2);
+    var order: [16]usize = undefined;
+    for (&order, 0..) |*o, i| o.* = i;
+    prng.random().shuffle(usize, &order);
+    for (order) |i| try std.testing.expect(redeemLoginTicket(acct, &tickets[i]));
+    for (order) |i| try std.testing.expect(!redeemLoginTicket(acct, &tickets[i]));
+
+    // The list holds 32: the oldest of 40 are dropped, and takeLoginTicket pops the oldest left.
+    for (0..40) |i| {
+        var t: [8]u8 = undefined;
+        _ = std.fmt.bufPrint(&t, "cap{d:0>5}", .{i}) catch unreachable;
+        try std.testing.expect(putLoginTicket(acct, &t, 300));
+    }
+    try std.testing.expect(!redeemLoginTicket(acct, "cap00007"));
+    var out: [32]u8 = undefined;
+    const n = takeLoginTicket(acct, &out);
+    try std.testing.expectEqualStrings("cap00008", out[0..n]);
+    var left: usize = 0;
+    while (takeLoginTicket(acct, &out) != 0) left += 1;
+    try std.testing.expectEqual(@as(usize, 31), left);
+
+    // A key left by the single-ticket format is replaced, not an error.
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "SET", key, "oldformat" });
+    }
+    try std.testing.expect(putLoginTicket(acct, "fresh001", 300));
+    try std.testing.expect(redeemLoginTicket(acct, "fresh001"));
+    try std.testing.expect(!redeemLoginTicket(acct, "oldformat"));
+}
+
+/// A connected local pair standing in for the redis socket: the test writes the "server" side.
+fn fakePair() ![2]net.Socket {
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPair;
+    return fds;
+}
+
+extern "c" fn usleep(usec: c_uint) c_int;
+
+fn sendThenClose(fd: net.Socket, parts: []const []const u8) void {
+    for (parts) |p| {
+        _ = std.c.write(fd, p.ptr, p.len);
+        _ = usleep(20_000);
+    }
+    net.closeSocket(fd);
+}
+
+test "a reply cut off by a closed connection is an error, not a panic" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    const t = try std.Thread.spawn(.{}, sendThenClose, .{ p[1], &[_][]const u8{"$10\r\nabc"} });
+    var r = Reader{ .fd = p[0] };
+    try std.testing.expect(readReply(&r) == null);
+    t.join();
+}
+
+test "a closed connection with nothing sent is an error" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    net.closeSocket(p[1]);
+    var r = Reader{ .fd = p[0] };
+    try std.testing.expect(readReply(&r) == null);
+}
+
+test "a lone CRLF where a reply should start is an error, not a panic" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    const t = try std.Thread.spawn(.{}, sendThenClose, .{ p[1], &[_][]const u8{"\r\n"} });
+    var r = Reader{ .fd = p[0] };
+    try std.testing.expect(readReply(&r) == null);
+    t.join();
+}
+
+test "a reply split across several reads is reassembled" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    const t = try std.Thread.spawn(.{}, sendThenClose, .{ p[1], &[_][]const u8{ "$1", "0\r\nabc", "defghij", "\r", "\n" } });
+    var r = Reader{ .fd = p[0] };
+    try std.testing.expectEqualStrings("abcdefghij", readReply(&r).?.bulk.?);
+    t.join();
+}
+
+test "a READONLY reply drops the pooled connection and the command is retried on a fresh one" {
+    // Nothing listens on port 1, so the retry's dial fails: what the test sees is that the replica's
+    // connection was dropped (not kept for the next caller) and that the retry was attempted.
+    const saved_port = port;
+    port = 1;
+    defer port = saved_port;
+    const p = try fakePair();
+    defer net.closeSocket(p[1]);
+    const ro = "-READONLY You can't write against a read only replica.\r\n";
+    _ = std.c.write(p[1], ro, ro.len);
+    var slot = Slot{ .fd = p[0] };
+    const s = &slot;
+    wrong_node = false;
+    var r: Reader = undefined;
+    const rep = command(s, &r, &.{ "SET", "k", "v" });
+    try std.testing.expect(rep == null); // the retry could not connect, so there is no reply
+    try std.testing.expect(s.fd == null); // and the replica's connection is gone
+    try std.testing.expect(!wrong_node);
+}
+
+test "READONLY and MASTERDOWN mark the connection, other errors do not" {
+    const p = try fakePair();
+    defer net.closeSocket(p[0]);
+    defer net.closeSocket(p[1]);
+    wrong_node = false;
+    var r = Reader{ .fd = p[0] };
+    _ = std.c.write(p[1], "-ERR nope\r\n", 11);
+    try std.testing.expect(readReply(&r).? == .err);
+    try std.testing.expect(!wrong_node);
+    const md = "-MASTERDOWN Link with MASTER is down\r\n";
+    _ = std.c.write(p[1], md, md.len);
+    try std.testing.expect(readReply(&r).? == .err);
+    try std.testing.expect(wrong_node);
+    // A caller that never looked still hands back a connection that is not reused.
+    var slot = Slot{ .fd = null };
+    slot.lock.lock();
+    release(&slot);
+    try std.testing.expect(!wrong_node);
+}
+
+test "a game name with spaces and capitals keys to a folded, storable key" {
+    var nb: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("d09 over up", gameKey("D09 Over Up", &nb).?);
+    try std.testing.expectEqualStrings("jan3", gameKey("Jan3", &nb).?);
+    try std.testing.expect(gameKey("", &nb) == null);
+    try std.testing.expect(gameKey("a\nb", &nb) == null);
+}
+
+test "a restarted server's games release their characters, a live game's are kept" {
+    try testRedis();
+    {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        // game 10 (hex a) is live and has a record; game 11 (hex b) lost its server and has none
+        _ = command(s, &r, &.{ "SET", prefix ++ "game:byid:a", "live" });
+        _ = command(s, &r, &.{ "DEL", prefix ++ "game:byid:b" });
+    }
+    defer {
+        const s = acquire();
+        defer release(s);
+        var r: Reader = undefined;
+        _ = command(s, &r, &.{ "DEL", prefix ++ "game:byid:a", prefix ++ "gamechars:10", prefix ++ "gamechars:11", prefix ++ "gamepend:10", prefix ++ "gamepend:11", prefix ++ "gameseen:10", prefix ++ "gameseen:11" });
+        _ = command(s, &r, &.{ "DEL", prefix ++ "charlock:orphan/Alive", prefix ++ "charlock:orphan/Stuck", prefix ++ "charlock:orphan/Other" });
+    }
+    try std.testing.expect(lockChar("orphan", "Alive", "game:10", 300));
+    try std.testing.expect(addGameChar(10, "orphan", "Alive", 8) == .taken);
+    try std.testing.expect(lockChar("orphan", "Stuck", "game:11", 300));
+    try std.testing.expect(addGameChar(11, "orphan", "Stuck", 8) == .taken);
+    try std.testing.expect(lockChar("orphan", "Other", "someone-else", 300));
+
+    // Other locks on the redis may belong to games that are gone too, so count only ours.
+    try std.testing.expect(releaseOrphanCharLocks() >= 1);
+
+    var ob: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("game:10", charLockOwner("orphan", "Alive", &ob).?);
+    try std.testing.expect(charLockOwner("orphan", "Stuck", &ob) == null);
+    try std.testing.expectEqualStrings("someone-else", charLockOwner("orphan", "Other", &ob).?);
+    // the freed character can be taken by its next game
+    try std.testing.expect(lockChar("orphan", "Stuck", "game:10", 300));
+    // nothing of ours left to free on a second pass
+    _ = releaseOrphanCharLocks();
+    try std.testing.expect(charLockOwner("orphan", "Stuck", &ob) != null);
+}
+
+fn testForget(gameid: u32, chars: []const []const u8) void {
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    var kb: [5][64]u8 = undefined;
+    const names = [_][]const u8{ "gamechars", "gamepend", "gameseen", "gamepresent", "gamecount" };
+    for (names, 0..) |n, i| {
+        const k = std.fmt.bufPrint(&kb[i], prefix ++ "{s}:{d}", .{ n, gameid }) catch continue;
+        _ = command(s, &r, &.{ "DEL", k });
+    }
+    for (chars) |c| {
+        var lb: [96]u8 = undefined;
+        const k = std.fmt.bufPrint(&lb, prefix ++ "charlock:acc/{s}", .{c}) catch continue;
+        _ = command(s, &r, &.{ "DEL", k });
+    }
+}
+
+fn testIsMember(gameid: u32, set: []const u8, member: []const u8) bool {
+    const s = acquire();
+    defer release(s);
+    var r: Reader = undefined;
+    var kb: [64]u8 = undefined;
+    const k = std.fmt.bufPrint(&kb, prefix ++ "{s}:{d}", .{ set, gameid }) catch return false;
+    const cmd: []const u8 = if (std.mem.eql(u8, set, "gamechars")) "SISMEMBER" else "HEXISTS";
+    const rep = command(s, &r, &.{ cmd, k, member }) orelse return false;
+    return switch (rep) {
+        .int => |v| v == 1,
+        else => false,
+    };
+}
+
+test "a join the server never confirmed is let go, and the character can be taken again" {
+    try testRedis();
+    const gid: u32 = 910001;
+    testForget(gid, &.{"Ghost"});
+    defer testForget(gid, &.{"Ghost"});
+    try std.testing.expect(lockChar("acc", "Ghost", "game:910001", 60));
+    try std.testing.expect(addGameChar(gid, "acc", "Ghost", 8) == .taken);
+    // Not yet past its time: left alone, and not renewed either.
+    var sw = sweepGameSeats(gid, "game:910001", 300, 60_000, 240_000);
+    try std.testing.expectEqual(@as(usize, 0), sw.renewed);
+    try std.testing.expectEqual(@as(usize, 0), sw.unconfirmed);
+    try std.testing.expect(testIsMember(gid, "gamechars", "acc/Ghost"));
+    _ = usleep(20_000);
+    sw = sweepGameSeats(gid, "game:910001", 300, 10, 240_000);
+    try std.testing.expectEqual(@as(usize, 1), sw.unconfirmed);
+    var ob: [64]u8 = undefined;
+    try std.testing.expect(charLockOwner("acc", "Ghost", &ob) == null);
+    try std.testing.expect(!testIsMember(gid, "gamechars", "acc/Ghost"));
+    try std.testing.expect(!testIsMember(gid, "gamepend", "acc/Ghost"));
+    try std.testing.expect(lockChar("acc", "Ghost", "game:910002", 60));
+    testForget(910002, &.{});
+}
+
+test "a confirmed seat is renewed and a leave clears the member set as well as the lock" {
+    try testRedis();
+    const gid: u32 = 910003;
+    testForget(gid, &.{"Real"});
+    defer testForget(gid, &.{"Real"});
+    try std.testing.expect(lockChar("acc", "Real", "game:910003", 60));
+    try std.testing.expect(addGameChar(gid, "acc", "Real", 8) == .taken);
+    try std.testing.expectEqual(@as(usize, 1), confirmGameChar(gid, "acc", "Real", "game:910003", 300, false));
+    try std.testing.expect(!testIsMember(gid, "gamepend", "acc/Real"));
+    _ = usleep(20_000);
+    // Long past any pending time, and still ours: a confirmed seat is never judged by that clock.
+    var sw = sweepGameSeats(gid, "game:910003", 300, 10, 240_000);
+    try std.testing.expectEqual(@as(usize, 1), sw.renewed);
+    try std.testing.expectEqual(@as(usize, 0), sw.unconfirmed);
+    try std.testing.expect(releaseGameCharExact(gid, "acc", "Real", "game:910003"));
+    var ob: [64]u8 = undefined;
+    try std.testing.expect(charLockOwner("acc", "Real", &ob) == null);
+    try std.testing.expect(!testIsMember(gid, "gamechars", "acc/Real"));
+    try std.testing.expect(!testIsMember(gid, "gameseen", "acc/Real"));
+    sw = sweepGameSeats(gid, "game:910003", 300, 10, 240_000);
+    try std.testing.expectEqual(@as(usize, 0), sw.renewed);
+}
+
+test "a seat whose lock another game took is forgotten, not renewed" {
+    try testRedis();
+    const gid: u32 = 910004;
+    testForget(gid, &.{"Moved"});
+    defer testForget(gid, &.{"Moved"});
+    try std.testing.expect(lockChar("acc", "Moved", "game:910004", 60));
+    try std.testing.expect(addGameChar(gid, "acc", "Moved", 8) == .taken);
+    _ = confirmGameChar(gid, "acc", "Moved", "game:910004", 300, false);
+    try std.testing.expect(unlockChar("acc", "Moved", "game:910004"));
+    try std.testing.expect(lockChar("acc", "Moved", "game:910005", 60));
+    const sw = sweepGameSeats(gid, "game:910004", 300, 60_000, 240_000);
+    try std.testing.expectEqual(@as(usize, 0), sw.renewed);
+    try std.testing.expect(!testIsMember(gid, "gamechars", "acc/Moved"));
+    var ob: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("game:910005", charLockOwner("acc", "Moved", &ob).?);
+}
+
+test "a seat the server stopped reporting is released, but only for a server that reports" {
+    try testRedis();
+    const gid: u32 = 910006;
+    testForget(gid, &.{ "Quiet", "Loud" });
+    defer testForget(gid, &.{ "Quiet", "Loud" });
+    try std.testing.expect(lockChar("acc", "Quiet", "game:910006", 60));
+    try std.testing.expect(addGameChar(gid, "acc", "Quiet", 8) == .taken);
+    // Confirmed by an enter notice: the server has never sent a presence notice for this game.
+    _ = confirmGameChar(gid, "acc", "Quiet", "game:910006", 300, false);
+    _ = usleep(20_000);
+    var sw = sweepGameSeats(gid, "game:910006", 300, 60_000, 10);
+    try std.testing.expectEqual(@as(usize, 1), sw.renewed);
+    try std.testing.expectEqual(@as(usize, 0), sw.unreported);
+    // Now it does report, for somebody else; Quiet is not among them.
+    try std.testing.expect(lockChar("acc", "Loud", "game:910006", 60));
+    try std.testing.expect(addGameChar(gid, "acc", "Loud", 8) == .taken);
+    _ = confirmGameChar(gid, "acc", "Loud", "game:910006", 300, true);
+    _ = usleep(20_000);
+    _ = confirmGameChar(gid, "acc", "Loud", "game:910006", 300, true);
+    sw = sweepGameSeats(gid, "game:910006", 300, 60_000, 10);
+    try std.testing.expectEqual(@as(usize, 1), sw.unreported);
+    try std.testing.expectEqual(@as(usize, 1), sw.renewed);
+    var ob: [64]u8 = undefined;
+    try std.testing.expect(charLockOwner("acc", "Quiet", &ob) == null);
+    try std.testing.expect(charLockOwner("acc", "Loud", &ob) != null);
+}
+
+test "an unconfirmed join is taken back out of the count only if the server has not recounted since" {
+    try testRedis();
+    const gid: u32 = 910007;
+    testForget(gid, &.{ "Late", "Early" });
+    defer testForget(gid, &.{ "Late", "Early" });
+    try std.testing.expect(registerGame("zz-seat-test", gid, .{ 127, 0, 0, 1 }, 4000, 1, 3, 0, 0, "", "", 8, 60));
+    defer removeGameById(gid);
+    try std.testing.expect(lockChar("acc", "Early", "game:910007", 60));
+    try std.testing.expect(addGameChar(gid, "acc", "Early", 8) == .taken);
+    _ = usleep(20_000);
+    // The server recounts after Early's join, so the count already says what is true.
+    try std.testing.expect(setGamePlayers(gid, 2));
+    _ = usleep(20_000);
+    try std.testing.expect(lockChar("acc", "Late", "game:910007", 60));
+    try std.testing.expect(addGameChar(gid, "acc", "Late", 8) == .taken);
+    _ = usleep(20_000);
+    const sw = sweepGameSeats(gid, "game:910007", 300, 10, 240_000);
+    try std.testing.expectEqual(@as(usize, 1), sw.unconfirmed);
+    try std.testing.expect(dropGamePlayers(gid, 1));
+    try std.testing.expectEqual(@as(u16, 1), findGame("zz-seat-test").?.players);
+    try std.testing.expect(dropGamePlayers(gid, 5));
+    try std.testing.expectEqual(@as(u16, 0), findGame("zz-seat-test").?.players);
+}
+
+test "the same game's unconfirmed seat can be taken back, a confirmed one cannot" {
+    try testRedis();
+    const gid: u32 = 910008;
+    testForget(gid, &.{"Again"});
+    defer testForget(gid, &.{"Again"});
+    try std.testing.expect(lockChar("acc", "Again", "game:910008", 60));
+    try std.testing.expect(addGameChar(gid, "acc", "Again", 8) == .taken);
+    try std.testing.expect(retakePendingChar(gid, "acc", "Again", "game:910008", 60));
+    // A different game does not get to take it.
+    try std.testing.expect(!retakePendingChar(910009, "acc", "Again", "game:910009", 60));
+    _ = confirmGameChar(gid, "acc", "Again", "game:910008", 300, false);
+    try std.testing.expect(!retakePendingChar(gid, "acc", "Again", "game:910008", 60));
+}
+
+test "a game record carries its cap after the description, and a full game's record is unchanged" {
+    var buf: [game_rec_max]u8 = undefined;
+    const full = formatGame(&buf, .{ .gameid = 3, .gs_ip = .{ 10, 0, 0, 1 }, .gs_port = 4100, .gsid = 9, .players = 2 }, "pw", "a b").?;
+    try std.testing.expectEqualStrings("3 10.0.0.1 4100 9 2 0 0 pw a b", full);
+    try std.testing.expectEqual(@as(u8, 8), parseGame(full).?.max_players);
+
+    var b4: [game_rec_max]u8 = undefined;
+    const four = formatGame(&b4, .{ .gameid = 3, .gs_ip = .{ 10, 0, 0, 1 }, .gs_port = 4100, .gsid = 9, .players = 2, .max_players = 4 }, "pw", "a b").?;
+    try std.testing.expectEqualStrings("3 10.0.0.1 4100 9 2 0 0 pw a b\n#4", four);
+    const g = parseGame(four).?;
+    try std.testing.expectEqual(@as(u8, 4), g.max_players);
+    try std.testing.expectEqualStrings("a b", g.desc());
+}
+
+test "the last seat goes to one join only" {
+    try testRedis();
+    const gid: u32 = 90_210;
+    testForget(gid, &.{});
+    defer testForget(gid, &.{});
+    try std.testing.expectEqual(SeatResult.taken, addGameChar(gid, "a", "One", 2));
+    try std.testing.expectEqual(SeatResult.taken, addGameChar(gid, "b", "Two", 2));
+    try std.testing.expectEqual(SeatResult.full, addGameChar(gid, "c", "Three", 2));
+    // A character already seated is not counted against itself.
+    try std.testing.expectEqual(SeatResult.taken, addGameChar(gid, "a", "One", 2));
 }

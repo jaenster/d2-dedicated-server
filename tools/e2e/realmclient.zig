@@ -142,6 +142,7 @@ fn dec14(b0: u8, b1: u8) u16 {
 
 pub const ChatEvent = struct {
     eid: u32,
+    flags: u32 = 0,
     username: []const u8, // slice into RealmClient.rxbuf (valid until next recv)
     text: []const u8,
 };
@@ -153,8 +154,10 @@ pub const EID_LEAVE = 0x03;
 pub const EID_WHISPER = 0x04;
 pub const EID_TALK = 0x05;
 pub const EID_CHANNEL = 0x07;
+pub const EID_WHISPERSENT = 0x0a;
 pub const EID_INFO = 0x12;
 pub const EID_ERROR = 0x13;
+pub const EID_EMOTE = 0x17;
 
 /// Reply to MCP_CREATEGAME / MCP_JOINGAME. Named rather than anonymous so the
 /// no-password wrappers can forward the password-carrying versions' return value.
@@ -537,7 +540,7 @@ pub const AdInfo = struct {
         const tstart = off;
         while (off < b.len and b[off] != 0) off += 1;
         const text = b[tstart..off];
-        return .{ .eid = eid, .username = username, .text = text };
+        return .{ .eid = eid, .flags = net.rdU32(b, 4), .username = username, .text = text };
     }
 
     /// Give bnet reads a deadline so a missing event fails instead of hanging.
@@ -793,14 +796,19 @@ pub const AdInfo = struct {
     /// Create a game at a specific difficulty. It rides in bits 12-14 of the create flags
     /// (Normal 0, Nightmare 0x1000, Hell 0x2000).
     pub fn createGameDiff(self: *RealmClient, name: []const u8, desc: []const u8, difficulty: u2) !CreateResult {
-        return self.createGameFull(name, desc, "", @as(u32, difficulty) << 12);
+        return self.createGameFull(name, desc, "", @as(u32, difficulty) << 12, 8);
     }
 
     pub fn createGameWithPassword(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8) !CreateResult {
-        return self.createGameFull(name, desc, password, 0);
+        return self.createGameFull(name, desc, password, 0, 8);
     }
 
-    fn createGameFull(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8, flags: u32) !CreateResult {
+    /// Create a game that takes at most `max_players` players.
+    pub fn createGameMax(self: *RealmClient, name: []const u8, desc: []const u8, max_players: u8) !CreateResult {
+        return self.createGameFull(name, desc, "", 0, max_players);
+    }
+
+    fn createGameFull(self: *RealmClient, name: []const u8, desc: []const u8, password: []const u8, flags: u32, max_players: u8) !CreateResult {
         const fd = self.d2cs.?;
         var body: [128]u8 = undefined;
         var w = net.Writer.init(&body);
@@ -808,7 +816,7 @@ pub const AdInfo = struct {
         w.u32v(flags);
         w.u8v(1);
         w.u8v(0);
-        w.u8v(8); // max_players
+        w.u8v(max_players);
         w.cstr(name);
         w.cstr(password);
         w.cstr(desc);

@@ -83,6 +83,9 @@ pub const GameRec = struct {
     /// 0 Normal, 1 Nightmare, 2 Hell. A character has to have progressed far enough to be
     /// allowed in, and the client has a specific message for each way that can fail.
     difficulty: u8 = 0,
+    /// Players the game takes: what the creator chose, 1..8. A record written before the
+    /// choice was kept reads back as 8.
+    max_players: u8 = 8,
     /// Game join password (empty = open game). Stored with the record so any realmd
     /// instance can validate a join. D2 passwords are short alphanumeric (no spaces).
     password: [16]u8 = [_]u8{0} ** 16,
@@ -208,6 +211,8 @@ pub const NamedGame = struct {
     /// carries it: a listed game a character cannot legally enter should say so on the list
     /// rather than at the disconnect.
     status: u8 = 0,
+    /// 0 Normal, 1 Nightmare, 2 Hell: the list leaves out what the viewer has not unlocked.
+    difficulty: u8 = 0,
     description: [32]u8 = [_]u8{0} ** 32,
     desc_len: u8 = 0,
 
@@ -220,7 +225,6 @@ pub const NamedGame = struct {
         g.desc_len = n;
     }
 };
-
 
 test "a server matches a label it published, and never one it did not" {
     var rec = GsRec{ .gsid = 1, .gs_ip = .{ 127, 0, 0, 1 } };

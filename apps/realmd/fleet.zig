@@ -111,7 +111,9 @@ fn nextSeq() u32 {
     return (@as(u32, @truncate(state.instance_hash)) << 16) | low;
 }
 
-const Result = struct { ok: bool, gameid: u32, result: u32 = 1 };
+/// `timed_out` is a server that never answered (dead, or its record has outlived it), as opposed to
+/// one that answered no.
+const Result = struct { ok: bool, gameid: u32, result: u32 = 1, timed_out: bool = false };
 
 /// Hand `packet` to `gsid` and wait for the answer carrying the same seq.
 fn dispatch(gsid: u32, packet: []const u8, seq: u32) Result {
@@ -133,7 +135,7 @@ fn dispatch(gsid: u32, packet: []const u8, seq: u32) Result {
         waited_us += nap;
         if (nap < 10_000) nap *= 2;
     }
-    return failed;
+    return .{ .ok = false, .gameid = 0, .result = 1, .timed_out = true };
 }
 
 fn writeHeader(buf: []u8, size: u16, typ: p.Type, seq: u32) void {
@@ -182,10 +184,51 @@ pub const CreateRequest = struct {
 /// The version narrowing happens inside redis rather than here, because picking and reserving has
 /// to be one round trip — reserving a server chosen from a snapshot would let two instances place
 /// a game on the same last free slot.
-fn stockPick(version: []const u8) ?u32 {
-    if (version.len == 0) return store.pickAndReserveGs();
-    return store.pickAndReserveGsMatching("v", version);
+fn stockPick(version: []const u8, exclude: []const u32) ?u32 {
+    if (version.len == 0) return store.pickAndReserveGs(exclude);
+    return store.pickAndReserveGsMatching("v", version, exclude);
 }
+
+/// What to do with one server's answer to a create. The answer is about that server, not about the
+/// request: only a name that is taken is final.
+pub const Disposition = enum {
+    /// The game exists.
+    placed,
+    /// The name is taken on the server that answered; trying another would scatter same-named games.
+    name_taken,
+    /// This server is full. Its next heartbeat says so; the next pick skips it.
+    server_full,
+    /// This server refused for another reason (draining, shutting down, engine trouble).
+    refused,
+    /// This server did not answer.
+    silent,
+};
+
+pub fn classify(ok: bool, gameid: u32, result: u32, timed_out: bool) Disposition {
+    if (ok and gameid != 0) return .placed;
+    if (timed_out) return .silent;
+    if (result == p.CREATE_NAME_TAKEN) return .name_taken;
+    if (result == p.CREATE_SERVER_FULL) return .server_full;
+    return .refused;
+}
+
+/// The servers one create has already been refused by, so the retry goes elsewhere.
+pub const Tried = struct {
+    ids: [max_gs]u32 = undefined,
+    n: usize = 0,
+
+    pub fn add(t: *Tried, gsid: u32) void {
+        if (t.has(gsid) or t.n == t.ids.len) return;
+        t.ids[t.n] = gsid;
+        t.n += 1;
+    }
+    pub fn has(t: *const Tried, gsid: u32) bool {
+        return std.mem.indexOfScalar(u32, t.ids[0..t.n], gsid) != null;
+    }
+    pub fn slice(t: *const Tried) []const u32 {
+        return t.ids[0..t.n];
+    }
+};
 
 /// Ask an extension where this game should go, and reserve the server it names. Null when no
 /// extension has an opinion, or when the one it named cannot take the game after all — in which
@@ -227,11 +270,16 @@ pub fn createGameRouted(req: CreateRequest) ?CreateResult {
     // Only the FIRST attempt is the extension's to place. Once a server has refused the game, the
     // retry is the realm working around that refusal, and asking again would get the same answer.
     var ext_pick: ?u32 = extPickGs(req);
+    // Every server that has answered this create with anything but a place for the game. They are
+    // not picked again, so a refusal from one server (a drained machine, one that is shutting
+    // down) is never the final answer while another could host the game.
+    var tried: Tried = .{};
+    var refused_any = false;
     while (attempts < max_gs) : (attempts += 1) {
-        const gsid = ext_pick orelse stockPick(req.version) orelse {
-            // Nothing has room. Which of the two answers that is depends on whether there is a
-            // fleet at all, and the player is told something different for each.
-            last_create_failure = if (registeredCount() > 0) .all_full else .no_gs;
+        const gsid = ext_pick orelse stockPick(req.version, tried.slice()) orelse {
+            // Nothing has room. Which answer that is depends on whether anything refused, and
+            // whether there is a fleet at all; the player is told something different for each.
+            last_create_failure = if (refused_any) .refused else if (registeredCount() > 0) .all_full else .no_gs;
             return null;
         };
         ext_pick = null;
@@ -254,24 +302,39 @@ pub fn createGameRouted(req: CreateRequest) ?CreateResult {
         writeHeader(buf[0..p.HEADER_LEN], @intCast(pos), .creategame, seq);
 
         const r = dispatch(gsid, buf[0..pos], seq);
-        if (r.ok and r.gameid != 0) {
-            return .{ .gsid = gsid, .gameid = r.gameid, .ip = addrOf(rec), .port = rec.gs_port };
-        }
+        const d = classify(r.ok, r.gameid, r.result, r.timed_out);
+        if (d == .placed) return .{ .gsid = gsid, .gameid = r.gameid, .ip = addrOf(rec), .port = rec.gs_port };
         // The game did not happen, so the slot we reserved for it is free again.
         store.releaseGsSlot(gsid);
-        // A name this server already hosts is final; trying the next one would only scatter
-        // same-named games across the fleet.
-        if (r.result == p.CREATE_NAME_TAKEN) {
-            last_create_failure = .name_taken;
-            return null;
+        switch (d) {
+            // A name this server already hosts is final; trying the next one would only scatter
+            // same-named games across the fleet.
+            .name_taken => {
+                last_create_failure = .name_taken;
+                return null;
+            },
+            .server_full => {
+                // The server publishes its own `full` as it answers, so the next pick skips it.
+                last_create_failure = .all_full;
+                tried.add(gsid);
+            },
+            .refused => {
+                log.line("fleet", "gs {x} refused the create (result {d}); trying another", .{ gsid, r.result });
+                refused_any = true;
+                last_create_failure = .refused;
+                tried.add(gsid);
+            },
+            .silent => {
+                log.line("fleet", "gs {x} did not answer in time; trying another", .{gsid});
+                refused_any = true;
+                last_create_failure = .refused;
+                tried.add(gsid);
+                // Take the request back: a server that revives later must not create a game for a
+                // client that has moved on, and the retry may name the same game.
+                _ = store.dropGsRequest(gsid, buf[0..pos]);
+            },
+            .placed => unreachable,
         }
-        if (r.result == p.CREATE_SERVER_FULL) {
-            // The server publishes its own `full` as it answers, so the next pick skips it.
-            last_create_failure = .all_full;
-            continue;
-        }
-        last_create_failure = .refused;
-        return null;
     }
     return null;
 }
@@ -304,7 +367,10 @@ fn apply(typ: p.Type, body: []const u8) void {
             if (body.len < 14) return;
             const gsid = std.mem.readInt(u32, body[4..8], .little);
             state.global.expireGamesByGs(gsid);
-            log.line("fleet", "game server 0x{x} started; its stale games expired", .{gsid});
+            // The games it hosted are gone and never sent CLOSEGAME: their characters are free now,
+            // not when the lease runs out. Games on other servers still have records and are kept.
+            const freed = store.releaseOrphanCharLocks();
+            log.line("fleet", "game server 0x{x} started; its stale games expired, {d} character lock(s) freed", .{ gsid, freed });
         },
         .updategameinfo => {
             // The server is the only party that sees players leave, so its count replaces ours
@@ -333,6 +399,11 @@ fn apply(typ: p.Type, body: []const u8) void {
             // therefore releases nothing when it cannot tell them apart, and the seat waits for
             // the game-close sweep, which needs no names at all.
             const acct = if (off < body.len) p.readCStr(body, &off) else "";
+            // The seat becomes real once the server says the player is in, and stays so for as long
+            // as the server keeps saying it. Without the account it is matched by name, which only
+            // ever keeps a lock.
+            if ((flag == p.GAMEINFO_ENTER or flag == p.GAMEINFO_PRESENT) and char.len > 0)
+                _ = store.confirmGameChar(gameid, acct, char, flag == p.GAMEINFO_PRESENT);
             if (flag == p.GAMEINFO_LEAVE and char.len > 0) {
                 if (acct.len > 0) {
                     _ = store.releaseGameCharExact(gameid, acct, char);
@@ -356,12 +427,14 @@ fn apply(typ: p.Type, body: []const u8) void {
     }
 }
 
-/// How often the realm renews the leases on characters in live games, and the bound on how many
-/// games one pass covers. A minute against a five-minute lease leaves four missed passes of slack.
-const lease_renew_us: c_uint = 60 * 1_000_000;
+/// How often the realm goes over the seats of live games, and the bound on how many games one pass
+/// covers. Short enough that a join that never completed is given up within a pass of its own
+/// timeout; the lease it renews is five minutes.
+const lease_renew_us: c_uint = 20 * 1_000_000;
 const lease_pass_games = 256;
 
-/// Renew every live game's character leases, forever.
+/// Go over every live game's seats, forever: renew the leases of players the game server stands
+/// behind, and let go of the rest.
 ///
 /// The claim a join takes is a LEASE with a TTL, so a game server that dies cannot strand a
 /// character. Nothing renewed it, which turns that safety into the opposite defect — and a worse
@@ -373,14 +446,33 @@ const lease_pass_games = 256;
 /// game only stays in this index while its server is still heartbeating — a server that dies has
 /// its games expired on the spot, so nothing renews them and they lapse on schedule. Liveness still
 /// comes from the server; the realm only carries it.
+///
+/// What it renews is only what the server has confirmed. A join the realm authorised is a seat
+/// nobody has seen anyone sit in, and renewing it as long as the game lives is what kept a player
+/// out of their own character after a join that never reached the server. Such a seat is dropped
+/// when its short lease is up, together with the player the realm had counted for it.
 pub fn renewCharLeases() void {
     var games: [lease_pass_games]state.GameInfo = undefined;
+    var passes: u32 = 0;
     while (true) {
         _ = usleep(lease_renew_us);
+        passes +%= 1;
         const n = state.snapshotGames(&games);
         var renewed: usize = 0;
-        for (games[0..n]) |g| renewed += store.renewGameCharLeases(g.gameid);
-        if (renewed > 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
+        for (games[0..n]) |g| {
+            const sw = store.sweepGameSeats(g.gameid);
+            renewed += sw.renewed;
+            if (sw.unconfirmed > 0) {
+                state.global.dropGamePlayers(g.gameid, @intCast(@min(sw.unconfirmed, 0xFFFF)));
+                log.line("fleet", "game {d}: {d} join(s) never reached the game server, seat(s) released", .{ g.gameid, sw.unconfirmed });
+            }
+            if (sw.unreported > 0)
+                log.line("fleet", "game {d}: {d} seat(s) the game server no longer reports, released", .{ g.gameid, sw.unreported });
+        }
+        // A server that was reaped (stopped heartbeating) had its game records expired without a close.
+        const freed = store.releaseOrphanCharLocks();
+        if (freed > 0) log.line("fleet", "freed {d} character lock(s) held by games that are gone", .{freed});
+        if (renewed > 0 and passes % 3 == 0) log.line("fleet", "renewed {d} character lease(s) across {d} game(s)", .{ renewed, n });
     }
 }
 
@@ -404,4 +496,30 @@ pub fn consumeEvents() void {
         if (size > n or size < p.HEADER_LEN) continue;
         apply(@enumFromInt(typ), buf[p.HEADER_LEN..size]);
     }
+}
+
+test "classify: only a taken name is final; a refusal or silence moves on to the next server" {
+    const t = std.testing;
+    try t.expectEqual(Disposition.placed, classify(true, 7, 0, false));
+    try t.expectEqual(Disposition.name_taken, classify(false, 0, p.CREATE_NAME_TAKEN, false));
+    try t.expectEqual(Disposition.server_full, classify(false, 0, p.CREATE_SERVER_FULL, false));
+    // a draining or shutting-down server answers with some other code: not final
+    try t.expectEqual(Disposition.refused, classify(false, 0, 1, false));
+    try t.expectEqual(Disposition.refused, classify(false, 0, 0x77, false));
+    // "ok" with no game id is not a game
+    try t.expectEqual(Disposition.refused, classify(true, 0, 0, false));
+    // no answer at all is its own case
+    try t.expectEqual(Disposition.silent, classify(false, 0, 1, true));
+}
+
+test "Tried: remembers each server once and keeps the order" {
+    const t = std.testing;
+    var tr: Tried = .{};
+    tr.add(5);
+    tr.add(9);
+    tr.add(5);
+    try t.expectEqual(@as(usize, 2), tr.slice().len);
+    try t.expect(tr.has(9));
+    try t.expect(!tr.has(6));
+    try t.expectEqual(@as(u32, 5), tr.slice()[0]);
 }

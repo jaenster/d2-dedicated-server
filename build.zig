@@ -162,6 +162,9 @@ pub fn build(b: *std.Build) void {
     // As a module, not a relative import: the same file is the root of the `fastcall` module that
     // d2engine uses, and a file may belong to only one module.
     d2gs.root_module.addImport("fastcall", fastcall_mod);
+    // packages/clock — the process's millisecond clock.
+    const clock_mod = b.createModule(.{ .root_source_file = b.path("packages/clock/clock.zig") });
+    d2gs.root_module.addImport("clock", clock_mod);
     b.installArtifact(d2gs);
 
     // apps/d2host — the pre-1.14 shape of the same server: D2Game.dll driven as a library instead
@@ -399,6 +402,13 @@ pub fn build(b: *std.Build) void {
     // realm-example comment above.
     test_step.dependOn(&realm_example.step);
 
+    const clock_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("packages/clock/clock.zig"),
+        .target = host,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(clock_tests).step);
+
     const realm_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("apps/realmd/realm_tests.zig"),
@@ -468,6 +478,12 @@ pub fn build(b: *std.Build) void {
         // Saves the store refused, kept until it takes them. Pure logic, and the difference
         // between a redis blip costing a delay and it costing a player's session.
         .{ "packages/gs-store/savequeue.zig", false, false },
+        // Which players this server still has in its games, repeated to the realm so a seat whose
+        // leave notice was lost does not outlive the player.
+        .{ "packages/gs-store/presence.zig", false, false },
+        // The store client's reply parsing: a blocking pop's answer read whole, or the queue's
+        // connection desyncs.
+        .{ "packages/gs-store/gs_store.zig", false, false },
         // The engine callback contract: its layout asserts are the point, and they fire at
         // compile time on any target, so they are worth checking here and not only in the DLL.
         .{ "packages/d2engine/d2engine.zig", false, false },

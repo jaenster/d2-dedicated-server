@@ -571,6 +571,96 @@ fn scCreateJoinGame() Result {
     return .{ .name = name, .status = .pass, .msg = msg("create+join ok create-token={d} join-token={d} gs_ip=127.0.0.1 (creates={d} joins={d})", .{ cg.token, jg.token, gs.creates, gs.joins }) };
 }
 
+/// A character just created is the one the next game is for. The client goes from the creation
+/// screen straight to the lobby without an MCP_CHARLOGON, so the realm has to take the create as
+/// the selection — or the first game names an empty character to the game server.
+fn scCreateCharThenGame() Result {
+    const name = "create_char_then_game";
+    const acct = "FirstGameAcct";
+    const char = "FirstGamer";
+    var gs = FakeGS{ .gsid = 0xABCE, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 43 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const res = c.charCreateFresh(1, 0x20, char) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res != 0) return fail(name, "create char result=0x{x}", .{res});
+    // No charLogon here, exactly as the game client does it.
+    const cg = c.createGame("firstgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create game result={d}", .{cg.result});
+    if (gs.joins == 0) return fail(name, "FakeGS saw no join notify", .{});
+    const jc = std.mem.sliceTo(&gs.join_char, 0);
+    const ja = std.mem.sliceTo(&gs.join_account, 0);
+    if (!std.mem.eql(u8, jc, char)) return fail(name, "GS was told char='{s}' want '{s}'", .{ jc, char });
+    if (!std.ascii.eqlIgnoreCase(ja, acct)) return fail(name, "GS was told account='{s}' want '{s}'", .{ ja, acct });
+    return .{ .name = name, .status = .pass, .msg = msg("first game after create names '{s}' of '{s}' to the GS", .{ jc, ja }) };
+}
+
+/// A refused logon leaves the connection with nothing: a realm session, a game list, a game
+/// cannot be had on it, and the realm closes it. The same for an MCP connection whose startup was
+/// refused. (Both used to go on serving: a refused logon still named the account on the
+/// connection, and SID_LOGONREALMEX minted a session for it.)
+fn scRejectedLogonGated() Result {
+    const name = "rejected_logon_gated";
+    const acct = "GatedAcct";
+    var gs = FakeGS{ .gsid = 0xABD0, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 45 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+
+    // an account with a password
+    {
+        var a = rc.RealmClient{};
+        defer a.close();
+        a.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        a.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        const made = a.createAccount(acct, "right-password") catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (made != 0) return fail(name, "create account result={d}", .{made});
+    }
+
+    // a wrong password: refused, and the realm logon on the same connection gets nothing
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const res = c.loginPwResult(acct, "wrong-password") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (res == 0) return fail(name, "a wrong password was accepted", .{});
+    c.setBnetTimeout(2000);
+    if (c.enterRealm()) |_| {
+        if (c.sessionId() != 0) return fail(name, "SID_LOGONREALMEX minted session {d} after a refused logon", .{c.sessionId()});
+    } else |_| {} // the connection was closed: what we want
+
+    // an MCP connection whose startup is refused cannot create or join
+    var m = rc.RealmClient{};
+    defer m.close();
+    m.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    m.lo = 0x0bad_5e55;
+    m.hi = 0x0bad_5e55;
+    m.account = acct;
+    const st = m.startup() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (st == 0) return fail(name, "a made-up session was accepted", .{});
+    const cg = m.createGame("gatedgame", "d");
+    if (cg) |r| if (r.result == 0) return fail(name, "created a game after a refused startup", .{}) else {} else |_| {}
+    if (gs.creates != 0) return fail(name, "the GS was asked to create a game ({d})", .{gs.creates});
+
+    // and one that never started up at all
+    var n = rc.RealmClient{};
+    defer n.close();
+    n.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const jg = n.joinGame("gatedgame");
+    if (jg) |r| if (r.result == 0) return fail(name, "joined a game without a startup", .{}) else {} else |_| {}
+    if (gs.joins != 0) return fail(name, "the GS was told of a join ({d})", .{gs.joins});
+    return .{ .name = name, .status = .pass, .msg = msg("refused logon: no realm session; refused or missing startup: no create, no join", .{}) };
+}
+
 /// The store refuses a save built from bytes it has since moved past.
 ///
 /// This is the mechanism that makes a rollback impossible rather than merely unlikely. Every other
@@ -855,6 +945,174 @@ fn scGamePopulation() Result {
     return .{ .name = name, .status = .pass, .msg = msg("players 1 -> 4 -> 1 from the GS; description '{s}' survived", .{final.description}) };
 }
 
+/// A player who leaves a game is free to join it again at once, and the game's count follows.
+///
+/// The realm held the seat for as long as the game lived when the leave did not clear it, and a
+/// join whose client never arrived the same way: the character was then "held by game:N" for good,
+/// the game's member set kept the lock renewed, and the list kept counting a player who was gone.
+fn scSeatReleasedOnLeave() Result {
+    const name = "seat_released_on_leave";
+    const acct = "SeatGuy";
+    const char = "Rider";
+    const gid: u32 = 0x5EA7;
+
+    var gs = FakeGS{ .gsid = 0x5EA7, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = gid };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    if ((c.charCreateFresh(1, 0x20, char) catch 1) != 0) return fail(name, "could not create '{s}'", .{char});
+    if ((c.charLogon(char) catch 1) != 0) return fail(name, "could not log on as '{s}'", .{char});
+
+    var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    defer rcl.close();
+    var gcb: [64]u8 = undefined;
+    const gamechars = std.fmt.bufPrint(&gcb, "realmd:gamechars:{d}", .{gid}) catch unreachable;
+    const lockkey = "realmd:charlock:" ++ acct ++ "/" ++ char;
+
+    const cg = c.createGame("seatgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    const jg = c.joinGame("seatgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (jg.result != 0) return fail(name, "join result={d}", .{jg.result});
+    gs.sendSeatNotice(gid, 1, 1, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+
+    const findRow = struct {
+        fn f(list: []const rc.GameEntry) ?rc.GameEntry {
+            for (list) |g| {
+                if (std.mem.eql(u8, g.name, "seatgame")) return g;
+            }
+            return null;
+        }
+    }.f;
+    var rows: [8]rc.GameEntry = undefined;
+    var dst: [512]u8 = undefined;
+    if (!awaitPlayers(&c, &rows, &dst, findRow, 1)) return fail(name, "count did not settle at 1 after the enter", .{});
+    const held = rcl.cmd(&.{ "GET", lockkey }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    if (held != .bulk or held.bulk == null) return fail(name, "the character is not held while it is in the game", .{});
+
+    // The leave. Nothing else is sent: the lock, the member and the count all have to follow it.
+    gs.sendSeatNotice(gid, 0, 2, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitPlayers(&c, &rows, &dst, findRow, 0)) return fail(name, "count did not fall to 0 after the leave", .{});
+    var freed = false;
+    var waited: u32 = 0;
+    while (waited < 1000) : (waited += 25) {
+        const l = rcl.cmd(&.{ "GET", lockkey }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+        const m = rcl.cmd(&.{ "SISMEMBER", gamechars, acct ++ "/" ++ char }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+        if (l == .bulk and l.bulk == null and m == .int and m.int == 0) {
+            freed = true;
+            break;
+        }
+        _ = net.usleep(25_000);
+    }
+    if (!freed) return fail(name, "after the leave the lock or the game's member set still held the character", .{});
+
+    // And it can go straight back in.
+    const again = c.joinGame("seatgame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (again.result != 0) return fail(name, "rejoin after a leave refused: result=0x{x}", .{again.result});
+    return .{ .name = name, .status = .pass, .msg = msg("leave freed the lock and the member, count 1 -> 0, rejoin accepted", .{}) };
+}
+
+/// A character is in one game at a time, so a create by a character another game still holds is
+/// refused instead of leaving an empty game behind a join that would be turned away. Once the game
+/// server reports the leave, the same character can create again.
+fn scCreateWhileHeld() Result {
+    const name = "create_while_held";
+    const acct = "HeldGuy";
+    const char = "Anchor";
+    const gid: u32 = 0x4E1D;
+
+    var gs = FakeGS{ .gsid = 0x4E1D, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = gid };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    openLobby(&c, acct) catch |e| return fail(name, "lobby {s}", .{@errorName(e)});
+    if ((c.charCreateFresh(1, 0x20, char) catch 1) != 0) return fail(name, "could not create '{s}'", .{char});
+    if ((c.charLogon(char) catch 1) != 0) return fail(name, "could not log on as '{s}'", .{char});
+
+    const first = c.createGame("heldfirst", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (first.result != 0) return fail(name, "first create result={d}", .{first.result});
+    const joined = c.joinGame("heldfirst") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (joined.result != 0) return fail(name, "join result=0x{x}", .{joined.result});
+    gs.sendSeatNotice(gid, 1, 1, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = net.usleep(200_000);
+
+    const refused = c.createGame("heldsecond", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (refused.result == 0) return fail(name, "a create by a character another game holds was accepted", .{});
+    if (gs.creates != 1) return fail(name, "the refused create reached the game server (creates={d})", .{gs.creates});
+
+    gs.sendSeatNotice(gid, 0, 2, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = net.usleep(300_000);
+    const again = c.createGame("heldthird", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (again.result != 0) return fail(name, "create after the leave refused: result={d}", .{again.result});
+    return .{ .name = name, .status = .pass, .msg = msg("create refused while another game held the character (result={d}), accepted after the leave", .{refused.result}) };
+}
+
+/// A join the player never completed must not lock them out of asking again, nor count twice.
+fn scUnconfirmedJoinRetaken() Result {
+    const name = "unconfirmed_join_retaken";
+    const acct = "GhostGuy";
+    const char = "Stray";
+    const gid: u32 = 0x6057;
+
+    var gs = FakeGS{ .gsid = 0x6057, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = gid };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    if ((c.charCreateFresh(1, 0x20, char) catch 1) != 0) return fail(name, "could not create '{s}'", .{char});
+    if ((c.charLogon(char) catch 1) != 0) return fail(name, "could not log on as '{s}'", .{char});
+
+    const cg = c.createGame("strayjoin", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+    const first = c.joinGame("strayjoin") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (first.result != 0) return fail(name, "first join result=0x{x}", .{first.result});
+
+    const findRow = struct {
+        fn f(list: []const rc.GameEntry) ?rc.GameEntry {
+            for (list) |g| {
+                if (std.mem.eql(u8, g.name, "strayjoin")) return g;
+            }
+            return null;
+        }
+    }.f;
+    var rows: [8]rc.GameEntry = undefined;
+    var dst: [512]u8 = undefined;
+    var n = c.gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const before = (findRow(rows[0..n]) orelse return fail(name, "game missing from the list", .{})).players;
+
+    // The client never reaches the game server: no enter notice. It asks again, and is not shut out
+    // by its own earlier attempt.
+    const second = c.joinGame("strayjoin") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (second.result != 0) return fail(name, "second join refused by the first's seat: result=0x{x}", .{second.result});
+    n = c.gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const after = (findRow(rows[0..n]) orelse return fail(name, "game missing from the list", .{})).players;
+    if (after != before) return fail(name, "asking again counted a second player: {d} -> {d}", .{ before, after });
+
+    // Once the server confirms the player, the seat is real and nothing takes it over.
+    gs.sendSeatNotice(gid, 1, 1, char, acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (!awaitPlayers(&c, &rows, &dst, findRow, 1)) return fail(name, "count did not settle at 1", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("an unconfirmed seat was taken back on the second ask; count stayed {d}", .{after}) };
+}
+
 /// Poll the game list until 'popgame' reports `want` players. UPDATEGAMEINFO is fire-and-
 /// forget, so there is no reply to wait on — only the effect to observe.
 fn awaitPlayers(
@@ -939,6 +1197,67 @@ fn scGameInfo() Result {
     return .{ .name = name, .status = .pass, .msg = msg("unknown=no-info; 2 players named+levelled, leave compacted to Frostie; desc '{s}'", .{d.description}) };
 }
 
+/// Opens a logged-in d2cs connection for `acct`, ready to create or join.
+fn openLobby(c: *rc.RealmClient, acct: []const u8) !void {
+    try c.connectBnet();
+    try c.auth();
+    try c.login(acct);
+    try c.enterRealm();
+    try c.connectD2cs();
+    if ((try c.startup()) != 0) return error.StartupFailed;
+}
+
+/// A game takes the players its creator chose and no more: the creator's own join is seat one, a
+/// join past the limit is refused with "Game is Full." (0x2b) and a zero address, and a refused
+/// join leaves the seat count where it was. Eight is the engine's ceiling, so a ninth is refused in
+/// a game that asked for eight.
+fn scGameMaxPlayers() Result {
+    const name = "game_max_players";
+    var gs = FakeGS{ .gsid = 0x4A11, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 9300 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not publish itself", .{});
+
+    const Case = struct { game: []const u8, max: u8, seats: usize };
+    const cases = [_]Case{
+        .{ .game = "solo1", .max = 1, .seats = 1 },
+        .{ .game = "duo2", .max = 2, .seats = 2 },
+        .{ .game = "full8", .max = 8, .seats = 8 },
+    };
+    var clients: [9]rc.RealmClient = undefined;
+    for (&clients) |*cl| cl.* = .{};
+    defer for (&clients) |*cl| cl.close();
+
+    var round: usize = 0;
+    for (cases) |cs| {
+        // Every case uses its own accounts, so a seat held in one game cannot be what refuses a join in
+        // the next.
+        var abuf: [9][24]u8 = undefined;
+        var i: usize = 0;
+        while (i < cs.seats + 1) : (i += 1) {
+            const acct = std.fmt.bufPrint(&abuf[i], "Mp{d}x{d}", .{ round, i }) catch unreachable;
+            if (clients[i].d2cs != null) clients[i].close();
+            openLobby(&clients[i], acct) catch |e| return fail(name, "{s}: lobby for {s}: {s}", .{ cs.game, acct, @errorName(e) });
+        }
+        const cg = clients[0].createGameMax(cs.game, "d", cs.max) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (cg.result != 0) return fail(name, "{s}: create result={d}", .{ cs.game, cg.result });
+        i = 0;
+        while (i < cs.seats) : (i += 1) {
+            const j = clients[i].joinGame(cs.game) catch |e| return fail(name, "{s}", .{@errorName(e)});
+            if (j.result != 0) return fail(name, "{s}: join {d} of {d} -> 0x{x}, want 0", .{ cs.game, i + 1, cs.seats, j.result });
+        }
+        // Past the limit, twice: a refused join must not have taken a seat.
+        var extra: usize = 0;
+        while (extra < 2) : (extra += 1) {
+            const full = clients[cs.seats].joinGame(cs.game) catch |e| return fail(name, "{s}", .{@errorName(e)});
+            if (full.result != 0x2b) return fail(name, "{s}: join {d} of {d} -> 0x{x}, want 0x2b (game is full)", .{ cs.game, cs.seats + 1, cs.seats, full.result });
+            if (!std.mem.eql(u8, &full.ip, &[_]u8{ 0, 0, 0, 0 })) return fail(name, "{s}: a refused join carried address {any}, want zero", .{ cs.game, full.ip });
+        }
+        round += 1;
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("max 1: 2nd refused; max 2: 3rd refused; max 8: 9th refused (0x2b, zero address)", .{}) };
+}
+
 fn scJoinErrors() Result {
     const name = "join_error_codes";
     var gs = FakeGS{ .gsid = 0xE770, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .gameid = 777 };
@@ -972,21 +1291,7 @@ fn scJoinErrors() Result {
     const unnamed = c.createGame("", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (unnamed.result != 0x1e) return fail(name, "empty game name -> 0x{x}, want 0x1e (invalid game name)", .{unnamed.result});
 
-    // Eight is the engine's own ceiling (CreateClient refuses a ninth). Report a full game
-    // from the GS and the ninth join is turned away with "Game is Full." rather than being
-    // sent to a server that will drop it.
-    gs.sendUpdateGameInfo(777, 8, true) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    var full_result: u32 = 0;
-    var waited: u32 = 0;
-    while (waited < 2000) : (waited += 25) {
-        const j = c.joinGameWithPassword("pwgame", "letmein") catch |e| return fail(name, "{s}", .{@errorName(e)});
-        full_result = j.result;
-        if (full_result == 0x2b) break;
-        _ = net.usleep(25_000);
-    }
-    if (full_result != 0x2b) return fail(name, "join of a full game -> 0x{x}, want 0x2b (game is full)", .{full_result});
-
-    return .{ .name = name, .status = .pass, .msg = msg("missing=0x2a wrong-pw=0x29 ok=0 unnamed=0x1e full=0x2b", .{}) };
+    return .{ .name = name, .status = .pass, .msg = msg("missing=0x2a wrong-pw=0x29 ok=0 unnamed=0x1e", .{}) };
 }
 
 fn scFleetCapacity() Result {
@@ -1019,10 +1324,69 @@ fn scFleetCapacity() Result {
     return .{ .name = name, .status = .pass, .msg = msg("spread a={d} b={d}, 3rd rejected (result={d})", .{ gs_a.creates, gs_b.creates, r3 }) };
 }
 
-/// The chat lobby has to name people by their CHARACTER. The 1.14d client splits a channel
-/// username on '*' and draws the part after it (COMCALLBACK_FormatChannelUserData @0x4471b0);
-/// realmd used to substitute the account name, which has no '*', so the list showed accounts
-/// and the client had no character to render at all.
+/// A server that answers a create with a refusal (a draining machine, one shutting down) is not the
+/// end of the create while another server can host the game.
+fn scRefusedServerFallsBack() Result {
+    const name = "refused_server_falls_back";
+    // The refusing server is the less loaded one, so it is the first pick.
+    var gs_a = FakeGS{ .gsid = 0xAA1, .ip = .{ 127, 0, 0, 2 }, .refuse_create_with = 0x77, .next_gameid = 100 };
+    var gs_b = FakeGS{ .gsid = 0xBB1, .ip = .{ 127, 0, 0, 3 }, .extra_live = 1, .next_gameid = 200 };
+    gs_a.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs_a.stop();
+    gs_b.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs_b.stop();
+    if (!gs_a.isRegistered() or !gs_b.isRegistered()) return fail(name, "both FakeGS must register", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("RefusedGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const r = (c.createGame("refgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)})).result;
+    if (r != 0) return fail(name, "create must succeed on the second server (result={d})", .{r});
+    if (gs_a.creates != 1) return fail(name, "the less loaded server must have been asked first (a={d})", .{gs_a.creates});
+    if (gs_b.creates != 1) return fail(name, "the game must land on the other server (b={d})", .{gs_b.creates});
+    return .{ .name = name, .status = .pass, .msg = msg("refusal from a={d} then hosted on b={d}", .{ gs_a.creates, gs_b.creates }) };
+}
+
+/// A server that never answers (dead, but its record has not expired yet) costs one timeout, not the
+/// create: the request is taken back and the next server hosts the game.
+fn scSilentServerFallsBack() Result {
+    const name = "silent_server_falls_back";
+    var gs_a = FakeGS{ .gsid = 0xAA2, .ip = .{ 127, 0, 0, 2 }, .answer_after_ms = 600_000, .next_gameid = 100 };
+    var gs_b = FakeGS{ .gsid = 0xBB2, .ip = .{ 127, 0, 0, 3 }, .extra_live = 1, .next_gameid = 200 };
+    gs_a.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs_a.stop();
+    gs_b.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs_b.stop();
+    if (!gs_a.isRegistered() or !gs_b.isRegistered()) return fail(name, "both FakeGS must register", .{});
+
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login("SilentGuy") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    const r = (c.createGame("silentgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)})).result;
+    if (r != 0) return fail(name, "create must succeed on the live server (result={d})", .{r});
+    if (gs_b.creates != 1) return fail(name, "the game must land on the live server (b={d})", .{gs_b.creates});
+
+    var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    defer rcl.close();
+    var kb: [64]u8 = undefined;
+    const qk = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gs_a.gsid}) catch unreachable;
+    const len = rcl.cmd(&.{ "LLEN", qk }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    if (len != .int or len.int != 0) return fail(name, "the silent server's request must be taken back, or it creates a stale game when it revives", .{});
+    return .{ .name = name, .status = .pass, .msg = msg("silent a skipped (queue emptied), hosted on b", .{}) };
+}
+
 /// The slash commands the 1.14d client forwards. It intercepts a few locally (/fps,
 /// /players, /nopickup) but hands the rest to the realm verbatim, including whisper
 /// aliases realmd did not recognise and /help, which it cannot answer itself.
@@ -1185,6 +1549,124 @@ fn scNonLadderGameFlags() Result {
     return .{ .name = name, .status = .pass, .msg = msg("non-ladder creator -> ladder=0 hardcore=0 (expansion={d})", .{f.expansion}) };
 }
 
+/// A logged-on realm client whose character carries `status` (.d2s byte 0x24).
+fn clientWithChar(acct: []const u8, char: []const u8, status: u8) !rc.RealmClient {
+    var c = rc.RealmClient{};
+    errdefer c.close();
+    try c.connectBnet();
+    try c.auth();
+    try c.login(acct);
+    try c.enterRealm();
+    try c.connectD2cs();
+    if ((try c.startup()) != 0) return error.StartupFailed;
+    if ((try c.charCreateFresh(1, status, char)) != 0) return error.CharCreateFailed;
+    if ((try c.charLogon(char)) != 0) return error.CharLogonFailed;
+    return c;
+}
+
+const list_kinds = [_]struct { char: []const u8, game: []const u8, status: u8 }{
+    .{ .char = "ListClassic", .game = "g-classic", .status = 0x00 },
+    .{ .char = "ListClassicLad", .game = "g-classic-lad", .status = 0x40 },
+    .{ .char = "ListClassicHc", .game = "g-classic-hc", .status = 0x04 },
+    .{ .char = "ListExp", .game = "g-exp", .status = 0x20 },
+    .{ .char = "ListExpLad", .game = "g-exp-lad", .status = 0x60 },
+    .{ .char = "ListExpHc", .game = "g-exp-hc", .status = 0x24 },
+};
+
+/// The game list shows a character only the games it could join: classic or expansion, ladder or
+/// not, hardcore or not. Each of six kinds makes one game and must then see exactly its own.
+fn scGameListFiltered() Result {
+    const name = "game_list_filtered";
+    var gs = FakeGS{ .gsid = 0x1157, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 8100 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    // The list is capped, and the games earlier scenarios left behind would crowd this one's out of
+    // it: forget them (the index only; their records lapse on their own).
+    {
+        var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+        defer rcl.close();
+        _ = rcl.cmd(&.{ "DEL", "realmd:games" }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    }
+
+    var clients: [list_kinds.len]rc.RealmClient = undefined;
+    var opened: usize = 0;
+    defer for (clients[0..opened]) |*c| c.close();
+    for (list_kinds, 0..) |k, i| {
+        var acct: [24]u8 = undefined;
+        const an = std.fmt.bufPrint(&acct, "ListAcct{d}", .{i}) catch unreachable;
+        clients[i] = clientWithChar(an, k.char, k.status) catch |e| return fail(name, "{s} {s}", .{ k.char, @errorName(e) });
+        opened += 1;
+        const cg = clients[i].createGame(k.game, "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (cg.result != 0) return fail(name, "{s} create result={d}", .{ k.char, cg.result });
+    }
+    for (list_kinds, 0..) |k, i| {
+        var rows: [16]rc.GameEntry = undefined;
+        var dst: [1024]u8 = undefined;
+        const n = clients[i].gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        // Other scenarios leave games behind; only this one's ("g-...") are judged.
+        var mine: usize = 0;
+        var own = false;
+        for (rows[0..n]) |g| {
+            if (!std.mem.startsWith(u8, g.name, "g-")) continue;
+            mine += 1;
+            if (std.mem.eql(u8, g.name, k.game)) own = true;
+        }
+        if (mine != 1 or !own) {
+            return fail(name, "{s} (0x{x:0>2}) lists {d} of this scenario's games (own listed: {}); want only '{s}'", .{ k.char, k.status, mine, own, k.game });
+        }
+        // The detail panel of a game the list would not show says nothing, as for a missing one.
+        const other = list_kinds[(i + 1) % list_kinds.len].game;
+        var d: [512]u8 = undefined;
+        const info = clients[i].gameInfo(other, &d) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (info.token != 0xFFFF_FFFF) return fail(name, "{s}: game info of '{s}' answered (token 0x{x})", .{ k.char, other, info.token });
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("classic/expansion x ladder x hardcore: each of 6 kinds lists only its own game, and no detail for the others", .{}) };
+}
+
+/// An expansion character that asks to join a classic game by name is told so with the code the
+/// client words as "an Expansion character cannot join a game created by a Diablo II character",
+/// carrying a zero address (which is what makes the client read the result), and nothing reaches
+/// the game server.
+fn scJoinWrongKind() Result {
+    const name = "join_wrong_kind";
+    var gs = FakeGS{ .gsid = 0x1158, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 8200 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    var classic = clientWithChar("WrongAcctC", "WrongClassic", 0x00) catch |e| return fail(name, "classic {s}", .{@errorName(e)});
+    defer classic.close();
+    var exp = clientWithChar("WrongAcctE", "WrongExp", 0x20) catch |e| return fail(name, "expansion {s}", .{@errorName(e)});
+    defer exp.close();
+    const cg = classic.createGame("wrongkind", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+
+    const jr = exp.joinGame("wrongkind") catch |e| return fail(name, "join: {s}", .{@errorName(e)});
+    if (jr.result != 0x79) return fail(name, "expansion into classic -> 0x{x}, want 0x79", .{jr.result});
+    if (jr.ip[0] != 0 or jr.ip[1] != 0 or jr.ip[2] != 0 or jr.ip[3] != 0) return fail(name, "a refusal carried an address", .{});
+
+    // The other direction, and the ladder and hardcore mixes, each with its own code.
+    const cg2 = exp.createGame("wrongexp", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg2.result != 0) return fail(name, "create wrongexp result={d}", .{cg2.result});
+    const joins_before = gs.joins;
+    const cases = [_]struct { joiner: []const u8, acct: []const u8, status: u8, want: u32 }{
+        .{ .joiner = "WrongClassic2", .acct = "WrongAcctC2", .status = 0x00, .want = 0x78 },
+        .{ .joiner = "WrongLadder", .acct = "WrongAcctL", .status = 0x60, .want = 0x7d },
+        .{ .joiner = "WrongHardcore", .acct = "WrongAcctH", .status = 0x24, .want = 0x71 },
+    };
+    for (cases) |cs| {
+        var j = clientWithChar(cs.acct, cs.joiner, cs.status) catch |e| return fail(name, "{s} {s}", .{ cs.joiner, @errorName(e) });
+        defer j.close();
+        const r = j.joinGame("wrongexp") catch |e| return fail(name, "{s}: {s}", .{ cs.joiner, @errorName(e) });
+        if (r.result != cs.want) return fail(name, "{s} -> 0x{x}, want 0x{x}", .{ cs.joiner, r.result, cs.want });
+        if (r.ip[0] != 0 or r.ip[1] != 0 or r.ip[2] != 0 or r.ip[3] != 0) return fail(name, "{s}: a refusal carried an address", .{cs.joiner});
+    }
+    if (gs.joins != joins_before) return fail(name, "the game server saw {d} join(s) for refused clients", .{gs.joins - joins_before});
+    return .{ .name = name, .status = .pass, .msg = msg("exp->classic 0x79, classic->exp 0x78, ladder 0x7d, hardcore 0x71, each with a zero address; no join reached the GS", .{}) };
+}
+
 fn scGetFileTime() Result {
     const name = "get_file_time";
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
@@ -1283,7 +1765,7 @@ fn scConcurrentClients() Result {
     defer after.close();
     after.connectBnet() catch |e| return fail(name, "realm stopped accepting after the load: {s}", .{@errorName(e)});
     after.auth() catch |e| return fail(name, "auth after load: {s}", .{@errorName(e)});
-    after.login("StressAfter") catch |e| return fail(name, "login after load: {s}", .{@errorName(e)});
+    after.login("AfterLoad") catch |e| return fail(name, "login after load: {s}", .{@errorName(e)});
     after.enterChat() catch |e| return fail(name, "enterChat after load: {s}", .{@errorName(e)});
     after.joinChannel("Diablo II") catch |e| return fail(name, "joinChannel after load: {s}", .{@errorName(e)});
     after.setBnetTimeout(1500);
@@ -1295,7 +1777,10 @@ fn scConcurrentClients() Result {
     while (i < 64) : (i += 1) {
         const ev = after.readChatEvent() catch break;
         if (ev.eid != rc.EID_SHOWUSER) continue;
-        if (std.mem.indexOf(u8, ev.username, "Stress") != null) ghosts += 1;
+        if (std.mem.indexOf(u8, ev.username, "Stress") != null) {
+            std.debug.print("channel still lists '{s}'\n", .{ev.username});
+            ghosts += 1;
+        }
     }
     if (ghosts > 0) return fail(name, "{d} disconnected clients are still in the channel", .{ghosts});
 
@@ -1372,7 +1857,7 @@ fn scNameResolution() Result {
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.login("ResolveAcctA") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    a.enterChatAs("Clan*Amazon", "PX2D") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("Amazon", "TypeGuru,Amazon") catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.setBnetTimeout(2000);
 
@@ -1381,7 +1866,7 @@ fn scNameResolution() Result {
     b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.login("ResolveAcctB") catch |e| return fail(name, "B {s}", .{@errorName(e)});
-    b.enterChatAs("Clan*Necro", "PX2D") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChatAs("Necro", "TypeGuru,Necro") catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.setBnetTimeout(2000);
     _ = net.usleep(150_000);
@@ -1399,7 +1884,7 @@ fn scNameResolution() Result {
     if (!got) return fail(name, "a whisper to the character name never arrived", .{});
 
     // And by the full chat identity.
-    b.chatCommand("/w Clan*Amazon and again") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.chatCommand("/w Amazon*ResolveAcctA and again") catch |e| return fail(name, "B {s}", .{@errorName(e)});
     got = false;
     i = 0;
     while (i < 10) : (i += 1) {
@@ -1408,7 +1893,7 @@ fn scNameResolution() Result {
         got = std.mem.indexOf(u8, ev.text, "and again") != null;
         break;
     }
-    if (!got) return fail(name, "a whisper to the full clan*char identity never arrived", .{});
+    if (!got) return fail(name, "a whisper to the full char*account identity never arrived", .{});
 
     // /whois by character name has to find them too.
     b.chatCommand("/whois Amazon") catch |e| return fail(name, "B {s}", .{@errorName(e)});
@@ -1517,7 +2002,7 @@ fn scChatCommands() Result {
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.login("CmdAlice") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    a.enterChat() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("AliceChar", "TypeGuru,AliceChar") catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.setBnetTimeout(2000);
 
@@ -1550,6 +2035,24 @@ fn scChatCommands() Result {
         if (!got) return fail(name, "'{s}' did not arrive as a whisper", .{alias});
     }
 
+    // The client has no /r of its own and forwards it, so the realm answers the last whisperer.
+    const replies = [_][]const u8{ "/r", "/reply", "/R" };
+    for (replies) |verb| {
+        var buf: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{s} back{s}", .{ verb, verb }) catch return fail(name, "fmt", .{});
+        b.chatCommand(line) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+
+        var got = false;
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            const ev = a.readChatEvent() catch break;
+            if (ev.eid != rc.EID_WHISPER) continue;
+            got = std.mem.indexOf(u8, ev.text, "back") != null;
+            break;
+        }
+        if (!got) return fail(name, "'{s}' did not reach the last whisperer", .{verb});
+    }
+
     // /help is forwarded by the client because it cannot answer it; a blank reply is
     // indistinguishable from the command doing nothing.
     a.chatCommand("/help") catch |e| return fail(name, "A {s}", .{@errorName(e)});
@@ -1569,7 +2072,7 @@ fn scChatCommands() Result {
     a.chatCommand("/notacommand") catch |e| return fail(name, "A {s}", .{@errorName(e)});
     var told = false;
     i = 0;
-    while (i < 8) : (i += 1) {
+    while (i < 32) : (i += 1) {
         const ev = a.readChatEvent() catch break;
         if (ev.eid != rc.EID_ERROR) continue;
         told = std.mem.indexOf(u8, ev.text, "not a valid command") != null;
@@ -1577,9 +2080,12 @@ fn scChatCommands() Result {
     }
     if (!told) return fail(name, "an unknown command was not reported as one", .{});
 
-    return .{ .name = name, .status = .pass, .msg = msg("6 whisper aliases delivered, /help lists commands, unknown command reported", .{}) };
+    return .{ .name = name, .status = .pass, .msg = msg("6 whisper aliases and /r replies delivered, /help lists commands, unknown command reported", .{}) };
 }
 
+/// The chat lobby names people by CHARACTER and account: the 1.14d client splits a channel username
+/// on '*' (COMCALLBACK_FormatChannelUserData @0x4471b0) and matches its own name and each row by
+/// the account after it.
 fn scLobbyCharNames() Result {
     const name = "lobby_char_names";
     const channel = "Diablo II";
@@ -1589,10 +2095,11 @@ fn scLobbyCharNames() Result {
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.login("CharAcctA") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    // What a real client asks to be known as: clan tag, '*', then the character.
-    a.enterChatAs("Clanny*Sorceress", "PX2D") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    if (!std.mem.eql(u8, a.uniqueName(), "Clanny*Sorceress"))
-        return fail(name, "ENTERCHAT unique name is '{s}', want the requested 'Clanny*Sorceress'", .{a.uniqueName()});
+    // What a real client asks to be known as: the bare character, and "<realm>,<character>". The realm
+    // answers with Battle.net's unique name for a Diablo II user, charname*account.
+    a.enterChatAs("Sorceress", "TypeGuru,Sorceress") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    if (!std.mem.eql(u8, a.uniqueName(), "Sorceress*CharAcctA"))
+        return fail(name, "ENTERCHAT unique name is '{s}', want 'Sorceress*CharAcctA'", .{a.uniqueName()});
     a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
 
     var b = rc.RealmClient{};
@@ -1600,7 +2107,7 @@ fn scLobbyCharNames() Result {
     b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.login("CharAcctB") catch |e| return fail(name, "B {s}", .{@errorName(e)});
-    b.enterChatAs("Clanny*Barbarian", "PX2D") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChatAs("Barbarian", "TypeGuru,Barbarian") catch |e| return fail(name, "B {s}", .{@errorName(e)});
     b.setBnetTimeout(2000);
     b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
 
@@ -1613,7 +2120,7 @@ fn scLobbyCharNames() Result {
     while (i < 12) : (i += 1) {
         const ev = b.readChatEvent() catch break;
         if (ev.eid != rc.EID_SHOWUSER and ev.eid != rc.EID_JOIN) continue;
-        if (std.mem.eql(u8, ev.username, "Clanny*Sorceress")) {
+        if (std.mem.eql(u8, ev.username, "Sorceress*CharAcctA")) {
             saw_a = true;
             break;
         }
@@ -1636,11 +2143,146 @@ fn scLobbyCharNames() Result {
     while (i < 8) : (i += 1) {
         const ev = b.readChatEvent() catch |e| return fail(name, "B no TALK ({s})", .{@errorName(e)});
         if (ev.eid != rc.EID_TALK) continue;
-        if (!std.mem.eql(u8, ev.username, "Clanny*Sorceress"))
-            return fail(name, "TALK came from '{s}', want 'Clanny*Sorceress'", .{ev.username});
-        return .{ .name = name, .status = .pass, .msg = msg("channel list and chat both name A 'Clanny*Sorceress' (character, not CharAcctA)", .{}) };
+        if (!std.mem.eql(u8, ev.username, "Sorceress*CharAcctA"))
+            return fail(name, "TALK came from '{s}', want 'Sorceress*CharAcctA'", .{ev.username});
+        return .{ .name = name, .status = .pass, .msg = msg("channel list and chat both name A 'Sorceress*CharAcctA' (character and account)", .{}) };
     }
     return fail(name, "B never received A's TALK", .{});
+}
+
+/// A character named like its account (case aside) used to be left out of its chat name: the realm took
+/// the request for a client with no character, the statstring lookup missed and the lobby drew a user it
+/// could not parse as a character (a brown-robed figure under the account name). The name and the
+/// statstring both have to carry the character, whose class and level the list is drawn from.
+fn scLobbyCharNamedLikeAccount() Result {
+    const name = "lobby_char_named_like_account";
+    const channel = "Diablo II";
+    var save: [0x80]u8 = undefined;
+    _ = rc.storePutChar("samename", "Samename", d2sWithProgression(&save, "Samename", 0, 41, 0)) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("samename") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("Samename", "beta,Samename") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    if (!std.mem.eql(u8, a.uniqueName(), "Samename*samename"))
+        return fail(name, "unique name is '{s}', want 'Samename*samename'", .{a.uniqueName()});
+    a.setBnetTimeout(1500);
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    const own = nextEvent(&a, rc.EID_SHOWUSER, 6) orelse return fail(name, "A is not in its own user list", .{});
+    const head = "PX2Dbeta,Samename,";
+    if (!std.mem.startsWith(u8, own.text, head))
+        return fail(name, "statstring is '{s}', want PX2D + realm,character,", .{own.text});
+    const blob = own.text[head.len..];
+    if (blob.len < 28 or blob[13] != 1 or blob[25] != 41)
+        return fail(name, "statstring carries class+1 {d} level {d}, want 1 and 41", .{ if (blob.len > 13) blob[13] else 0, if (blob.len > 25) blob[25] else 0 });
+    return .{ .name = name, .status = .pass, .msg = msg("a character named like its account is named and drawn as the character (class and level in its statstring)", .{}) };
+}
+
+/// The next event of kind `eid` a client is sent within `tries` events; null when none comes.
+fn nextEvent(c: *rc.RealmClient, eid: u32, tries: usize) ?rc.ChatEvent {
+    var i: usize = 0;
+    while (i < tries) : (i += 1) {
+        const ev = c.readChatEvent() catch return null;
+        if (ev.eid == eid) return ev;
+    }
+    return null;
+}
+
+/// The whole SID_CHATEVENT sequence Battle.net sent a Diablo II client: on a join EID_CHANNEL
+/// (the channel's name in the TEXT) and an EID_SHOWUSER for every user in the channel, the joiner
+/// included, each named charname*account with the statstring the list is drawn from; EID_JOIN and
+/// EID_LEAVE to the others; talk from the speaker's name and NOT echoed back (the client draws its
+/// own); a whisper from the sender's name, echoed to the sender as EID_WHISPERSENT naming the
+/// target; EID_EMOTE to everyone including the speaker.
+fn scLobbyChatEvents() Result {
+    const name = "lobby_chat_events";
+    const channel = "Diablo II";
+    const name_a = "EvSorc*EvAcctA";
+    const name_b = "EvNecro*EvAcctB";
+    var save: [0x80]u8 = undefined;
+    _ = rc.storePutChar("EvAcctA", "EvSorc", d2sWithProgression(&save, "EvSorc", 1, 33, 0)) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+    _ = rc.storePutChar("EvAcctB", "EvNecro", d2sWithProgression(&save, "EvNecro", 2, 44, 0)) catch |e| return fail(name, "save {s}", .{@errorName(e)});
+
+    var a = rc.RealmClient{};
+    defer a.close();
+    a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.login("EvAcctA") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("EvSorc", "TypeGuru,EvSorc") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    if (!std.mem.eql(u8, a.uniqueName(), name_a)) return fail(name, "A's unique name is '{s}'", .{a.uniqueName()});
+    a.setBnetTimeout(1500);
+    a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
+
+    // The joiner is told the channel by its name in the text, and finds itself in the list.
+    const ch = nextEvent(&a, rc.EID_CHANNEL, 4) orelse return fail(name, "A got no EID_CHANNEL", .{});
+    if (!std.mem.eql(u8, ch.text, channel)) return fail(name, "EID_CHANNEL text is '{s}', want the channel's name", .{ch.text});
+    const self_a = nextEvent(&a, rc.EID_SHOWUSER, 4) orelse return fail(name, "A is not in its own user list", .{});
+    if (!std.mem.eql(u8, self_a.username, name_a)) return fail(name, "A's own row is '{s}', want '{s}'", .{ self_a.username, name_a });
+    if (!std.mem.startsWith(u8, self_a.text, "PX2DTypeGuru,EvSorc,"))
+        return fail(name, "A's statstring is '{s}', want PX2D + realm,character,", .{self_a.text});
+    // class + 1 at 13 of the blob after the second comma, level at 25
+    const blob = self_a.text["PX2DTypeGuru,EvSorc,".len..];
+    if (blob.len < 28 or blob[13] != 2 or blob[25] != 33) return fail(name, "A's statstring carries class {d} level {d}, want the saved 2/33", .{ blob[13], blob[25] });
+
+    var b = rc.RealmClient{};
+    defer b.close();
+    b.connectBnet() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.auth() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.login("EvAcctB") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.enterChatAs("EvNecro", "TypeGuru,EvNecro") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    b.setBnetTimeout(1500);
+    b.joinChannel(channel) catch |e| return fail(name, "B {s}", .{@errorName(e)});
+
+    // B sees the channel, then both users, itself among them.
+    if (nextEvent(&b, rc.EID_CHANNEL, 2) == null) return fail(name, "B got no EID_CHANNEL", .{});
+    var saw_a = false;
+    var saw_b = false;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const ev = nextEvent(&b, rc.EID_SHOWUSER, 3) orelse break;
+        if (std.mem.eql(u8, ev.username, name_a)) saw_a = true;
+        if (std.mem.eql(u8, ev.username, name_b)) saw_b = true;
+    }
+    if (!saw_a or !saw_b) return fail(name, "B's user list: saw A={any} B={any}", .{ saw_a, saw_b });
+
+    // A is told B joined, with B's statstring.
+    const jb = nextEvent(&a, rc.EID_JOIN, 4) orelse return fail(name, "A never saw B join", .{});
+    if (!std.mem.eql(u8, jb.username, name_b) or !std.mem.startsWith(u8, jb.text, "PX2D"))
+        return fail(name, "EID_JOIN was '{s}' / '{s}'", .{ jb.username, jb.text });
+
+    // Talk carries the speaker's name and is not sent back to the speaker.
+    a.chatCommand("hello there") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    const talk = nextEvent(&b, rc.EID_TALK, 4) orelse return fail(name, "B got no talk", .{});
+    if (!std.mem.eql(u8, talk.username, name_a) or !std.mem.eql(u8, talk.text, "hello there"))
+        return fail(name, "talk was '{s}': '{s}'", .{ talk.username, talk.text });
+    a.setBnetTimeout(400);
+    if (nextEvent(&a, rc.EID_TALK, 3) != null) return fail(name, "A's own talk was echoed back (the client draws it itself: it would show twice)", .{});
+    a.setBnetTimeout(1500);
+
+    // A whisper arrives from the sender's name; the sender's echo names the target.
+    a.chatCommand("/w EvNecro psst") catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    const wh = nextEvent(&b, rc.EID_WHISPER, 4) orelse return fail(name, "B got no whisper", .{});
+    if (!std.mem.eql(u8, wh.username, name_a) or !std.mem.eql(u8, wh.text, "psst"))
+        return fail(name, "whisper was '{s}': '{s}'", .{ wh.username, wh.text });
+    const sent = nextEvent(&a, rc.EID_WHISPERSENT, 4) orelse return fail(name, "A got no EID_WHISPERSENT", .{});
+    if (!std.mem.eql(u8, sent.username, name_b) or !std.mem.eql(u8, sent.text, "psst"))
+        return fail(name, "the echo was '{s}': '{s}'", .{ sent.username, sent.text });
+
+    // An emote goes to everyone, the speaker too.
+    b.chatCommand("/me waves") catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    const em_a = nextEvent(&a, rc.EID_EMOTE, 4) orelse return fail(name, "A got no emote", .{});
+    const em_b = nextEvent(&b, rc.EID_EMOTE, 4) orelse return fail(name, "B got no emote of its own", .{});
+    if (!std.mem.eql(u8, em_a.username, name_b) or !std.mem.eql(u8, em_a.text, "waves") or !std.mem.eql(u8, em_b.text, "waves"))
+        return fail(name, "emote was '{s}': '{s}'", .{ em_a.username, em_a.text });
+
+    // Leaving is announced by name.
+    b.leaveChat() catch |e| return fail(name, "B {s}", .{@errorName(e)});
+    const gone = nextEvent(&a, rc.EID_LEAVE, 4) orelse return fail(name, "A never saw B leave", .{});
+    if (!std.mem.eql(u8, gone.username, name_b)) return fail(name, "EID_LEAVE was '{s}'", .{gone.username});
+
+    return .{ .name = name, .status = .pass, .msg = msg("channel, own row, statstring, join/leave, talk, whisper (+sent), emote all as Battle.net sent them", .{}) };
 }
 
 fn scLobbyChatAtoB() Result {
@@ -2303,7 +2945,7 @@ fn scChatAcrossInstances() Result {
     a.connectBnet() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.auth() catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.login("CrossAlice") catch |e| return fail(name, "A {s}", .{@errorName(e)});
-    a.enterChat() catch |e| return fail(name, "A {s}", .{@errorName(e)});
+    a.enterChatAs("AliceChar", "TypeGuru,AliceChar") catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.joinChannel(channel) catch |e| return fail(name, "A {s}", .{@errorName(e)});
     a.setBnetTimeout(3000);
 
@@ -2323,7 +2965,7 @@ fn scChatAcrossInstances() Result {
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         const ev = b.readChatEvent() catch break;
-        if (ev.eid == rc.EID_SHOWUSER and std.mem.eql(u8, ev.username, "CrossAlice")) {
+        if (ev.eid == rc.EID_SHOWUSER and std.mem.eql(u8, ev.username, "AliceChar*CrossAlice")) {
             saw_alice = true;
             break;
         }
@@ -2358,7 +3000,21 @@ fn scChatAcrossInstances() Result {
     }
     if (!whispered) return fail(name, "A never received the whisper B sent from the other instance", .{});
 
-    return .{ .name = name, .status = .pass, .msg = msg("one channel across two instances: user list, talk and whisper all cross", .{}) };
+    // By the CHARACTER, which is what a player types and only the instance holding it can resolve.
+    b.chatCommand("/w AliceChar again") catch |e| return fail(name, "B whisper {s}", .{@errorName(e)});
+    whispered = false;
+    i = 0;
+    while (i < 12) : (i += 1) {
+        const ev = a.readChatEvent() catch break;
+        if (ev.eid == rc.EID_ERROR) return fail(name, "whisper to a character across instances refused: {s}", .{ev.text});
+        if (ev.eid == rc.EID_WHISPER and std.mem.eql(u8, ev.text, "again")) {
+            whispered = true;
+            break;
+        }
+    }
+    if (!whispered) return fail(name, "A never received the whisper addressed to its character from the other instance", .{});
+
+    return .{ .name = name, .status = .pass, .msg = msg("one channel across two instances: user list, talk and whisper (by account and by character) all cross", .{}) };
 }
 
 fn scMultiInstance() Result {
@@ -2441,7 +3097,7 @@ fn scMultiInstance() Result {
     const cg = a.createGame("fleetgame", "d") catch |e| return fail(name, "A create {s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "A create result={d}", .{cg.result});
     // ...and confirm B's admin API lists it (shared-store snapshotGames, not A's memory).
-    var rxbuf: [4096]u8 = undefined;
+    var rxbuf: [16384]u8 = undefined;
     const lg = net.httpRequest(17118, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "B admin games {s}", .{@errorName(e)});
     if (lg.status != 200) return fail(name, "B admin games status={d}", .{lg.status});
     if (std.mem.indexOf(u8, lg.body, "fleetgame") == null)
@@ -2785,6 +3441,15 @@ fn resetFixtures() void {
     }
 }
 
+/// `E2E_ONLY=scName[,scName...]` runs just those scenarios; the rest report as skipped.
+fn only(comptime id: []const u8, comptime run: fn () Result) Result {
+    const want = envOr("E2E_ONLY", "");
+    if (want.len == 0) return run();
+    var it = std.mem.splitScalar(u8, want, ',');
+    while (it.next()) |w| if (std.mem.eql(u8, std.mem.trim(u8, w, " "), id)) return run();
+    return .{ .name = id, .status = .skip, .msg = "not in E2E_ONLY" };
+}
+
 pub fn main() !void {
     // A whole run can be moved off the default ports. Without this, a stray realm server
     // on 6112 quietly becomes the system under test.
@@ -2799,49 +3464,61 @@ pub fn main() !void {
     resetFixtures();
 
     const results = [_]Result{
-        scLogin(),
-        scMcpOn6112(),
-        scCharListStatstring(),
-        scCreateJoinGame(),
-        scSaveAccountKey(),
-        scDeleteInGame(),
-        scSaveFence(),
-        scRealmUniqueNames(),
-        scGamePopulation(),
-        scJoinErrors(),
-        scGameInfo(),
-        scFleetCapacity(),
-        scAdminApi(),
-        scMultiGameOneGs(),
-        scD2ingressTokenTranslate(),
-        scEmbeddedGameEdge(),
-        scCreateAccountRealAuth(),
-        scCharCreate(),
-        scCharVersion(),
-        scClassicChar(),
-        scLadder(),
-        scLadderExperience(),
-        scCharUpgrade(),
-        scCharDelete(),
-        scCharCopy(),
-        scLobbyChatAtoB(),
-        scLobbyCharNames(),
-        scChatCommands(),
-        scConcurrentClients(),
-        scFriendsListLoad(),
-        scNameResolution(),
-        scLeaveChannel(),
-        scDifficultyGate(),
-        scClassicGameFlags(),
-        scHardcoreGameFlags(),
-        scLadderGameFlags(),
-        scNonLadderGameFlags(),
-        scGetFileTime(),
-        scBannerAd(),
-        scSaveDurability(),
-        scFriendsPersist(),
-        scChatAcrossInstances(),
-        scMultiInstance(),
+        only("scLogin", scLogin),
+        only("scMcpOn6112", scMcpOn6112),
+        only("scCharListStatstring", scCharListStatstring),
+        only("scCreateJoinGame", scCreateJoinGame),
+        only("scSaveAccountKey", scSaveAccountKey),
+        only("scDeleteInGame", scDeleteInGame),
+        only("scSaveFence", scSaveFence),
+        only("scRealmUniqueNames", scRealmUniqueNames),
+        only("scGamePopulation", scGamePopulation),
+        only("scSeatReleasedOnLeave", scSeatReleasedOnLeave),
+        only("scUnconfirmedJoinRetaken", scUnconfirmedJoinRetaken),
+        only("scCreateWhileHeld", scCreateWhileHeld),
+        only("scJoinErrors", scJoinErrors),
+        only("scGameMaxPlayers", scGameMaxPlayers),
+        only("scGameInfo", scGameInfo),
+        only("scFleetCapacity", scFleetCapacity),
+        only("scRefusedServerFallsBack", scRefusedServerFallsBack),
+        only("scSilentServerFallsBack", scSilentServerFallsBack),
+        only("scAdminApi", scAdminApi),
+        only("scMultiGameOneGs", scMultiGameOneGs),
+        only("scD2ingressTokenTranslate", scD2ingressTokenTranslate),
+        only("scEmbeddedGameEdge", scEmbeddedGameEdge),
+        only("scCreateAccountRealAuth", scCreateAccountRealAuth),
+        only("scCharCreate", scCharCreate),
+        only("scCreateCharThenGame", scCreateCharThenGame),
+        only("scRejectedLogonGated", scRejectedLogonGated),
+        only("scCharVersion", scCharVersion),
+        only("scClassicChar", scClassicChar),
+        only("scLadder", scLadder),
+        only("scLadderExperience", scLadderExperience),
+        only("scCharUpgrade", scCharUpgrade),
+        only("scCharDelete", scCharDelete),
+        only("scCharCopy", scCharCopy),
+        only("scLobbyChatAtoB", scLobbyChatAtoB),
+        only("scLobbyCharNames", scLobbyCharNames),
+        only("scLobbyCharNamedLikeAccount", scLobbyCharNamedLikeAccount),
+        only("scLobbyChatEvents", scLobbyChatEvents),
+        only("scChatCommands", scChatCommands),
+        only("scConcurrentClients", scConcurrentClients),
+        only("scFriendsListLoad", scFriendsListLoad),
+        only("scNameResolution", scNameResolution),
+        only("scLeaveChannel", scLeaveChannel),
+        only("scDifficultyGate", scDifficultyGate),
+        only("scClassicGameFlags", scClassicGameFlags),
+        only("scHardcoreGameFlags", scHardcoreGameFlags),
+        only("scLadderGameFlags", scLadderGameFlags),
+        only("scNonLadderGameFlags", scNonLadderGameFlags),
+        only("scGameListFiltered", scGameListFiltered),
+        only("scJoinWrongKind", scJoinWrongKind),
+        only("scGetFileTime", scGetFileTime),
+        only("scBannerAd", scBannerAd),
+        only("scSaveDurability", scSaveDurability),
+        only("scFriendsPersist", scFriendsPersist),
+        only("scChatAcrossInstances", scChatAcrossInstances),
+        only("scMultiInstance", scMultiInstance),
     };
 
     if (child) |pid| {

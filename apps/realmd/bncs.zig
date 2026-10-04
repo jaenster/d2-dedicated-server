@@ -23,6 +23,7 @@ const bnftp = @import("bnftp.zig");
 const d2cs = @import("d2cs.zig");
 const chat = @import("chat.zig");
 const friends = @import("friends.zig");
+const friendcmd = @import("friendcmd.zig");
 const store = @import("store.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
@@ -42,15 +43,15 @@ pub var d2cs_ip: [4]u8 = .{ 127, 0, 0, 1 };
 pub var d2cs_port: u16 = 6112;
 
 // Comma-separated account names that get Battle.net-admin + operator flags in chat
-// (the "@"/Blizzard-rep style ops). Set from REALMD_ADMINS. Case-insensitive.
+// (the "@"/Blizzard-rep style ops). Set from REALMD_CHAT_OPS. Case-insensitive.
 pub var admin_accounts: []const u8 = "";
 
 const FLAG_OPERATOR: u32 = @intFromEnum(protocol.ChatUserFlag.operator);
 const FLAG_ADMIN: u32 = @intFromEnum(protocol.ChatUserFlag.bnet_admin);
 
-fn isAdmin(account: []const u8) bool {
-    if (admin_accounts.len == 0 or account.len == 0) return false;
-    var it = std.mem.tokenizeScalar(u8, admin_accounts, ',');
+fn accountListed(list: []const u8, account: []const u8) bool {
+    if (list.len == 0 or account.len == 0) return false;
+    var it = std.mem.tokenizeScalar(u8, list, ',');
     while (it.next()) |a| {
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, a, " "), account)) return true;
     }
@@ -81,8 +82,10 @@ const EID_LEAVE = 0x03;
 const EID_WHISPER = 0x04;
 const EID_TALK = 0x05;
 const EID_CHANNEL = 0x07;
+const EID_WHISPERSENT = 0x0a;
 const EID_INFO = 0x12;
 const EID_ERROR = 0x13;
+const EID_EMOTE = 0x17;
 
 const default_channel = "Diablo II";
 const SID_LEAVECHAT = 0x10;
@@ -124,12 +127,30 @@ const SID_RESETPASSWORD = 0x5a; // request password reset (notify)
 const SID_CHANGEEMAIL = 0x5b; // change account email (notify)
 const SID_REPORTCRASH = 0x5d; // crash dump upload (notify)
 
-// Token generator. These tokens aren't security-relevant (we don't verify
-// them), they just need to be distinct per connection. A counter stepped by an
-// odd constant gives a full-period non-repeating sequence.
+// The server token is the logon's challenge: the password proof hashes it, so a token an attacker
+// can predict lets a captured proof be replayed on a later connection. It comes from the OS's
+// entropy. Should that ever fail, the counter keeps tokens distinct, and the failure is logged.
+extern "c" fn getentropy(buf: [*]u8, len: usize) c_int;
 var token_ctr = std.atomic.Value(u32).init(0x1234abcd);
 fn nextToken() u32 {
+    var b: [4]u8 = undefined;
+    if (getentropy(&b, b.len) == 0) return std.mem.readInt(u32, &b, .little);
+    log.line("bncs", "no entropy for a server token; falling back to a counter", .{});
     return token_ctr.fetchAdd(0x9e3779b1, .monotonic);
+}
+
+/// What a connection may send before it has logged on: the version check, the logon itself,
+/// account creation and recovery, and the housekeeping the login screen does. Everything else
+/// needs a logged-on account.
+fn allowedBeforeLogon(id: u8) bool {
+    return switch (id) {
+        SID_NULL, SID_PING, SID_AUTH_INFO, SID_AUTH_CHECK, SID_LOGONRESPONSE2, SID_LOGONRESPONSE,
+        SID_AUTHACCOUNTLOGON, SID_CREATEACCOUNT2, SID_CHANGEPASSWORD, SID_RESETPASSWORD,
+        SID_GETFILETIME, SID_NETGAMEPORT, SID_CLIENTID2, SID_LOCALEINFO, SID_REPORTCRASH,
+        SID_STARTVERSIONING, SID_REPORTVERSION, SID_CDKEY3, SID_NEWS_INFO, SID_CHECKAD,
+        SID_DISPLAYAD, SID_CLICKAD, SID_QUERYADURL => true,
+        else => false,
+    };
 }
 
 pub const Conn = struct {
@@ -144,14 +165,25 @@ pub const Conn = struct {
     client_token: u32 = 0,
     account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     account_len: u8 = 0,
+    /// Set by a successful logon and by nothing else. Every command past the login screen checks
+    /// it (allowedBeforeLogon); `drop` closes the connection once the current packet is answered.
+    authed: bool = false,
+    drop: bool = false,
     in_channel: bool = false,
     channel: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
     channel_len: u8 = 0,
+    /// The first channel this connection joined. The client draws it at the head of its channel
+    /// list by itself, so the list the realm answers leaves it out (channelList).
+    home: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
+    home_len: u8 = 0,
     user_flags: u32 = 0, // this account's chat flags (admin/operator) in the current channel
     // The client's SID_ENTERCHAT statstring (D2: encodes the char it's on). Captured
     // on enter, replayed to other members in EID_SHOWUSER/EID_JOIN so chat shows chars.
     stat: [chat.max_stat]u8 = [_]u8{0} ** chat.max_stat,
     stat_len: u8 = 0,
+    // The product the client named in SID_GETCHANNELLIST, as it is on the wire (D2XP reads "PX2D"). It
+    // is the first four bytes of the statstring the user list is drawn from.
+    product: [4]u8 = .{ 'P', 'X', '2', 'D' },
     // The `clan*charname` the client asked to be known as in SID_ENTERCHAT.
     chat_name: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
     chat_name_len: u8 = 0,
@@ -178,6 +210,9 @@ pub const Conn = struct {
         @memcpy(c.channel[0..n], name[0..n]);
         c.channel_len = n;
         c.in_channel = true;
+    }
+    fn homeName(c: *const Conn) []const u8 {
+        return c.home[0..c.home_len];
     }
     fn channelName(c: *Conn) []const u8 {
         return c.channel[0..c.channel_len];
@@ -322,7 +357,9 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
             if (len - off < plen) break; // wait for the rest
             dispatch(&c, tag, acc[off + 1], acc[off + 4 .. off + plen]);
             off += plen;
+            if (c.drop) break;
         }
+        if (c.drop) break;
         if (off > 0) {
             std.mem.copyForwards(u8, acc[0 .. len - off], acc[off..len]);
             len -= off;
@@ -362,6 +399,11 @@ pub var trace_packets: bool = false;
 pub var modern_challenge: bool = false;
 
 fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
+    if (!c.authed and !allowedBeforeLogon(id)) {
+        log.line(tag, "SID 0x{x:0>2} before a logon; dropping the connection", .{id});
+        c.drop = true;
+        return;
+    }
     if (!hook.bncsPacket(c, id, body)) return; // an extension took it
     if (trace_packets) {
         log.line(tag, "rx SID 0x{x:0>2} ({d} bytes)", .{ id, body.len });
@@ -374,7 +416,7 @@ fn dispatch(c: *Conn, tag: []const u8, id: u8, body: []const u8) void {
         SID_LOGONRESPONSE2 => onLogon(c, tag, body),
         SID_CREATEACCOUNT2 => onCreateAccount(c, tag, body),
         SID_ENTERCHAT => onEnterChat(c, tag, body),
-        SID_GETCHANNELLIST => onGetChannelList(c),
+        SID_GETCHANNELLIST => onGetChannelList(c, body),
         SID_JOINCHANNEL => onJoinChannel(c, tag, body),
         SID_CHATCOMMAND => onChatCommand(c, tag, body),
         SID_QUERYREALMS2 => onQueryRealms(c, tag),
@@ -501,13 +543,17 @@ const LOGON_BAD_PASSWORD: u32 = 2;
 fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     c.client_token = r.getU32();
-    const server_token = r.getU32(); // client echoes the token we sent
+    const echoed = r.getU32(); // the client echoes the token we sent
     var got: [20]u8 = undefined;
     @memcpy(&got, r.take20());
     const acct = r.getStr();
     c.setAccount(acct);
 
-    const result = logonResult(c, server_token, got);
+    // The proof is checked against the token THIS connection was given, never the one the client
+    // says it was given: trusting the echo would let a proof captured elsewhere be replayed.
+    const result = if (echoed != c.server_token) LOGON_BAD_PASSWORD else logonResult(c, c.server_token, got);
+    c.authed = result == LOGON_OK;
+    if (!c.authed) c.drop = true;
     if (result == LOGON_OK) friends.setOnline(acct); // presence for friends online-status
     hook.accountLogin(acct, result == LOGON_OK);
     log.line(tag, "logon account={s} -> result={d}", .{ acct, result });
@@ -596,28 +642,90 @@ fn onCreateAccount(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+/// How Battle.net named a Diablo II user in chat: `charname*account`. The character is what the
+/// lobby prints in front of a line of talk; the account after the '*' is the user's identity, the
+/// key the client matches its own name and each row of the channel list by (a name with no
+/// character is just the account, as it is for a client that never picked one). The client asks to
+/// be known as the bare character, so the realm adds the account; a name that already carries a
+/// '*' is taken as given.
+pub fn uniqueName(out: []u8, requested: []const u8, account: []const u8) []const u8 {
+    if (requested.len == 0 or std.ascii.eqlIgnoreCase(requested, account)) return truncated(out, account);
+    if (std.mem.indexOfScalar(u8, requested, '*') != null) return truncated(out, requested);
+    return withCharacter(out, requested, account);
+}
+
+/// `character*account`, with the character cut to what room the account leaves.
+fn withCharacter(out: []u8, requested: []const u8, account: []const u8) []const u8 {
+    const room = if (out.len > account.len + 1) out.len - account.len - 1 else 0;
+    const ch = requested[0..@min(requested.len, room)];
+    if (ch.len == 0) return truncated(out, account);
+    @memcpy(out[0..ch.len], ch);
+    out[ch.len] = '*';
+    @memcpy(out[ch.len + 1 ..][0..account.len], account);
+    return out[0 .. ch.len + 1 + account.len];
+}
+
+fn truncated(out: []u8, s: []const u8) []const u8 {
+    const n = @min(s.len, out.len);
+    @memcpy(out[0..n], s[0..n]);
+    return out[0..n];
+}
+
+/// The character in a chat name: what comes before the '*'.
+fn charOfName(name: []const u8) []const u8 {
+    return if (std.mem.indexOfScalar(u8, name, '*')) |i| name[0..i] else name;
+}
+
+/// The character in a client's own statstring, `<realm>,<character>`: what is between the first comma and
+/// the next, or the end. Null when there is none or it could not be a character's name.
+fn statChar(stat: []const u8) ?[]const u8 {
+    const comma = std.mem.indexOfScalar(u8, stat, ',') orelse return null;
+    const rest = stat[comma + 1 ..];
+    const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+    const ch = rest[0..end];
+    if (ch.len == 0 or ch.len > 15) return null;
+    for (ch) |c| {
+        if (c < 0x21 or c > 0x7e or c == '*' or c == ',') return null;
+    }
+    return ch;
+}
+
 fn onEnterChat(c: *Conn, tag: []const u8, body: []const u8) void {
-    // SID_ENTERCHAT C->S: (STRING) requested-username (empty; we use the account),
-    // (STRING) statstring (D2: the char the client is on). Capture the statstring so
-    // we can replay it to other members when this user joins a channel.
+    // SID_ENTERCHAT C->S: (STRING) username, (STRING) statstring. A D2 client sends the character
+    // it is on and "<realm>,<character>"; the realm answers with the unique name and the statstring
+    // every other client will draw this user from.
     var r = proto.Reader.init(body);
-    // The requested username is NOT decoration: for D2 it arrives as `clan*charname`, and
-    // the channel list draws the part after the '*' as the character. Discarding it and
-    // substituting the account name is why the lobby showed accounts instead of characters.
     const requested = r.getStr();
-    if (requested.len > 0) c.setChatName(requested);
-    c.setStat(r.getStr());
+    const client_stat = r.getStr();
     const acct = c.accountName();
+
+    var nb: [state.max_name + 1]u8 = undefined;
+    // A character named like its account (case aside) asks to be known as the account, which the
+    // realm cannot tell from a client with no character. The statstring the client sends says which
+    // character it is on, so that decides: without it the character was left out of the name, the
+    // statstring lookup missed and the lobby drew a user it could not parse as a character.
+    const as_account = requested.len == 0 or std.ascii.eqlIgnoreCase(requested, acct);
+    const unique = if (as_account) (if (statChar(client_stat)) |ch| withCharacter(&nb, ch, acct) else uniqueName(&nb, requested, acct)) else uniqueName(&nb, requested, acct);
+    c.setChatName(unique);
+    const char = charOfName(c.chatName());
+
+    // The client's own statstring has no product tag and no character data, so the list would draw
+    // an unknown user; the realm builds the real one from the character's save.
+    const realm_end = std.mem.indexOfScalar(u8, client_stat, ',') orelse client_stat.len;
+    const realm = if (realm_end > 0) client_stat[0..realm_end] else "Realm";
+    var sb: [chat.max_stat]u8 = undefined;
+    const stat = d2cs.chatStat(&sb, &c.product, realm, acct, char) orelse client_stat;
+    c.setStat(stat);
     log.line(tag, "enter chat as {s} (chat name '{s}', stat {d}B)", .{ acct, c.chatName(), c.stat_len });
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_ENTERCHAT);
     w.putStr(c.chatName()); // unique name — the identity the client adopts for itself
-    w.putStr(c.statSlice()); // statstring (echo the client's own)
+    w.putStr(c.statSlice());
     w.putStr(acct); // account name
     finish(c, &w);
     // NOTE: do not push a SID_CHATEVENT here. The D2 realm lobby is not a chat
     // channel and an unsolicited channel-join event corrupts its control state
-    // (crash in D2WINMAIN_SetControlDisabled). Chat-flag enums live in protocol.zig.
+    // (crash in D2WINMAIN_SetControlDisabled). The channel is announced when the client joins one.
 }
 
 // SID_LEAVECHAT (0x10): the client is leaving the channel. It used to be accepted and
@@ -655,14 +763,40 @@ fn onNotifyJoin(c: *Conn, tag: []const u8, body: []const u8) void {
     log.line(tag, "{s} joined game '{s}'", .{ c.accountName(), game_name });
 }
 
-fn onGetChannelList(c: *Conn) void {
+/// Four printable characters: a product tag and not stray bytes that would end up in a statstring.
+fn isProductTag(b: []const u8) bool {
+    for (b) |ch| if (ch < 0x21 or ch > 0x7e or ch == ',') return false;
+    return true;
+}
+
+/// The channels the realm offers, as SID_GETCHANNELLIST lists them.
+const public_channels = [_][]const u8{ default_channel, "Trade", "Hardcore" };
+
+/// The body of the channel list: every public channel but `home`. The 1.14d client builds its list
+/// from the first channel it joined (drawn first, always), the one it is in now, and then this list
+/// minus the one it is in now (UIMENU_CreateTcpIpGameList @0x440fc0; COMCALLBACK_HandleChannelError
+/// @0x4496b0 keeps both names). A home channel that is also in this list is therefore drawn twice
+/// as soon as the player is in another channel.
+fn channelListBody(buf: []u8, home: []const u8) []u8 {
+    var n: usize = 0;
+    for (public_channels) |name| {
+        if (std.ascii.eqlIgnoreCase(name, home)) continue;
+        if (n + name.len + 1 > buf.len) break;
+        @memcpy(buf[n..][0..name.len], name);
+        buf[n + name.len] = 0;
+        n += name.len + 1;
+    }
+    buf[n] = 0; // an empty string ends the list
+    return buf[0 .. n + 1];
+}
+
+fn onGetChannelList(c: *Conn, body: []const u8) void {
+    // The body is the product the client is chatting as; its four bytes head the statstring.
+    if (body.len >= 4 and isProductTag(body[0..4])) @memcpy(&c.product, body[0..4]);
+    var list: [128]u8 = undefined;
     var buf: [256]u8 = undefined;
     var w = startPacket(&buf, SID_GETCHANNELLIST);
-    // Public channels offered in the channel-select UI. The home channel first.
-    w.putStr(default_channel); // "Diablo II"
-    w.putStr("Trade");
-    w.putStr("Hardcore");
-    w.putStr(""); // empty string terminates the list
+    w.putBytes(channelListBody(&list, c.homeName()));
     finish(c, &w);
 }
 
@@ -733,6 +867,14 @@ fn showRemoteUserCb(ctx: *const ShowUserCtx, rm: chat.RemoteMember) void {
     sendEvent(ctx.c, EID_SHOWUSER, rm.flags, rm.display, rm.stat);
 }
 
+/// The chat flags of a user in a public channel: none, unless the account is a configured chat op.
+/// Never earned by being first in the channel: the client draws any user with the operator flag as a
+/// "Moderator" with the moderator portrait (ComCallback @0x446d90 skips the character data when
+/// flag 2 is set), so a player would lose their class, gear and title gender.
+fn chatUserFlags(ops: []const u8, account: []const u8) u32 {
+    return if (accountListed(ops, account)) FLAG_ADMIN | FLAG_OPERATOR else 0;
+}
+
 fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     _ = r.getU32(); // flags
@@ -740,23 +882,27 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     if (channel.len == 0) channel = default_channel;
     const acct = c.accountName();
 
-    // Compute this user's chat flags: configured admins always; the FIRST person in
-    // an otherwise-empty channel becomes its operator (typical Battle.net behaviour).
-    var flags: u32 = 0;
-    if (isAdmin(acct)) flags |= FLAG_ADMIN | FLAG_OPERATOR;
-    // Realm-wide, not per-instance: counting only our own members would hand the operator badge
-    // to the first person on every replica, so a busy channel would have as many ops as instances.
-    if (chat.countInChannelShared(channel) == 0) flags |= FLAG_OPERATOR;
+    const flags = chatUserFlags(admin_accounts, acct);
     c.user_flags = flags;
     log.line(tag, "join channel '{s}' as {s} (flags=0x{x})", .{ channel, acct, flags });
 
     c.setChannel(channel);
+    const first_join = c.home_len == 0;
+    if (first_join) {
+        const n: u8 = @intCast(@min(channel.len, chat.max_channel));
+        @memcpy(c.home[0..n], channel[0..n]);
+        c.home_len = n;
+    }
     _ = chat.joinShared(c.fd, acct, c.chatName(), channel, flags, c.statSlice());
     chat.setGame(c.fd, ""); // back in the lobby: no longer in a game
 
-    // Tell the joiner which channel they're in (EID_CHANNEL carries the CHANNEL flags),
-    // then list existing members, then announce the join to everyone else.
-    sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), channel, "");
+    // What Battle.net sent on a join, in its order. EID_CHANNEL carries the CHANNEL flags and puts
+    // the channel's name in the TEXT: the client prints "You have joined channel: <text>" and titles
+    // the user list "<text> (n)" from it. Then EID_SHOWUSER for everyone already in, the joiner
+    // among them: the client finds its own name in that list to put it in front of its own talk, and
+    // counts the header from the rows it is given. Then EID_JOIN to everyone else.
+    sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), "", channel);
+    sendEvent(c, EID_SHOWUSER, flags, c.chatName(), c.statSlice());
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
     chat.forEachRemoteInChannel(channel, &ctx, showRemoteUserCb);
@@ -888,17 +1034,31 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
 }
 
 fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
-    if (!c.in_channel) return; // talking before joining a channel: ignore
     var r = proto.Reader.init(body);
     const text = r.getStr();
     const acct = c.accountName();
+    // Commands work wherever the player is: in a game the client sends them over this same
+    // connection while it is in no channel. Only plain talk and /me need a channel to speak into.
+    const is_command = text.len > 0 and text[0] == '/';
+    if (!c.in_channel and !is_command) return;
 
-    if (parseWhisper(text)) |w| {
+    var reply_buf: [chat.max_name]u8 = undefined;
+    var whisper = parseWhisper(text);
+    if (whisper == null) {
+        if (parseReply(text)) |msg| {
+            const target = chat.lastWhisperOf(c.fd, &reply_buf) orelse {
+                sendEvent(c, EID_ERROR, 0, "", "No one has whispered you.");
+                return;
+            };
+            whisper = .{ .target = target, .msg = msg };
+        }
+    }
+    if (whisper) |w| {
         // A recipient who squelched the sender never gets the whisper, but Battle.net
         // still shows the sender a normal "To <target>:" echo (no hint they're ignored).
         if (chat.fdOf(w.target)) |tfd| {
             if (chat.recipientIgnores(tfd, acct)) {
-                sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg);
+                sendEvent(c, EID_WHISPERSENT, c.user_flags, w.target, w.msg);
                 return;
             }
         }
@@ -908,15 +1068,17 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         // Local first — most whispers are between people on the same instance and cost nothing
         // extra. Only when nobody here answers to that name do we ask the rest of the realm,
         // which is the difference between "not logged on" and "not on THIS realmd".
-        var res = chat.whisperEx(w.target, bytes); // delivers unless target is in DND
+        var res = chat.whisperEx(w.target, acct, bytes); // delivers unless target is in DND
         if (!res.found) res = chat.whisperRemote(w.target, acct, bytes);
         if (!res.found) {
             sendEvent(c, EID_ERROR, 0, w.target, "That user is not logged on.");
             return;
         }
-        // Echo to sender (D2 shows "To <target>: msg"), then surface the target's
+        // Echo to sender as EID_WHISPERSENT (the client prints "You whisper to <target>: msg"; an
+        // EID_WHISPER would read as the target whispering to them), then surface the target's
         // away/DND auto-reply if they set one (DND also suppressed delivery above).
-        sendEvent(c, EID_WHISPER, c.user_flags, w.target, w.msg);
+        var db: [chat.max_name]u8 = undefined;
+        sendEvent(c, EID_WHISPERSENT, c.user_flags, chat.displayOf(w.target, &db) orelse w.target, w.msg);
         var rb: [192]u8 = undefined;
         if (res.dnd_len > 0) {
             const s = std.fmt.bufPrint(&rb, "{s} is unavailable ({s})", .{ w.target, res.dndSlice() }) catch return;
@@ -929,12 +1091,16 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     }
     if (handleSocialCmd(c, tag, text)) return;
     if (handleGuildCmd(c, tag, text)) return;
-    if (parseFriendCmd(text)) |fc| {
+    if (friendcmd.parse(text)) |fc| {
         handleFriendCmd(c, tag, fc);
         return;
     }
     if (handleHelpCmd(c, text)) return;
     if (hook.chatCommand(c, tag, text)) return;
+    if (afterVerb(text, "/me") orelse afterVerb(text, "/emote")) |what| {
+        if (c.in_channel) emote(c, tag, what);
+        return;
+    }
     if (text.len > 0 and text[0] == '/') {
         // An unknown command must never reach the channel — typing a typo should not say
         // it out loud. It used to answer with an empty INFO line, which looks to the
@@ -959,6 +1125,17 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     broadcastEvent(c, EID_TALK, c.user_flags, c.chatName(), text);
 }
 
+/// "/me <text>": an action, shown to the whole channel as `*name text*` — to the speaker as well,
+/// because unlike talk the client does not draw its own.
+fn emote(c: *Conn, tag: []const u8, what: []const u8) void {
+    if (what.len == 0) return;
+    const acct = c.accountName();
+    if (!hook.chatSay(c, acct, c.channelName(), what)) return;
+    log.line(tag, "{s} emotes: {s}", .{ acct, what });
+    sendEvent(c, EID_EMOTE, c.user_flags, c.chatName(), what);
+    broadcastEvent(c, EID_EMOTE, c.user_flags, c.chatName(), what);
+}
+
 const Whisper = struct { target: []const u8, msg: []const u8 };
 
 /// If `text` starts with "<verb> " (case-insensitively), the rest after the space.
@@ -975,6 +1152,12 @@ fn afterVerb(text: []const u8, verb: []const u8) ?[]const u8 {
 /// and /msg used to fall through and do nothing at all. The client compares them with
 /// stricmp, so this does too.
 const whisper_verbs = [_][]const u8{ "/w", "/whisper", "/m", "/msg" };
+
+/// "/r <text>" and "/reply <text>": the 1.14d client has no handler for them and forwards the
+/// line verbatim, so the realm answers the last person who whispered this connection.
+fn parseReply(text: []const u8) ?[]const u8 {
+    return afterVerb(text, "/r") orelse afterVerb(text, "/reply");
+}
 
 fn parseWhisper(text: []const u8) ?Whisper {
     for (whisper_verbs) |v| {
@@ -1091,7 +1274,8 @@ fn handleHelpCmd(c: *Conn, text: []const u8) bool {
     const lines = [_][]const u8{
         "Commands:",
         "  /w /whisper /m /msg <name> <text>  send a private message",
-        "  /f add|remove|list <name>          manage your friends list",
+        "  /r /reply <text>                   answer the last whisper",
+        "  /f l|a|r|m|p|d                     friends: list, add, remove, message all, promote, demote",
         "  /away [message]                    set or clear an away reply",
         "  /dnd [message]                     block incoming whispers",
         "  /ignore /unignore <name>           squelch or unsquelch someone",
@@ -1103,64 +1287,78 @@ fn handleHelpCmd(c: *Conn, text: []const u8) bool {
     return true;
 }
 
-const FriendCmd = struct { action: enum { add, remove, list }, name: []const u8 };
-
-// "/f ...", "/friend ...", "/friends ..." — manage the friends list from chat.
-fn parseFriendCmd(text: []const u8) ?FriendCmd {
-    var rest: []const u8 = undefined;
-    if (std.mem.startsWith(u8, text, "/friends")) {
-        rest = std.mem.trim(u8, text[8..], " ");
-    } else if (std.mem.startsWith(u8, text, "/friend")) {
-        rest = std.mem.trim(u8, text[7..], " ");
-    } else if (std.mem.eql(u8, text, "/f") or std.mem.startsWith(u8, text, "/f ")) {
-        rest = std.mem.trim(u8, text[2..], " ");
-    } else return null;
-
-    const sp = std.mem.indexOfScalar(u8, rest, ' ');
-    const verb = if (sp) |s| rest[0..s] else rest;
-    const arg = if (sp) |s| std.mem.trim(u8, rest[s + 1 ..], " ") else "";
-    if (verb.len == 0 or std.mem.startsWith(u8, "list", verb)) return .{ .action = .list, .name = "" };
-    if (std.mem.eql(u8, verb, "add") or std.mem.eql(u8, verb, "a")) return .{ .action = .add, .name = arg };
-    if (std.mem.eql(u8, verb, "remove") or std.mem.eql(u8, verb, "r") or std.mem.eql(u8, verb, "del")) return .{ .action = .remove, .name = arg };
-    return .{ .action = .list, .name = "" };
+/// The name a friend is stored under: the account behind whichever name was typed when that person
+/// is online (the lobby shows characters, the list keeps accounts), else the text as typed.
+fn friendAccount(name: []const u8, out: []u8) []const u8 {
+    return chat.resolveAccount(name, out) orelse name;
 }
 
-fn handleFriendCmd(c: *Conn, tag: []const u8, fc: FriendCmd) void {
+fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
     const acct = c.accountName();
+    var rb: [160]u8 = undefined;
+    var nb: [chat.max_name]u8 = undefined;
     switch (fc.action) {
+        .usage => for (friendcmd.usage_lines) |l| sendEvent(c, EID_INFO, 0, "", l),
         .add => {
-            if (fc.name.len == 0) return sendEvent(c, EID_INFO, 0, "", "Usage: /f add <account>");
-            const ok = friends.add(acct, fc.name);
-            log.line(tag, "{s} friend-add {s} -> {}", .{ acct, fc.name, ok });
-            sendEvent(c, EID_INFO, 0, "", if (ok) "Added to your friends list." else "Already on your list (or it is full).");
+            if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f a <account>");
+            const target = friendAccount(fc.arg, &nb);
+            if (target.len > friends.max_name) return sendEvent(c, EID_ERROR, 0, "", "That is not a valid account name.");
+            if (std.ascii.eqlIgnoreCase(target, acct)) return sendEvent(c, EID_ERROR, 0, "", "You can't add yourself to your friends list.");
+            const ok = friends.add(acct, target);
+            log.line(tag, "{s} friend-add {s} -> {}", .{ acct, target, ok });
+            if (ok) {
+                sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was added to your friends list.", .{target}) catch "Added to your friends list.");
+            } else sendEvent(c, EID_ERROR, 0, "", "That user is already on your friends list, or your list is full.");
         },
         .remove => {
-            const ok = friends.remove(acct, fc.name);
-            log.line(tag, "{s} friend-remove {s} -> {}", .{ acct, fc.name, ok });
-            sendEvent(c, EID_INFO, 0, "", if (ok) "Removed from your friends list." else "That player is not on your list.");
+            if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f r <account>");
+            const target = friendAccount(fc.arg, &nb);
+            const ok = friends.remove(acct, target);
+            log.line(tag, "{s} friend-remove {s} -> {}", .{ acct, target, ok });
+            if (ok) {
+                sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was removed from your friends list.", .{target}) catch "Removed from your friends list.");
+            } else sendEvent(c, EID_ERROR, 0, "", "That user is not on your friends list.");
+        },
+        .promote, .demote => {
+            if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f p|d <account>");
+            const target = friendAccount(fc.arg, &nb);
+            switch (friends.move(acct, target, fc.action == .promote)) {
+                .moved => sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was moved {s} your friends list.", .{ target, if (fc.action == .promote) "up" else "down" }) catch "Moved."),
+                .at_edge => sendEvent(c, EID_ERROR, 0, "", "That friend is already at that end of your list."),
+                .not_found => sendEvent(c, EID_ERROR, 0, "", "That user is not on your friends list."),
+            }
+        },
+        .msg => {
+            if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f m <message>");
+            var infos: [friends.max_friends]friends.FriendInfo = undefined;
+            const n = friends.list(acct, &infos);
+            var sent: usize = 0;
+            var wbuf: [512]u8 = undefined;
+            const bytes = buildChatEvent(&wbuf, EID_WHISPER, c.user_flags, c.chatName(), fc.arg);
+            for (infos[0..n]) |f| {
+                if (!f.online) continue;
+                if (chat.fdOf(f.nameSlice())) |tfd| {
+                    if (chat.recipientIgnores(tfd, acct)) continue;
+                }
+                var res = chat.whisperEx(f.nameSlice(), acct, bytes);
+                if (!res.found) res = chat.whisperRemote(f.nameSlice(), acct, bytes);
+                if (res.found) sent += 1;
+            }
+            log.line(tag, "{s} friend-message to {d} friend(s)", .{ acct, sent });
+            if (sent == 0) {
+                sendEvent(c, EID_INFO, 0, "", "None of your friends are online.");
+            } else sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "Message sent to {d} friend{s}.", .{ sent, if (sent == 1) "" else "s" }) catch "Message sent.");
         },
         .list => {
             var infos: [friends.max_friends]friends.FriendInfo = undefined;
             const n = friends.list(acct, &infos);
-            if (n == 0) sendEvent(c, EID_INFO, 0, "", "Your friends list is empty.");
-            // Chat text is the ONLY way a 1.14d client can be shown this — see the note on
-            // onFriendsList. So say where each friend actually is, not just whether they
-            // are on: "online in Diablo II", "away", and so on.
-            for (infos[0..n]) |f| {
-                var rb: [96]u8 = undefined;
-                const where: []const u8 = if (!f.online)
-                    "offline"
-                else if (f.dnd)
-                    "online (do not disturb)"
-                else if (f.away)
-                    "online (away)"
-                else if (f.location_len > 0 and f.in_game)
-                    std.fmt.bufPrint(&rb, "in the game {s}", .{f.locationSlice()}) catch "online"
-                else if (f.location_len > 0)
-                    std.fmt.bufPrint(&rb, "online in {s}", .{f.locationSlice()}) catch "online"
-                else
-                    "online";
-                sendEvent(c, EID_INFO, 0, f.nameSlice(), where);
+            if (n == 0) return sendEvent(c, EID_INFO, 0, "", "Your friends list is empty.");
+            sendEvent(c, EID_INFO, 0, "", "Your friends are:");
+            // Chat text is the only way a 1.14d client can be shown this — see the note on
+            // onFriendsList.
+            for (infos[0..n], 1..) |f, i| {
+                const line = friendcmd.listLine(&rb, i, f.nameSlice(), f.online, f.dnd, f.away, f.in_game, f.locationSlice());
+                sendEvent(c, EID_INFO, 0, "", line);
             }
         },
     }
@@ -1233,6 +1431,41 @@ fn onGetFileTime(c: *Conn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
+/// The profile keys the client has fields for, and the longest value each may hold. Anything else a
+/// client names is neither read nor stored: the store is keyed by whatever string arrives, so an
+/// open key space would let any account fill it.
+const profile_keys = [_]struct { key: []const u8, max: usize }{
+    .{ .key = "profile\\sex", .max = 16 },
+    .{ .key = "profile\\age", .max = 8 },
+    .{ .key = "profile\\location", .max = 64 },
+    .{ .key = "profile\\description", .max = 200 },
+};
+
+fn profileKey(key: []const u8) ?usize {
+    for (profile_keys, 0..) |k, i| if (std.ascii.eqlIgnoreCase(k.key, key)) return i;
+    return null;
+}
+
+/// Accounts are one name whatever their case, and a profile is looked up by the name a list shows,
+/// which may be spelled otherwise than the logon was. Too long a name comes back empty.
+fn lowerName(out: []u8, name: []const u8) []const u8 {
+    if (name.len > out.len) return "";
+    return std.ascii.lowerString(out, name);
+}
+
+/// A profile value as it is kept: control characters dropped (a newline or an escape in a profile is
+/// drawn into other players' windows), cut at the field's length.
+fn cleanProfileValue(out: []u8, value: []const u8, max: usize) []const u8 {
+    var n: usize = 0;
+    for (value) |ch| {
+        if (ch < 0x20 or ch == 0x7f) continue;
+        if (n == max or n == out.len) break;
+        out[n] = ch;
+        n += 1;
+    }
+    return out[0..n];
+}
+
 // SID_READUSERDATA (0x26): C->S { u32 numAccounts, u32 numKeys, u32 reqId,
 // STRING[numAccounts] accounts, STRING[numKeys] keys }. Reply mirrors the
 // header then STRING[numAccounts*numKeys] values (account-major). Profile reads
@@ -1263,15 +1496,18 @@ fn onReadUserData(c: *Conn, tag: []const u8, body: []const u8) void {
     // for, and it does not fit in anything modest — size for it rather than truncate.
     var buf: [4 * 16 * 258 + 32]u8 = undefined;
     var w = startPacket(&buf, SID_READUSERDATA);
-    w.putU32(num_accounts);
-    w.putU32(num_keys);
+    // The counts are those of the strings that follow, so a request past the arrays answers what it
+    // got rather than a header that promises more than the body holds.
+    w.putU32(@intCast(na));
+    w.putU32(@intCast(nk));
     w.putU32(reqid);
     var ai: usize = 0;
     while (ai < na) : (ai += 1) {
         var ki: usize = 0;
         while (ki < nk) : (ki += 1) {
             var vbuf: [256]u8 = undefined;
-            const n = store.getUserData(accts[ai], keys[ki], &vbuf);
+            var ab: [state.max_name + 1]u8 = undefined;
+            const n = if (profileKey(keys[ki])) |k| store.getUserData(lowerName(&ab, accts[ai]), profile_keys[k].key, &vbuf) else 0;
             w.putStr(vbuf[0..n]);
         }
     }
@@ -1310,7 +1546,11 @@ fn onWriteUserData(c: *Conn, tag: []const u8, body: []const u8) void {
         while (ki < num_keys) : (ki += 1) {
             const val = r.getStr();
             if (ai < na and ki < nk and std.ascii.eqlIgnoreCase(accts[ai], c.accountName())) {
-                if (store.setUserData(accts[ai], keys[ki], val)) stored += 1;
+                if (profileKey(keys[ki])) |k| {
+                    var vb: [256]u8 = undefined;
+                    var ab: [state.max_name + 1]u8 = undefined;
+                    if (store.setUserData(lowerName(&ab, c.accountName()), profile_keys[k].key, cleanProfileValue(&vb, val, profile_keys[k].max))) stored += 1;
+                }
             }
         }
     }
@@ -1446,10 +1686,12 @@ fn onChangePassword(c: *Conn, tag: []const u8, body: []const u8) void {
         // logged in as that account, so that is what is required.
         var verified = false;
         if (has_pw) {
-            const expect = xsha1.doubleHash(client_token, server_token, stored);
-            verified = std.mem.eql(u8, &expect, &old_proof);
+            // against this connection's token, not the echoed one: a captured proof must not replay
+            const expect = xsha1.doubleHash(client_token, c.server_token, stored);
+            verified = server_token == c.server_token and std.mem.eql(u8, &expect, &old_proof);
         } else {
-            verified = c.account_len != 0 and std.ascii.eqlIgnoreCase(c.accountName(), user);
+            // logged on, not merely named: a refused logon leaves the name on the connection
+            verified = c.authed and std.ascii.eqlIgnoreCase(c.accountName(), user);
             if (!verified) log.line(tag, "changepassword '{s}' refused: password-less and this connection is not logged in as it", .{user});
         }
         if (verified) ok = store.setAccountPassword(user, new_hash);
@@ -1583,4 +1825,113 @@ fn onNewsInfo(c: *Conn, tag: []const u8, body: []const u8) void {
     w.putU32(0); // entry timestamp; 0 = this entry is the MOTD
     w.putStr(motd); // MOTD text (NUL-terminated)
     finish(c, &w);
+}
+
+test "a character named like its account is still named charname*account" {
+    var b: [state.max_name + 1]u8 = undefined;
+    try std.testing.expectEqualStrings("Gravlabs*gravlabs", withCharacter(&b, statChar("beta,Gravlabs").?, "gravlabs"));
+    try std.testing.expect(statChar("beta") == null);
+    try std.testing.expect(statChar("beta,") == null);
+    try std.testing.expect(statChar("beta,a*b") == null);
+    try std.testing.expectEqualStrings("Sorc", statChar("TypeGuru,Sorc,extra").?);
+}
+
+test "a Diablo II user is named charname*account" {
+    var b: [state.max_name + 1]u8 = undefined;
+    try std.testing.expectEqualStrings("Sorc*jaenster", uniqueName(&b, "Sorc", "jaenster"));
+    // no character, or the account itself: just the account
+    try std.testing.expectEqualStrings("jaenster", uniqueName(&b, "", "jaenster"));
+    try std.testing.expectEqualStrings("jaenster", uniqueName(&b, "JAENSTER", "jaenster"));
+    // already a chat name: taken as given
+    try std.testing.expectEqualStrings("Sorc*other", uniqueName(&b, "Sorc*other", "jaenster"));
+    // a name that cannot fit gives up characters, never the account
+    var small: [12]u8 = undefined;
+    try std.testing.expectEqualStrings("Sor*jaenster", uniqueName(&small, "Sorceress", "jaenster"));
+    try std.testing.expectEqualStrings("Sorc", charOfName("Sorc*jaenster"));
+    try std.testing.expectEqualStrings("jaenster", charOfName("jaenster"));
+}
+
+/// The body of a SID_CHATEVENT as the client's dispatcher reads it: eid, flags, ping, ip, account
+/// number, registration authority, then the user name and the text.
+fn expectEvent(pkt: []const u8, eid: u32, flags: u32, user: []const u8, text: []const u8) !void {
+    try std.testing.expectEqual(@as(u8, 0xff), pkt[0]);
+    try std.testing.expectEqual(@as(u8, SID_CHATEVENT), pkt[1]);
+    try std.testing.expectEqual(@as(u16, @intCast(pkt.len)), std.mem.readInt(u16, pkt[2..4], .little));
+    const body = pkt[4..];
+    try std.testing.expectEqual(eid, std.mem.readInt(u32, body[0..4], .little));
+    try std.testing.expectEqual(flags, std.mem.readInt(u32, body[4..8], .little));
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 16, body[8..24]);
+    try std.testing.expectEqualStrings(user, std.mem.sliceTo(body[24..], 0));
+    try std.testing.expectEqualStrings(text, std.mem.sliceTo(body[24 + user.len + 1 ..], 0));
+    try std.testing.expectEqual(@as(usize, 24 + user.len + 1 + text.len + 1), body.len);
+}
+
+test "the events of a join are encoded as the client reads them" {
+    var b: [512]u8 = undefined;
+    // EID_CHANNEL: the channel's NAME is the text; the user field is empty. The client titles its
+    // user list and prints "You have joined channel: ..." from the text.
+    try expectEvent(buildChatEvent(&b, EID_CHANNEL, 1, "", "Diablo II"), 7, 1, "", "Diablo II");
+    // EID_SHOWUSER / EID_JOIN: the chat name, and the statstring as the text
+    const stat = "PX2DUSEast,Sorc,\x84\x80";
+    try expectEvent(buildChatEvent(&b, EID_SHOWUSER, 0x02, "Sorc*jaenster", stat), 1, 2, "Sorc*jaenster", stat);
+    try expectEvent(buildChatEvent(&b, EID_JOIN, 0, "Sorc*jaenster", stat), 2, 0, "Sorc*jaenster", stat);
+    try expectEvent(buildChatEvent(&b, EID_LEAVE, 0, "Sorc*jaenster", ""), 3, 0, "Sorc*jaenster", "");
+    // talk and whispers carry the speaker's chat name; a whisper echoed to its sender names the target
+    try expectEvent(buildChatEvent(&b, EID_TALK, 0, "Sorc*jaenster", "hello"), 5, 0, "Sorc*jaenster", "hello");
+    try expectEvent(buildChatEvent(&b, EID_WHISPER, 0, "Sorc*jaenster", "psst"), 4, 0, "Sorc*jaenster", "psst");
+    try expectEvent(buildChatEvent(&b, EID_WHISPERSENT, 0, "Necro*other", "psst"), 0x0a, 0, "Necro*other", "psst");
+    try expectEvent(buildChatEvent(&b, EID_EMOTE, 0, "Sorc*jaenster", "waves"), 0x17, 0, "Sorc*jaenster", "waves");
+    try expectEvent(buildChatEvent(&b, EID_INFO, 0, "", "hi"), 0x12, 0, "", "hi");
+    try expectEvent(buildChatEvent(&b, EID_ERROR, 0, "", "no"), 0x13, 0, "", "no");
+}
+
+test "a product tag is four printable characters" {
+    try std.testing.expect(isProductTag("PX2D"));
+    try std.testing.expect(!isProductTag("P,2D"));
+    try std.testing.expect(!isProductTag("P\x002D"));
+}
+
+test "a player gets no chat flags; only a configured chat op does" {
+    // Being first in a channel is not a reason: the client turns any operator into a "Moderator"
+    // and drops the character's portrait and title gender
+    try std.testing.expectEqual(@as(u32, 0), chatUserFlags("", "jaenster"));
+    try std.testing.expectEqual(@as(u32, 0), chatUserFlags("ops1,ops2", "jaenster"));
+    try std.testing.expectEqual(FLAG_ADMIN | FLAG_OPERATOR, chatUserFlags("ops1, Jaenster", "jaenster"));
+    try std.testing.expectEqual(@as(u32, 0), chatUserFlags("jaenster", ""));
+}
+
+test "the channel list leaves out the channel the client draws itself" {
+    var b: [128]u8 = undefined;
+    // before any join: everything
+    try std.testing.expectEqualSlices(u8, "Diablo II\x00Trade\x00Hardcore\x00\x00", channelListBody(&b, ""));
+    // the home channel is the client's to draw, whatever its case
+    try std.testing.expectEqualSlices(u8, "Trade\x00Hardcore\x00\x00", channelListBody(&b, "Diablo II"));
+    try std.testing.expectEqualSlices(u8, "Trade\x00Hardcore\x00\x00", channelListBody(&b, "diablo ii"));
+    // a home that is not a public channel takes nothing out
+    try std.testing.expectEqualSlices(u8, "Diablo II\x00Trade\x00Hardcore\x00\x00", channelListBody(&b, "private"));
+    // each channel once, and the list is terminated
+    var seen: usize = 0;
+    var it = std.mem.splitScalar(u8, channelListBody(&b, "Trade")[0 .. channelListBody(&b, "Trade").len - 1], 0);
+    while (it.next()) |name| {
+        if (name.len > 0) seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "a profile value loses control characters and is cut at its field" {
+    var b: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("Ede, NL", cleanProfileValue(&b, "Ede,\r\n\x1b NL\x00", 64));
+    try std.testing.expectEqualStrings("abcd", cleanProfileValue(&b, "abcdefgh", 4));
+    try std.testing.expectEqualStrings("", cleanProfileValue(&b, "\x01\x02", 4));
+}
+
+test "only the client's four profile fields are keys" {
+    try std.testing.expect(profileKey("profile\\sex") != null);
+    try std.testing.expect(profileKey("Profile\\Description") != null);
+    try std.testing.expect(profileKey("profile\\location") != null);
+    try std.testing.expect(profileKey("profile\\age") != null);
+    try std.testing.expect(profileKey("System\\Account Created") == null);
+    try std.testing.expect(profileKey("") == null);
+    var b: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("jaenster", lowerName(&b, "JaEnsTer"));
 }

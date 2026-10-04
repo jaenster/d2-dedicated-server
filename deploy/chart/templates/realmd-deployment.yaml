@@ -66,8 +66,12 @@ spec:
             - name: REALMD_PG_DSN
               valueFrom:
                 secretKeyRef: { name: {{ $pgSecret | quote }}, key: {{ $pgKey | quote }} }
+            {{- if .Values.requireGS }}
+            # Presence is what enables it (config.zig reads only whether it is set), so it is
+            # omitted entirely rather than set to "0", which would still turn it on.
             - name: REALMD_REQUIRE_GS
-              value: {{ ternary "1" "0" .Values.requireGS | quote }}
+              value: "1"
+            {{- end }}
             - name: REALMD_LOG_JSON
               value: {{ ternary "1" "0" .Values.realmd.logJson | quote }}
             - name: REALMD_SHUTDOWN_GRACE_MS

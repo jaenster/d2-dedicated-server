@@ -41,6 +41,7 @@ const cdkeydump = @import("runtime/cdkeydump.zig");
 const crash = @import("runtime/crash.zig");
 const memstat = @import("runtime/memstat.zig");
 const framepace = @import("runtime/framepace.zig");
+const clock = @import("clock");
 const tickstat = @import("runtime/tickstat.zig");
 
 /// A safety-check failure anywhere in this DLL logs where it happened and kills the
@@ -398,7 +399,10 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // ticks fully. A ~1 Hz safety tick (retail's QSERVER_CooperativeThreadMain sleeps 10ms idle)
     // guards a count that's ever wrong by stepping slowly instead of freezing.
     const IDLE_SLEEP_MS: u32 = 10;
-    const IDLE_TICKS_PER_SAFETY: u64 = 100;
+    // With no game live there is nothing to step: a 50 ms loop still runs a create or join the
+    // queue thread hands over within a frame or two, at a fifth of the wakeups.
+    const NO_GAME_SLEEP_MS: u32 = 50;
+    const IDLE_TICKS_PER_SAFETY: u64 = 1000 / NO_GAME_SLEEP_MS;
     var idle_ticks: u64 = 0;
     while (true) {
         command.pump(); // run queued engine commands (create game, …) on this thread
@@ -422,8 +426,8 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         // With games live, wait for the frame the engine is actually going to run: both
         // TickAllGames and DispatchAndCleanup self-gate on their own 40 ms accumulators, so
         // polling faster only burns wakeups — it cannot make the simulation advance sooner.
-        // Idle, keep retail's 10 ms so a joining client is picked up promptly.
-        if (busy) framepace.sleepToNextFrame(IDLE_SLEEP_MS) else Sleep(IDLE_SLEEP_MS);
+        // Idle, 50 ms: the queue thread blocks in the store and hands a create over as it lands.
+        if (busy) framepace.sleepToNextFrame(IDLE_SLEEP_MS) else Sleep(NO_GAME_SLEEP_MS);
     }
 }
 
@@ -441,6 +445,14 @@ pub export fn DllMain(hModule: HMODULE, reason: DWORD, _: ?*anyopaque) callconv(
         if (hasFlag("d2gs")) {
             log.print("d2gs: DLL_PROCESS_ATTACH (--d2gs)");
             log.hex("d2gs: Game.exe base=0x", @intFromPtr(GetModuleHandleA(null)));
+            // The game's GetTickCount and timeGetTime onto the process's millisecond clock (packages/clock),
+            // before any of its loops run: the server's 25 Hz gate and every tick difference to the millisecond.
+            {
+                const c = clock.install114d();
+                log.print(if (c.get_tick_count and c.time_get_time) "d2gs: clock: GetTickCount and timeGetTime count from the performance counter" else "d2gs: clock: a 1.14d import slot does not hold the system's function, not all redirected");
+                if (!c.get_tick_count) log.print("d2gs: clock: GetTickCount left to the system");
+                if (!c.time_get_time) log.print("d2gs: clock: timeGetTime left to the system");
+            }
             // Are we the dedicated GS process? --realm implies it (realm mode is meaningless
             // without a running server), so callers pass just `--realm` instead of pairing it
             // with --d2gs-boot. This one decision also gates the server_only features below.

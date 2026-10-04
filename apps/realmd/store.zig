@@ -104,24 +104,48 @@ fn caseEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-pub fn listChars(account: []const u8, names: []Name) usize {
-    var n = pg.listChars(account, names);
-    var cached: [max_chars]Name = undefined;
-    const m = redis.listChars(account, &cached);
-    for (cached[0..m]) |c| {
+/// Fold the cache's names into the durable list, which arrives oldest first.
+///
+/// A name only the cache knows is a character whose first save has not flushed yet, so it is the
+/// newest there is and goes last. Among themselves they are put in name order — the cache's set
+/// has no order of its own, and a list that reshuffles between logins is exactly what this exists
+/// to prevent. Names already listed (any case) are skipped; whatever does not fit is dropped.
+fn mergeOldestFirst(names: []Name, durable: usize, cached: []const Name) usize {
+    var n = durable;
+    const first = n;
+    for (cached) |c| {
         if (n >= names.len) break;
         var seen = false;
         for (names[0..n]) |have| {
-            if (caseEql(have.slice(), c.slice())) {
-                seen = true;
-                break;
-            }
+            if (caseEql(have.slice(), c.slice())) seen = true;
         }
-        if (seen) continue;
-        names[n] = c;
-        n += 1;
+        if (!seen) {
+            names[n] = c;
+            n += 1;
+        }
     }
+    std.mem.sort(Name, names[first..n], {}, struct {
+        fn lt(_: void, x: Name, y: Name) bool {
+            return std.ascii.lessThanIgnoreCase(x.slice(), y.slice());
+        }
+    }.lt);
     return n;
+}
+
+/// In the order the characters were made, oldest first. The order is stored, so it holds across
+/// logins and across realm instances, and a request for the first sixteen of more gets the
+/// sixteen that sort first rather than whichever the store returned.
+pub fn listChars(account: []const u8, names: []Name) usize {
+    const n = pg.listChars(account, names);
+    var cached: [max_chars]Name = undefined;
+    const m = redis.listChars(account, &cached);
+    return mergeOldestFirst(names, n, cached[0..m]);
+}
+
+/// Record that the character was made now. Idempotent: a character that already has a row keeps
+/// its original stamp.
+pub fn markCreated(account: []const u8, charname: []const u8) void {
+    _ = pg.markCreated(account, charname);
 }
 
 /// The same list, with the engine each character belongs to.
@@ -425,20 +449,39 @@ pub fn takeLoginTicket(account: []const u8, out: []u8) usize {
     return redis.takeLoginTicket(account, out);
 }
 
+/// The account's outstanding tickets, oldest first. Nothing is consumed.
+pub fn listLoginTickets(account: []const u8, out: [][32]u8, lens: []u8) usize {
+    return redis.listLoginTickets(account, out, lens);
+}
+
+/// Consume `ticket` if it is one of the account's outstanding tickets.
+pub fn redeemLoginTicket(account: []const u8, ticket: []const u8) bool {
+    return redis.redeemLoginTicket(account, ticket);
+}
+
 pub fn expireSession(id: u64) void {
     redis.expireSession(id);
 }
 
 // games (ephemeral)
 
-pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8) bool {
-    return redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, game_ttl_s);
+/// Why the last `registerGame` on this thread failed.
+pub fn registerGameError() []const u8 {
+    return redis.game_register_error;
+}
+
+pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, max_players: u8) bool {
+    return redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, max_players, game_ttl_s);
 }
 
 /// Overwrite a hosted game's player count (UPDATEGAMEINFO from the GS that hosts it).
 /// False if no live game carries that id.
 pub fn setGamePlayers(gameid: u32, players: u16) bool {
     return redis.setGamePlayers(gameid, players);
+}
+
+pub fn dropGamePlayers(gameid: u32, n: u16) bool {
+    return redis.dropGamePlayers(gameid, n);
 }
 
 pub fn findGame(name: []const u8) ?GameRec {
@@ -521,20 +564,24 @@ pub fn takeGsReply(seq: u32, out: []u8) ?usize {
 
 /// Pick the least-loaded game server with room and reserve a slot on it, atomically.
 /// Null when every server is full, which the caller reports differently from an empty fleet.
-pub fn pickAndReserveGs() ?u32 {
-    return redis.pickAndReserveGs();
+pub fn pickAndReserveGs(exclude: []const u32) ?u32 {
+    return redis.pickAndReserveGs(exclude);
 }
 
 /// The same pick, restricted to servers publishing `key=value`. Null when none of the ones that
 /// match has room, which is a different answer from "the fleet is full".
-pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8) ?u32 {
-    return redis.pickAndReserveGsMatching(key, value);
+pub fn pickAndReserveGsMatching(key: []const u8, value: []const u8, exclude: []const u32) ?u32 {
+    return redis.pickAndReserveGsMatching(key, value, exclude);
 }
 
 /// Reserve a slot on one named server, for a caller that chose it rather than asking us to.
 /// False when that server is gone or has no room — the choice still has to survive the race.
 pub fn reserveGs(gsid: u32) bool {
     return redis.reserveGs(gsid);
+}
+
+pub fn dropGsRequest(gsid: u32, packet: []const u8) bool {
+    return redis.dropGsRequest(gsid, packet);
 }
 
 /// Give back a slot whose create did not happen.
@@ -615,8 +662,26 @@ pub fn charInUse(account: []const u8, charname: []const u8) bool {
     return charLockOwner(account, charname, &buf) != null;
 }
 
+/// How long a join's claim holds a character before the game server has confirmed the player is
+/// in. Long enough for a slow load, short enough that a join whose client never arrived does not
+/// keep the character from its next one.
+pub const seat_pending_s: u32 = 60;
+
+/// How long a seat may go unreported by a game server that reports its players before the realm
+/// stops carrying it. Longer than the server holds a leave notice back for the player's last save
+/// (150 s), so a leave that is merely waiting is never overtaken.
+pub const seat_unreported_s: u32 = 240;
+
+/// Take a character for a join. The claim is short until the game server confirms the player is in
+/// (`confirmGameChar`) — see `seat_pending_s`.
 pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8) bool {
-    return redis.lockChar(account, charname, owner, char_lock_ttl_s);
+    return redis.lockChar(account, charname, owner, seat_pending_s);
+}
+
+/// A client asking again for the game it already has an unconfirmed seat in.
+pub fn retakePendingChar(gameid: u32, account: []const u8, charname: []const u8) bool {
+    var ob: [32]u8 = undefined;
+    return redis.retakePendingChar(gameid, account, charname, gameOwnerId(&ob, gameid), seat_pending_s);
 }
 
 pub fn refreshCharLock(account: []const u8, charname: []const u8, owner: []const u8) bool {
@@ -653,15 +718,28 @@ pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {
     return std.fmt.bufPrint(buf, "game:{d}", .{gameid}) catch buf[0..0];
 }
 
-pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8) bool {
-    return redis.addGameChar(gameid, account, charname);
+pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: u32) redis.SeatResult {
+    return redis.addGameChar(gameid, account, charname, max);
 }
 
-/// Renew the leases on every character a live game holds. The realm calls this on a timer for
-/// every game still in the index — see `fleet.renewCharLeases`.
-pub fn renewGameCharLeases(gameid: u32) usize {
+/// One pass over a live game's seats: renew the confirmed ones, drop the ones that never arrived
+/// and, for a server that reports presence, the ones it stopped reporting. The realm calls this on
+/// a timer for every game still in the index — see `fleet.renewCharLeases`.
+pub fn sweepGameSeats(gameid: u32) redis.SeatSweep {
     var ob: [32]u8 = undefined;
-    return redis.renewGameCharLeases(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s);
+    return redis.sweepGameSeats(gameid, gameOwnerId(&ob, gameid), char_lock_ttl_s, seat_pending_s * 1000, seat_unreported_s * 1000);
+}
+
+/// The game server says this player is in the game. `account` is empty when it could not say.
+pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8, present: bool) usize {
+    var ob: [32]u8 = undefined;
+    return redis.confirmGameChar(gameid, account, charname, gameOwnerId(&ob, gameid), char_lock_ttl_s, present);
+}
+
+/// Free the characters held by games the realm no longer lists (a game server that restarted or was
+/// reaped never closes them), leaving every live game's locks alone.
+pub fn releaseOrphanCharLocks() usize {
+    return redis.releaseOrphanCharLocks();
 }
 
 pub fn releaseGameChars(gameid: u32) usize {
@@ -787,4 +865,37 @@ pub fn chatPush(instance: u32, packet: []const u8) bool {
 
 pub fn chatPop(instance: u32, out: []u8) ?usize {
     return redis.chatPop(instance, out);
+}
+
+fn setName(n: *Name, v: []const u8) void {
+    @memcpy(n.buf[0..v.len], v);
+    n.len = @intCast(v.len);
+}
+
+test "mergeOldestFirst puts unflushed characters last, in name order" {
+    var names: [5]Name = [_]Name{.{}} ** 5;
+    setName(&names[0], "Old");
+    setName(&names[1], "Older");
+    var cached: [3]Name = .{ .{}, .{}, .{} };
+    setName(&cached[0], "zed");
+    setName(&cached[1], "OLD");
+    setName(&cached[2], "Amy");
+    const n = mergeOldestFirst(&names, 2, &cached);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("Old", names[0].slice());
+    try std.testing.expectEqualStrings("Older", names[1].slice());
+    try std.testing.expectEqualStrings("Amy", names[2].slice());
+    try std.testing.expectEqualStrings("zed", names[3].slice());
+}
+
+test "mergeOldestFirst drops the newest when the list is full" {
+    var names: [2]Name = [_]Name{.{}} ** 2;
+    setName(&names[0], "A");
+    setName(&names[1], "B");
+    var cached: [1]Name = .{.{}};
+    setName(&cached[0], "New");
+    const n = mergeOldestFirst(&names, 2, &cached);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("A", names[0].slice());
+    try std.testing.expectEqualStrings("B", names[1].slice());
 }

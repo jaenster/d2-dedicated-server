@@ -7,7 +7,7 @@ const std = @import("std");
 const net = @import("realm_infra").net;
 const Lock = @import("realm_infra").lock.Lock;
 
-pub const max_name = 16;
+pub const max_name = 32; // an account and a character with the '*' between: 15 + 1 + 15 and room
 pub const max_channel = 32;
 pub const max_stat = 128; // SID_CHATEVENT statstring (the per-user char info D2 draws)
 pub const max_status = 96; // /away and /dnd message length
@@ -46,8 +46,16 @@ pub const Member = struct {
     ignores: [max_ignores][max_name]u8 = [_][max_name]u8{[_]u8{0} ** max_name} ** max_ignores,
     ignore_lens: [max_ignores]u8 = [_]u8{0} ** max_ignores,
     ignore_count: u8 = 0,
+    /// Who whispered this member last, by account name, so "/r" has someone to answer.
+    last_whisper: [max_name]u8 = [_]u8{0} ** max_name,
+    last_whisper_len: u8 = 0,
     send_lock: Lock = .{},
 
+    pub fn setLastWhisper(m: *Member, from: []const u8) void {
+        const n: u8 = @intCast(@min(from.len, max_name));
+        @memcpy(m.last_whisper[0..n], from[0..n]);
+        m.last_whisper_len = n;
+    }
     pub fn nameSlice(m: *const Member) []const u8 {
         return m.name[0..m.name_len];
     }
@@ -148,6 +156,8 @@ pub fn leave(fd: net.Socket) void {
     var chan_len: usize = 0;
     var name: [max_name]u8 = undefined;
     var name_len: usize = 0;
+    var disp: [max_name]u8 = undefined;
+    var disp_len: usize = 0;
     {
         reg.lock.lock();
         defer reg.lock.unlock();
@@ -157,6 +167,8 @@ pub fn leave(fd: net.Socket) void {
                 @memcpy(chan[0..chan_len], m.channelSlice());
                 name_len = m.name_len;
                 @memcpy(name[0..name_len], m.nameSlice());
+                disp_len = m.displaySlice().len;
+                @memcpy(disp[0..disp_len], m.displaySlice());
                 m.in_use = false;
                 m.fd = -1;
                 m.name_len = 0;
@@ -168,6 +180,8 @@ pub fn leave(fd: net.Socket) void {
     // Outside the lock: a disconnect must not hold up the channel it is leaving. `gone` — the
     // connection is over, so the by-name index goes too and a whisper stops finding them.
     if (name_len > 0) unpublish(chan[0..chan_len], name[0..name_len], true);
+    var kb: [max_name + 2]u8 = undefined;
+    if (aliasKey(&kb, disp[0..disp_len])) |k| store.chatDelMember(chan[0..chan_len], k, true);
 }
 
 /// Write bytes to a member under its send_lock.
@@ -198,17 +212,17 @@ pub fn forEachInChannel(
 
 // social helpers (caller must NOT hold reg.lock)
 
-/// The character part of a `clan*charname` chat identity, or the whole string when there
-/// is no '*'. This is the part the channel list draws, so it is the part a player sees and
-/// therefore the part they type.
+/// The character part of a `charname*account` chat identity, or the whole string when there is no '*'.
+/// The character is what the lobby prints in front of a line of talk, so it is what a player sees
+/// and therefore types.
 fn charPart(display: []const u8) []const u8 {
     const star = std.mem.indexOfScalar(u8, display, '*') orelse return display;
-    return display[star + 1 ..];
+    return display[0..star];
 }
 
-/// Whether `name` refers to this member: matches account (scripts/admin API), full chat
-/// identity, or the character alone (what the channel list shows, so what a player actually
-/// sees to whisper). Matching only the account meant the one visible name didn't work.
+/// Whether `name` refers to this member: the account (scripts, the admin API), `*account` (how the
+/// lobby writes an account), the full chat identity, or the character alone (what a line of talk
+/// shows, so what a player actually whispers).
 ///
 /// Ambiguity resolves to the first match — two accounts with identically-named characters
 /// is possible on a closed realm and there's no better answer than "whoever we find".
@@ -216,6 +230,7 @@ fn matchesName(m: *const Member, name: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(m.nameSlice(), name)) return true;
     const disp = m.displaySlice();
     if (std.ascii.eqlIgnoreCase(disp, name)) return true;
+    if (name.len > 1 and name[0] == '*' and std.ascii.eqlIgnoreCase(m.nameSlice(), name[1..])) return true;
     return std.ascii.eqlIgnoreCase(charPart(disp), name);
 }
 
@@ -364,15 +379,29 @@ pub const WhisperResult = struct {
         return w.away[0..w.away_len];
     }
 };
-pub fn whisperEx(name: []const u8, bytes: []const u8) WhisperResult {
+pub fn whisperEx(name: []const u8, from: []const u8, bytes: []const u8) WhisperResult {
     reg.lock.lock();
     defer reg.lock.unlock();
     const m = findByNameLocked(name) orelse return .{};
     var res = WhisperResult{ .found = true, .dnd_len = m.dnd_len, .away_len = m.away_len };
     @memcpy(res.dnd[0..m.dnd_len], m.dndSlice());
     @memcpy(res.away[0..m.away_len], m.awaySlice());
-    if (m.dnd_len == 0) sendTo(m, bytes); // DND suppresses delivery
+    if (m.dnd_len == 0) { // DND suppresses delivery
+        m.setLastWhisper(from);
+        sendTo(m, bytes);
+    }
     return res;
+}
+
+/// The account that whispered `fd`'s member last, copied into `out`; null when nobody has.
+pub fn lastWhisperOf(fd: net.Socket, out: []u8) ?[]const u8 {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    const m = findByFdLocked(fd) orelse return null;
+    if (m.last_whisper_len == 0) return null;
+    const n = @min(m.last_whisper_len, out.len);
+    @memcpy(out[0..n], m.last_whisper[0..n]);
+    return out[0..n];
 }
 
 /// The fd of an online member by name (for ops /kick), or null. The caller acts on
@@ -429,6 +458,27 @@ pub fn resolveAccount(name: []const u8, out: []u8) ?[]const u8 {
     const n = @min(acct.len, out.len);
     @memcpy(out[0..n], acct[0..n]);
     return out[0..n];
+}
+
+/// How the lobby names whoever answers to `name` (`charname*account`), copied into `out`, on this
+/// instance or any other. Null when nobody does.
+pub fn displayOf(name: []const u8, out: []u8) ?[]const u8 {
+    {
+        reg.lock.lock();
+        defer reg.lock.unlock();
+        if (findByNameLocked(name)) |m| {
+            const d = m.displaySlice();
+            const n = @min(d.len, out.len);
+            @memcpy(out[0..n], d[0..n]);
+            return out[0..n];
+        }
+    }
+    var rec: [512]u8 = undefined;
+    const n = findRemote(name, &rec) orelse return null;
+    const rm = decodeMember(rec[0..n]) orelse return null;
+    const k = @min(rm.display.len, out.len);
+    @memcpy(out[0..k], rm.display[0..k]);
+    return out[0..k];
 }
 
 pub fn fdOf(name: []const u8) ?net.Socket {
@@ -520,6 +570,25 @@ fn decodeMember(rec: []const u8) ?RemoteMember {
     };
 }
 
+/// The by-name index key a whisper to the CHARACTER finds this member under: the index proper is keyed
+/// by account, but a player whispers the name a line of talk shows, which is the character. Lower-cased
+/// because the local lookup is case-blind and this one has to agree with it; the '~' keeps it out of
+/// the account namespace.
+fn aliasKey(buf: []u8, display: []const u8) ?[]const u8 {
+    const ch = charPart(display);
+    if (ch.len == 0 or 1 + ch.len > buf.len) return null;
+    buf[0] = '~';
+    for (ch, 0..) |c, i| buf[1 + i] = std.ascii.toLower(c);
+    return buf[0 .. 1 + ch.len];
+}
+
+fn putAlias(rec: []const u8) void {
+    const rm = decodeMember(rec) orelse return;
+    var kb: [max_name + 2]u8 = undefined;
+    const k = aliasKey(&kb, rm.display) orelse return;
+    _ = store.chatPutIndex(k, rec);
+}
+
 /// Publish (or refresh) one of our members. Called whenever anything another instance can see
 /// changes — the channel, the statstring, /away, /dnd, going off to a game.
 fn publish(m: *const Member) void {
@@ -527,6 +596,7 @@ fn publish(m: *const Member) void {
     var buf: [max_stat + max_status * 2 + max_name + max_channel + 16]u8 = undefined;
     const rec = encodeMember(&buf, m) orelse return;
     _ = store.chatPutMember(m.channelSlice(), m.nameSlice(), rec);
+    putAlias(rec);
 }
 
 /// Re-publish after a change other instances can see. When the member has left the channel (a
@@ -557,6 +627,7 @@ fn republish(fd: net.Socket, left_channel: []const u8) void {
     } else {
         _ = store.chatPutIndex(name[0..name_len], rec);
     }
+    putAlias(rec);
 }
 
 fn publishByFd(fd: net.Socket) void {
@@ -580,6 +651,7 @@ fn publishByFd(fd: net.Socket) void {
     // Deliberately outside the registry lock: this is a store round trip, and holding the lock
     // across it would stall every broadcast on the instance for its duration.
     _ = store.chatPutMember(chan[0..chan_len], name[0..name_len], rec);
+    putAlias(rec);
 }
 
 /// Take one of our members out of the shared room. `gone` distinguishes leaving a channel (still
@@ -653,11 +725,21 @@ pub fn broadcastRemote(channel: []const u8, sender: []const u8, eid: u32, bytes:
     for (inst.ids[0..inst.n]) |id| _ = store.chatPush(id, buf[0..pos]);
 }
 
+/// The shared record of whoever answers to `name` on any instance: by account first, then by the
+/// character a player sees. `*account` is how the lobby writes an account.
+fn findRemote(name: []const u8, out: []u8) ?usize {
+    const bare = if (name.len > 1 and name[0] == '*') name[1..] else name;
+    if (store.chatFindMember(bare, out)) |n| return n;
+    var kb: [max_name + 2]u8 = undefined;
+    const k = aliasKey(&kb, name) orelse return null;
+    return store.chatFindMember(k, out);
+}
+
 /// Try to whisper someone held by another instance. Returns their presence the same way the local
 /// path does, so the caller answers the sender identically wherever the target happens to be.
 pub fn whisperRemote(name: []const u8, sender: []const u8, bytes: []const u8) WhisperResult {
     var recbuf: [512]u8 = undefined;
-    const n = store.chatFindMember(name, &recbuf) orelse return .{};
+    const n = findRemote(name, &recbuf) orelse return .{};
     const rm = decodeMember(recbuf[0..n]) orelse return .{};
     if (rm.instance == instance) return .{}; // ours and not found locally = gone
     var res = WhisperResult{ .found = true };
@@ -685,7 +767,7 @@ pub fn whisperRemote(name: []const u8, sender: []const u8, bytes: []const u8) Wh
 /// Where a user is, when no local member answers to that name.
 pub fn presenceOfRemote(name: []const u8) ?Presence {
     var recbuf: [512]u8 = undefined;
-    const n = store.chatFindMember(name, &recbuf) orelse return null;
+    const n = findRemote(name, &recbuf) orelse return null;
     const rm = decodeMember(recbuf[0..n]) orelse return null;
     if (rm.instance == instance) return null;
     // The record is keyed by the channel the member is in, and `game` beats it for the same
@@ -699,12 +781,15 @@ pub fn presenceOfRemote(name: []const u8) ?Presence {
 
 // the inbox
 
+/// SID_CHATEVENT's EID_TALK: the one event a recipient's /ignore squelches.
+const eid_talk: u32 = 0x05;
+
 const InboxCtx = struct { eid: u32, sender: []const u8, payload: []const u8 };
 
 fn inboxDeliverCb(ctx: *const InboxCtx, m: *Member) void {
     // The recipient's squelch list, applied where it lives. The sending instance could not have
     // done this: an /ignore is a fact about the person receiving.
-    if (ctx.eid == 1 and m.ignoresName(ctx.sender)) return; // EID_TALK
+    if (ctx.eid == eid_talk and m.ignoresName(ctx.sender)) return;
     sendTo(m, ctx.payload);
 }
 
@@ -726,6 +811,7 @@ fn applyInbox(ev: []const u8) void {
             reg.lock.lock();
             defer reg.lock.unlock();
             const m = findByNameLocked(name) orelse return;
+            m.setLastWhisper(sender);
             sendTo(m, payload);
         },
         else => {},

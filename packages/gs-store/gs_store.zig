@@ -7,6 +7,7 @@
 const std = @import("std");
 const resp = @import("resp");
 const savequeue = @import("savequeue.zig");
+pub const presence = @import("presence.zig");
 
 const SOCKET = usize;
 const INVALID_SOCKET: SOCKET = ~@as(usize, 0);
@@ -123,9 +124,13 @@ pub fn enabled() bool {
 }
 
 fn drop() void {
-    if (sock != INVALID_SOCKET) {
-        _ = closesocket(sock);
-        sock = INVALID_SOCKET;
+    dropSock(&sock);
+}
+
+fn dropSock(sp: *SOCKET) void {
+    if (sp.* != INVALID_SOCKET) {
+        _ = closesocket(sp.*);
+        sp.* = INVALID_SOCKET;
     }
 }
 
@@ -143,7 +148,11 @@ fn resolve() ?u32 {
 }
 
 fn ensure() ?SOCKET {
-    if (sock != INVALID_SOCKET) return sock;
+    return ensureSock(&sock, io_timeout_ms);
+}
+
+fn ensureSock(sp: *SOCKET, timeout_ms: u32) ?SOCKET {
+    if (sp.* != INVALID_SOCKET) return sp.*;
     if (!configured) return null;
     const s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) return null;
@@ -152,7 +161,7 @@ fn ensure() ?SOCKET {
         return null;
     };
     // Both directions: a send that blocks forever wedges the tick just as surely as a read.
-    const tv = std.mem.toBytes(io_timeout_ms);
+    const tv = std.mem.toBytes(timeout_ms);
     _ = setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, @sizeOf(u32));
     _ = setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, @sizeOf(u32));
     const sa = sockaddr_in{ .family = AF_INET, .port = htons(port), .addr = ip };
@@ -160,7 +169,7 @@ fn ensure() ?SOCKET {
         _ = closesocket(s);
         return null;
     }
-    sock = s;
+    sp.* = s;
     return s;
 }
 
@@ -229,24 +238,28 @@ pub fn commandBig(head: []const []const u8, tail: []const u8) ?Reply {
 }
 
 fn readReply(s: SOCKET) ?Reply {
+    return readReplyInto(s, &sock, &rx);
+}
+
+fn readReplyInto(s: SOCKET, sp: *SOCKET, buf: []u8) ?Reply {
     var fill: usize = 0;
     while (true) {
-        switch (resp.parse(rx[0..fill])) {
+        switch (resp.parse(buf[0..fill])) {
             .ok => |o| return .{ .value = o.reply, .len = o.consumed },
             .need_more => {
-                if (fill == rx.len) {
-                    drop(); // a reply larger than the buffer; we cannot resynchronise
+                if (fill == buf.len) {
+                    dropSock(sp); // a reply larger than the buffer; we cannot resynchronise
                     return null;
                 }
-                const n = recv(s, rx[fill..].ptr, @intCast(rx.len - fill), 0);
+                const n = recv(s, buf[fill..].ptr, @intCast(buf.len - fill), 0);
                 if (n <= 0) {
-                    drop();
+                    dropSock(sp);
                     return null;
                 }
                 fill += @intCast(n);
             },
             .invalid => {
-                drop();
+                dropSock(sp);
                 return null;
             },
         }
@@ -506,19 +519,109 @@ pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32,
 
 /// Take the next request queued for this server, or 0 if there is none.
 ///
-/// Polled from the server tick rather than blocked on: a blocking pop would hold the connection
-/// this server also uses to fetch characters and publish itself, and the tick is frequent enough
-/// that a poll costs a client nothing it can perceive.
+/// Polled on the shared connection; `waitRequest` is the blocking form for a thread of its own.
 pub fn popRequest(gsid: u32, out: []u8) usize {
     var kb: [64]u8 = undefined;
     const key = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
     const rep = command(&.{ "LPOP", key }) orelse return 0;
-    return switch (rep.value) {
+    return copyBulk(rep.value, out);
+}
+
+/// The queue's own connection: a blocking pop holds it for up to `wait_s`, so it cannot be the
+/// connection the tick fetches characters and publishes on. Only the queue thread touches it.
+var qsock: SOCKET = INVALID_SOCKET;
+var qrx: [2048]u8 = undefined;
+
+/// Wait up to `wait_s` seconds for the next request queued for this server (BLPOP on a connection
+/// of its own), or 0 if none came. One round trip per request or per `wait_s`, where polling costs
+/// one per poll: under wine every socket call is several wineserver requests, so an idle server's
+/// CPU is mostly its polling.
+pub fn waitRequest(gsid: u32, out: []u8, wait_s: u32) usize {
+    var kb: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
+    var wb: [16]u8 = undefined;
+    const ws = std.fmt.bufPrint(&wb, "{d}", .{wait_s}) catch return 0;
+    const s = ensureSock(&qsock, wait_s * 1000 + io_timeout_ms) orelse {
+        Sleep(1000); // no store: do not spin on reconnects
+        return 0;
+    };
+    var tx: [256]u8 = undefined;
+    const wire = resp.encode(&tx, &.{ "BLPOP", key, ws }) orelse return 0;
+    if (!sendAll(s, wire)) {
+        dropSock(&qsock);
+        return 0;
+    }
+    return readPopped(s, out);
+}
+
+/// BLPOP's answer: `*2` then the key and the value, or a null array when it timed out. The whole
+/// answer is read before anything is taken from it, so the connection never desyncs.
+fn readPopped(s: SOCKET, out: []u8) usize {
+    var fill: usize = 0;
+    while (true) {
+        switch (parsePopped(qrx[0..fill])) {
+            .done => |v| return copyBulk(.{ .bulk = v }, out),
+            .timed_out => return 0,
+            .need_more => {
+                if (fill == qrx.len) {
+                    dropSock(&qsock);
+                    return 0;
+                }
+                const n = recv(s, qrx[fill..].ptr, @intCast(qrx.len - fill), 0);
+                if (n <= 0) {
+                    dropSock(&qsock);
+                    return 0;
+                }
+                fill += @intCast(n);
+            },
+            .invalid => {
+                dropSock(&qsock);
+                return 0;
+            },
+        }
+    }
+}
+
+const Popped = union(enum) { done: ?[]const u8, timed_out, need_more, invalid };
+
+fn parsePopped(in: []const u8) Popped {
+    const head = switch (resp.parse(in)) {
+        .ok => |o| o,
+        .need_more => return .need_more,
+        .invalid => return .invalid,
+    };
+    const n = switch (head.reply) {
+        .array_len => |n| n,
+        .bulk => |b| if (b == null) return .timed_out else return .invalid,
+        else => return .invalid,
+    };
+    if (n < 0) return .timed_out;
+    if (n != 2) return .invalid;
+    var at = head.consumed;
+    var value: ?[]const u8 = null;
+    for (0..2) |i| {
+        const e = switch (resp.parse(in[at..])) {
+            .ok => |o| o,
+            .need_more => return .need_more,
+            .invalid => return .invalid,
+        };
+        const b = switch (e.reply) {
+            .bulk => |b| b,
+            else => return .invalid,
+        };
+        if (i == 1) value = b;
+        at += e.consumed;
+    }
+    return .{ .done = value };
+}
+
+fn copyBulk(v: resp.Reply, out: []u8) usize {
+    return switch (v) {
         .bulk => |b| blk: {
-            const v = b orelse break :blk 0;
-            if (v.len > out.len) break :blk 0;
-            @memcpy(out[0..v.len], v);
-            break :blk v.len;
+            const bytes = b orelse break :blk 0;
+            if (bytes.len > out.len) break :blk 0;
+            @memcpy(out[0..bytes.len], bytes);
+            break :blk bytes.len;
         },
         else => 0,
     };
@@ -576,4 +679,14 @@ test "the DLL's redis client encodes commands the shared codec can read back" {
     var buf: [128]u8 = undefined;
     const wire = resp.encode(&buf, &.{ "GET", "realmd:char:acct:Hero" }).?;
     try std.testing.expectEqualStrings("*2\r\n$3\r\nGET\r\n$21\r\nrealmd:char:acct:Hero\r\n", wire);
+}
+
+test "a blocking pop's answer: the value, a timeout, or wait for more" {
+    const got = parsePopped("*2\r\n$9\r\nrealmd:gs\r\n$3\r\nabc\r\n");
+    try std.testing.expectEqualStrings("abc", got.done.?);
+    try std.testing.expect(parsePopped("*-1\r\n") == .timed_out);
+    try std.testing.expect(parsePopped("$-1\r\n") == .timed_out);
+    try std.testing.expect(parsePopped("*2\r\n$9\r\nrealmd:gs\r\n$3\r\nab") == .need_more);
+    try std.testing.expect(parsePopped("*2\r\n") == .need_more);
+    try std.testing.expect(parsePopped("*3\r\n") == .invalid);
 }
