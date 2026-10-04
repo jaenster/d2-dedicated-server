@@ -187,6 +187,36 @@ pub fn remove(owner: []const u8, friend: []const u8) bool {
     return false;
 }
 
+pub const MoveResult = enum { moved, not_found, at_edge };
+
+/// Move `friend` one place up (`up`) or down the owner's list. The list reads in table order, so the
+/// move swaps the two entries' slots. Returns whether it moved, was already at that end, or is not
+/// on the list.
+pub fn move(owner: []const u8, friend: []const u8, up: bool) MoveResult {
+    lock.lock();
+    defer lock.unlock();
+    ensureLoadedLocked(owner);
+    var idx: [max_friends]usize = undefined;
+    var n: usize = 0;
+    var at: ?usize = null;
+    for (&pairs, 0..) |*p, i| {
+        if (!p.in_use or !eqi(p.ownerSlice(), owner)) continue;
+        if (n >= idx.len) break;
+        if (eqi(p.friendSlice(), friend)) at = n;
+        idx[n] = i;
+        n += 1;
+    }
+    const pos = at orelse return .not_found;
+    if (up and pos == 0) return .at_edge;
+    if (!up and pos + 1 == n) return .at_edge;
+    const other = if (up) pos - 1 else pos + 1;
+    const tmp = pairs[idx[pos]];
+    pairs[idx[pos]] = pairs[idx[other]];
+    pairs[idx[other]] = tmp;
+    persistLocked(owner);
+    return .moved;
+}
+
 pub const FriendInfo = struct {
     name: [max_name]u8 = [_]u8{0} ** max_name,
     name_len: u8 = 0,
@@ -247,3 +277,25 @@ pub fn list(owner: []const u8, out: []FriendInfo) usize {
 // lives in the account's profile, which is Postgres, and the only honest test of "it survives a
 // restart" is one that restarts against a real Postgres — the e2e suite's `friends_persist`
 // scenario, which does exactly that. A stand-in store here would have tested the stand-in.
+
+test "promote and demote swap neighbours and stop at the ends" {
+    const t = std.testing;
+    const me = "MoveOwner";
+    _ = add(me, "First");
+    _ = add(me, "Second");
+    _ = add(me, "Third");
+    try t.expectEqual(MoveResult.at_edge, move(me, "First", true));
+    try t.expectEqual(MoveResult.moved, move(me, "Third", true));
+    var infos: [max_friends]FriendInfo = undefined;
+    var n = list(me, &infos);
+    try t.expectEqual(@as(usize, 3), n);
+    try t.expectEqualStrings("Third", infos[1].nameSlice());
+    try t.expectEqual(MoveResult.moved, move(me, "First", false));
+    n = list(me, &infos);
+    try t.expectEqualStrings("First", infos[1].nameSlice());
+    try t.expectEqual(MoveResult.at_edge, move(me, "Second", false));
+    try t.expectEqual(MoveResult.not_found, move(me, "Nobody", true));
+    _ = remove(me, "First");
+    _ = remove(me, "Second");
+    _ = remove(me, "Third");
+}

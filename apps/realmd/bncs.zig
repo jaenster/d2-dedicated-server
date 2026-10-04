@@ -23,6 +23,7 @@ const bnftp = @import("bnftp.zig");
 const d2cs = @import("d2cs.zig");
 const chat = @import("chat.zig");
 const friends = @import("friends.zig");
+const friendcmd = @import("friendcmd.zig");
 const store = @import("store.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
@@ -1008,10 +1009,13 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
 }
 
 fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
-    if (!c.in_channel) return; // talking before joining a channel: ignore
     var r = proto.Reader.init(body);
     const text = r.getStr();
     const acct = c.accountName();
+    // Commands work wherever the player is: in a game the client sends them over this same
+    // connection while it is in no channel. Only plain talk and /me need a channel to speak into.
+    const is_command = text.len > 0 and text[0] == '/';
+    if (!c.in_channel and !is_command) return;
 
     if (parseWhisper(text)) |w| {
         // A recipient who squelched the sender never gets the whisper, but Battle.net
@@ -1051,14 +1055,14 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
     }
     if (handleSocialCmd(c, tag, text)) return;
     if (handleGuildCmd(c, tag, text)) return;
-    if (parseFriendCmd(text)) |fc| {
+    if (friendcmd.parse(text)) |fc| {
         handleFriendCmd(c, tag, fc);
         return;
     }
     if (handleHelpCmd(c, text)) return;
     if (hook.chatCommand(c, tag, text)) return;
     if (afterVerb(text, "/me") orelse afterVerb(text, "/emote")) |what| {
-        emote(c, tag, what);
+        if (c.in_channel) emote(c, tag, what);
         return;
     }
     if (text.len > 0 and text[0] == '/') {
@@ -1228,7 +1232,7 @@ fn handleHelpCmd(c: *Conn, text: []const u8) bool {
     const lines = [_][]const u8{
         "Commands:",
         "  /w /whisper /m /msg <name> <text>  send a private message",
-        "  /f add|remove|list <name>          manage your friends list",
+        "  /f l|a|r|m|p|d                     friends: list, add, remove, message all, promote, demote",
         "  /away [message]                    set or clear an away reply",
         "  /dnd [message]                     block incoming whispers",
         "  /ignore /unignore <name>           squelch or unsquelch someone",
@@ -1240,64 +1244,78 @@ fn handleHelpCmd(c: *Conn, text: []const u8) bool {
     return true;
 }
 
-const FriendCmd = struct { action: enum { add, remove, list }, name: []const u8 };
-
-// "/f ...", "/friend ...", "/friends ..." — manage the friends list from chat.
-fn parseFriendCmd(text: []const u8) ?FriendCmd {
-    var rest: []const u8 = undefined;
-    if (std.mem.startsWith(u8, text, "/friends")) {
-        rest = std.mem.trim(u8, text[8..], " ");
-    } else if (std.mem.startsWith(u8, text, "/friend")) {
-        rest = std.mem.trim(u8, text[7..], " ");
-    } else if (std.mem.eql(u8, text, "/f") or std.mem.startsWith(u8, text, "/f ")) {
-        rest = std.mem.trim(u8, text[2..], " ");
-    } else return null;
-
-    const sp = std.mem.indexOfScalar(u8, rest, ' ');
-    const verb = if (sp) |s| rest[0..s] else rest;
-    const arg = if (sp) |s| std.mem.trim(u8, rest[s + 1 ..], " ") else "";
-    if (verb.len == 0 or std.mem.startsWith(u8, "list", verb)) return .{ .action = .list, .name = "" };
-    if (std.mem.eql(u8, verb, "add") or std.mem.eql(u8, verb, "a")) return .{ .action = .add, .name = arg };
-    if (std.mem.eql(u8, verb, "remove") or std.mem.eql(u8, verb, "r") or std.mem.eql(u8, verb, "del")) return .{ .action = .remove, .name = arg };
-    return .{ .action = .list, .name = "" };
+/// The name a friend is stored under: the account behind whichever name was typed when that person
+/// is online (the lobby shows characters, the list keeps accounts), else the text as typed.
+fn friendAccount(name: []const u8, out: []u8) []const u8 {
+    return chat.resolveAccount(name, out) orelse name;
 }
 
-fn handleFriendCmd(c: *Conn, tag: []const u8, fc: FriendCmd) void {
+fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
     const acct = c.accountName();
+    var rb: [160]u8 = undefined;
+    var nb: [chat.max_name]u8 = undefined;
     switch (fc.action) {
+        .usage => for (friendcmd.usage_lines) |l| sendEvent(c, EID_INFO, 0, "", l),
         .add => {
-            if (fc.name.len == 0) return sendEvent(c, EID_INFO, 0, "", "Usage: /f add <account>");
-            const ok = friends.add(acct, fc.name);
-            log.line(tag, "{s} friend-add {s} -> {}", .{ acct, fc.name, ok });
-            sendEvent(c, EID_INFO, 0, "", if (ok) "Added to your friends list." else "Already on your list (or it is full).");
+            if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f a <account>");
+            const target = friendAccount(fc.arg, &nb);
+            if (target.len > friends.max_name) return sendEvent(c, EID_ERROR, 0, "", "That is not a valid account name.");
+            if (std.ascii.eqlIgnoreCase(target, acct)) return sendEvent(c, EID_ERROR, 0, "", "You can't add yourself to your friends list.");
+            const ok = friends.add(acct, target);
+            log.line(tag, "{s} friend-add {s} -> {}", .{ acct, target, ok });
+            if (ok) {
+                sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was added to your friends list.", .{target}) catch "Added to your friends list.");
+            } else sendEvent(c, EID_ERROR, 0, "", "That user is already on your friends list, or your list is full.");
         },
         .remove => {
-            const ok = friends.remove(acct, fc.name);
-            log.line(tag, "{s} friend-remove {s} -> {}", .{ acct, fc.name, ok });
-            sendEvent(c, EID_INFO, 0, "", if (ok) "Removed from your friends list." else "That player is not on your list.");
+            if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f r <account>");
+            const target = friendAccount(fc.arg, &nb);
+            const ok = friends.remove(acct, target);
+            log.line(tag, "{s} friend-remove {s} -> {}", .{ acct, target, ok });
+            if (ok) {
+                sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was removed from your friends list.", .{target}) catch "Removed from your friends list.");
+            } else sendEvent(c, EID_ERROR, 0, "", "That user is not on your friends list.");
+        },
+        .promote, .demote => {
+            if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f p|d <account>");
+            const target = friendAccount(fc.arg, &nb);
+            switch (friends.move(acct, target, fc.action == .promote)) {
+                .moved => sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was moved {s} your friends list.", .{ target, if (fc.action == .promote) "up" else "down" }) catch "Moved."),
+                .at_edge => sendEvent(c, EID_ERROR, 0, "", "That friend is already at that end of your list."),
+                .not_found => sendEvent(c, EID_ERROR, 0, "", "That user is not on your friends list."),
+            }
+        },
+        .msg => {
+            if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f m <message>");
+            var infos: [friends.max_friends]friends.FriendInfo = undefined;
+            const n = friends.list(acct, &infos);
+            var sent: usize = 0;
+            var wbuf: [512]u8 = undefined;
+            const bytes = buildChatEvent(&wbuf, EID_WHISPER, c.user_flags, c.chatName(), fc.arg);
+            for (infos[0..n]) |f| {
+                if (!f.online) continue;
+                if (chat.fdOf(f.nameSlice())) |tfd| {
+                    if (chat.recipientIgnores(tfd, acct)) continue;
+                }
+                var res = chat.whisperEx(f.nameSlice(), bytes);
+                if (!res.found) res = chat.whisperRemote(f.nameSlice(), acct, bytes);
+                if (res.found) sent += 1;
+            }
+            log.line(tag, "{s} friend-message to {d} friend(s)", .{ acct, sent });
+            if (sent == 0) {
+                sendEvent(c, EID_INFO, 0, "", "None of your friends are online.");
+            } else sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "Message sent to {d} friend{s}.", .{ sent, if (sent == 1) "" else "s" }) catch "Message sent.");
         },
         .list => {
             var infos: [friends.max_friends]friends.FriendInfo = undefined;
             const n = friends.list(acct, &infos);
-            if (n == 0) sendEvent(c, EID_INFO, 0, "", "Your friends list is empty.");
-            // Chat text is the ONLY way a 1.14d client can be shown this — see the note on
-            // onFriendsList. So say where each friend actually is, not just whether they
-            // are on: "online in Diablo II", "away", and so on.
-            for (infos[0..n]) |f| {
-                var rb: [96]u8 = undefined;
-                const where: []const u8 = if (!f.online)
-                    "offline"
-                else if (f.dnd)
-                    "online (do not disturb)"
-                else if (f.away)
-                    "online (away)"
-                else if (f.location_len > 0 and f.in_game)
-                    std.fmt.bufPrint(&rb, "in the game {s}", .{f.locationSlice()}) catch "online"
-                else if (f.location_len > 0)
-                    std.fmt.bufPrint(&rb, "online in {s}", .{f.locationSlice()}) catch "online"
-                else
-                    "online";
-                sendEvent(c, EID_INFO, 0, f.nameSlice(), where);
+            if (n == 0) return sendEvent(c, EID_INFO, 0, "", "Your friends list is empty.");
+            sendEvent(c, EID_INFO, 0, "", "Your friends are:");
+            // Chat text is the only way a 1.14d client can be shown this — see the note on
+            // onFriendsList.
+            for (infos[0..n], 1..) |f, i| {
+                const line = friendcmd.listLine(&rb, i, f.nameSlice(), f.online, f.dnd, f.away, f.in_game, f.locationSlice());
+                sendEvent(c, EID_INFO, 0, "", line);
             }
         },
     }

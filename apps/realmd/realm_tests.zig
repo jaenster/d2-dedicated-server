@@ -7,6 +7,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("guilds.zig");
     _ = @import("friends.zig");
+    _ = @import("friendcmd.zig");
     _ = @import("d2s.zig");
     _ = @import("proto.zig");
     _ = @import("fleet.zig");
