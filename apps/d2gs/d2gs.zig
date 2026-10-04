@@ -398,7 +398,10 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // ticks fully. A ~1 Hz safety tick (retail's QSERVER_CooperativeThreadMain sleeps 10ms idle)
     // guards a count that's ever wrong by stepping slowly instead of freezing.
     const IDLE_SLEEP_MS: u32 = 10;
-    const IDLE_TICKS_PER_SAFETY: u64 = 100;
+    // With no game live there is nothing to step: a 50 ms loop still runs a create or join the
+    // queue thread hands over within a frame or two, at a fifth of the wakeups.
+    const NO_GAME_SLEEP_MS: u32 = 50;
+    const IDLE_TICKS_PER_SAFETY: u64 = 1000 / NO_GAME_SLEEP_MS;
     var idle_ticks: u64 = 0;
     while (true) {
         command.pump(); // run queued engine commands (create game, …) on this thread
@@ -422,8 +425,8 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
         // With games live, wait for the frame the engine is actually going to run: both
         // TickAllGames and DispatchAndCleanup self-gate on their own 40 ms accumulators, so
         // polling faster only burns wakeups — it cannot make the simulation advance sooner.
-        // Idle, keep retail's 10 ms so a joining client is picked up promptly.
-        if (busy) framepace.sleepToNextFrame(IDLE_SLEEP_MS) else Sleep(IDLE_SLEEP_MS);
+        // Idle, 50 ms: the queue thread blocks in the store and hands a create over as it lands.
+        if (busy) framepace.sleepToNextFrame(IDLE_SLEEP_MS) else Sleep(NO_GAME_SLEEP_MS);
     }
 }
 
