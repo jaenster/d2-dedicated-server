@@ -760,7 +760,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // the orphaned empty game on its own idle timer.
     if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc)) {
         store.releaseGameName(name);
-        log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it", .{ name, rr.gameid });
+        log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it: {s}", .{ name, rr.gameid, store.registerGameError() });
         return fail(c, &w, CREATE_ERROR_GENERIC);
     }
     // The game record now owns the name and is what a duplicate create is refused against, so the

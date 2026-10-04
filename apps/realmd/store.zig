@@ -441,6 +441,11 @@ pub fn expireSession(id: u64) void {
 
 // games (ephemeral)
 
+/// Why the last `registerGame` on this thread failed.
+pub fn registerGameError() []const u8 {
+    return redis.game_register_error;
+}
+
 pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8) bool {
     return redis.registerGame(name, gameid, gs_ip, gs_port, gsid, players, status, difficulty, password, description, game_ttl_s);
 }

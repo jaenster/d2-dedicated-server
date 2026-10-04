@@ -624,11 +624,21 @@ fn sanitize(name: []const u8, out: []u8) ?[]const u8 {
 /// A game name reduced to the key it is stored under. LOWERCASED: Battle.net treats game names
 /// case-insensitively ("Jan" == "jan"), so a case-preserving key would split CREATEGAME and
 /// JOINGAME onto two different records for what the player sees as one game.
+///
+/// Spaces and punctuation are kept: Battle.net game names have them ("D09 Over Up"), and a redis
+/// key is binary safe. Only what cannot be typed is refused: control bytes and anything outside
+/// printable ASCII.
 fn gameKey(name: []const u8, out: []u8) ?[]const u8 {
-    const safe = sanitize(name, out) orelse return null;
-    for (out[0..safe.len]) |*c| c.* = std.ascii.toLower(c.*);
-    return out[0..safe.len];
+    if (name.len == 0 or name.len >= out.len) return null;
+    for (name, 0..) |c, i| {
+        if (c < 0x20 or c > 0x7e) return null;
+        out[i] = std.ascii.toLower(c);
+    }
+    return out[0..name.len];
 }
+
+/// Why the last `registerGame` on this thread returned false, for the caller's log line.
+pub threadlocal var game_register_error: []const u8 = "";
 
 // characters (durable)
 
@@ -1002,7 +1012,8 @@ pub fn expireSession(id: u64) void {
 
 pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, gsid: u32, players: u16, status: u8, difficulty: u8, password: []const u8, description: []const u8, ttl_s: u32) bool {
     var nb: [64]u8 = undefined;
-    const safe = gameKey(name, &nb) orelse return false;
+    game_register_error = "";
+    const safe = gameKey(name, &nb) orelse return regFail("name is empty, too long, or has characters outside printable ASCII");
 
     var gk: [128]u8 = undefined;
     const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
@@ -1028,7 +1039,7 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
     var r: Reader = undefined;
     // The record, both reverse indexes (by id, by gs) and the global name set snapshotGames
     // enumerates — four writes that all have to land for a game to be findable, in one trip.
-    return if (has_ttl) pipeline(s, &r, &.{
+    const ok = if (has_ttl) pipeline(s, &r, &.{
         &.{ "SET", gamekey, body, "PX", px },
         &.{ "SET", idkey, safe, "PX", px },
         &.{ "SADD", gskey, safe },
@@ -1039,6 +1050,13 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
         &.{ "SADD", gskey, safe },
         &.{ "SADD", prefix ++ "games", safe },
     });
+    if (!ok) game_register_error = "redis connection failed or a write was answered with an error";
+    return ok;
+}
+
+fn regFail(why: []const u8) bool {
+    game_register_error = why;
+    return false;
 }
 
 /// Enumerate active games for /admin/games: read the global name set, fetch each record.
@@ -2961,4 +2979,12 @@ test "READONLY and MASTERDOWN mark the connection, other errors do not" {
     slot.lock.lock();
     release(&slot);
     try std.testing.expect(!wrong_node);
+}
+
+test "a game name with spaces and capitals keys to a folded, storable key" {
+    var nb: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("d09 over up", gameKey("D09 Over Up", &nb).?);
+    try std.testing.expectEqualStrings("jan3", gameKey("Jan3", &nb).?);
+    try std.testing.expect(gameKey("", &nb) == null);
+    try std.testing.expect(gameKey("a\nb", &nb) == null);
 }
