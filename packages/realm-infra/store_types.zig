@@ -211,6 +211,8 @@ pub const NamedGame = struct {
     /// carries it: a listed game a character cannot legally enter should say so on the list
     /// rather than at the disconnect.
     status: u8 = 0,
+    /// 0 Normal, 1 Nightmare, 2 Hell: the list leaves out what the viewer has not unlocked.
+    difficulty: u8 = 0,
     description: [32]u8 = [_]u8{0} ** 32,
     desc_len: u8 = 0,
 
@@ -223,7 +225,6 @@ pub const NamedGame = struct {
         g.desc_len = n;
     }
 };
-
 
 test "a server matches a label it published, and never one it did not" {
     var rec = GsRec{ .gsid = 1, .gs_ip = .{ 127, 0, 0, 1 } };

@@ -1511,6 +1511,124 @@ fn scNonLadderGameFlags() Result {
     return .{ .name = name, .status = .pass, .msg = msg("non-ladder creator -> ladder=0 hardcore=0 (expansion={d})", .{f.expansion}) };
 }
 
+/// A logged-on realm client whose character carries `status` (.d2s byte 0x24).
+fn clientWithChar(acct: []const u8, char: []const u8, status: u8) !rc.RealmClient {
+    var c = rc.RealmClient{};
+    errdefer c.close();
+    try c.connectBnet();
+    try c.auth();
+    try c.login(acct);
+    try c.enterRealm();
+    try c.connectD2cs();
+    if ((try c.startup()) != 0) return error.StartupFailed;
+    if ((try c.charCreateFresh(1, status, char)) != 0) return error.CharCreateFailed;
+    if ((try c.charLogon(char)) != 0) return error.CharLogonFailed;
+    return c;
+}
+
+const list_kinds = [_]struct { char: []const u8, game: []const u8, status: u8 }{
+    .{ .char = "ListClassic", .game = "g-classic", .status = 0x00 },
+    .{ .char = "ListClassicLad", .game = "g-classic-lad", .status = 0x40 },
+    .{ .char = "ListClassicHc", .game = "g-classic-hc", .status = 0x04 },
+    .{ .char = "ListExp", .game = "g-exp", .status = 0x20 },
+    .{ .char = "ListExpLad", .game = "g-exp-lad", .status = 0x60 },
+    .{ .char = "ListExpHc", .game = "g-exp-hc", .status = 0x24 },
+};
+
+/// The game list shows a character only the games it could join: classic or expansion, ladder or
+/// not, hardcore or not. Each of six kinds makes one game and must then see exactly its own.
+fn scGameListFiltered() Result {
+    const name = "game_list_filtered";
+    var gs = FakeGS{ .gsid = 0x1157, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 8100 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    // The list is capped, and the games earlier scenarios left behind would crowd this one's out of
+    // it: forget them (the index only; their records lapse on their own).
+    {
+        var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+        defer rcl.close();
+        _ = rcl.cmd(&.{ "DEL", "realmd:games" }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
+    }
+
+    var clients: [list_kinds.len]rc.RealmClient = undefined;
+    var opened: usize = 0;
+    defer for (clients[0..opened]) |*c| c.close();
+    for (list_kinds, 0..) |k, i| {
+        var acct: [24]u8 = undefined;
+        const an = std.fmt.bufPrint(&acct, "ListAcct{d}", .{i}) catch unreachable;
+        clients[i] = clientWithChar(an, k.char, k.status) catch |e| return fail(name, "{s} {s}", .{ k.char, @errorName(e) });
+        opened += 1;
+        const cg = clients[i].createGame(k.game, "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (cg.result != 0) return fail(name, "{s} create result={d}", .{ k.char, cg.result });
+    }
+    for (list_kinds, 0..) |k, i| {
+        var rows: [16]rc.GameEntry = undefined;
+        var dst: [1024]u8 = undefined;
+        const n = clients[i].gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        // Other scenarios leave games behind; only this one's ("g-...") are judged.
+        var mine: usize = 0;
+        var own = false;
+        for (rows[0..n]) |g| {
+            if (!std.mem.startsWith(u8, g.name, "g-")) continue;
+            mine += 1;
+            if (std.mem.eql(u8, g.name, k.game)) own = true;
+        }
+        if (mine != 1 or !own) {
+            return fail(name, "{s} (0x{x:0>2}) lists {d} of this scenario's games (own listed: {}); want only '{s}'", .{ k.char, k.status, mine, own, k.game });
+        }
+        // The detail panel of a game the list would not show says nothing, as for a missing one.
+        const other = list_kinds[(i + 1) % list_kinds.len].game;
+        var d: [512]u8 = undefined;
+        const info = clients[i].gameInfo(other, &d) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (info.token != 0xFFFF_FFFF) return fail(name, "{s}: game info of '{s}' answered (token 0x{x})", .{ k.char, other, info.token });
+    }
+    return .{ .name = name, .status = .pass, .msg = msg("classic/expansion x ladder x hardcore: each of 6 kinds lists only its own game, and no detail for the others", .{}) };
+}
+
+/// An expansion character that asks to join a classic game by name is told so with the code the
+/// client words as "an Expansion character cannot join a game created by a Diablo II character",
+/// carrying a zero address (which is what makes the client read the result), and nothing reaches
+/// the game server.
+fn scJoinWrongKind() Result {
+    const name = "join_wrong_kind";
+    var gs = FakeGS{ .gsid = 0x1158, .ip = .{ 127, 0, 0, 1 }, .maxgame = 100, .next_gameid = 8200 };
+    gs.start(2000) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    defer gs.stop();
+    if (!gs.isRegistered()) return fail(name, "FakeGS did not register", .{});
+
+    var classic = clientWithChar("WrongAcctC", "WrongClassic", 0x00) catch |e| return fail(name, "classic {s}", .{@errorName(e)});
+    defer classic.close();
+    var exp = clientWithChar("WrongAcctE", "WrongExp", 0x20) catch |e| return fail(name, "expansion {s}", .{@errorName(e)});
+    defer exp.close();
+    const cg = classic.createGame("wrongkind", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg.result != 0) return fail(name, "create result={d}", .{cg.result});
+
+    const jr = exp.joinGame("wrongkind") catch |e| return fail(name, "join: {s}", .{@errorName(e)});
+    if (jr.result != 0x79) return fail(name, "expansion into classic -> 0x{x}, want 0x79", .{jr.result});
+    if (jr.ip[0] != 0 or jr.ip[1] != 0 or jr.ip[2] != 0 or jr.ip[3] != 0) return fail(name, "a refusal carried an address", .{});
+
+    // The other direction, and the ladder and hardcore mixes, each with its own code.
+    const cg2 = exp.createGame("wrongexp", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (cg2.result != 0) return fail(name, "create wrongexp result={d}", .{cg2.result});
+    const joins_before = gs.joins;
+    const cases = [_]struct { joiner: []const u8, acct: []const u8, status: u8, want: u32 }{
+        .{ .joiner = "WrongClassic2", .acct = "WrongAcctC2", .status = 0x00, .want = 0x78 },
+        .{ .joiner = "WrongLadder", .acct = "WrongAcctL", .status = 0x60, .want = 0x7d },
+        .{ .joiner = "WrongHardcore", .acct = "WrongAcctH", .status = 0x24, .want = 0x71 },
+    };
+    for (cases) |cs| {
+        var j = clientWithChar(cs.acct, cs.joiner, cs.status) catch |e| return fail(name, "{s} {s}", .{ cs.joiner, @errorName(e) });
+        defer j.close();
+        const r = j.joinGame("wrongexp") catch |e| return fail(name, "{s}: {s}", .{ cs.joiner, @errorName(e) });
+        if (r.result != cs.want) return fail(name, "{s} -> 0x{x}, want 0x{x}", .{ cs.joiner, r.result, cs.want });
+        if (r.ip[0] != 0 or r.ip[1] != 0 or r.ip[2] != 0 or r.ip[3] != 0) return fail(name, "{s}: a refusal carried an address", .{cs.joiner});
+    }
+    if (gs.joins != joins_before) return fail(name, "the game server saw {d} join(s) for refused clients", .{gs.joins - joins_before});
+    return .{ .name = name, .status = .pass, .msg = msg("exp->classic 0x79, classic->exp 0x78, ladder 0x7d, hardcore 0x71, each with a zero address; no join reached the GS", .{}) };
+}
+
 fn scGetFileTime() Result {
     const name = "get_file_time";
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
@@ -3354,6 +3472,8 @@ pub fn main() !void {
         only("scHardcoreGameFlags", scHardcoreGameFlags),
         only("scLadderGameFlags", scLadderGameFlags),
         only("scNonLadderGameFlags", scNonLadderGameFlags),
+        only("scGameListFiltered", scGameListFiltered),
+        only("scJoinWrongKind", scJoinWrongKind),
         only("scGetFileTime", scGetFileTime),
         only("scBannerAd", scBannerAd),
         only("scSaveDurability", scSaveDurability),

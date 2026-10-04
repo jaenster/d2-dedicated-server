@@ -696,6 +696,14 @@ fn joinStatusError(game: u8, joiner: u8) ?u32 {
     return null;
 }
 
+/// Whether the logged-on character could join `g` — the join's own status and difficulty checks, so
+/// the list shows exactly the games a join would not turn away for being the wrong kind. Battle.net
+/// listed only those: a classic character never saw expansion games, nor a softcore one hardcore.
+fn gameOpenTo(status: u8, difficulty: u8, joiner: u8, progression: u8) bool {
+    if (joinStatusError(status, joiner) != null) return false;
+    return difficultyError(difficulty, progression, (joiner & STATUS_EXPANSION) != 0) == null;
+}
+
 /// A game name the realm will accept. The client offers "Invalid Game Name" as a distinct
 /// error, so an empty or oversized name should get it rather than being pushed to a GS
 /// that will refuse it for reasons we'd then have to describe as "Server Down".
@@ -1033,10 +1041,15 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     const reqid = r.getU16();
     var games: [64]state.GameInfo = undefined;
     const n = state.snapshotGames(&games);
-    log.line(tag, "game list (reqid={d}) -> {d} game(s)", .{ reqid, n });
 
     const acct = c.accountName();
+    // Nothing to compare against until a character is on: the list is then unfiltered.
+    const have_char = c.charName().len > 0;
+    const joiner: u8 = if (have_char) charStatus(c) else 0;
+    const progression: u8 = if (have_char) charProgression(c) else 0;
+    var shown: usize = 0;
     for (games[0..n]) |g| {
+        if (have_char and !gameOpenTo(g.status, g.difficulty, joiner, progression)) continue;
         // An extension decides what this player is shown — a private league's games, a staging
         // game, a lobby scoped to a channel. Hiding is cosmetic: a player who knows the name can
         // still attempt the join, and gameJoin is where that is actually refused.
@@ -1052,7 +1065,9 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
         w.putStr(g.name_slice()); // +0xc game name (shown in the list)
         w.putStr(g.desc()); // description the creator typed
         finish(c, &w);
+        shown += 1;
     }
+    log.line(tag, "game list (reqid={d}) char=0x{x:0>2} -> {d} of {d} game(s) open to it", .{ reqid, joiner, shown, n });
     // End-of-list marker: token == -2 -> SetD2GSJoinResult(0x33) -> RefreshGameListDisplay().
     var tbuf: [16]u8 = undefined;
     var tw = startPacket(&tbuf, MCP_GAMELIST);
@@ -1124,6 +1139,14 @@ fn onGameInfo(c: *DConn, tag: []const u8, body: []const u8) void {
         return;
     };
     const g = game;
+    // A game the list would not have shown is not described either.
+    if (c.charName().len > 0 and !gameOpenTo(g.status, g.difficulty, charStatus(c), charProgression(c))) {
+        log.line(tag, "game info '{s}' -> not open to this character", .{name});
+        w.putU32(0xFFFF_FFFF);
+        w.zeros(8);
+        finish(c, &w);
+        return;
+    }
 
     var members: [state.max_members]state.Member = undefined;
     const n = state.global.gameMembers(g.gameid, &members);

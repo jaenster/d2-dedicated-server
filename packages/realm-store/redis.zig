@@ -1131,7 +1131,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
         };
         if (n >= out.len) continue;
         const rec = parseGame(val) orelse continue;
-        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status };
+        var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status, .difficulty = rec.difficulty };
         ng.setDesc(rec.desc());
         const gname = names[i][0..nlen[i]];
         const cl: u8 = @intCast(@min(gname.len, ng.name.len));
