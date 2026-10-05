@@ -710,6 +710,30 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_crprobe.addArgs(args);
     b.step("checkrev-probe", "Replay the BNCS version-check against a real Battle.net").dependOn(&run_crprobe.step);
 
+    // char-forge - a .d2s of a given class and level from the game's own tables (tools/char-forge)
+    {
+        const realm_d2s = b.createModule(.{
+            .root_source_file = b.path("apps/realmd/d2s.zig"),
+            .imports = &.{.{ .name = "libd2", .module = libd2 }},
+        });
+        const forge_root = b.createModule(.{
+            .root_source_file = b.path("tools/char-forge/main.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        forge_root.addImport("libd2", libd2);
+        const exe = b.addExecutable(.{ .name = "char-forge", .root_module = forge_root });
+        b.step("char-forge", "build the character save writer").dependOn(&b.addInstallArtifact(exe, .{}).step);
+        const forge_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/char-forge/forge.zig"),
+            .target = host,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "libd2", .module = libd2 }, .{ .name = "realm_d2s", .module = realm_d2s } },
+        }) });
+        test_step.dependOn(&b.addRunArtifact(forge_tests).step);
+    }
+
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_realmd.addArgs(args);
