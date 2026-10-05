@@ -9,6 +9,7 @@ test {
     _ = @import("friends.zig");
     _ = @import("friendcmd.zig");
     _ = @import("d2s.zig");
+    _ = @import("admin.zig");
     _ = @import("proto.zig");
     _ = @import("fleet.zig");
     _ = @import("store.zig");
