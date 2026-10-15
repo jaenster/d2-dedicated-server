@@ -133,7 +133,7 @@ jobs:
       - name: save it
         if: matrix.target == 'realmd'
         run: docker save e2e-realmd:ci -o /tmp/realmd.tar
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.target == 'realmd'
         with:
           name: image-realmd
@@ -206,7 +206,7 @@ jobs:
         run: |
           docker build -f deploy/Dockerfile --target gs-native --load -t e2e-gs-native:ci .
           docker save e2e-gs-native:ci -o /tmp/gs-native.tar
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: image-gs-native
           path: /tmp/gs-native.tar
