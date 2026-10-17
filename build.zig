@@ -503,6 +503,10 @@ pub fn build(b: *std.Build) void {
         // about our confidence, not about anything d2host does at runtime, and folding it into the
         // d2engine module made a test-expectations file a compile input to every shipped image.
         .{ "packages/d2engine/served.zig", false, false },
+        // The Pandemonium Event's decisions: when an uber boss calls a minion and which level a set
+        // of keys opens. Each rule takes its rolls from the boss's seed in a fixed order, and these
+        // tests pin that order, which a refactor of the engine glue could otherwise quietly change.
+        .{ "apps/d2gs/runtime/feature/ubers_policy.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{
