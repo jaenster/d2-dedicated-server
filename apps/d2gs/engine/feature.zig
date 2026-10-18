@@ -63,7 +63,7 @@ const registry = [_]Feature{
     .{ .mod = @import("../runtime/feature/ladderitems.zig"), .name = "ladderitems", .flag = "ladder-items", .default = false },
     .{ .mod = @import("../runtime/feature/arena.zig"), .name = "arena", .flag = "arena", .default = false },
     .{ .mod = @import("../runtime/feature/expmod.zig"), .name = "expmod", .flag = "expmod", .default = false },
-    .{ .mod = @import("../runtime/feature/ubers.zig"), .name = "ubers", .flag = "ubers", .default = false },
+    .{ .mod = @import("../runtime/feature/ubers.zig"), .name = "ubers", .server_only = true },
     // Client-side maphack (the d2gs.dll injects into the real client too).
     .{ .mod = @import("../runtime/feature/omnivision.zig"), .name = "omnivision", .flag = "omnivision", .default = false },
     .{ .mod = @import("../runtime/feature/mapunits.zig"), .name = "mapunits", .flag = "mapunits", .default = false },

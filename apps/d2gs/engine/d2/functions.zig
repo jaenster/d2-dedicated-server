@@ -712,8 +712,8 @@ pub const GetQuestState: *const fn (?*anyopaque, u32, u32) callconv(.winapi) i32
 pub const CreateTombPortal = fastcall(0x0054F430, fn (?*anyopaque, ?*anyopaque, i32, i32, i32, i32) ?*UnitAny);
 
 /// SERVER_SpawnPortal: creates a portal to any destination level.
-/// ECX=pGame, EDX=pUnit, stack: pRoom, nX, nY, eDestLevel, ppPortal (out), nClassId, bIgnore
-pub const SpawnPortal = fastcall(0x0056D130, fn (?*anyopaque, ?*UnitAny, ?*anyopaque, i32, i32, i32, ?*?*UnitAny, i32, i32) void);
+/// ECX=pGame, EDX=pUnit, stack: pRoom, nX, nY, eDestLevel, ppPortal (out), nClassId, bIgnore. BOOL.
+pub const SpawnPortal = fastcall(0x0056D130, fn (?*anyopaque, ?*UnitAny, ?*anyopaque, i32, i32, i32, ?*?*UnitAny, i32, i32) u32);
 
 /// FindSpawnableLocation: scans outward from pPoint for a walkable tile.
 /// ECX=pRoom (Room1), EDX=pPoint (in/out POINT*), stack: nScanRadius, eCollisionFlags, ppRoomOut, dwTag, nMaxIter
@@ -818,41 +818,62 @@ pub const TxtNpcGetLine = cdeclTxt(0x00656900);
 /// D2CLIENT_GetMonsterOwner: __fastcall(nMonsterId) -> owner unit ID
 pub const GetMonsterOwner = fastcall(0x479150, fn (u32) u32);
 
-// Ubers (server) — monster/item/portal spawn + boss AI (recon 9df5e900)
+// Ubers (server): the parts of the Pandemonium Event that 1.14d still ships
 
-/// SERVER_SpawnMonster @0x5A4440 — __fastcall. Full monster spawn with GUID/seed/
-/// flags/mods. ECX=pGame, EDX=pRoom; stack: x, y, classId, guid, seed, isChampion,
-/// isSuperUnique, superUniqueId, mods(char* → &[9]u8).
-pub const SpawnMonster = fastcall(0x5A4440, fn (?*anyopaque, ?*anyopaque, i32, i32, u32, u32, u32, BOOL, BOOL, u32, [*]const u8) ?*UnitAny);
+/// SpawnMonsterAtRoomPos @0x5B2F20: CreateMonster at a world position in pRoom.
+/// ECX=pGame, EDX=pRoom; stack: x, y, classId, eMode, nSpawnRadius, nFlags(i16).
+pub const SpawnMonsterAtRoomPos = fastcall(0x5B2F20, fn (?*anyopaque, ?*anyopaque, i32, i32, u32, u32, i32, i16) ?*UnitAny);
 
-/// SpawnMonster (with-mode variant) @0x5b2f20 — __fastcall. Spawns adds for boss AI.
-/// ECX=pGame, EDX=pRoom; stack: x, y, classId, eMode, nParam, nFlags(i16).
-pub const SpawnMonsterWithMode = fastcall(0x5B2F20, fn (?*anyopaque, ?*anyopaque, i32, i32, u32, u32, u32, i16) ?*UnitAny);
+/// SetupUpdateEvent @0x553380: queue a unit event; 0x14 plays the "I can't" sound for a failed cube output.
+/// ECX=pUnit, EDX=nUpdateType, stack: pUpdateUnit.
+pub const SetupUpdateEvent = fastcall(0x553380, fn (?*UnitAny, u32, ?*UnitAny) void);
 
-/// FindBestSpotToSpawnItem @0x555DA0 — __fastcall. ECX=pRoom, EDX=pPoint(in);
-/// stack: pNewPosition(out), nCollisionMask(u32), nMaxSearchRadius(byte).
-pub const FindBestSpotToSpawnItem = fastcall(0x555DA0, fn (?*Room1, *POINT, *POINT, u32, u8) ?*Room1);
-
-/// ITEM_CreateItemInstance @0x558D90 (Charon "SpawnItemWithStruct") — __fastcall.
-/// ECX=pGame, EDX=pItemGenCtx (*ItemGenerationData), stack: param (1).
-pub const SpawnItemWithStruct = fastcall(0x558D90, fn (?*anyopaque, *types.ItemGenerationData, i32) ?*UnitAny);
-
-/// TXT_Items_ConvertItemCodeToItemClassId @0x633680 — __stdcall(char[4] code as DWORD).
-pub const GetItemClassIdByCode = struct {
-    const Fn = *const fn (u32) callconv(.winapi) i32;
-    const ptr: Fn = funcPtr(0x633680, Fn);
-    pub inline fn call(code: u32) i32 {
-        return ptr(code);
+/// DRLGROOM_GetLevelIdFromRoom @0x61A1B0 (__stdcall).
+pub const GetLevelIdFromRoom = struct {
+    const Fn = *const fn (?*anyopaque) callconv(.winapi) i32;
+    const ptr: Fn = funcPtr(0x61A1B0, Fn);
+    pub inline fn call(room: ?*anyopaque) i32 {
+        return ptr(room);
     }
 };
 
-/// SetupUpdateEvent (Charon "PlaySoundMaybe") @0x553380 — __fastcall.
-/// ECX=pUnit, EDX=nUpdateType, stack: pUpdateUnit.
-pub const PlaySoundMaybe = fastcall(0x553380, fn (?*UnitAny, u32, ?*UnitAny) void);
+/// DRLGROOM_GetRoomCoordinates @0x619730 (__stdcall): the room's origin and size, in subtiles.
+pub const RoomCoords = extern struct { x: i32, y: i32, w: i32, h: i32, tile_rect: [4]i32 };
+pub const GetRoomCoordinates = struct {
+    const Fn = *const fn (?*anyopaque, *RoomCoords) callconv(.winapi) void;
+    const ptr: Fn = funcPtr(0x619730, Fn);
+    pub inline fn call(room: ?*anyopaque, out: *RoomCoords) void {
+        ptr(room, out);
+    }
+};
 
-/// Boss AI base functions (__fastcall: ECX=pGame, EDX=pUnit, stack: pAiParam).
-/// The Uber* replacements call these after spawning adds.
-pub const MephAI = fastcall(0x5F78B0, fn (?*anyopaque, ?*UnitAny, ?*types.AIParams) void);
+/// UNIT_GetModuloFromSeed @0x45C390: advance a unit seed, return [0, n). ECX=pSeed, EDX=n.
+pub const SeedRoll = fastcall(0x45C390, fn (*anyopaque, u32) u32);
+
+/// ForEach @0x5DD0B0: the monster AI's unit walker. Row 0 of its mode table is "every unit in the
+/// rooms around pUnit" with no callback of its own, so the one passed in runs.
+/// ECX=pGame, EDX=pUnit; stack: pArg, pfnCallback, nMode. Callee-clean.
+pub const AiForEach = fastcall(0x5DD0B0, fn (?*anyopaque, ?*UnitAny, ?*anyopaque, usize, i32) u32);
+
+/// AI_CountNearbyMinionsByClass @0x5DD140: the uber census callback, for AiForEach.
+pub const UBER_CENSUS_CALLBACK: usize = 0x5DD140;
+
+/// AI_BAAL_FindRandomTargetPlayer @0x5F8010: the player an uber minion is sent at (or null).
+pub const UberMinionTarget = fastcall(0x5F8010, fn (?*anyopaque, ?*UnitAny) ?*UnitAny);
+
+/// AI_UberBoss_SpawnMinion @0x5F7F10: one Uber Mephisto skeleton at pTarget (or at himself).
+/// ECX=pGame, EDX=pUnit; stack: pTarget.
+pub const UberMephistoSpawnMinion = fastcall(0x5F7F10, fn (?*anyopaque, ?*UnitAny, ?*UnitAny) void);
+
+/// MONSTERAI_SpawnSpecificMinions @0x5E9DD0: one demon hole (711) at pTarget. ECX=pGame; stack: pTarget.
+pub const UberDiabloSpawnPit = fastcall(0x5E9DD0, fn (?*anyopaque, ?*UnitAny, ?*UnitAny) void);
+
+/// AI_Baal_SpawnTentacle @0x5FD0F0: one wraith or vampire next to Uber Baal. ECX=pGame, EDX=pUnit.
+pub const UberBaalSpawnMinion = fastcall(0x5FD0F0, fn (?*anyopaque, ?*UnitAny) void);
+
+/// The act bosses' own AI (__fastcall: ECX=pGame, EDX=pUnit, stack: pAiParam). The uber AI is each
+/// of these with a minion block in front.
+pub const MephistoAI = fastcall(0x5F78B0, fn (?*anyopaque, ?*UnitAny, ?*types.AIParams) void);
 pub const DiabloAI = fastcall(0x5E9170, fn (?*anyopaque, ?*UnitAny, ?*types.AIParams) void);
 pub const BaalAI = fastcall(0x5FCFE0, fn (?*anyopaque, ?*UnitAny, ?*types.AIParams) void);
 

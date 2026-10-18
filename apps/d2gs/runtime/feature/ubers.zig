@@ -1,13 +1,28 @@
-//! Ubers (server) — Pandemonium event + Uber Tristram. Ported from Charon's Ubers.cpp,
-//! EXCLUDING Diablo Clone (no SoJ-sale announce, no SPAWN_UniqueMonster hook, no anni drop).
+//! Ubers (server): the Pandemonium Event and Uber Tristram, as Blizzard's realm ran them.
 //!
-//! roomInit spawns uber minions/bosses once per game by preset: Pandemonium (133 Lilith, 134
-//! Duriel, 135 Izual) and Uber Tristram (136: Meph/Baal/Diablo at Cain-cage preset 26).
-//! CubeKeys/CubeOrgans intercepts spawn the matching red portals (Hell only, once per game).
-//! KillMonster tracks uber Meph/Diablo/Baal kills in level 136 and drops the Hellfire Torch
-//! ("cm2 ", unique txt 400) + a "std " once all three die. Boss AIs summon random adds first.
+//! 1.14d's Game.exe still carries almost all of the event. What it ships:
+//!   - the uber monsters and their quest umods: MONSTER_OnCreateAttachQuests @0x5B1CF0 gives Uber
+//!     Mephisto questcomplete, aura, lightning, resist and fast, Uber Diablo questcomplete, resist and
+//!     fast, Uber Baal questcomplete, cold, resist and fast, on every create path;
+//!   - the reward: umod 22 (questcomplete) runs MONSTER_DispatchSpecialDeath @0x5A3250 when one of the
+//!     three dies, and AI_UberTristram_CheckDeathAndDropLoot @0x5E0070 marks it on the game and, once
+//!     all three are down, drops the Hellfire Torch (cm2, unique quality; its class and +3 come from the
+//!     unique's randclassskill property) and one Standard of Heroes (std) per player in the game;
+//!   - the three minion spawners, the census callback and the minion target picker, all with no caller;
+//!   - SERVER_SpawnPortal's leave to open red portals from town to 133..136, and the ban on town
+//!     portals in Uber Tristram.
+//! What the realm build cut, and this module puts back:
+//!   - the two cube outputs: CUBE_SpecialOutput_Unused2/3 are thunks to `xor eax,eax; ret`;
+//!   - the boss spawn: SUNIT_SpawnPresetUnitsForRoom @0x5559A0 still holds back the presets the realm
+//!     spawned the bosses at, and in Uber Tristram even still makes the stray call that was left when
+//!     the spawn call was taken out;
+//!   - the uber AI entries: three `ret 4` stubs where the minion blocks were.
 //!
-//! Addresses + struct offsets verified against recon session 9df5e900 (1.14d Game.exe).
+//! The portal name. A red portal's destination byte (object data +4) is written by its object init,
+//! Objects_InitFn12 @0x54FE70, from a table keyed on the level the portal stands in: Harrogath means
+//! Nihlathak's Temple. SERVER_SpawnPortal never overwrites it, so a portal from Harrogath to any of the
+//! four uber levels went out to the client as Nihlathak's Temple. The realm wrote the destination
+//! after the portal was made; so does this.
 const std = @import("std");
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");
@@ -15,466 +30,240 @@ const feature = @import("../../engine/feature.zig");
 const d2types = @import("../../engine/d2types.zig");
 const d2 = @import("../../engine/d2/functions.zig");
 const types = @import("../../engine/d2/types.zig");
+const policy = @import("ubers_policy.zig");
+const ai = @import("ubers_ai.zig");
 
 const UnitAny = types.UnitAny;
-const Room1 = types.Room1;
-const POINT = types.POINT;
-const ItemQuality = types.ItemQuality;
+const Game = d2types.D2GameStrc;
 
-// hook / jump sites (recon-verified)
-const CUBE_KEYS_HOOK: usize = 0x565A90; // 5-byte JMP thunk (CUBE_SpecialOutput_Unused2)
-const CUBE_ORGANS_HOOK: usize = 0x565AA0; // 5-byte JMP thunk (CUBE_SpecialOutput_Unused3)
-const KILLMONSTER_ENTRY: usize = 0x57CCB0; // SERVER_KillMonster
-const KILLMONSTER_REJOIN: usize = 0x57CCB6; // entry + 6 (push ebp; mov ebp,esp; sub esp,0x20)
-const UBER_MEPH_AI: usize = 0x5F81C0; // AI_Function1_UberMephisto (empty `ret 4` stub)
-const UBER_DIABLO_AI: usize = 0x5E9DF0; // AI_Function1_UberDiablo (empty `ret 4` stub)
-const UBER_BAAL_AI: usize = 0x5FD200; // AI_Function1_UberBaal (empty `ret 4` stub)
-const DURABILITY_NOP_FROM: usize = 0x559009; // ITEM_CreateItemInstance durability setup
-const DURABILITY_NOP_TO: usize = 0x559025; // next clean instruction (PUSH EDI)
+const CUBE_KEYS: usize = 0x565A90; // CUBE_SpecialOutput_Unused2, "Pandemonium Portal"
+const CUBE_ORGANS: usize = 0x565AA0; // CUBE_SpecialOutput_Unused3, "Pandemonium Finale Portal"
+const UBER_MEPHISTO_AI: usize = 0x5F81C0;
+const UBER_DIABLO_AI: usize = 0x5E9DF0;
+const UBER_BAAL_AI: usize = 0x5FD200;
+/// AITHINK_Fn1_Diablo's `call AI_Diablo_DecideAction`, between its target choice and its action switch.
+const DIABLO_SELECT_CALL: usize = 0x5E924A;
+const DIABLO_SELECT_BYTES = [_]u8{ 0xE8, 0xC1, 0xF5, 0xFF, 0xFF };
 
-// per-game flags
-// Fixed-size registry keyed by the game's unique token (D2GameStrc.nToken @0x00).
-// NOTE vs Charon: Charon keys its map by pGame+0x4 ("seed"), which the recon labels
-// pHashLink1 (a hash-chain pointer, NOT a seed). nToken @0x00 is the documented
-// per-game unique token, so we key on that instead. No std hashmap / global churn.
-const GameFlags = packed struct {
-    den_portal: bool = false,
-    sands_portal: bool = false,
-    furnace_portal: bool = false,
-    tristram_portal: bool = false,
-    lilith_spawned: bool = false,
-    duriel_spawned: bool = false,
-    izual_spawned: bool = false,
-    meph_spawned: bool = false,
-    baal_spawned: bool = false,
-    diablo_spawned: bool = false,
-    meph_killed: bool = false,
-    diablo_killed: bool = false,
-    baal_killed: bool = false,
-    torch_dropped: bool = false,
-};
+/// SUNIT_SpawnPresetUnitsForRoom: in Uber Tristram, after the Cain-cage preset (object 26) is held
+/// back, `push ebx; call DRLGROOM_GetLevelIdFromRoom` with the answer thrown away, then `jmp next`.
+/// That is where the spawn call was.
+const PRESET_TRISTRAM_SITE: usize = 0x555A29;
+const PRESET_TRISTRAM_BYTES = [_]u8{ 0x53, 0xE8, 0x81, 0x47, 0x0C, 0x00, 0xEB, 0x60 };
+/// The `jz next` that holds back object 397 in Matron's Den and the Furnace of Pain, and the chosen
+/// corner object in the Forgotten Sands. Pointed at the site above, so a held-back preset reaches the
+/// same call.
+const PRESET_HOLD_JZ: usize = 0x555A85;
+const PRESET_HOLD_BYTES = [_]u8{ 0x74, 0x0A };
 
-const Entry = struct { token: u32, used: bool = false, flags: GameFlags = .{} };
-const MAX_GAMES = 64;
-var registry: [MAX_GAMES]Entry = .{Entry{ .token = 0 }} ** MAX_GAMES;
+const PORTAL_RED: i32 = 0x3C;
+const CANT_SOUND: u32 = 0x14; // the cube's "I can't" event, as CUBE_SpecialOutput_CowPortal uses it
 
-fn flagsFor(token: u32) *GameFlags {
-    for (&registry) |*e| {
-        if (e.used and e.token == token) return &e.flags;
-    }
-    for (&registry) |*e| {
-        if (!e.used) {
-            e.* = .{ .token = token, .used = true, .flags = .{} };
-            return &e.flags;
-        }
-    }
-    // Registry full: recycle slot 0 (best-effort; games are short-lived).
-    registry[0] = .{ .token = token, .used = true, .flags = .{} };
-    return &registry[0].flags;
+// the per-game record of which portals are open
+
+/// These belong to the game, but 1.14d's D2GameStrc has no room for them, so they live here, one
+/// row per game, claimed when the game is made and freed when it ends.
+const Opened = struct { keys: [3]bool = .{ false, false, false }, tristram: bool = false };
+const Row = struct { game: ?*Game = null, opened: Opened = .{} };
+var rows: [256]Row = [_]Row{.{}} ** 256;
+
+fn rowFor(game: *Game) ?*Row {
+    for (&rows) |*r| if (r.game == game) return r;
+    for (&rows) |*r| if (r.game == null) {
+        r.* = .{ .game = game };
+        return r;
+    };
+    return null; // never seen with 256 games in one process; the cube output then fails
 }
 
-// RNG (mt19937 substitute)
-// std Math.random is unavailable here and CRT rand() is forbidden (and gives the
-// same sequence every launch). Use a 64-bit SplitMix-style xorshift seeded from a
-// monotonically-advancing counter, so item seeds differ across spawns and launches.
-var rng_state: u64 = 0x9E3779B97F4A7C15;
-var guid: u32 = 0x4FFFFFFF;
-
-fn rngNext() u64 {
-    var x = rng_state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    rng_state = x +% 0x9E3779B97F4A7C15;
-    return rng_state;
+pub fn gameCreate(ctx: *const feature.GameCtx) void {
+    if (rowFor(ctx.game)) |r| r.opened = .{};
 }
 
-/// Inclusive [min, max].
-fn randomNumber(min: i32, max: i32) i32 {
-    if (max <= min) return min;
-    const span: u64 = @intCast(@as(i64, max) - @as(i64, min) + 1);
-    return min + @as(i32, @intCast(rngNext() % span));
-}
-
-fn randomElement(comptime T: type, items: []const T) T {
-    return items[@intCast(randomNumber(0, @as(i32, @intCast(items.len)) - 1))];
-}
-
-fn randSeed() i32 {
-    return @intCast(rngNext() & 0x7FFFFFFF);
+pub fn gameDestroy(ctx: *const feature.GameCtx) void {
+    for (&rows) |*r| if (r.game == ctx.game) {
+        r.* = .{};
+    };
 }
 
 // helpers
 
-fn getActFromRoom(room: *Room1) u32 {
-    const room2 = room.pRoom2 orelse return 0;
-    const level = room2.pLevel orelse return 0;
-    return d2.GetAct.call(@bitCast(level.dwLevelNo));
+fn levelOf(unit: *UnitAny) i32 {
+    const room = unit.getRoom1() orelse return -1;
+    return d2.GetLevelIdFromRoom.call(room);
 }
 
-/// Charon PortalTo: spawn a red portal from pUnit's room to `level_id` (same act).
-fn portalTo(pGame: *d2types.D2GameStrc, pUnit: *UnitAny, level_id: i32, is_blue: bool) ?*UnitAny {
-    const room = pUnit.getRoom1() orelse return null;
-    if (getActFromRoom(room) != d2.GetAct.call(level_id)) return null;
-
-    var pos: POINT = undefined;
-    d2.UnitLocation.call(pUnit, &pos);
-
-    var target: ?*Room1 = null;
-    // FindSpawnableLocation(pRoom, &pos, nScanRadius=3, eFlags=0x400, &target, dwTag=4, nMaxIter=100)
-    d2.FindSpawnableLocation.call(.{ @ptrCast(room), @ptrCast(&pos), 3, 0x400, @ptrCast(&target), 4, 100 });
-
-    var pPortal: ?*UnitAny = null;
-    const class_id: i32 = if (is_blue) 0x3B else 0x3C;
-    d2.SpawnPortal.call(.{ @ptrCast(pGame), null, @ptrCast(target), pos.x, pos.y, level_id, &pPortal, class_id, 0 });
-    return pPortal;
+fn roll(unit: *UnitAny, n: u32) u32 {
+    return d2.SeedRoll.call(.{ @ptrCast(&unit.dwLoSeed), n });
 }
 
-/// Charon SpawnItem: spawn a custom item near pVictim using the item-gen struct.
-fn spawnItem(pGame: *d2types.D2GameStrc, pVictim: *UnitAny, code: *const [4]u8, item_level: i32, quality: ItemQuality, txt_file_no: i32) ?*UnitAny {
-    var gen = std.mem.zeroes(types.ItemGenerationData);
-    var pos: POINT = undefined;
-    var new_pos: POINT = undefined;
+/// Open a red portal at the player to `level`, the way the realm's cube outputs did, and name its
+/// destination. Returns false when there was no room for it.
+fn openPortal(game: *Game, player: *UnitAny, level: i32) bool {
+    const room = player.getRoom1() orelse return false;
+    var pos: types.POINT = undefined;
+    d2.UnitLocation.call(player, &pos);
+    var xy = [2]i32{ pos.x, pos.y };
+    var spot: ?*anyopaque = null;
+    d2.FindSpawnableLocation.call(.{ @ptrCast(room), &xy, 3, 0x400, &spot, 4, 100 });
+    if (spot == null) return false;
 
-    d2.UnitLocation.call(pVictim, &pos);
-    const room = pVictim.getRoom1() orelse return null;
-    gen.pDrlgRoom = d2.FindBestSpotToSpawnItem.call(.{ room, &pos, &new_pos, 1, 1 });
-    gen.wItemFormat = pGame.wItemFormat;
-    gen.nItemClassId = d2.GetItemClassIdByCode.call(@bitCast(code.*));
-    gen.nPosX = new_pos.x;
-    gen.nPosY = new_pos.y;
-    gen.eQuality = quality;
-    gen.pGame = @ptrCast(pGame);
-    gen.nItemLevel = item_level;
-    gen.usually_one = 1;
-    gen.dwMode = 3;
-
-    if (txt_file_no >= 0) {
-        gen.somethingCustom = 1;
-        gen.dwFileIndex = @bitCast(txt_file_no);
+    var portal: ?*UnitAny = null;
+    if (d2.SpawnPortal.call(.{ @ptrCast(game), player, spot, xy[0], xy[1], level, &portal, PORTAL_RED, 0 }) == 0) return false;
+    if (portal) |p| {
+        // Object data +4: the level the client names this portal after (see the module comment).
+        const data: [*]u8 = @ptrCast(p.pUnitData orelse return true);
+        data[4] = @intCast(level);
     }
-
-    gen.nInitSeed = randSeed();
-    gen.nModSeed = randSeed();
-
-    return d2.SpawnItemWithStruct.call(.{ @ptrCast(pGame), &gen, 1 });
+    return true;
 }
 
-const minion_mods: [9]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0 };
-
-fn spawnUber(pGame: *d2types.D2GameStrc, room: *Room1, x: i32, y: i32, class_id: u32) bool {
-    const u = d2.SpawnMonster.call(.{ @ptrCast(pGame), @ptrCast(room), x, y, class_id, guid, 0, 0, 0, 0, &minion_mods });
-    guid +%= 1;
-    return u != null;
+fn refuse(player: *UnitAny) i32 {
+    d2.SetupUpdateEvent.call(.{ player, CANT_SOUND, player });
+    return 0;
 }
 
-// CubeKeys / CubeOrgans intercepts (__fastcall: ECX=pGame, EDX=pUnit)
-// Return TRUE → cube consumes the items (the desired behaviour). The engine
-// thunk site is a 5-byte JMP, so we JUMP-replace it cleanly.
+// the cube outputs (__fastcall: ECX = pGame, EDX = the player; TRUE consumes the ingredients)
 
-fn cubeKeysHandler(pGame: *d2types.D2GameStrc, pUnit: *UnitAny) callconv(.c) i32 {
-    if (pGame.nDifficulty != 2) {
-        d2.PlaySoundMaybe.call(.{ pUnit, 0x14, pUnit });
-        return 0;
-    }
-    const f = flagsFor(pGame.nToken);
+/// Keys: Hell, in Harrogath, while one of the three is still closed. The player's seed is rolled
+/// before any of that is checked, as the realm did.
+fn cubeKeys(game: *Game, player: *UnitAny) callconv(.c) i32 {
+    const r = roll(player, 3);
+    if (game.nDifficulty != policy.HELL or levelOf(player) != policy.HARROGATH) return refuse(player);
+    const row = rowFor(game) orelse return refuse(player);
+    const level = policy.keyPortalLevel(r, row.opened.keys) orelse return refuse(player);
+    if (!openPortal(game, player, level)) return refuse(player);
+    row.opened.keys[@intCast(level - policy.MATRONS_DEN)] = true;
+    return 1;
+}
 
-    var choices: [3]i32 = undefined;
-    var n: usize = 0;
-    if (!f.den_portal) {
-        choices[n] = 133;
-        n += 1;
-    }
-    if (!f.sands_portal) {
-        choices[n] = 134;
-        n += 1;
-    }
-    if (!f.furnace_portal) {
-        choices[n] = 135;
-        n += 1;
-    }
+/// Organs: Hell, in Harrogath, once per game.
+fn cubeOrgans(game: *Game, player: *UnitAny) callconv(.c) i32 {
+    if (game.nDifficulty != policy.HELL or levelOf(player) != policy.HARROGATH) return refuse(player);
+    const row = rowFor(game) orelse return refuse(player);
+    if (row.opened.tristram) return refuse(player);
+    if (!openPortal(game, player, policy.UBER_TRISTRAM)) return refuse(player);
+    row.opened.tristram = true;
+    return 1;
+}
 
-    if (n > 0) {
-        const target = randomElement(i32, choices[0..n]);
-        if (portalTo(pGame, pUnit, target, false) != null) {
-            switch (target) {
-                133 => {
-                    f.den_portal = true;
-                    return 1;
-                },
-                134 => {
-                    f.sands_portal = true;
-                    return 1;
-                },
-                135 => {
-                    f.furnace_portal = true;
-                    return 1;
-                },
-                else => {},
-            }
+fn CubeShim(comptime handler: anytype) type {
+    return struct {
+        fn shim() callconv(.naked) void {
+            asm volatile (
+                \\push %edx
+                \\push %ecx
+                \\call %[h:P]
+                \\add $8, %esp
+                \\ret
+                :
+                : [h] "X" (&handler),
+            );
         }
-    }
-
-    d2.PlaySoundMaybe.call(.{ pUnit, 0x14, pUnit });
-    return 0;
+    };
 }
 
-fn cubeOrgansHandler(pGame: *d2types.D2GameStrc, pUnit: *UnitAny) callconv(.c) i32 {
-    const f = flagsFor(pGame.nToken);
-    if (pGame.nDifficulty != 2 and !f.tristram_portal) {
-        d2.PlaySoundMaybe.call(.{ pUnit, 0x14, pUnit });
-        return 0;
-    }
-    if (portalTo(pGame, pUnit, 136, false) != null) {
-        f.tristram_portal = true;
-        return 1;
-    }
-    d2.PlaySoundMaybe.call(.{ pUnit, 0x14, pUnit });
-    return 0;
+// the boss spawn
+
+const PresetUnit = extern struct {
+    mode: i32,
+    class_id: i32,
+    x: i32,
+    next: ?*PresetUnit,
+    path: ?*anyopaque,
+    unit_type: i32,
+    y: i32,
+    flags: i32,
+};
+
+/// The realm's boss spawn, which is the preset-monster spawn (SPAWN_SpawnMonsterWithCollisionObj
+/// @0x54E490 by way of SpawnUnitByType @0x5557D0) with spawn flag 0x10 added: the exact spot first,
+/// then a search four out, and the unit marked ISINIT|ISRESURRECT like every preset spawn. None of the
+/// six uber rows sets neverCount, so the flag that would add 8 is left out.
+fn spawnBoss(game: *Game, room: *anyopaque, x: i32, y: i32, class_id: u32) void {
+    const unit = d2.SpawnMonsterAtRoomPos.call(.{ @ptrCast(game), room, x, y, class_id, 1, -1, 0x10 }) orelse
+        d2.SpawnMonsterAtRoomPos.call(.{ @ptrCast(game), room, x, y, class_id, 1, 4, 0x10 }) orelse {
+        log.hex("ubers: boss did not spawn, class ", class_id);
+        return;
+    };
+    unit.dwFlags |= 0x0300_0000;
 }
 
-/// Naked __fastcall shim: ECX=pGame, EDX=pUnit, no stack args. Forward to the
-/// cdecl handler, return its BOOL in EAX, callee-clean `ret`.
-fn cubeKeysShim() callconv(.naked) void {
+/// A preset the stock code held back for the realm (EDI = pGame, EBX = pRoom, ESI = the preset).
+fn heldPreset(game: *Game, room: *anyopaque, preset: *PresetUnit) callconv(.c) void {
+    var at: d2.RoomCoords = undefined;
+    d2.GetRoomCoordinates.call(room, &at);
+    const x = at.x + preset.x;
+    const y = at.y + preset.y;
+    switch (d2.GetLevelIdFromRoom.call(room)) {
+        policy.UBER_TRISTRAM => if (preset.class_id == 0x1A) {
+            spawnBoss(game, room, x, y, 704); // Uber Mephisto
+            spawnBoss(game, room, x, y, 709); // Uber Baal
+            spawnBoss(game, room, x, y, 705); // Uber Diablo
+        },
+        policy.MATRONS_DEN => spawnBoss(game, room, x, y, 707), // Lilith
+        policy.FURNACE_OF_PAIN => spawnBoss(game, room, x, y, 706), // Uber Izual
+        // She spawns at 0,0 room-relative, not at the object's place: the room's corner.
+        policy.FORGOTTEN_SANDS => spawnBoss(game, room, at.x, at.y, 708), // Uber Duriel
+        else => {},
+    }
+}
+
+/// Reached by `call` from the Tristram site, and by the redirected `jz` through it. Keeps every
+/// register the loop lives on (EBX, ESI, EDI are callee-saved in the handler).
+fn heldPresetShim() callconv(.naked) void {
     asm volatile (
-        \\push %edx
-        \\push %ecx
+        \\push %esi
+        \\push %ebx
+        \\push %edi
         \\call %[h:P]
-        \\add $8, %esp
+        \\add $12, %esp
         \\ret
         :
-        : [h] "X" (&cubeKeysHandler),
-        : .{ .ecx = true, .edx = true, .memory = true });
-}
-
-fn cubeOrgansShim() callconv(.naked) void {
-    asm volatile (
-        \\push %edx
-        \\push %ecx
-        \\call %[h:P]
-        \\add $8, %esp
-        \\ret
-        :
-        : [h] "X" (&cubeOrgansHandler),
-        : .{ .ecx = true, .edx = true, .memory = true });
-}
-
-// KillMonster detour (relocated-prologue, like roominit)
-// __fastcall(pGame ECX, pVictim EDX, pAttacker [esp+4], bRemove [esp+8]).
-// Original is callee-clean `ret 8`. Our shim re-runs the original (reloc stub),
-// then calls our handler, then `ret 8`.
-
-fn killMonsterRelocated() callconv(.naked) void {
-    asm volatile (
-        \\push %ebp
-        \\mov %esp, %ebp
-        \\sub $0x20, %esp
-        \\push $0x0057CCB6
-        \\ret
+        : [h] "X" (&heldPreset),
     );
 }
 
-fn killMonsterHandler(pGame: *d2types.D2GameStrc, pVictim: *UnitAny) callconv(.c) void {
-    const f = flagsFor(pGame.nToken);
-
-    const room = pVictim.getRoom1();
-    const level_no: u32 = blk: {
-        const r = room orelse break :blk 0;
-        const r2 = r.pRoom2 orelse break :blk 0;
-        const lvl = r2.pLevel orelse break :blk 0;
-        break :blk lvl.dwLevelNo;
-    };
-
-    if (level_no == 136) {
-        switch (pVictim.dwTxtFileNo) {
-            704 => f.meph_killed = true,
-            705 => f.diablo_killed = true,
-            709 => f.baal_killed = true,
-            else => {},
-        }
-    }
-
-    if (f.meph_killed and f.diablo_killed and f.baal_killed and !f.torch_dropped) {
-        if (spawnItem(pGame, pVictim, "cm2 ", 90, .unique, 400) != null) {
-            _ = spawnItem(pGame, pVictim, "std ", 90, .normal, -1);
-            f.torch_dropped = true;
-        }
-    }
-}
-
-/// Reached via JMP at the original entry (ECX=pGame, EDX=pVictim, [esp]=ret,
-/// [esp+4]=pAttacker, [esp+8]=bRemove). Run the original with the same frame, then
-/// call our handler, then callee-clean `ret 8`.
-fn killMonsterShim() callconv(.naked) void {
-    asm volatile (
-    // Save pGame/pVictim across the original call.
-        \\push %ecx
-        \\push %edx
-        // Re-invoke original: re-push its two stack args (now at +12 / +8 due to the
-        // two saves above), restore ECX/EDX, call the relocated prologue.
-        \\pushl 16(%esp)              // bRemove  (orig [esp+8] -> +8+8)
-        \\pushl 16(%esp)              // pAttacker(orig [esp+4] -> +4+8+4)
-        \\mov 8(%esp), %edx           // pVictim
-        \\mov 12(%esp), %ecx          // pGame
-        \\call %[reloc:P]            // original; its `ret 8` cleans the 2 re-pushed args
-        \\pop %edx                    // restore pVictim
-        \\pop %ecx                    // restore pGame
-        // Call our handler(pGame, pVictim) cdecl.
-        \\push %edx
-        \\push %ecx
-        \\call %[handler:P]
-        \\add $8, %esp
-        \\ret $8                      // callee-clean like the original
-        :
-        : [reloc] "X" (&killMonsterRelocated),
-          [handler] "X" (&killMonsterHandler),
-        : .{ .eax = true, .ecx = true, .edx = true, .memory = true });
-}
-
-// Uber boss AI replacements (__fastcall: ECX=pGame, EDX=pUnit, [esp+4]=pAi)
-// The stub functions are empty `ret 4`; we JUMP-replace them. Each summons random
-// adds at the target/self, then runs the real boss AI, then callee-clean `ret 4`.
-
-fn uberMephHandler(pGame: *d2types.D2GameStrc, pUnit: *UnitAny, pAi: *types.AIParams) callconv(.c) void {
-    const ids = [_]u32{ 725, 726, 727, 728, 729, 730 };
-    if (pAi.pTarget) |target| {
-        if (randomNumber(0, 9) < 3) {
-            if (target.dynamicPath()) |dp| {
-                if (dp.pRoom1) |room| {
-                    _ = d2.SpawnMonsterWithMode.call(.{ @ptrCast(pGame), @ptrCast(room), @as(i32, dp.xPos), @as(i32, dp.yPos), randomElement(u32, &ids), 8, 1, 0 });
-                }
-            }
-        }
-    }
-    d2.MephAI.call(.{ @ptrCast(pGame), pUnit, pAi });
-}
-
-fn uberDiabloHandler(pGame: *d2types.D2GameStrc, pUnit: *UnitAny, pAi: *types.AIParams) callconv(.c) void {
-    if (pAi.pTarget) |target| {
-        if (randomNumber(0, 9) == 0) {
-            if (target.dynamicPath()) |dp| {
-                if (dp.pRoom1) |room| {
-                    _ = d2.SpawnMonsterWithMode.call(.{ @ptrCast(pGame), @ptrCast(room), @as(i32, dp.xPos), @as(i32, dp.yPos), 711, 1, 1, 0 });
-                }
-            }
-        }
-    }
-    d2.DiabloAI.call(.{ @ptrCast(pGame), pUnit, pAi });
-}
-
-fn uberBaalHandler(pGame: *d2types.D2GameStrc, pUnit: *UnitAny, pAi: *types.AIParams) callconv(.c) void {
-    const ids = [_]u32{ 731, 732 };
-    if (randomNumber(0, 9) < 3) {
-        if (pUnit.dynamicPath()) |dp| {
-            if (dp.pRoom1) |room| {
-                _ = d2.SpawnMonsterWithMode.call(.{ @ptrCast(pGame), @ptrCast(room), @as(i32, dp.xPos), @as(i32, dp.yPos), randomElement(u32, &ids), 1, 1, 0 });
-            }
-        }
-    }
-    d2.BaalAI.call(.{ @ptrCast(pGame), pUnit, pAi });
-}
-
-/// Build a naked __fastcall AI shim around a cdecl handler(pGame, pUnit, pAi).
+/// The engine calls an AI entry __fastcall(pGame, pUnit), pAiParam on the stack, `ret 4`.
 fn AiShim(comptime handler: anytype) type {
     return struct {
         fn shim() callconv(.naked) void {
             asm volatile (
-                \\pushl 4(%esp)               // pAiParam (the one stack arg)
-                \\push %edx                    // pUnit
-                \\push %ecx                    // pGame
+                \\pushl 4(%esp)
+                \\push %edx
+                \\push %ecx
                 \\call %[h:P]
                 \\add $12, %esp
-                \\ret $4                       // callee-clean (original was `ret 4`)
+                \\ret $4
                 :
                 : [h] "X" (&handler),
-                : .{ .eax = true, .ecx = true, .edx = true, .memory = true });
+            );
         }
     };
-}
-
-// roomInit hook (fanned out by runtime/roominit.zig)
-
-/// `room` is the D2RoomStrc* (Room1) handed by the roominit driver.
-pub fn roomInit(ctx: *const feature.GameCtx, room: *anyopaque) void {
-    const pGame = ctx.game;
-    const pRoom1: *Room1 = @ptrCast(@alignCast(room));
-    const room2 = pRoom1.pRoom2 orelse return;
-    const level = room2.pLevel orelse return;
-    const f = flagsFor(pGame.nToken);
-
-    const base_x: i32 = @bitCast(room2.dwPosX *% 5);
-    const base_y: i32 = @bitCast(room2.dwPosY *% 5);
-
-    switch (level.dwLevelNo) {
-        133 => { // Den → Lilith (707), preset 397
-            var preset = room2.pPreset;
-            while (preset) |p| : (preset = p.pPresetNext) {
-                if (p.dwTxtFileNo == 397 and !f.lilith_spawned) {
-                    const x = base_x + @as(i32, @bitCast(p.dwPosX));
-                    const y = base_y + @as(i32, @bitCast(p.dwPosY));
-                    if (spawnUber(pGame, pRoom1, x, y, 707)) f.lilith_spawned = true;
-                }
-            }
-        },
-        134 => { // Sands → Duriel (708), preset 402
-            var preset = room2.pPreset;
-            while (preset) |p| : (preset = p.pPresetNext) {
-                if (p.dwTxtFileNo == 402 and !f.duriel_spawned) {
-                    const x = base_x + @as(i32, @bitCast(p.dwPosX));
-                    const y = base_y + @as(i32, @bitCast(p.dwPosY));
-                    if (spawnUber(pGame, pRoom1, x, y, 708)) f.duriel_spawned = true;
-                }
-            }
-        },
-        135 => { // Furnace → Izual (706), preset 397
-            var preset = room2.pPreset;
-            while (preset) |p| : (preset = p.pPresetNext) {
-                if (p.dwTxtFileNo == 397 and !f.izual_spawned) {
-                    const x = base_x + @as(i32, @bitCast(p.dwPosX));
-                    const y = base_y + @as(i32, @bitCast(p.dwPosY));
-                    if (spawnUber(pGame, pRoom1, x, y, 706)) f.izual_spawned = true;
-                }
-            }
-        },
-        136 => { // Uber Tristram → Meph (704), Baal (709), Diablo (705) at Cain cage (26)
-            var preset = room2.pPreset;
-            while (preset) |p| : (preset = p.pPresetNext) {
-                if (p.dwTxtFileNo == 26) {
-                    const x = base_x + @as(i32, @bitCast(p.dwPosX));
-                    const y = base_y + @as(i32, @bitCast(p.dwPosY));
-                    if (!f.meph_spawned and spawnUber(pGame, pRoom1, x, y, 704)) f.meph_spawned = true;
-                    if (!f.baal_spawned and spawnUber(pGame, pRoom1, x, y, 709)) f.baal_spawned = true;
-                    if (!f.diablo_spawned and spawnUber(pGame, pRoom1, x, y, 705)) f.diablo_spawned = true;
-                }
-            }
-        },
-        else => {},
-    }
 }
 
 // install
 
 pub fn install() void {
-    comptime {
-        if (KILLMONSTER_REJOIN != KILLMONSTER_ENTRY + 6) @compileError("killmonster rejoin must be entry+6");
-    }
-
-    const MephShim = AiShim(uberMephHandler);
-    const DiabloShim = AiShim(uberDiabloHandler);
-    const BaalShim = AiShim(uberBaalHandler);
-
+    const stub = [_]u8{0xC2}; // ret 4
+    const thunk = [_]u8{0xE9}; // jmp to the `xor eax,eax; ret` the realm build left
     var ok = true;
-    ok = patch.MemoryPatch(CUBE_KEYS_HOOK).jump(@intFromPtr(&cubeKeysShim)).commit() and ok;
-    ok = patch.MemoryPatch(CUBE_ORGANS_HOOK).jump(@intFromPtr(&cubeOrgansShim)).commit() and ok;
-    ok = patch.MemoryPatch(UBER_MEPH_AI).jump(@intFromPtr(&MephShim.shim)).commit() and ok;
-    ok = patch.MemoryPatch(UBER_DIABLO_AI).jump(@intFromPtr(&DiabloShim.shim)).commit() and ok;
-    ok = patch.MemoryPatch(UBER_BAAL_AI).jump(@intFromPtr(&BaalShim.shim)).commit() and ok;
-    ok = patch.MemoryPatch(KILLMONSTER_ENTRY).jump(@intFromPtr(&killMonsterShim)).nops(1).commit() and ok;
-    // Ignore durability modification on custom spawn items.
-    ok = patch.MemoryPatch(DURABILITY_NOP_FROM).nopTo(DURABILITY_NOP_TO).commit() and ok;
+    ok = patch.MemoryPatch(CUBE_KEYS).expect(&thunk).jump(@intFromPtr(&CubeShim(cubeKeys).shim)).commit() and ok;
+    ok = patch.MemoryPatch(CUBE_ORGANS).expect(&thunk).jump(@intFromPtr(&CubeShim(cubeOrgans).shim)).commit() and ok;
+    ok = patch.MemoryPatch(UBER_MEPHISTO_AI).expect(&stub).jump(@intFromPtr(&AiShim(ai.mephisto).shim)).commit() and ok;
+    ok = patch.MemoryPatch(UBER_DIABLO_AI).expect(&stub).jump(@intFromPtr(&AiShim(ai.diablo).shim)).commit() and ok;
+    ok = patch.MemoryPatch(UBER_BAAL_AI).expect(&stub).jump(@intFromPtr(&AiShim(ai.baal).shim)).commit() and ok;
+    // Only Uber Diablo takes the other selector; the shim sends every other class on to 1.14d's.
+    ok = patch.MemoryPatch(DIABLO_SELECT_CALL).expect(&DIABLO_SELECT_BYTES).call(@intFromPtr(&ai.diabloSelectShim)).commit() and ok;
+    // `push ebx; call GetLevelIdFromRoom` (6 bytes) becomes `call heldPresetShim; nop`; the `jmp next`
+    // after it stays.
+    ok = patch.MemoryPatch(PRESET_TRISTRAM_SITE).expect(&PRESET_TRISTRAM_BYTES).call(@intFromPtr(&heldPresetShim)).nops(1).commit() and ok;
+    // `jz next` becomes `jz PRESET_TRISTRAM_SITE`: rel8 from the end of the jz.
+    const rel: i8 = @intCast(@as(isize, PRESET_TRISTRAM_SITE) - @as(isize, PRESET_HOLD_JZ + 2));
+    ok = patch.MemoryPatch(PRESET_HOLD_JZ).expect(&PRESET_HOLD_BYTES).bytes(&.{ 0x74, @bitCast(rel) }).commit() and ok;
 
     if (ok) {
-        log.print("ubers: installed (Pandemonium + Uber Tristram)");
+        log.print("ubers: installed (Pandemonium Event and Uber Tristram)");
     } else {
         log.print("ubers: FAILED to install one or more patches");
     }
