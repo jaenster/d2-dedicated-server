@@ -43,8 +43,8 @@ the registry, done.
 
 See [`apps/d2gs/runtime/feature/`](../apps/d2gs/runtime/feature/): `expmod` (XP scaling), `ubers`
 (Pandemonium / Uber Tristram), `arena` (server-side PvP rounds), `ladder-items`, `guild-panel`, and
-client-side maphack (`omnivision`, `mapunits`, `mapreveal`) -- the same DLL injects into a real client too. Each is
-toggled by its own `--<flag>`; see [`docs/FLAGS.md`](FLAGS.md).
+client-side maphack (`omnivision`, `mapunits`, `mapreveal`) -- the same DLL injects into a real client too. `ubers` is
+always on in the GS; the others are toggled by their own `--<flag>`; see [`docs/FLAGS.md`](FLAGS.md).
 
 ## Native mods of your own
 

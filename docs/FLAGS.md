@@ -28,7 +28,6 @@ Off by default unless noted. See [`docs/MODDING.md`](MODDING.md).
 | `--bypass-checkrev` | (client) skip the bnet version check |
 | `--no-compress` | disable packet compression (debugging) |
 | `--expmod` | server: XP scaling |
-| `--ubers` | server: Pandemonium / Uber Tristram event |
 | `--arena` | server: PvP arena rounds |
 | `--ladder-items` | server: ladder-only item content (opt-in; bootstrap-flaky) |
 | `--guild-panel` | client: Steeg Stone guild panel |
