@@ -664,6 +664,27 @@ pub fn build(b: *std.Build) void {
         stress_e2e_step.dependOn(&run_stress_e2e.step);
     }
 
+    // join-probe - one clientless player joining a game, for a character of any account (tools/join-probe)
+    if (b.lazyDependency("clientless", .{ .target = host, .optimize = optimize })) |clientless_dep| {
+        const exe = b.addExecutable(.{
+            .name = "join-probe",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/join-probe/main.zig"),
+                .target = host,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        exe.root_module.addImport("d2-realm", clientless_dep.module("d2-realm"));
+        exe.root_module.addImport("d2-session", clientless_dep.module("d2-session"));
+        const run = b.addRunArtifact(exe);
+        run.addPassthruArgs();
+        const step = b.step("join-probe", "one clientless player joining a game with a given account and character");
+        step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        step.dependOn(&run.step);
+    }
+
+
     // gamestress — create N games against a RUNNING realm/GS (manual: `zig build gamestress`).
     // Used to verify the empty-game reaper fix (the GS shouldn't OOM past ~8 games).
     const gamestress_mod = b.createModule(.{
