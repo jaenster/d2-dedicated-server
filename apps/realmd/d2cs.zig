@@ -15,6 +15,7 @@ const d2s = @import("d2s.zig");
 const fleet = @import("fleet.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
+const metrics = @import("metrics.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d2s create time
 
@@ -258,6 +259,11 @@ fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: b
     var c = DConn{ .fd = fd };
     defer flushOut(&c); // no exit path may strand queued packets
     log.line(tag, "client connected", .{});
+    metrics.connectionOpened(.mcp);
+    defer {
+        metrics.sessionChanged(.mcp, c.authed, false);
+        metrics.connectionClosed(.mcp);
+    }
 
     var acc: [16384]u8 = undefined;
     var len: usize = @min(initial.len, acc.len);
@@ -366,12 +372,16 @@ fn onStartup(c: *DConn, tag: []const u8, body: []const u8) void {
         c.client_version_len = @intCast(v.len);
         @memcpy(c.client_version[0..v.len], v);
         result = 0x00;
+        metrics.logon(.mcp_session_ok);
         log.line(tag, "startup session={d} -> account={s} engine={s}", .{ sid, acct, v });
     } else {
+        metrics.logon(.mcp_session_unknown_session);
         log.line(tag, "startup session={d} -> UNKNOWN (rejected)", .{sid});
     }
 
+    const was = c.authed;
     c.authed = result == 0x00;
+    metrics.sessionChanged(.mcp, was, c.authed);
     if (!c.authed) c.drop = true;
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, MCP_STARTUP);
@@ -548,6 +558,7 @@ fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "char logon '{s}' (account={s}) -> REFUSED: character is {s}, client is {s}", .{
             name, acct, char_version.slice(), client_version,
         });
+        metrics.charLogon(.incompatible);
         var rbuf: [12]u8 = undefined;
         var rw = startPacket(&rbuf, MCP_CHARLOGON);
         rw.putU32(CHARLOGON_REFUSED);
@@ -557,6 +568,7 @@ fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
     c.setChar(name); // remember the active char so a later join can name it to the GS
     hook.charLogon(c.accountName(), name);
     log.line(tag, "char logon '{s}' (account={s}) -> ok", .{ name, c.accountName() });
+    metrics.charLogon(.ok);
     var buf: [12]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARLOGON);
     w.putU32(CHARLOGON_OK);
@@ -713,6 +725,10 @@ fn validGameName(name: []const u8) bool {
 }
 
 fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
+    // Every return below names its outcome; the time is what the player waited for the answer.
+    const t0 = metrics.nowUs();
+    var outcome: metrics.Create = .gs_refused;
+    defer metrics.gameCreate(outcome, t0);
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
     // MCP create-game flags DWORD: difficulty lives in bits 12-14 (Normal=0x0000,
@@ -741,10 +757,12 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
 
     if (!validGameName(name)) {
         log.line(tag, "create game '{s}' -> invalid name", .{name});
+        outcome = .invalid_name;
         return fail(c, &w, CREATE_INVALID_NAME);
     }
     if (hook.gameCreate(c.accountName(), c.charName(), name, difficulty)) |result| {
         log.line(tag, "create game '{s}' -> refused by extension ({d})", .{ name, result });
+        outcome = .refused;
         return fail(c, &w, result);
     }
     if (!fleet.ready()) {
@@ -752,6 +770,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // client's switch that fits. The 0x06 that used to go out here isn't a case at
         // all, so the client fell to `default:` and left the player on a dead screen.
         log.line(tag, "create game '{s}' -> NO GS available", .{name});
+        outcome = .no_gs;
         return fail(c, &w, CREATE_SERVER_DOWN);
     }
     // A name already in the realm registry is a DIFFERENT failure than "no GS took it":
@@ -759,6 +778,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // Asking the GS first would just get a refusal we'd report as the generic 0x1e.
     if (state.global.findGame(name) != null) {
         log.line(tag, "create game '{s}' -> name already exists", .{name});
+        outcome = .name_taken;
         return fail(c, &w, CREATE_NAME_TAKEN);
     }
     // The game inherits the CREATOR's character flags — a hardcore ladder character makes
@@ -792,6 +812,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // stress rounds. Claiming first moves the refusal to where the loser can still be told.
     if (!store.reserveGameName(name)) {
         log.line(tag, "create game '{s}' (account={s}) -> name already claimed", .{ name, c.accountName() });
+        outcome = .name_taken;
         return fail(c, &w, CREATE_NAME_TAKEN);
     }
     const char_version = store.charVersion(c.accountName(), c.charName());
@@ -820,6 +841,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // realm is down while it plainly is not.
         if (fleet.last_create_failure == .name_taken) {
             log.line(tag, "create game '{s}' -> name already exists (GS refused; lost the race)", .{name});
+            outcome = .name_taken;
             return fail(c, &w, CREATE_NAME_TAKEN);
         }
         // Nothing to do with the name. Say WHICH of the two it was in the LOG: a fleet with no
@@ -830,8 +852,11 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // whoever runs the realm is in the line above.
         if (fleet.last_create_failure == .all_full) {
             log.line(tag, "create game '{s}' -> every GS is at its game limit (fleet is full)", .{name});
+            outcome = .fleet_full;
             return fail(c, &w, CREATE_SERVER_DOWN);
         }
+        // No server at all is a different operational signal from one that said no.
+        outcome = if (fleet.last_create_failure == .no_gs) .no_gs else .gs_refused;
         log.line(tag, "create game '{s}' -> GS refused", .{name});
         return fail(c, &w, CREATE_SERVER_DOWN);
     }
@@ -844,6 +869,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc, max_players)) {
         store.releaseGameName(name);
         log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it: {s}", .{ name, rr.gameid, store.registerGameError() });
+        outcome = .store_error;
         return fail(c, &w, CREATE_ERROR_GENERIC);
     }
     // The game record now owns the name and is what a duplicate create is refused against, so the
@@ -881,6 +907,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putU16(token); // game token (client presents this to the d2ingress)
     w.putU16(0); // unknown
     w.putU32(0); // result: success
+    outcome = .ok;
     finish(c, &w);
 }
 
@@ -908,6 +935,9 @@ test "a passworded game needs exactly its password" {
 }
 
 fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
+    const t0 = metrics.nowUs();
+    var outcome: metrics.Join = .not_found;
+    defer metrics.gameJoin(outcome, t0);
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
     const name = r.getStr();
@@ -934,16 +964,19 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     if (game == null) {
         log.line(tag, "join game '{s}' -> not found", .{name});
+        outcome = .not_found;
         return rejectJoin(c, &w, JOIN_NO_SUCH_GAME);
     }
     const g = game.?;
     // Reject a wrong password for a passworded game (open games have pw_len == 0).
     if (!joinPasswordOk(g.pw(), join_pass)) {
         log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD (game has {d} chars, join sent {d})", .{ name, c.accountName(), g.pw_len, join_pass.len });
+        outcome = .bad_password;
         return rejectJoin(c, &w, JOIN_BAD_PASSWORD);
     }
     if (hook.gameJoin(c.accountName(), c.charName(), name)) |result| {
         log.line(tag, "join game '{s}' (account={s}) -> refused by extension ({d})", .{ name, c.accountName(), result });
+        outcome = .refused;
         return rejectJoin(c, &w, result);
     }
     // Guild Hall game type (cut feature): a game named exactly after a guild IS that
@@ -954,6 +987,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         var ghc = gh;
         if (ghc.findMember(c.accountName()) == null) {
             log.line(tag, "join guild hall '{s}' (account={s}) -> NOT A MEMBER, hidden", .{ name, c.accountName() });
+            outcome = .not_member;
             return rejectJoin(c, &w, JOIN_NO_SUCH_GAME);
         }
         log.line(tag, "join guild hall '{s}' as member {s}", .{ name, c.accountName() });
@@ -964,6 +998,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const joiner = charStatus(c);
     if (joinStatusError(g.status, joiner)) |why| {
         log.line(tag, "join game '{s}' (account={s}) -> status mismatch game=0x{x:0>2} char=0x{x:0>2} -> 0x{x}", .{ name, c.accountName(), g.status, joiner, why });
+        outcome = .status_mismatch;
         return rejectJoin(c, &w, why);
     }
     // Nightmare and Hell are earned. The client hides difficulties a character has not
@@ -971,6 +1006,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // either way it gets the specific message rather than a confusing generic failure.
     if (difficultyError(g.difficulty, charProgression(c), (joiner & STATUS_EXPANSION) != 0)) |why| {
         log.line(tag, "join game '{s}' (account={s}) -> difficulty {d} not unlocked (progression {d}) -> 0x{x}", .{ name, c.accountName(), g.difficulty, charProgression(c), why });
+        outcome = .difficulty_locked;
         return rejectJoin(c, &w, why);
     }
     // A character is in one game at a time. Checked HERE, upfront, because the game server's own
@@ -1011,6 +1047,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // least-bad listed code: untrue here, but it refuses visibly. Replace it if a truer one
         // is found.
         log.line(tag, "join game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
+        outcome = .char_busy;
         return rejectJoin(c, &w, JOIN_FULL);
     }
     // The seat limit is enforced here, atomically, against every seat the game holds. The player
@@ -1021,6 +1058,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (store.addGameChar(g.gameid, c.accountName(), c.charName(), seatLimit(g.max_players)) == .full) {
         _ = store.unlockChar(c.accountName(), c.charName(), jowner);
         log.line(tag, "join game '{s}' (account={s}) -> FULL (every seat taken or pending)", .{ name, c.accountName() });
+        outcome = .full;
         return rejectJoin(c, &w, JOIN_FULL);
     }
     // Stage the character into the shared store before the game server goes looking. The server
@@ -1049,6 +1087,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putBytes(&advertised_ip); // d2gs / d2ingress IP (in_addr, network order)
     w.putU32(0); // game hash
     w.putU32(JOIN_OK); // result: success
+    outcome = .ok;
     finish(c, &w);
 }
 

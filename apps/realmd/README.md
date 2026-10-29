@@ -13,10 +13,27 @@ source. MIT-licensed.
 | port | name | role |
 |-|-|-|
 | 6112 | `bncs.zig` | BNCS chat/login **and** MCP: account login, realm query, BNFTP version MPQ, char list, create/join |
-| 8080 | `health.zig` | probes + the admin API and web UI |
+| 8080 | `health.zig` | probes, `/metrics`, the admin API and web UI. ClusterIP, never routed |
 
 One client-facing port, as real Battle.net has it: `bncs.handle` selector-muxes MCP onto it.
 Game servers have no port here at all — they meet the realm in redis.
+
+## Metrics
+
+`GET /metrics` on the health port, Prometheus text. Per instance: a realm of several replicas is
+the sum. Labels are closed sets; nothing names an account, a character or a game. Games are not
+counted here: they live in redis, so every replica would report the same realm-wide number.
+
+| metric | type | labels |
+|-|-|-|
+| `realmd_connections` | gauge | `protocol`: bncs, mcp |
+| `realmd_sessions` | gauge | `protocol`: bncs, mcp (connections that have logged in) |
+| `realmd_logons_total` | counter | `method`/`result`: password and extension (SID_LOGONRESPONSE2; extension = an `authenticate` hook such as a launcher ticket) with ok, bad_password, no_account; mcp_session with ok, unknown_session; nls with unsupported |
+| `realmd_char_logons_total` | counter | `result`: ok, incompatible |
+| `realmd_game_creates_total` | counter | `result`: ok, invalid_name, refused, no_gs, name_taken, fleet_full, gs_refused, store_error |
+| `realmd_game_joins_total` | counter | `result`: ok, not_found, bad_password, refused, not_member, status_mismatch, difficulty_locked, full, char_busy |
+| `realmd_game_create_seconds` | histogram | request to answer, the game server round trip included |
+| `realmd_game_join_seconds` | histogram | request to answer, the waits for a pending create or a seat included |
 
 ## Architecture
 
@@ -54,6 +71,7 @@ fleet with no host ports — d2ingress splices to pod IPs):
 - `admin.zig` / `webui.zig` — the admin API and its web UI, on the health port.
 - `gameedge.zig` — the optional in-process game-traffic edge (`REALMD_GAME_PORT`), for a single host with no separate d2ingress.
 - `health.zig` / `shutdown.zig` — probes, and the SIGTERM drain.
+- `metrics.zig` — the Prometheus counters `GET /metrics` renders (below).
 - `assets/` — `bnserver-D2DV.ini` (gateway/version config), the factored Blizzard weak-signature key, README.
 
 ## Testing it

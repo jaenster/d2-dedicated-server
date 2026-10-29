@@ -39,6 +39,8 @@ pub const state = @import("state.zig");
 pub const health = @import("health.zig");
 pub const admin = @import("admin.zig");
 pub const shutdown = @import("shutdown.zig");
+/// Counters an extension may add to, and what `GET /metrics` on the health port renders.
+pub const metrics = @import("metrics.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
 
 /// The realm's own modules, re-exported so an extension can reach the server it extends: read a

@@ -27,6 +27,7 @@ const friendcmd = @import("friendcmd.zig");
 const store = @import("store.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
+const metrics = @import("metrics.zig");
 const auth = @import("auth.zig");
 const version = @import("version.zig");
 
@@ -144,11 +145,7 @@ fn nextToken() u32 {
 /// needs a logged-on account.
 fn allowedBeforeLogon(id: u8) bool {
     return switch (id) {
-        SID_NULL, SID_PING, SID_AUTH_INFO, SID_AUTH_CHECK, SID_LOGONRESPONSE2, SID_LOGONRESPONSE,
-        SID_AUTHACCOUNTLOGON, SID_CREATEACCOUNT2, SID_CHANGEPASSWORD, SID_RESETPASSWORD,
-        SID_GETFILETIME, SID_NETGAMEPORT, SID_CLIENTID2, SID_LOCALEINFO, SID_REPORTCRASH,
-        SID_STARTVERSIONING, SID_REPORTVERSION, SID_CDKEY3, SID_NEWS_INFO, SID_CHECKAD,
-        SID_DISPLAYAD, SID_CLICKAD, SID_QUERYADURL => true,
+        SID_NULL, SID_PING, SID_AUTH_INFO, SID_AUTH_CHECK, SID_LOGONRESPONSE2, SID_LOGONRESPONSE, SID_AUTHACCOUNTLOGON, SID_CREATEACCOUNT2, SID_CHANGEPASSWORD, SID_RESETPASSWORD, SID_GETFILETIME, SID_NETGAMEPORT, SID_CLIENTID2, SID_LOCALEINFO, SID_REPORTCRASH, SID_STARTVERSIONING, SID_REPORTVERSION, SID_CDKEY3, SID_NEWS_INFO, SID_CHECKAD, SID_DISPLAYAD, SID_CLICKAD, SID_QUERYADURL => true,
         else => false,
     };
 }
@@ -309,6 +306,13 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     var c = Conn{ .fd = fd, .server_token = nextToken() };
     defer flushOut(&c); // no exit path may strand queued packets
     log.line(tag, "client connected", .{});
+    // Counted once the selector says BNCS; an MCP or BNFTP connection is handed off before that.
+    // A defer, because not every exit from the read loop goes through disconnect().
+    var counted = false;
+    defer if (counted) {
+        metrics.sessionChanged(.bncs, c.authed, false);
+        metrics.connectionClosed(.bncs);
+    };
 
     var acc: [16384]u8 = undefined;
     var len: usize = 0;
@@ -342,6 +346,8 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
                 return;
             }
             got_proto = true;
+            counted = true;
+            metrics.connectionOpened(.bncs);
             off = 1;
         }
         while (len - off >= 4) {
@@ -551,8 +557,16 @@ fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
 
     // The proof is checked against the token THIS connection was given, never the one the client
     // says it was given: trusting the echo would let a proof captured elsewhere be replayed.
-    const result = if (echoed != c.server_token) LOGON_BAD_PASSWORD else logonResult(c, c.server_token, got);
+    var by_extension = false;
+    const result = if (echoed != c.server_token) LOGON_BAD_PASSWORD else logonResult(c, c.server_token, got, &by_extension);
+    const was = c.authed;
     c.authed = result == LOGON_OK;
+    metrics.sessionChanged(.bncs, was, c.authed);
+    metrics.logon(switch (result) {
+        LOGON_OK => if (by_extension) .extension_ok else .password_ok,
+        LOGON_NO_ACCOUNT => if (by_extension) .extension_no_account else .password_no_account,
+        else => if (by_extension) .extension_bad_password else .password_bad_password,
+    });
     if (!c.authed) c.drop = true;
     if (result == LOGON_OK) friends.setOnline(acct); // presence for friends online-status
     hook.accountLogin(acct, result == LOGON_OK);
@@ -572,7 +586,7 @@ fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
 // convenience); strict (default) rejects them with LOGON_NO_ACCOUNT.
 pub var permissive_auth: bool = false;
 
-fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
+fn logonResult(c: *Conn, server_token: u32, got: [20]u8, by_extension: *bool) u32 {
     const acct = c.accountName();
     var stored: [20]u8 = undefined;
     // An extension answers first if it wants to: a realm behind an existing account database, a
@@ -588,26 +602,29 @@ fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
         .exe_version = c.exe_version,
         .verbyte = c.verbyte,
     };
-    if (hook.authenticate(req)) |decision| return switch (decision) {
-        .accept => blk: {
-            if (store.accountPwHash(acct, &stored) == null) {
-                if (!hook.accountCreate(acct)) break :blk LOGON_NO_ACCOUNT;
-                // With an UNUSABLE password, not a null one. A password-less account is accepted
-                // by the stock check below whatever the client sends, so creating one here would
-                // mean an extension that authenticated a player once — a launcher ticket, an SSO
-                // callback — left behind an account anybody can then log into with any password.
-                // The extension said yes, so the extension owns this account from now on.
-                const unusable = auth.unusablePassword() orelse {
-                    log.line("bncs", "no entropy to close account {s}; refusing rather than creating it open", .{acct});
-                    break :blk LOGON_NO_ACCOUNT;
-                };
-                _ = store.createAccount(acct, unusable);
-            }
-            break :blk LOGON_OK;
-        },
-        .reject_password => LOGON_BAD_PASSWORD,
-        .reject_no_account => LOGON_NO_ACCOUNT,
-    };
+    if (hook.authenticate(req)) |decision| {
+        by_extension.* = true;
+        return switch (decision) {
+            .accept => blk: {
+                if (store.accountPwHash(acct, &stored) == null) {
+                    if (!hook.accountCreate(acct)) break :blk LOGON_NO_ACCOUNT;
+                    // With an UNUSABLE password, not a null one. A password-less account is accepted
+                    // by the stock check below whatever the client sends, so creating one here would
+                    // mean an extension that authenticated a player once — a launcher ticket, an SSO
+                    // callback — left behind an account anybody can then log into with any password.
+                    // The extension said yes, so the extension owns this account from now on.
+                    const unusable = auth.unusablePassword() orelse {
+                        log.line("bncs", "no entropy to close account {s}; refusing rather than creating it open", .{acct});
+                        break :blk LOGON_NO_ACCOUNT;
+                    };
+                    _ = store.createAccount(acct, unusable);
+                }
+                break :blk LOGON_OK;
+            },
+            .reject_password => LOGON_BAD_PASSWORD,
+            .reject_no_account => LOGON_NO_ACCOUNT,
+        };
+    }
     const has_pw = store.accountPwHash(acct, &stored) orelse {
         if (permissive_auth) {
             // Auto-registration is still a creation, so an extension gating who may exist gets
@@ -1736,6 +1753,7 @@ fn onAuthAccountLogon(c: *Conn, tag: []const u8) void {
     w.putU32(1); // 1 = account does not exist — clean NLS failure (realmd is OLS-only)
     finish(c, &w);
     log.line(tag, "authaccountlogon (NLS) -> rejected; realmd is OLS-only", .{});
+    metrics.logon(.nls_unsupported);
 }
 
 // Product code for an online friend (D2XP), little-endian 4 chars as the client expects.

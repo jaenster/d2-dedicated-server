@@ -5,6 +5,8 @@
 //!   GET /readyz  -> 200 only if started AND not draining AND store reachable AND (if
 //!                   REALMD_REQUIRE_GS) a game server is registered; 503 otherwise so k8s
 //!                   keeps the pod out of Service endpoints.
+//!   GET /metrics -> Prometheus text (metrics.zig). Unauthenticated, like the probes: the port is
+//!                   ClusterIP and never routed, and nothing in it names a player.
 const std = @import("std");
 const net = @import("realm_infra").net;
 const fleet = @import("fleet.zig");
@@ -12,6 +14,7 @@ const store = @import("store.zig");
 const shutdown = @import("shutdown.zig");
 const admin = @import("admin.zig");
 const webui = @import("webui.zig");
+const metrics = @import("metrics.zig");
 
 /// When set (REALMD_REQUIRE_GS), /readyz only goes green once ≥1 GS is registered —
 /// so the pod isn't routed client traffic before it can actually host games.
@@ -119,6 +122,13 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
         } else {
             respond(fd, ok, "ready\n");
         }
+    } else if (std.mem.eql(u8, path, "/metrics")) {
+        var body: [16384]u8 = undefined;
+        const text = metrics.render(&body);
+        var head: [160]u8 = undefined;
+        const h = std.fmt.bufPrint(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{text.len}) catch return;
+        _ = net.writeAll(fd, h);
+        _ = net.writeAll(fd, text);
     } else if (std.mem.eql(u8, parseMethod(req), "GET")) {
         // Everything else is the admin web UI (a single-page app). Only GET; other
         // methods on unknown paths stay a 404.
