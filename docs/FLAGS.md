@@ -15,7 +15,7 @@ is what the container images and the Helm chart use.
 | `--redis <host:port>` | the shared store — this server's only link to a realm. Env: `D2GS_REDIS_ADDR` |
 | `--gs-addr <ip:port>` | public address clients dial for this GS's games (published in its own redis record). Env: `D2GS_GS_ADDR` |
 | `--max-games <n>` | capacity this GS publishes in its redis record. Env: `D2GS_MAX_GAMES` |
-| `--reap-ms <n>` | how long an empty game is kept before it is destroyed (default 5000). Also this server's throughput ceiling -- see [How many games per server](PERFORMANCE.md#how-many-games-per-server). Env: `D2GS_REAP_MS` |
+| `--reap-ms <n>` | how long an empty game stays open so its players can rejoin it (default 300000, retail's five minutes, also the most it takes). While the server has fewer than two free game slots, empty games are destroyed after 5 s instead -- see [How many games per server](PERFORMANCE.md#how-many-games-per-server). Env: `D2GS_REAP_MS` |
 | `--realm-gw <ip>` | (client) point the game's bnet gateway list at your realm instead of Blizzard's |
 
 ## Feature toggles

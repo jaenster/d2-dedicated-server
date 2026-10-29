@@ -90,6 +90,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("packages/gs-health/gs_health.zig"),
     });
 
+    // How long an empty game is kept: pure policy the engine patch is driven by.
+    const gs_reap = b.addModule("gs_reap", .{
+        .root_source_file = b.path("packages/gs-reap/gs_reap.zig"),
+    });
+
     // Host-side infrastructure (net/log/config/lock/store types) for the NATIVE binaries.
     // Deliberately NOT given to the DLL, so libc-socket / POSIX code never enters that build.
     const realm_infra = b.addModule("realm_infra", .{
@@ -157,6 +162,7 @@ pub fn build(b: *std.Build) void {
     d2gs.root_module.addImport("gs_store", gs_store);
     d2gs.root_module.addImport("gs_seats", gs_seats);
     d2gs.root_module.addImport("gs_health", gs_health);
+    d2gs.root_module.addImport("gs_reap", gs_reap);
     d2gs.root_module.addImport("obs", obs);
     d2gs.root_module.addImport("d2engine", d2engine);
     // As a module, not a relative import: the same file is the root of the `fastcall` module that
@@ -446,6 +452,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(gs_health_tests).step);
+
+    const gs_reap_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/gs-reap/gs_reap.zig"),
+            .target = host,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(gs_reap_tests).step);
 
     // d2ingress's pure wire logic (the 0xAF greeting strip it applies to the GS→client splice),
     // rooted at the binary itself with its infra import.
