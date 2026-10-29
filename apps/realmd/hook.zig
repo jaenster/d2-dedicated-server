@@ -22,7 +22,8 @@
 //!
 //! Hooks come in three shapes, and which one a hook is says what an extension may do with it:
 //!
-//!   - OBSERVE (`void`): it already happened. `accountLogin`, `charLogon`, `charSave`.
+//!   - OBSERVE (`void`): it already happened. `accountLogin`, `charLogon`, `charSave`,
+//!     `charCreated`, `charDeleted`, `gameStarted`, `gamePlayer`, `gameClosed`.
 //!   - VETO (`?Result`): the realm is about to allow something; return a refusal code to stop it,
 //!     null to stay out of the way. First extension to answer wins. `charCreate`, `gameCreate`.
 //!   - OVERRIDE (`?T`): the realm is about to DECIDE something; return the decision to make it,
@@ -196,6 +197,22 @@ pub fn charLogon(account: []const u8, charname: []const u8) void {
     }
 }
 
+/// A character was created and stored. OBSERVE: `charCreate` is where one is refused; this runs
+/// only for a character that now exists. `status` is the .d2s status byte it was made with
+/// (hardcore 0x04, expansion 0x20, ladder 0x40).
+pub fn charCreated(account: []const u8, charname: []const u8, class: u8, status: u8) void {
+    inline for (registry) |ext| {
+        if (@hasDecl(ext, "charCreated")) ext.charCreated(account, charname, class, status);
+    }
+}
+
+/// A character was deleted from the store. OBSERVE.
+pub fn charDeleted(account: []const u8, charname: []const u8) void {
+    inline for (registry) |ext| {
+        if (@hasDecl(ext, "charDeleted")) ext.charDeleted(account, charname);
+    }
+}
+
 /// A game is about to be created. Return an MCP result code to refuse it, null to allow.
 pub fn gameCreate(account: []const u8, charname: []const u8, gamename: []const u8, difficulty: u8) ?u32 {
     inline for (registry) |ext| {
@@ -214,6 +231,59 @@ pub fn gameJoin(account: []const u8, charname: []const u8, gamename: []const u8)
         }
     }
     return null;
+}
+
+/// A game a game server accepted and the realm recorded. The password is deliberately not here:
+/// nothing an observer does with it could be anything but a leak.
+pub const GameStarted = struct {
+    account: []const u8,
+    charname: []const u8,
+    gamename: []const u8,
+    gameid: u32,
+    /// The server hosting it, as the fleet knows it.
+    gsid: u32,
+    difficulty: u8,
+    hardcore: bool,
+    expansion: bool,
+    ladder: bool,
+};
+
+/// OBSERVE: a game now exists. `gameCreate` is where one is refused; this runs only for a create
+/// that succeeded, after the realm recorded it.
+pub fn gameStarted(g: GameStarted) void {
+    inline for (registry) |ext| {
+        if (@hasDecl(ext, "gameStarted")) ext.gameStarted(g);
+    }
+}
+
+/// A player entering or leaving a game, as its game server reported it.
+pub const GamePlayer = struct {
+    gameid: u32,
+    /// Empty from a game server too old to send it.
+    account: []const u8,
+    charname: []const u8,
+    level: u8,
+    class: u8,
+    /// True for an entry, false for a departure.
+    entered: bool,
+    /// The game's population after the change, as the server counts it.
+    players: u32,
+};
+
+/// OBSERVE: a player entered or left a game. Reported by whichever instance drained the game
+/// server's event, once across the realm.
+pub fn gamePlayer(p: GamePlayer) void {
+    inline for (registry) |ext| {
+        if (@hasDecl(ext, "gamePlayer")) ext.gamePlayer(p);
+    }
+}
+
+/// OBSERVE: a game ended on its game server. Runs before the realm forgets the game, once across
+/// the realm.
+pub fn gameClosed(gameid: u32) void {
+    inline for (registry) |ext| {
+        if (@hasDecl(ext, "gameClosed")) ext.gameClosed(gameid);
+    }
 }
 
 /// The game a server is being chosen for, and the fleet to choose from. `servers` is the live

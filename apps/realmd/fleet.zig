@@ -404,6 +404,15 @@ fn apply(typ: p.Type, body: []const u8) void {
             // ever keeps a lock.
             if ((flag == p.GAMEINFO_ENTER or flag == p.GAMEINFO_PRESENT) and char.len > 0)
                 _ = store.confirmGameChar(gameid, acct, char, flag == p.GAMEINFO_PRESENT);
+            if (flag == p.GAMEINFO_ENTER or flag == p.GAMEINFO_LEAVE) hook.gamePlayer(.{
+                .gameid = gameid,
+                .account = acct,
+                .charname = char,
+                .level = @intCast(@min(level, 255)),
+                .class = @intCast(@min(class, 255)),
+                .entered = flag == p.GAMEINFO_ENTER,
+                .players = players,
+            });
             if (flag == p.GAMEINFO_LEAVE and char.len > 0) {
                 if (acct.len > 0) {
                     _ = store.releaseGameCharExact(gameid, acct, char);
@@ -420,6 +429,7 @@ fn apply(typ: p.Type, body: []const u8) void {
             // reported leaving — a client that vanished, or a server lost mid-game — since
             // otherwise those characters would stay claimed until their lease ran out.
             _ = store.releaseGameChars(gameid);
+            hook.gameClosed(gameid);
             state.global.removeGameById(gameid);
             log.line("fleet", "game {d} closed", .{gameid});
         },

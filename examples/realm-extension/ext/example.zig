@@ -114,6 +114,16 @@ pub fn charLogon(account: []const u8, charname: []const u8) void {
     realmd.log.line(name, "{s}/{s} entered", .{ account, charname });
 }
 
+/// OBSERVE a character that was created and stored; `status` is its .d2s status byte.
+pub fn charCreated(account: []const u8, charname: []const u8, class: u8, status: u8) void {
+    realmd.log.line(name, "{s}/{s} created (class {d}, status 0x{x:0>2})", .{ account, charname, class, status });
+}
+
+/// OBSERVE a character that was deleted.
+pub fn charDeleted(account: []const u8, charname: []const u8) void {
+    realmd.log.line(name, "{s}/{s} deleted", .{ account, charname });
+}
+
 /// OVERRIDE which engine a new character belongs to. The realm's own answer is the engine of the
 /// client that created it; return a tag to decide differently — an account pinned to an era, a
 /// launcher that said which one, a season that only runs one.
@@ -164,6 +174,21 @@ pub fn gameJoin(account: []const u8, charname: []const u8, gamename: []const u8)
     _ = charname;
     _ = gamename;
     return null;
+}
+
+/// OBSERVE a game that now exists. No password: an observer has no business with it.
+pub fn gameStarted(g: realmd.hook.GameStarted) void {
+    realmd.log.line(name, "game '{s}' started by {s} (id {d}, difficulty {d})", .{ g.gamename, g.charname, g.gameid, g.difficulty });
+}
+
+/// OBSERVE a player entering or leaving a game, as its server reported it.
+pub fn gamePlayer(p: realmd.hook.GamePlayer) void {
+    realmd.log.line(name, "{s} {s} game {d} ({d} now)", .{ p.charname, if (p.entered) "entered" else "left", p.gameid, p.players });
+}
+
+/// OBSERVE a game that ended.
+pub fn gameClosed(gameid: u32) void {
+    realmd.log.line(name, "game {d} closed", .{gameid});
 }
 
 /// OVERRIDE what the join list shows this player. False hides a game, true forces it visible,

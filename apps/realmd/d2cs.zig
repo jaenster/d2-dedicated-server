@@ -643,6 +643,7 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     // connection has no active character, so the first game it creates or joins names an empty
     // one to the game server; only a reconnect, which does select it, got it right.
     c.setChar(name);
+    hook.charCreated(acct, name, class, status_flags);
     hook.charLogon(acct, name);
     w.putU32(0); // success
     finish(c, &w);
@@ -850,6 +851,17 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // TTL after the game it guarded had already ended.
     store.releaseGameName(name);
     state.global.noteGameCreated(rr.gameid); // starts the clock the detail panel counts from
+    hook.gameStarted(.{
+        .account = c.accountName(),
+        .charname = c.charName(),
+        .gamename = name,
+        .gameid = rr.gameid,
+        .gsid = rr.gsid,
+        .difficulty = difficulty,
+        .hardcore = hardcore,
+        .expansion = expansion,
+        .ladder = ladder != 0,
+    });
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -1118,6 +1130,7 @@ fn onCharDelete(c: *DConn, tag: []const u8, body: []const u8) void {
     const ok = store.deleteCharD2s(c.accountName(), name);
     // The name goes back to the realm with the character.
     if (ok) store.releaseCharName(c.accountName(), name);
+    if (ok) hook.charDeleted(c.accountName(), name);
     log.line(tag, "char delete '{s}' (account={s}) -> {s}", .{ name, c.accountName(), if (ok) "deleted" else "FAILED" });
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARDELETE);

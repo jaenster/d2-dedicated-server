@@ -810,6 +810,36 @@ pub fn delExtCache(ext: []const u8, key: []const u8) void {
     _ = command(s, &r, &.{ "DEL", k });
 }
 
+/// Append to a list in the extension's namespace, keeping only the newest `cap` entries. The
+/// queue half of the extension keyspace: something outside the realm drains it with LPOP, and a
+/// realm with nothing draining it holds at most `cap` entries rather than growing without bound.
+pub fn pushExtList(ext: []const u8, key: []const u8, value: []const u8, cap: u32) bool {
+    var kb: [ext_key_buf]u8 = undefined;
+    const k = extKey(&kb, ext, key) orelse return false;
+    var cb: [16]u8 = undefined;
+    const keep = std.fmt.bufPrint(&cb, "-{d}", .{@max(cap, 1)}) catch return false;
+
+    const s = acquire();
+    defer release(s);
+    const fd = s.fd orelse ensureConn(s) orelse return false;
+    var c = CmdBuf{ .fd = fd };
+    c.add(&.{ "RPUSH", k, value });
+    c.add(&.{ "LTRIM", k, keep, "-1" });
+    c.flush();
+    if (!c.ok) {
+        dropConn(s);
+        return false;
+    }
+    var r: Reader = .{ .fd = fd };
+    for (0..2) |_| {
+        if (readReply(&r) == null) {
+            dropConn(s);
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Add to a counter in the extension's namespace and return the new value, setting the TTL only
 /// when the key is created. The one operation a rate limit or a "kills this season" counter needs
 /// and cannot build out of get+set without losing increments between instances.

@@ -258,6 +258,11 @@ pub const Ext = struct {
     pub fn cacheDel(e: Ext, key: []const u8) void {
         redis.delExtCache(e.name, key);
     }
+    /// Append to a shared list, keeping the newest `cap` entries: a queue for a consumer outside
+    /// the realm, which drains `realmd:ext:<name>:<key>` with LPOP.
+    pub fn cachePush(e: Ext, key: []const u8, value: []const u8, cap: u32) bool {
+        return redis.pushExtList(e.name, key, value, cap);
+    }
     /// Add to a shared counter and read back the new total. The TTL arms only on the increment
     /// that creates the key, so a rate-limit window ends rather than sliding forever.
     pub fn incr(e: Ext, key: []const u8, by: i64, ttl_s: u32) ?i64 {
