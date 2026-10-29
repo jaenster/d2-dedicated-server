@@ -47,7 +47,7 @@ test "our Fog exports every ordinal the engines import" {
 
     var missing: std.ArrayList(u8) = .empty;
     defer missing.deinit(gpa);
-    var stub_is_needed = [_]bool{false} ** unimplemented.ordinals.len;
+    var stub_is_needed: [unimplemented.ordinals.len]bool = @splat(false);
 
     var lines = std.mem.splitScalar(u8, required, '\n');
     while (lines.next()) |raw| {

@@ -15,55 +15,57 @@ const d2s = @import("d2s.zig");
 const fleet = @import("fleet.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
+const metrics = @import("metrics.zig");
+const ladder_list = @import("ladder.zig");
 
 extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d2s create time
 
 // MCP message ids (subset; everything else is logged).
 const mcp = @import("libd2").bnet.mcp;
 
-const MCP_STARTUP = @intFromEnum(mcp.Op.startup);
-const MCP_CHARCREATE = @intFromEnum(mcp.Op.charcreate);
-const MCP_CREATEGAME = @intFromEnum(mcp.Op.creategame);
-const MCP_JOINGAME = @intFromEnum(mcp.Op.joingame);
-const MCP_GAMELIST = @intFromEnum(mcp.Op.gamelist);
-const MCP_GAMEINFO = @intFromEnum(mcp.Op.gameinfo);
-const MCP_CHARLOGON = @intFromEnum(mcp.Op.charlogon);
-const MCP_CHARDELETE = @intFromEnum(mcp.Op.chardelete);
-const MCP_LADDERDATA = @intFromEnum(mcp.Op.ladderdata);
-const MCP_MOTD = @intFromEnum(mcp.Op.motd);
-const MCP_CANCELCREATE = @intFromEnum(mcp.Op.cancelcreate);
-const MCP_CHARRANK = @intFromEnum(mcp.Op.charrank);
-const MCP_CHARUPGRADE = @intFromEnum(mcp.Op.charupgrade);
-const MCP_CHARLIST2 = @intFromEnum(mcp.Op.charlist2);
+const MCP_STARTUP = @backingInt(mcp.Op.startup);
+const MCP_CHARCREATE = @backingInt(mcp.Op.charcreate);
+const MCP_CREATEGAME = @backingInt(mcp.Op.creategame);
+const MCP_JOINGAME = @backingInt(mcp.Op.joingame);
+const MCP_GAMELIST = @backingInt(mcp.Op.gamelist);
+const MCP_GAMEINFO = @backingInt(mcp.Op.gameinfo);
+const MCP_CHARLOGON = @backingInt(mcp.Op.charlogon);
+const MCP_CHARDELETE = @backingInt(mcp.Op.chardelete);
+const MCP_LADDERDATA = @backingInt(mcp.Op.ladderdata);
+const MCP_MOTD = @backingInt(mcp.Op.motd);
+const MCP_CANCELCREATE = @backingInt(mcp.Op.cancelcreate);
+const MCP_CHARRANK = @backingInt(mcp.Op.charrank);
+const MCP_CHARUPGRADE = @backingInt(mcp.Op.charupgrade);
+const MCP_CHARLIST2 = @backingInt(mcp.Op.charlist2);
 
 // MCP result codes from OOG_PollJoinCreatePump @0x441770 (D2Client/OOGUtilities.cpp), with the
 // string-table id each resolves to. A code not in this list falls to `default:`: no popup, no
 // state change, player frozen on the join screen.
 // CREATEGAME (0x03) replies:
-const CREATE_OK: u32 = @intFromEnum(mcp.CreateResult.created);
-const CREATE_INVALID_NAME: u32 = @intFromEnum(mcp.CreateResult.invalid_name); // str 0x1411 "Invalid Game Name"
-const CREATE_NAME_TAKEN: u32 = @intFromEnum(mcp.CreateResult.already_exists); // str 0x1412 "Game Already Exists"
-const CREATE_SERVER_DOWN: u32 = @intFromEnum(mcp.CreateResult.servers_down); // str 0x1413 "Server Down"
+const CREATE_OK: u32 = @backingInt(mcp.CreateResult.created);
+const CREATE_INVALID_NAME: u32 = @backingInt(mcp.CreateResult.invalid_name); // str 0x1411 "Invalid Game Name"
+const CREATE_NAME_TAKEN: u32 = @backingInt(mcp.CreateResult.already_exists); // str 0x1412 "Game Already Exists"
+const CREATE_SERVER_DOWN: u32 = @backingInt(mcp.CreateResult.servers_down); // str 0x1413 "Server Down"
 // There is NO "servers are full" code on the create path: JoinOrCreateGame @0x441500 bounds the
 // switch at 0x20 and sends everything else to str 0x1415 "Error Creating Game" (0x2b "Game is
 // Full" exists only on the JOIN path, and means that one game is full — not this). So a full
 // fleet gets the default bucket on purpose: "Error Creating Game" is vague but TRUE, whereas
 // "Server Down" would be a plain lie about servers that are up and busy.
-const CREATE_ERROR_GENERIC: u32 = @intFromEnum(mcp.CreateResult.generic); // > 0x20 -> str 0x1415 "Error Creating Game"
+const CREATE_ERROR_GENERIC: u32 = @backingInt(mcp.CreateResult.generic); // > 0x20 -> str 0x1415 "Error Creating Game"
 
 // JOINGAME (0x04) replies. NOTE the first two — they are not in the order you would
 // guess from the numbers, and realmd had them the wrong way round: 0x29 is the PASSWORD
 // failure and 0x2a is the MISSING-GAME failure.
-const JOIN_OK: u32 = @intFromEnum(mcp.JoinResult.ok);
-const JOIN_BAD_PASSWORD: u32 = @intFromEnum(mcp.JoinResult.password_incorrect); // str 0x1428 "password don't match"
-const JOIN_NO_SUCH_GAME: u32 = @intFromEnum(mcp.JoinResult.no_such_game); // str 0x1427 "Game does not exist."
-const JOIN_FULL: u32 = @intFromEnum(mcp.JoinResult.game_full); // str 0x1429 "Game is Full."
-const JOIN_HARDCORE_MIX: u32 = @intFromEnum(mcp.JoinResult.hardcore_mix); // str 0x1426 hc/normal mix
-const JOIN_CLASSIC_INTO_EXPANSION: u32 = @intFromEnum(mcp.JoinResult.classic_into_expansion); // str 0x2775
-const JOIN_EXPANSION_INTO_CLASSIC: u32 = @intFromEnum(mcp.JoinResult.expansion_into_classic); // str 0x2776
-const JOIN_LADDER_MISMATCH: u32 = @intFromEnum(mcp.JoinResult.ladder_mismatch);
-const JOIN_NEED_NIGHTMARE: u32 = @intFromEnum(mcp.JoinResult.need_nightmare); // str 0x14f4/0x5522 need Diablo/Baal kill
-const JOIN_NEED_HELL: u32 = @intFromEnum(mcp.JoinResult.need_hell); // str 0x14f3/0x5521, str 0x2ab1/0x2ab2 by ladder flag
+const JOIN_OK: u32 = @backingInt(mcp.JoinResult.ok);
+const JOIN_BAD_PASSWORD: u32 = @backingInt(mcp.JoinResult.password_incorrect); // str 0x1428 "password don't match"
+const JOIN_NO_SUCH_GAME: u32 = @backingInt(mcp.JoinResult.no_such_game); // str 0x1427 "Game does not exist."
+const JOIN_FULL: u32 = @backingInt(mcp.JoinResult.game_full); // str 0x1429 "Game is Full."
+const JOIN_HARDCORE_MIX: u32 = @backingInt(mcp.JoinResult.hardcore_mix); // str 0x1426 hc/normal mix
+const JOIN_CLASSIC_INTO_EXPANSION: u32 = @backingInt(mcp.JoinResult.classic_into_expansion); // str 0x2775
+const JOIN_EXPANSION_INTO_CLASSIC: u32 = @backingInt(mcp.JoinResult.expansion_into_classic); // str 0x2776
+const JOIN_LADDER_MISMATCH: u32 = @backingInt(mcp.JoinResult.ladder_mismatch);
+const JOIN_NEED_NIGHTMARE: u32 = @backingInt(mcp.JoinResult.need_nightmare); // str 0x14f4/0x5522 need Diablo/Baal kill
+const JOIN_NEED_HELL: u32 = @backingInt(mcp.JoinResult.need_hell); // str 0x14f3/0x5521, str 0x2ab1/0x2ab2 by ladder flag
 
 /// Character status bits as they sit in the .d2s header at 0x24 — the same bits the
 /// CharSel statstring and MCP_CHARCREATE speak in. A game stores the creator's, so a
@@ -173,13 +175,13 @@ pub const DConn = struct {
     out: [16384]u8 = undefined,
     out_len: usize = 0,
     session: u64 = 0,
-    account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    account: [state.max_name + 1]u8 = @splat(0),
     account_len: u8 = 0,
-    char: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    char: [state.max_name + 1]u8 = @splat(0),
     char_len: u8 = 0,
     // Which engine the client on the other end runs. MCP is a different connection from the login
     // that learned it, so it comes back off the session at startup rather than off the wire.
-    client_version: [state.max_version]u8 = [_]u8{0} ** state.max_version,
+    client_version: [state.max_version]u8 = @splat(0),
     client_version_len: u8 = 0,
     /// Set by a successful MCP_STARTUP and by nothing else; every other command needs it. `drop`
     /// closes the connection once the current packet is answered.
@@ -258,6 +260,11 @@ fn serve(fd: net.Socket, tag: []const u8, initial: []const u8, proto_consumed: b
     var c = DConn{ .fd = fd };
     defer flushOut(&c); // no exit path may strand queued packets
     log.line(tag, "client connected", .{});
+    metrics.connectionOpened(.mcp);
+    defer {
+        metrics.sessionChanged(.mcp, c.authed, false);
+        metrics.connectionClosed(.mcp);
+    }
 
     var acc: [16384]u8 = undefined;
     var len: usize = @min(initial.len, acc.len);
@@ -366,12 +373,16 @@ fn onStartup(c: *DConn, tag: []const u8, body: []const u8) void {
         c.client_version_len = @intCast(v.len);
         @memcpy(c.client_version[0..v.len], v);
         result = 0x00;
+        metrics.logon(.mcp_session_ok);
         log.line(tag, "startup session={d} -> account={s} engine={s}", .{ sid, acct, v });
     } else {
+        metrics.logon(.mcp_session_unknown_session);
         log.line(tag, "startup session={d} -> UNKNOWN (rejected)", .{sid});
     }
 
+    const was = c.authed;
     c.authed = result == 0x00;
+    metrics.sessionChanged(.mcp, was, c.authed);
     if (!c.authed) c.drop = true;
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, MCP_STARTUP);
@@ -383,7 +394,7 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const requested: u16 = @truncate(r.getU32());
 
-    var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
+    var names: [store.max_chars]store.Name = @splat(.{});
     const total = store.listChars(c.accountName(), &names);
     const ret: u16 = @intCast(@min(total, requested));
     log.line(tag, "charlist requested={d} (account={s}) -> total={d} returned={d}", .{ requested, c.accountName(), total, ret });
@@ -481,7 +492,7 @@ fn enc14(w: *proto.Writer, v: u32) void {
 // Offsets: [0..2] realm char count (14-bit), [2..13] equip slot1 (11, GRAPHIC codes),
 // [13] class+1 (parser subtracts CLASS_SORCERESS=1), [14..25] equip slot2 (11, color TRANSFORMS),
 // [25] level, [26..28] flags (14-bit; bit2=0x04 expansion, bit3=0x08 ladder/hardcore mix),
-// [28..30] field9 (14-bit), [30] act (0xFF->0), [31..33] two fields (0xFF->0), [33..36] guild tag.
+// [28..30] field9 (14-bit), [30] ladder season (0xFF->0, non-zero = ladder), [31..33] two fields (0xFF->0), [33..36] guild tag.
 // Every byte must stay non-zero (C-string); 14-bit ints set the high bit, "none" is 0xFF not 0x00.
 // Rendering: AllocCharSelectComponent @0x5066c0. Weapons are slot1[5]/[6]; unarmed (both 0xFF)
 // renders a valid naked character — real gear needs parsing .d2s items, not done yet.
@@ -508,7 +519,12 @@ fn writeStatString(w: *proto.Writer, class: u8, level: u8, status: u8, progressi
     const flags: u32 = (@as(u32, progression & 0x1f) << 8) | (status & 0x6C);
     enc14(w, flags);
     enc14(w, 0); // field9
-    w.putU8(0xFF); // act      (0xFF -> 0)
+    // The byte some references call bAct is the ladder season: CHARSEL_ParseRealmCharList reads
+    // it with 0xFF -> 0, and char select draws "Ladder" (str 0x2aaf) and sets the launcher's
+    // isLadder from it being non-zero; the 0x40 status bit is not looked at for either. The chat
+    // user list reads the same byte the same way and compares it with isLadder. 1 for a ladder
+    // character (the realm has one season), 0xFF (none) otherwise.
+    w.putU8(if (status & 0x40 != 0) 1 else 0xFF);
     w.putU8(0xFF); // field_0x32f
     w.putU8(0xFF); // field_0x330
     // The guild tag, which on this realm is the character's engine. Two characters, so the
@@ -548,6 +564,7 @@ fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
         log.line(tag, "char logon '{s}' (account={s}) -> REFUSED: character is {s}, client is {s}", .{
             name, acct, char_version.slice(), client_version,
         });
+        metrics.charLogon(.incompatible);
         var rbuf: [12]u8 = undefined;
         var rw = startPacket(&rbuf, MCP_CHARLOGON);
         rw.putU32(CHARLOGON_REFUSED);
@@ -557,6 +574,7 @@ fn onCharLogon(c: *DConn, tag: []const u8, body: []const u8) void {
     c.setChar(name); // remember the active char so a later join can name it to the GS
     hook.charLogon(c.accountName(), name);
     log.line(tag, "char logon '{s}' (account={s}) -> ok", .{ name, c.accountName() });
+    metrics.charLogon(.ok);
     var buf: [12]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARLOGON);
     w.putU32(CHARLOGON_OK);
@@ -596,6 +614,14 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     if (hook.charCreate(acct, name, class)) |result| {
         log.line(tag, "char create '{s}' (account={s}) -> refused by extension ({d})", .{ name, acct, result });
         w.putU32(result);
+        return finish(c, &w);
+    }
+    // The character list answers with at most max_chars, so a character past that would exist and never
+    // show; the client stops offering Create New Character at the same count.
+    var held: [store.max_chars]store.Name = undefined;
+    if (store.listChars(acct, &held) >= store.max_chars) {
+        log.line(tag, "char create '{s}' (account={s}) -> account is full ({d} characters)", .{ name, acct, store.max_chars });
+        w.putU32(0x15);
         return finish(c, &w);
     }
     var probe: [d2s.new_save_size]u8 = undefined;
@@ -643,6 +669,7 @@ fn onCharCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     // connection has no active character, so the first game it creates or joins names an empty
     // one to the game server; only a reconnect, which does select it, got it right.
     c.setChar(name);
+    hook.charCreated(acct, name, class, status_flags);
     hook.charLogon(acct, name);
     w.putU32(0); // success
     finish(c, &w);
@@ -712,6 +739,10 @@ fn validGameName(name: []const u8) bool {
 }
 
 fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
+    // Every return below names its outcome; the time is what the player waited for the answer.
+    const t0 = metrics.nowUs();
+    var outcome: metrics.Create = .gs_refused;
+    defer metrics.gameCreate(outcome, t0);
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
     // MCP create-game flags DWORD: difficulty lives in bits 12-14 (Normal=0x0000,
@@ -740,10 +771,12 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
 
     if (!validGameName(name)) {
         log.line(tag, "create game '{s}' -> invalid name", .{name});
+        outcome = .invalid_name;
         return fail(c, &w, CREATE_INVALID_NAME);
     }
     if (hook.gameCreate(c.accountName(), c.charName(), name, difficulty)) |result| {
         log.line(tag, "create game '{s}' -> refused by extension ({d})", .{ name, result });
+        outcome = .refused;
         return fail(c, &w, result);
     }
     if (!fleet.ready()) {
@@ -751,6 +784,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // client's switch that fits. The 0x06 that used to go out here isn't a case at
         // all, so the client fell to `default:` and left the player on a dead screen.
         log.line(tag, "create game '{s}' -> NO GS available", .{name});
+        outcome = .no_gs;
         return fail(c, &w, CREATE_SERVER_DOWN);
     }
     // A name already in the realm registry is a DIFFERENT failure than "no GS took it":
@@ -758,6 +792,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // Asking the GS first would just get a refusal we'd report as the generic 0x1e.
     if (state.global.findGame(name) != null) {
         log.line(tag, "create game '{s}' -> name already exists", .{name});
+        outcome = .name_taken;
         return fail(c, &w, CREATE_NAME_TAKEN);
     }
     // The game inherits the CREATOR's character flags — a hardcore ladder character makes
@@ -791,6 +826,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // stress rounds. Claiming first moves the refusal to where the loser can still be told.
     if (!store.reserveGameName(name)) {
         log.line(tag, "create game '{s}' (account={s}) -> name already claimed", .{ name, c.accountName() });
+        outcome = .name_taken;
         return fail(c, &w, CREATE_NAME_TAKEN);
     }
     const char_version = store.charVersion(c.accountName(), c.charName());
@@ -819,6 +855,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // realm is down while it plainly is not.
         if (fleet.last_create_failure == .name_taken) {
             log.line(tag, "create game '{s}' -> name already exists (GS refused; lost the race)", .{name});
+            outcome = .name_taken;
             return fail(c, &w, CREATE_NAME_TAKEN);
         }
         // Nothing to do with the name. Say WHICH of the two it was in the LOG: a fleet with no
@@ -829,8 +866,11 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // whoever runs the realm is in the line above.
         if (fleet.last_create_failure == .all_full) {
             log.line(tag, "create game '{s}' -> every GS is at its game limit (fleet is full)", .{name});
+            outcome = .fleet_full;
             return fail(c, &w, CREATE_SERVER_DOWN);
         }
+        // No server at all is a different operational signal from one that said no.
+        outcome = if (fleet.last_create_failure == .no_gs) .no_gs else .gs_refused;
         log.line(tag, "create game '{s}' -> GS refused", .{name});
         return fail(c, &w, CREATE_SERVER_DOWN);
     }
@@ -843,6 +883,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (!state.global.registerGame(name, rr.gameid, rr.ip, rr.port, rr.gsid, 1, status, difficulty, pass, desc, max_players)) {
         store.releaseGameName(name);
         log.line(tag, "create game '{s}' -> GS made gameid={d} but the store would not record it: {s}", .{ name, rr.gameid, store.registerGameError() });
+        outcome = .store_error;
         return fail(c, &w, CREATE_ERROR_GENERIC);
     }
     // The game record now owns the name and is what a duplicate create is refused against, so the
@@ -850,6 +891,17 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // TTL after the game it guarded had already ended.
     store.releaseGameName(name);
     state.global.noteGameCreated(rr.gameid); // starts the clock the detail panel counts from
+    hook.gameStarted(.{
+        .account = c.accountName(),
+        .charname = c.charName(),
+        .gamename = name,
+        .gameid = rr.gameid,
+        .gsid = rr.gsid,
+        .difficulty = difficulty,
+        .hardcore = hardcore,
+        .expansion = expansion,
+        .ladder = ladder != 0,
+    });
     // The creator immediately joins the game they just made, but the GAMELOGON only
     // carries the char name — the account reaches the GS solely via the join-context
     // notify. JOIN seeds it; CREATE must too, or the GS resolves an empty account and
@@ -869,6 +921,7 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putU16(token); // game token (client presents this to the d2ingress)
     w.putU16(0); // unknown
     w.putU32(0); // result: success
+    outcome = .ok;
     finish(c, &w);
 }
 
@@ -878,6 +931,18 @@ fn onCreateGame(c: *DConn, tag: []const u8, body: []const u8) void {
 fn joinPasswordOk(stored: []const u8, supplied: []const u8) bool {
     if (stored.len == 0 or std.mem.eql(u8, stored, "-1")) return true;
     return std.mem.eql(u8, stored, supplied);
+}
+
+/// A game with a password is private: the list leaves it out, as Battle.net does, and only a join
+/// that names it and gives the password gets in.
+fn isPrivate(password: []const u8) bool {
+    return !joinPasswordOk(password, "\x00");
+}
+
+test "only a game with a real password is private" {
+    try std.testing.expect(!isPrivate(""));
+    try std.testing.expect(!isPrivate("-1"));
+    try std.testing.expect(isPrivate("Pw1"));
 }
 
 test "a game created with an empty password is open to a join with an empty or any password" {
@@ -896,6 +961,9 @@ test "a passworded game needs exactly its password" {
 }
 
 fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
+    const t0 = metrics.nowUs();
+    var outcome: metrics.Join = .not_found;
+    defer metrics.gameJoin(outcome, t0);
     var r = proto.Reader.init(body);
     const reqid = r.getU16();
     const name = r.getStr();
@@ -922,16 +990,19 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     }
     if (game == null) {
         log.line(tag, "join game '{s}' -> not found", .{name});
+        outcome = .not_found;
         return rejectJoin(c, &w, JOIN_NO_SUCH_GAME);
     }
     const g = game.?;
     // Reject a wrong password for a passworded game (open games have pw_len == 0).
     if (!joinPasswordOk(g.pw(), join_pass)) {
         log.line(tag, "join game '{s}' (account={s}) -> WRONG PASSWORD (game has {d} chars, join sent {d})", .{ name, c.accountName(), g.pw_len, join_pass.len });
+        outcome = .bad_password;
         return rejectJoin(c, &w, JOIN_BAD_PASSWORD);
     }
     if (hook.gameJoin(c.accountName(), c.charName(), name)) |result| {
         log.line(tag, "join game '{s}' (account={s}) -> refused by extension ({d})", .{ name, c.accountName(), result });
+        outcome = .refused;
         return rejectJoin(c, &w, result);
     }
     // Guild Hall game type (cut feature): a game named exactly after a guild IS that
@@ -942,6 +1013,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         var ghc = gh;
         if (ghc.findMember(c.accountName()) == null) {
             log.line(tag, "join guild hall '{s}' (account={s}) -> NOT A MEMBER, hidden", .{ name, c.accountName() });
+            outcome = .not_member;
             return rejectJoin(c, &w, JOIN_NO_SUCH_GAME);
         }
         log.line(tag, "join guild hall '{s}' as member {s}", .{ name, c.accountName() });
@@ -952,6 +1024,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     const joiner = charStatus(c);
     if (joinStatusError(g.status, joiner)) |why| {
         log.line(tag, "join game '{s}' (account={s}) -> status mismatch game=0x{x:0>2} char=0x{x:0>2} -> 0x{x}", .{ name, c.accountName(), g.status, joiner, why });
+        outcome = .status_mismatch;
         return rejectJoin(c, &w, why);
     }
     // Nightmare and Hell are earned. The client hides difficulties a character has not
@@ -959,6 +1032,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     // either way it gets the specific message rather than a confusing generic failure.
     if (difficultyError(g.difficulty, charProgression(c), (joiner & STATUS_EXPANSION) != 0)) |why| {
         log.line(tag, "join game '{s}' (account={s}) -> difficulty {d} not unlocked (progression {d}) -> 0x{x}", .{ name, c.accountName(), g.difficulty, charProgression(c), why });
+        outcome = .difficulty_locked;
         return rejectJoin(c, &w, why);
     }
     // A character is in one game at a time. Checked HERE, upfront, because the game server's own
@@ -999,6 +1073,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
         // least-bad listed code: untrue here, but it refuses visibly. Replace it if a truer one
         // is found.
         log.line(tag, "join game '{s}' (account={s}) -> character '{s}' is held by {s}", .{ name, c.accountName(), c.charName(), holder });
+        outcome = .char_busy;
         return rejectJoin(c, &w, JOIN_FULL);
     }
     // The seat limit is enforced here, atomically, against every seat the game holds. The player
@@ -1009,6 +1084,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     if (store.addGameChar(g.gameid, c.accountName(), c.charName(), seatLimit(g.max_players)) == .full) {
         _ = store.unlockChar(c.accountName(), c.charName(), jowner);
         log.line(tag, "join game '{s}' (account={s}) -> FULL (every seat taken or pending)", .{ name, c.accountName() });
+        outcome = .full;
         return rejectJoin(c, &w, JOIN_FULL);
     }
     // Stage the character into the shared store before the game server goes looking. The server
@@ -1037,6 +1113,7 @@ fn onJoinGame(c: *DConn, tag: []const u8, body: []const u8) void {
     w.putBytes(&advertised_ip); // d2gs / d2ingress IP (in_addr, network order)
     w.putU32(0); // game hash
     w.putU32(JOIN_OK); // result: success
+    outcome = .ok;
     finish(c, &w);
 }
 
@@ -1062,6 +1139,7 @@ fn onGameList(c: *DConn, tag: []const u8, body: []const u8) void {
     var shown: usize = 0;
     for (games[0..n]) |g| {
         if (have_char and !gameOpenTo(g.status, g.difficulty, joiner, progression)) continue;
+        if (isPrivate(g.pw())) continue;
         // An extension decides what this player is shown — a private league's games, a staging
         // game, a lobby scoped to a channel. Hiding is cosmetic: a player who knows the name can
         // still attempt the join, and gameJoin is where that is actually refused.
@@ -1118,6 +1196,7 @@ fn onCharDelete(c: *DConn, tag: []const u8, body: []const u8) void {
     const ok = store.deleteCharD2s(c.accountName(), name);
     // The name goes back to the realm with the character.
     if (ok) store.releaseCharName(c.accountName(), name);
+    if (ok) hook.charDeleted(c.accountName(), name);
     log.line(tag, "char delete '{s}' (account={s}) -> {s}", .{ name, c.accountName(), if (ok) "deleted" else "FAILED" });
     var buf: [16]u8 = undefined;
     var w = startPacket(&buf, MCP_CHARDELETE);
@@ -1201,91 +1280,67 @@ fn onMotd(c: *DConn, tag: []const u8, body: []const u8) void {
     finish(c, &w);
 }
 
-// MCP_LADDERDATA (0x11). Request: u8 mode, u16 reqid; reply ranks the realm's characters. Wire
-// format from NET_MCP_CLIENT_Incoming0x11 @0x44afc0 + CHATDLG_HandleChatListClick @0x4403f0:
-// after the id, [u8 flag][u16 total][u16 chunk][u16 offset][data]; `data` (one chunk) =
-// [u32 rankBase=0][u32 count][u32 entrySize] then count entries of [u32 expLo][u32 expHi]
-// [u32 charStats][entrySize-byte name]. charStats = class(&0xf) | died<<4 | expansion<<5 |
-// hardcore<<6 | progression<<8 | level<<16. Empty realm -> the all-zero form; count/entrySize
-// are capped (<=256 / <=16) by the client parser. Ordering is by experience, which is NOT in the
-// header but in the packed attribute list (see d2s.attribute); the level byte alone ties.
-const ladder_max = 200;
-const ladder_entry_size: u32 = 16; // name field width
-
-const LadderEntry = struct {
-    name: [16]u8 = .{0} ** 16,
-    stats: u32 = 0,
-    experience: u32 = 0,
-};
-
-/// Highest experience first, falling back to level for characters whose save has no
-/// attribute section yet — a character created but never played has no experience to
-/// compare, and should not outrank one that has some.
-fn ladderRankDesc(_: void, a: LadderEntry, b: LadderEntry) bool {
-    if (a.experience != b.experience) return a.experience > b.experience;
-    return (a.stats >> 16) > (b.stats >> 16);
-}
-
-fn collectLadder(out: *[ladder_max]LadderEntry) usize {
-    var n: usize = 0;
-    var accts: [256][32]u8 = undefined;
-    const na = store.listAccounts(&accts);
-    for (accts[0..na]) |acct_buf| {
-        const acct = std.mem.sliceTo(&acct_buf, 0);
-        if (acct.len == 0) continue;
-        var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
-        const nc = store.listChars(acct, &names);
-        for (names[0..nc]) |nm| {
-            if (n >= ladder_max) return n;
-            // Big enough to reach the attribute section of a played save; the header
-            // alone would give the level but never the experience.
-            var save: [8192]u8 = undefined;
-            const sz = store.getCharD2s(acct, nm.slice(), &save);
-            if (sz <= 0x2b) continue;
-            const status = save[0x24];
-            const progression: u32 = if (sz > 0x25) save[0x25] else 0;
-            var stats: u32 = save[0x28] & 0xf; // class
-            if (status & 0x08 != 0) stats |= 0x10; // died
-            if (status & 0x20 != 0) stats |= 0x20; // expansion
-            if (status & 0x04 != 0) stats |= 0x40; // hardcore
-            stats |= (progression & 0x1f) << 8;
-            stats |= @as(u32, save[0x2b]) << 16; // level
-            const cn = nm.slice();
-            out[n] = .{ .stats = stats, .experience = d2s.attribute(save[0..sz], d2s.stat_experience) orelse 0 };
-            @memcpy(out[n].name[0..@min(cn.len, 16)], cn[0..@min(cn.len, 16)]);
-            n += 1;
-        }
-    }
-    return n;
-}
-
+// MCP_LADDERDATA (0x11). Request: u8 mode, u16 start (the first row the client wants, a multiple
+// of sixteen: the ladder screen asks again each time it is scrolled past one). Reply, after the
+// id (NET_MCP_CLIENT_Incoming0x11 @0x44afc0): [u8 mode][u16 total][u16 chunk][u16 offset] then
+// `chunk` bytes of the block at `offset`; the client stitches the pieces until it has `total`,
+// then parses the block (ladder.writeBlock) and draws the rows from rank `rankBase`. A block is
+// several packets because one realm packet over 1024 bytes is dropped by the client unread
+// (ladder.chunk_max). What is on the list is ladder.zig's.
+//
+// An empty list gets no reply: the all-zero form is the answer to a character search that found
+// nobody, and the client says "Player '' is not on the ladder" for it.
 fn onLadderData(c: *DConn, tag: []const u8, body: []const u8) void {
-    const mode: u8 = if (body.len > 0) body[0] else 0;
-    var entries: [ladder_max]LadderEntry = undefined;
-    const n = collectLadder(&entries);
-    std.sort.pdq(LadderEntry, entries[0..n], {}, ladderRankDesc);
-    log.line(tag, "ladder data request mode=0x{x} -> {d} entries", .{ mode, n });
+    var r = proto.Reader.init(body);
+    const mode_byte = r.getU8();
+    const start: usize = r.getU16();
+    const mode = ladder_list.decodeMode(mode_byte) orelse {
+        log.line(tag, "ladder data request with unknown mode 0x{x}, ignored", .{mode_byte});
+        return;
+    };
+    var list: [ladder_list.overall_rows]ladder_list.Entry = undefined;
+    const n = ladder_list.view(mode, &list);
+    const rows = ladder_list.page(list[0..n], start);
+    log.line(tag, "ladder data request mode=0x{x} start={d} -> {d} of {d}", .{ mode_byte, start, rows.len, n });
+    if (rows.len == 0) return;
+    sendLadder(c, mode_byte, @intCast(start), rows);
+}
 
-    var buf: [8192]u8 = undefined;
+/// Send `rows` (ranks from `rank_base`) as one block in as many 0x11 packets as it takes.
+fn sendLadder(c: *DConn, mode_byte: u8, rank_base: u32, rows: []const ladder_list.Entry) void {
+    var frames: [ladder_list.block_bytes_max + 16 * 16]u8 = undefined;
+    const bytes = ladderPackets(&frames, mode_byte, rank_base, rows);
+    queue(c, bytes);
+    flushOut(c);
+}
+
+/// The 0x11 packets for one block, back to back in `buf`, each a whole MCP packet of at most
+/// 2 + 1 + 7 + ladder.chunk_max bytes.
+fn ladderPackets(buf: []u8, mode_byte: u8, rank_base: u32, rows: []const ladder_list.Entry) []const u8 {
+    var block_buf: [ladder_list.block_bytes_max]u8 = undefined;
+    const block = ladder_list.writeBlock(&block_buf, rank_base, rows);
+    var at: usize = 0;
+    var off: usize = 0;
+    while (off < block.len) {
+        const len = @min(ladder_list.chunk_max, block.len - off);
+        var w = startPacket(buf[at..], MCP_LADDERDATA);
+        w.putU8(mode_byte);
+        w.putU16(@intCast(block.len)); // the whole block
+        w.putU16(@intCast(len)); // this piece
+        w.putU16(@intCast(off)); // where it goes
+        w.putBytes(block[off..][0..len]);
+        w.patchU16(0, @intCast(w.pos));
+        at += w.pos;
+        off += len;
+    }
+    return buf[0..at];
+}
+
+/// The empty 0x11: "Player '<name>' is not on the ladder." on the client's screen.
+fn sendNotOnLadder(c: *DConn) void {
+    var buf: [32]u8 = undefined;
     var w = startPacket(&buf, MCP_LADDERDATA);
-    if (n == 0) {
-        w.zeros(14); // empty-ladder form (Incoming0x11 clear-and-done path)
-        return finish(c, &w);
-    }
-    const total: u16 = @intCast(12 + n * (12 + ladder_entry_size));
-    w.putU8(mode); // flag — echo the requested mode so the client renders this tab
-    w.putU16(total); // whole-buffer size
-    w.putU16(total); // this chunk's length (single chunk)
-    w.putU16(0); // write offset
-    w.putU32(0); // rankBase
-    w.putU32(@intCast(n)); // count
-    w.putU32(ladder_entry_size); // per-entry name width
-    for (entries[0..n]) |e| {
-        w.putU32(e.experience); // experience low
-        w.putU32(0); // experience high — D2 experience is a u32, so this is always 0
-        w.putU32(e.stats);
-        w.putBytes(&e.name);
-    }
+    w.zeros(14);
     finish(c, &w);
 }
 
@@ -1321,15 +1376,83 @@ fn onCancelCreate(c: *DConn, tag: []const u8, body: []const u8) void {
     log.line(tag, "cancel game create (no-op)", .{});
 }
 
-// MCP_CHARRANK (0x16). Request: cstr charname, u32, u32. There is deliberately no reply:
-// the client's incoming dispatch table (Src::McpConnect::INCOMING @0x70ed00, bounds-checked
-// against 0x19) holds a null at index 0x16, so a 0x16 we sent back would be discarded before
-// any handler saw it. Logging it is the whole of the correct behaviour.
+// MCP_CHARRANK (0x16): the ladder screen's search for one character. Request
+// (NET_MCP_CLIENT_Send_0x16_CharRank @0x44aae0): [u32 hardcore][u32 expansion][cstr name]. The
+// client has no 0x16 handler (Src::McpConnect::INCOMING @0x70ed00 holds a null there); the answer
+// is a 0x11 for the overall list of that group (CHATDLG_RequestLadderRank @0x43ec60 has just set
+// the screen to it), starting at the page the character is on. The client scrolls there and
+// draws the searched name's row in white. Nobody by that name gets the empty 0x11.
 fn onCharRank(c: *DConn, tag: []const u8, body: []const u8) void {
-    _ = c;
     var r = proto.Reader.init(body);
+    const hardcore = r.getU32() != 0;
+    const expansion = r.getU32() != 0;
     const name = r.getStr();
-    log.line(tag, "char rank request '{s}' (client has no 0x16 handler; nothing to reply)", .{name});
+    const mode: ladder_list.Mode = .{ .hardcore = hardcore, .expansion = expansion };
+    var list: [ladder_list.overall_rows]ladder_list.Entry = undefined;
+    const n = ladder_list.view(mode, &list);
+    const rank = ladder_list.rankOf(list[0..n], name) orelse {
+        log.line(tag, "char rank '{s}' (mode 0x{x}): not on the ladder", .{ name, mode.byte() });
+        return sendNotOnLadder(c);
+    };
+    const start = ladder_list.pageStart(rank);
+    log.line(tag, "char rank '{s}' (mode 0x{x}): rank {d}", .{ name, mode.byte(), rank + 1 });
+    sendLadder(c, mode.byte(), @intCast(start), ladder_list.page(list[0..n], start));
+}
+
+/// What the client does with the 0x11 packets, after NET_MCP_CLIENT_Incoming0x11: each packet
+/// must fit its 1024-byte read, the pieces are stitched at their offsets, and the block that comes
+/// out names its first rank, count and name width.
+fn parseLikeClient(packets: []const u8, block_out: []u8) !struct { mode: u8, block: []const u8 } {
+    var at: usize = 0;
+    var total: usize = 0;
+    var mode: u8 = 0;
+    var got: usize = 0;
+    while (at < packets.len) {
+        const len = std.mem.readInt(u16, packets[at..][0..2], .little);
+        if (len - 2 > 1024) return error.DroppedByClient;
+        const p = packets[at + 2 .. at + len];
+        if (p[0] != MCP_LADDERDATA) return error.WrongId;
+        mode = p[1];
+        total = std.mem.readInt(u16, p[2..4], .little);
+        const chunk = std.mem.readInt(u16, p[4..6], .little);
+        const off = std.mem.readInt(u16, p[6..8], .little);
+        if (off + chunk > total or chunk != p.len - 8) return error.BadChunk;
+        @memcpy(block_out[off..][0..chunk], p[8..][0..chunk]);
+        got += chunk;
+        at += len;
+    }
+    if (got != total) return error.Incomplete;
+    return .{ .mode = mode, .block = block_out[0..total] };
+}
+
+test "a ladder page goes out in packets the client can read, and comes back whole" {
+    var rows: [ladder_list.block_max]ladder_list.Entry = undefined;
+    for (&rows, 0..) |*e, i| {
+        e.* = .{ .experience = @intCast(100_000 - i), .level = 90, .class = @intCast(i % 7), .status = 0x60 };
+        _ = std.fmt.bufPrint(&e.name, "Char{d}", .{i}) catch unreachable;
+    }
+    var buf: [ladder_list.block_bytes_max + 16 * 16]u8 = undefined;
+    const packets = ladderPackets(&buf, 0x1b, 32, &rows);
+    var block: [ladder_list.block_bytes_max]u8 = undefined;
+    const got = try parseLikeClient(packets, &block);
+    try std.testing.expectEqual(@as(u8, 0x1b), got.mode);
+    try std.testing.expectEqual(@as(u32, 32), std.mem.readInt(u32, got.block[0..4], .little)); // rank base
+    try std.testing.expectEqual(@as(u32, 256), std.mem.readInt(u32, got.block[4..8], .little)); // count
+    try std.testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, got.block[8..12], .little)); // name width
+    try std.testing.expectEqual(12 + 256 * ladder_list.wire_entry, @as(u32, @intCast(got.block.len)));
+    // The last row survived the stitching.
+    const last = got.block[12 + 255 * ladder_list.wire_entry ..];
+    try std.testing.expectEqual(@as(u32, 100_000 - 255), std.mem.readInt(u32, last[0..4], .little));
+    try std.testing.expectEqualStrings("Char255", std.mem.sliceTo(last[12..28], 0));
+    // The old single-packet reply of 176 rows was 4940 bytes; the client drops anything over 1024.
+    try std.testing.expect(packets.len > 1024);
+}
+
+test "a short ladder fits one packet" {
+    const rows = [_]ladder_list.Entry{.{ .experience = 5, .level = 2, .status = 0x60 }};
+    var buf: [256]u8 = undefined;
+    const packets = ladderPackets(&buf, 0x09, 0, &rows);
+    try std.testing.expectEqual(@as(usize, 2 + 1 + 7 + 12 + 28), packets.len);
 }
 
 test "a chat statstring is the character list's blob behind the product tag, with no NUL in it" {
@@ -1431,8 +1554,35 @@ test "a chat statstring carries the character's class, level, mode and title pro
     }
 }
 
+test "the statstring's ladder byte is 1 for a ladder character and 0xFF otherwise" {
+    var b: [128]u8 = undefined;
+    const Case = struct { status: u8, season: u8 };
+    const cases = [_]Case{
+        .{ .status = 0x60, .season = 1 }, // expansion ladder
+        .{ .status = 0x64, .season = 1 }, // expansion hardcore ladder
+        .{ .status = 0x40, .season = 1 }, // classic ladder
+        .{ .status = 0x20, .season = 0xFF }, // expansion non-ladder
+        .{ .status = 0x24, .season = 0xFF }, // expansion hardcore non-ladder
+        .{ .status = 0x00, .season = 0xFF }, // classic non-ladder
+    };
+    for (cases) |c| {
+        var w = proto.Writer.init(&b);
+        writeStatString(&w, 1, 50, c.status, 0, 1, &.{}, &.{}, "14");
+        const blob = w.slice();
+        try std.testing.expectEqual(c.season, blob[30]);
+        // the bytes around it keep their meaning: flags carry the same ladder bit, the two
+        // fields after it stay "none", and the guild tag follows
+        const flags = (blob[26] & 0x7f) | (@as(u32, blob[27] & 0x7f) << 7);
+        try std.testing.expectEqual(c.status & 0x40 != 0, flags & 0x40 != 0);
+        try std.testing.expectEqual(@as(u8, 0xFF), blob[31]);
+        try std.testing.expectEqual(@as(u8, 0xFF), blob[32]);
+        try std.testing.expectEqualStrings("14", blob[33..35]);
+        try std.testing.expect(std.mem.indexOfScalar(u8, blob, 0) == null);
+    }
+}
+
 test "a save's header is read into the statstring, gear or none" {
-    var save = [_]u8{0} ** 0xB0;
+    var save: [0xB0]u8 = @splat(0);
     save[0x24] = 0x28; // expansion, died bit
     save[0x25] = 15;
     save[0x28] = 1; // sorceress

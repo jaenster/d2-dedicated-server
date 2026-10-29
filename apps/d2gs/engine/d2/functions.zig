@@ -32,7 +32,7 @@ fn argToU32(comptime T: type, val: T) u32 {
             .@"fn" => if (val) |p| @intFromPtr(p) else 0,
             else => @bitCast(val),
         },
-        .@"enum" => @intFromEnum(val),
+        .@"enum" => @backingInt(val),
         .bool => if (val) @as(u32, 1) else 0,
         .int => @as(u32, @bitCast(@as(i32, @intCast(val)))),
         else => @compileError("unsupported arg type for fastcall: " ++ @typeName(T)),
@@ -77,13 +77,13 @@ fn buildFastcallAsm(comptime n: usize) []const u8 {
 
 fn ArgsArray(comptime FnType: type) type {
     const info = @typeInfo(FnType).@"fn";
-    const n = info.params.len;
+    const n = info.param_types.len;
     return [if (n > 0) n else 1]u32;
 }
 
 pub fn fastcall(comptime addr: u32, comptime FnType: type) type {
     const info = @typeInfo(FnType).@"fn";
-    const params = info.params;
+    const params = info.param_types;
     const n = params.len;
     const RetType = info.return_type orelse void;
     const has_ret = RetType != void;
@@ -96,7 +96,7 @@ pub fn fastcall(comptime addr: u32, comptime FnType: type) type {
             // Convert all args to u32 array
             var buf: ArgsArray(FnType) = undefined;
             inline for (0..n) |i| {
-                buf[i] = argToU32(params[i].type.?, args[i]);
+                buf[i] = argToU32(params[i].?, args[i]);
             }
 
             const asm_str = comptime buildFastcallAsm(n);

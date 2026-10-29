@@ -29,7 +29,7 @@ fn bnftpPath(filename: []const u8, out: []u8) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, filename, '/') != null) return null;
     if (std.mem.indexOfScalar(u8, filename, '\\') != null) return null;
     if (std.mem.indexOf(u8, filename, "..") != null) return null;
-    return std.fmt.bufPrint(out, "{s}/bnftp/{s}", .{ data_dir, filename }) catch null;
+    return std.mem.print(out, "{s}/bnftp/{s}", .{ data_dir, filename }) catch null;
 }
 
 /// Last-modified time of a BNFTP asset, in seconds since the unix epoch. Null when there

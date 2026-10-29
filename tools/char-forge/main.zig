@@ -17,7 +17,7 @@ const gpa = std.heap.c_allocator;
 
 fn say(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.mem.print(&buf, fmt, args) catch return;
     _ = std.c.write(2, s.ptr, s.len);
 }
 
@@ -27,7 +27,7 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 fn readFile(path: []const u8) ![]u8 {
-    const z = try gpa.dupeZ(u8, path);
+    const z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(z);
     const f = fopen(z, "rb") orelse return error.OpenFailed;
     defer _ = fclose(f);
@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .created = @intCast(time(null)),
     }) catch |e| fatal("cannot forge: {s}", .{@errorName(e)});
 
-    const z = try gpa.dupeZ(u8, pos[3]);
+    const z = try gpa.dupeSentinel(u8, pos[3], 0);
     const f = fopen(z, "wb") orelse fatal("cannot write {s}", .{pos[3]});
     _ = fwrite(out.ptr, 1, out.len, f);
     _ = fclose(f);

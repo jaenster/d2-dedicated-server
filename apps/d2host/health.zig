@@ -26,7 +26,7 @@ const sockaddr_in = extern struct {
     family: u16 = AF_INET,
     port: u16, // network order
     addr: u32 = INADDR_ANY,
-    zero: [8]u8 = .{0} ** 8,
+    zero: [8]u8 = @splat(0),
 };
 
 extern "ws2_32" fn WSAStartup(version: u16, data: *[512]u8) callconv(.winapi) i32;

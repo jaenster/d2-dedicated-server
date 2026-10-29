@@ -30,7 +30,7 @@ const Line = struct {
     len: usize = 0,
 
     fn add(self: *Line, comptime fmt: []const u8, args: anytype) void {
-        const written = std.fmt.bufPrint(self.buf[self.len..], fmt, args) catch {
+        const written = std.mem.print(self.buf[self.len..], fmt, args) catch {
             self.len = self.buf.len; // no room left; further appends are no-ops
             return;
         };
@@ -91,7 +91,7 @@ pub fn line(tag: []const u8, comptime fmt: []const u8, args: anytype) void {
         out.add("{{\"ts\":{d},\"tag\":\"{s}\",\"msg\":\"", .{ time(null), tag });
         // Format the message on its own first so it can be escaped as a JSON string value.
         var msg_buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, fmt, args) catch msg_buf[0..0];
+        const msg = std.mem.print(&msg_buf, fmt, args) catch msg_buf[0..0];
         out.addJsonStr(msg);
         out.addByte('"');
         // ambient per-thread trace/span + the user this connection is acting for
@@ -148,7 +148,7 @@ test "json string values are escaped" {
 
 test "an oversized append truncates instead of overflowing" {
     var out: Line = .{};
-    const big = [_]u8{'x'} ** (LINE_MAX + 100);
+    const big: [LINE_MAX + 100]u8 = @splat('x');
     out.addStr(&big);
     try std.testing.expectEqual(@as(usize, LINE_MAX), out.len);
     out.addByte('!'); // no room left: a no-op, not a write past the end

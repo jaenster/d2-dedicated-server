@@ -27,6 +27,7 @@ const friendcmd = @import("friendcmd.zig");
 const store = @import("store.zig");
 const guilds = @import("guilds.zig");
 const hook = @import("hook.zig");
+const metrics = @import("metrics.zig");
 const auth = @import("auth.zig");
 const version = @import("version.zig");
 
@@ -46,8 +47,8 @@ pub var d2cs_port: u16 = 6112;
 // (the "@"/Blizzard-rep style ops). Set from REALMD_CHAT_OPS. Case-insensitive.
 pub var admin_accounts: []const u8 = "";
 
-const FLAG_OPERATOR: u32 = @intFromEnum(protocol.ChatUserFlag.operator);
-const FLAG_ADMIN: u32 = @intFromEnum(protocol.ChatUserFlag.bnet_admin);
+const FLAG_OPERATOR: u32 = @backingInt(protocol.ChatUserFlag.operator);
+const FLAG_ADMIN: u32 = @backingInt(protocol.ChatUserFlag.bnet_admin);
 
 fn accountListed(list: []const u8, account: []const u8) bool {
     if (list.len == 0 or account.len == 0) return false;
@@ -144,11 +145,7 @@ fn nextToken() u32 {
 /// needs a logged-on account.
 fn allowedBeforeLogon(id: u8) bool {
     return switch (id) {
-        SID_NULL, SID_PING, SID_AUTH_INFO, SID_AUTH_CHECK, SID_LOGONRESPONSE2, SID_LOGONRESPONSE,
-        SID_AUTHACCOUNTLOGON, SID_CREATEACCOUNT2, SID_CHANGEPASSWORD, SID_RESETPASSWORD,
-        SID_GETFILETIME, SID_NETGAMEPORT, SID_CLIENTID2, SID_LOCALEINFO, SID_REPORTCRASH,
-        SID_STARTVERSIONING, SID_REPORTVERSION, SID_CDKEY3, SID_NEWS_INFO, SID_CHECKAD,
-        SID_DISPLAYAD, SID_CLICKAD, SID_QUERYADURL => true,
+        SID_NULL, SID_PING, SID_AUTH_INFO, SID_AUTH_CHECK, SID_LOGONRESPONSE2, SID_LOGONRESPONSE, SID_AUTHACCOUNTLOGON, SID_CREATEACCOUNT2, SID_CHANGEPASSWORD, SID_RESETPASSWORD, SID_GETFILETIME, SID_NETGAMEPORT, SID_CLIENTID2, SID_LOCALEINFO, SID_REPORTCRASH, SID_STARTVERSIONING, SID_REPORTVERSION, SID_CDKEY3, SID_NEWS_INFO, SID_CHECKAD, SID_DISPLAYAD, SID_CLICKAD, SID_QUERYADURL => true,
         else => false,
     };
 }
@@ -163,35 +160,35 @@ pub const Conn = struct {
     out: [8192]u8 = undefined,
     out_len: usize = 0,
     client_token: u32 = 0,
-    account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    account: [state.max_name + 1]u8 = @splat(0),
     account_len: u8 = 0,
     /// Set by a successful logon and by nothing else. Every command past the login screen checks
     /// it (allowedBeforeLogon); `drop` closes the connection once the current packet is answered.
     authed: bool = false,
     drop: bool = false,
     in_channel: bool = false,
-    channel: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
+    channel: [chat.max_channel]u8 = @splat(0),
     channel_len: u8 = 0,
     /// The first channel this connection joined. The client draws it at the head of its channel
     /// list by itself, so the list the realm answers leaves it out (channelList).
-    home: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
+    home: [chat.max_channel]u8 = @splat(0),
     home_len: u8 = 0,
     user_flags: u32 = 0, // this account's chat flags (admin/operator) in the current channel
     // The client's SID_ENTERCHAT statstring (D2: encodes the char it's on). Captured
     // on enter, replayed to other members in EID_SHOWUSER/EID_JOIN so chat shows chars.
-    stat: [chat.max_stat]u8 = [_]u8{0} ** chat.max_stat,
+    stat: [chat.max_stat]u8 = @splat(0),
     stat_len: u8 = 0,
     // The product the client named in SID_GETCHANNELLIST, as it is on the wire (D2XP reads "PX2D"). It
     // is the first four bytes of the statstring the user list is drawn from.
     product: [4]u8 = .{ 'P', 'X', '2', 'D' },
     // The `clan*charname` the client asked to be known as in SID_ENTERCHAT.
-    chat_name: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    chat_name: [state.max_name + 1]u8 = @splat(0),
     chat_name_len: u8 = 0,
     // What the client said it is, and what the realm made of it. Kept raw as well as resolved so
     // an extension can decide for itself about a client this realm has no mapping for.
     exe_version: u32 = 0,
     verbyte: u8 = 0,
-    client_version: [state.max_version]u8 = [_]u8{0} ** state.max_version,
+    client_version: [state.max_version]u8 = @splat(0),
     client_version_len: u8 = 0,
 
     fn setClientVersion(c: *Conn, v: []const u8) void {
@@ -309,6 +306,13 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     var c = Conn{ .fd = fd, .server_token = nextToken() };
     defer flushOut(&c); // no exit path may strand queued packets
     log.line(tag, "client connected", .{});
+    // Counted once the selector says BNCS; an MCP or BNFTP connection is handed off before that.
+    // A defer, because not every exit from the read loop goes through disconnect().
+    var counted = false;
+    defer if (counted) {
+        metrics.sessionChanged(.bncs, c.authed, false);
+        metrics.connectionClosed(.bncs);
+    };
 
     var acc: [16384]u8 = undefined;
     var len: usize = 0;
@@ -342,6 +346,8 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
                 return;
             }
             got_proto = true;
+            counted = true;
+            metrics.connectionOpened(.bncs);
             off = 1;
         }
         while (len - off >= 4) {
@@ -384,7 +390,9 @@ fn disconnect(c: *Conn, fd: net.Socket, tag: []const u8) void {
     if (c.in_channel) broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
     c.in_channel = false;
     chat.leave(fd);
-    if (c.account_len > 0) friends.setOffline(c.accountName());
+    // Not while another connection of the player's is still here: the realm connection closes as the
+    // game opens, and the chat link the game keeps is what makes them online.
+    if (c.account_len > 0 and !chat.held(c.accountName())) friends.setOffline(c.accountName());
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }
 
@@ -551,8 +559,16 @@ fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
 
     // The proof is checked against the token THIS connection was given, never the one the client
     // says it was given: trusting the echo would let a proof captured elsewhere be replayed.
-    const result = if (echoed != c.server_token) LOGON_BAD_PASSWORD else logonResult(c, c.server_token, got);
+    var by_extension = false;
+    const result = if (echoed != c.server_token) LOGON_BAD_PASSWORD else logonResult(c, c.server_token, got, &by_extension);
+    const was = c.authed;
     c.authed = result == LOGON_OK;
+    metrics.sessionChanged(.bncs, was, c.authed);
+    metrics.logon(switch (result) {
+        LOGON_OK => if (by_extension) .extension_ok else .password_ok,
+        LOGON_NO_ACCOUNT => if (by_extension) .extension_no_account else .password_no_account,
+        else => if (by_extension) .extension_bad_password else .password_bad_password,
+    });
     if (!c.authed) c.drop = true;
     if (result == LOGON_OK) friends.setOnline(acct); // presence for friends online-status
     hook.accountLogin(acct, result == LOGON_OK);
@@ -572,7 +588,7 @@ fn onLogon(c: *Conn, tag: []const u8, body: []const u8) void {
 // convenience); strict (default) rejects them with LOGON_NO_ACCOUNT.
 pub var permissive_auth: bool = false;
 
-fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
+fn logonResult(c: *Conn, server_token: u32, got: [20]u8, by_extension: *bool) u32 {
     const acct = c.accountName();
     var stored: [20]u8 = undefined;
     // An extension answers first if it wants to: a realm behind an existing account database, a
@@ -588,26 +604,29 @@ fn logonResult(c: *Conn, server_token: u32, got: [20]u8) u32 {
         .exe_version = c.exe_version,
         .verbyte = c.verbyte,
     };
-    if (hook.authenticate(req)) |decision| return switch (decision) {
-        .accept => blk: {
-            if (store.accountPwHash(acct, &stored) == null) {
-                if (!hook.accountCreate(acct)) break :blk LOGON_NO_ACCOUNT;
-                // With an UNUSABLE password, not a null one. A password-less account is accepted
-                // by the stock check below whatever the client sends, so creating one here would
-                // mean an extension that authenticated a player once — a launcher ticket, an SSO
-                // callback — left behind an account anybody can then log into with any password.
-                // The extension said yes, so the extension owns this account from now on.
-                const unusable = auth.unusablePassword() orelse {
-                    log.line("bncs", "no entropy to close account {s}; refusing rather than creating it open", .{acct});
-                    break :blk LOGON_NO_ACCOUNT;
-                };
-                _ = store.createAccount(acct, unusable);
-            }
-            break :blk LOGON_OK;
-        },
-        .reject_password => LOGON_BAD_PASSWORD,
-        .reject_no_account => LOGON_NO_ACCOUNT,
-    };
+    if (hook.authenticate(req)) |decision| {
+        by_extension.* = true;
+        return switch (decision) {
+            .accept => blk: {
+                if (store.accountPwHash(acct, &stored) == null) {
+                    if (!hook.accountCreate(acct)) break :blk LOGON_NO_ACCOUNT;
+                    // With an UNUSABLE password, not a null one. A password-less account is accepted
+                    // by the stock check below whatever the client sends, so creating one here would
+                    // mean an extension that authenticated a player once — a launcher ticket, an SSO
+                    // callback — left behind an account anybody can then log into with any password.
+                    // The extension said yes, so the extension owns this account from now on.
+                    const unusable = auth.unusablePassword() orelse {
+                        log.line("bncs", "no entropy to close account {s}; refusing rather than creating it open", .{acct});
+                        break :blk LOGON_NO_ACCOUNT;
+                    };
+                    _ = store.createAccount(acct, unusable);
+                }
+                break :blk LOGON_OK;
+            },
+            .reject_password => LOGON_BAD_PASSWORD,
+            .reject_no_account => LOGON_NO_ACCOUNT,
+        };
+    }
     const has_pw = store.accountPwHash(acct, &stored) orelse {
         if (permissive_auth) {
             // Auto-registration is still a creation, so an extension gating who may exist gets
@@ -756,6 +775,13 @@ fn onNotifyJoin(c: *Conn, tag: []const u8, body: []const u8) void {
     const game_name = r.getStr();
     const was_in_channel = c.in_channel;
     c.in_channel = false;
+    // A connection that never joined a channel (the chat link a game opens after its realm connection
+    // closed) is registered here, in no channel, so whispers and /f find it by name.
+    if (!chat.registered(c.fd)) {
+        const flags = chatUserFlags(admin_accounts, c.accountName());
+        c.user_flags = flags;
+        _ = chat.joinShared(c.fd, c.accountName(), c.chatName(), "", flags, c.statSlice());
+    }
     // Recorded before announced, for the same reason as leaving chat: a watcher who reacts to
     // the EID_LEAVE must find them already in the game, not still in the channel.
     chat.setGame(c.fd, game_name);
@@ -901,7 +927,7 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     // the user list "<text> (n)" from it. Then EID_SHOWUSER for everyone already in, the joiner
     // among them: the client finds its own name in that list to put it in front of its own talk, and
     // counts the header from the rows it is given. Then EID_JOIN to everyone else.
-    sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), "", channel);
+    sendEvent(c, EID_CHANNEL, @backingInt(protocol.ChatChannelFlag.public), "", channel);
     sendEvent(c, EID_SHOWUSER, flags, c.chatName(), c.statSlice());
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
@@ -951,7 +977,7 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, "", guildErr(e));
             return true;
         };
-        const msg = std.fmt.bufPrint(&rb, "Guild '{s}' [{s}] founded — you are the Guildmaster.", .{ namev, tagv }) catch "Guild founded.";
+        const msg = std.mem.print(&rb, "Guild '{s}' [{s}] founded — you are the Guildmaster.", .{ namev, tagv }) catch "Guild founded.";
         sendEvent(c, EID_INFO, 0, "", msg);
         log.line(tag, "{s} founded guild '{s}' [{s}]", .{ acct, namev, tagv });
         return true;
@@ -967,9 +993,9 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
     if (std.mem.eql(u8, sub, "info")) {
         var g = guilds.load(gname) orelse return true;
         const msg = if (g.nextUpgradeCost()) |cost|
-            std.fmt.bufPrint(&rb, "{s} [{s}] | Hall lvl {d} | Treasury {d} (next {d}) | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, cost, g.member_count }) catch "guild"
+            std.mem.print(&rb, "{s} [{s}] | Hall lvl {d} | Treasury {d} (next {d}) | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, cost, g.member_count }) catch "guild"
         else
-            std.fmt.bufPrint(&rb, "{s} [{s}] | Hall lvl {d} (MAX) | Treasury {d} | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, g.member_count }) catch "guild";
+            std.mem.print(&rb, "{s} [{s}] | Hall lvl {d} (MAX) | Treasury {d} | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, g.member_count }) catch "guild";
         sendEvent(c, EID_INFO, 0, "", msg);
         return true;
     }
@@ -982,7 +1008,7 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, "", guildErr(e));
             return true;
         };
-        const msg = std.fmt.bufPrint(&rb, "Deposited {d} into the Steeg Stone. Treasury: {d}.", .{ gold, total }) catch "Deposited.";
+        const msg = std.mem.print(&rb, "Deposited {d} into the Steeg Stone. Treasury: {d}.", .{ gold, total }) catch "Deposited.";
         sendEvent(c, EID_INFO, 0, "", msg);
         return true;
     }
@@ -991,7 +1017,7 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, "", guildErr(e));
             return true;
         };
-        const msg = std.fmt.bufPrint(&rb, "Guild Hall upgraded to level {d}!", .{lvl}) catch "Upgraded.";
+        const msg = std.mem.print(&rb, "Guild Hall upgraded to level {d}!", .{lvl}) catch "Upgraded.";
         sendEvent(c, EID_INFO, 0, "", msg);
         return true;
     }
@@ -1000,7 +1026,7 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, "", guildErr(e));
             return true;
         };
-        const msg = std.fmt.bufPrint(&rb, "{s} added to the guild.", .{args}) catch "Invited.";
+        const msg = std.mem.print(&rb, "{s} added to the guild.", .{args}) catch "Invited.";
         sendEvent(c, EID_INFO, 0, "", msg);
         return true;
     }
@@ -1081,10 +1107,10 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         sendEvent(c, EID_WHISPERSENT, c.user_flags, chat.displayOf(w.target, &db) orelse w.target, w.msg);
         var rb: [192]u8 = undefined;
         if (res.dnd_len > 0) {
-            const s = std.fmt.bufPrint(&rb, "{s} is unavailable ({s})", .{ w.target, res.dndSlice() }) catch return;
+            const s = std.mem.print(&rb, "{s} is unavailable ({s})", .{ w.target, res.dndSlice() }) catch return;
             sendEvent(c, EID_INFO, 0, w.target, s);
         } else if (res.away_len > 0) {
-            const s = std.fmt.bufPrint(&rb, "{s} is away ({s})", .{ w.target, res.awaySlice() }) catch return;
+            const s = std.mem.print(&rb, "{s} is away ({s})", .{ w.target, res.awaySlice() }) catch return;
             sendEvent(c, EID_INFO, 0, w.target, s);
         }
         return;
@@ -1215,7 +1241,7 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         if (cmd.arg.len == 0) {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /ignore <name>");
         } else if (chat.addIgnore(c.fd, target)) {
-            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} has been squelched.", .{cmd.arg}) catch return true);
+            sendEvent(c, EID_INFO, 0, acct, std.mem.print(&rb, "{s} has been squelched.", .{cmd.arg}) catch return true);
         } else sendEvent(c, EID_ERROR, 0, acct, "Already squelched, or your ignore list is full.");
         return true;
     }
@@ -1226,7 +1252,7 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         if (cmd.arg.len == 0) {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /unignore <name>");
         } else if (chat.removeIgnore(c.fd, untarget)) {
-            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} is no longer squelched.", .{cmd.arg}) catch return true);
+            sendEvent(c, EID_INFO, 0, acct, std.mem.print(&rb, "{s} is no longer squelched.", .{cmd.arg}) catch return true);
         } else sendEvent(c, EID_ERROR, 0, acct, "That user was not squelched.");
         return true;
     }
@@ -1239,11 +1265,11 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         if (chat.presenceOfAnywhere(cmd.arg)) |pres| {
             const where = pres.channelSlice();
             const line = if (where.len == 0)
-                std.fmt.bufPrint(&rb, "{s} is logged on.", .{cmd.arg}) catch return true
+                std.mem.print(&rb, "{s} is logged on.", .{cmd.arg}) catch return true
             else if (pres.in_game)
-                std.fmt.bufPrint(&rb, "{s} is in the game {s}.", .{ cmd.arg, where }) catch return true
+                std.mem.print(&rb, "{s} is in the game {s}.", .{ cmd.arg, where }) catch return true
             else
-                std.fmt.bufPrint(&rb, "{s} is in channel {s}.", .{ cmd.arg, where }) catch return true;
+                std.mem.print(&rb, "{s} is in channel {s}.", .{ cmd.arg, where }) catch return true;
             sendEvent(c, EID_INFO, 0, acct, line);
         } else sendEvent(c, EID_ERROR, 0, acct, "That user is not logged on.");
         return true;
@@ -1258,7 +1284,7 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         } else if (chat.fdOf(cmd.arg)) |kfd| {
             net.shutdownSocket(kfd);
             log.line(tag, "{s} kicked {s}", .{ acct, cmd.arg });
-            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} was kicked.", .{cmd.arg}) catch return true);
+            sendEvent(c, EID_INFO, 0, acct, std.mem.print(&rb, "{s} was kicked.", .{cmd.arg}) catch return true);
         } else sendEvent(c, EID_ERROR, 0, acct, "That user is not logged on.");
         return true;
     }
@@ -1307,7 +1333,7 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
             const ok = friends.add(acct, target);
             log.line(tag, "{s} friend-add {s} -> {}", .{ acct, target, ok });
             if (ok) {
-                sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was added to your friends list.", .{target}) catch "Added to your friends list.");
+                sendEvent(c, EID_INFO, 0, "", std.mem.print(&rb, "{s} was added to your friends list.", .{target}) catch "Added to your friends list.");
             } else sendEvent(c, EID_ERROR, 0, "", "That user is already on your friends list, or your list is full.");
         },
         .remove => {
@@ -1316,14 +1342,14 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
             const ok = friends.remove(acct, target);
             log.line(tag, "{s} friend-remove {s} -> {}", .{ acct, target, ok });
             if (ok) {
-                sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was removed from your friends list.", .{target}) catch "Removed from your friends list.");
+                sendEvent(c, EID_INFO, 0, "", std.mem.print(&rb, "{s} was removed from your friends list.", .{target}) catch "Removed from your friends list.");
             } else sendEvent(c, EID_ERROR, 0, "", "That user is not on your friends list.");
         },
         .promote, .demote => {
             if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f p|d <account>");
             const target = friendAccount(fc.arg, &nb);
             switch (friends.move(acct, target, fc.action == .promote)) {
-                .moved => sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was moved {s} your friends list.", .{ target, if (fc.action == .promote) "up" else "down" }) catch "Moved."),
+                .moved => sendEvent(c, EID_INFO, 0, "", std.mem.print(&rb, "{s} was moved {s} your friends list.", .{ target, if (fc.action == .promote) "up" else "down" }) catch "Moved."),
                 .at_edge => sendEvent(c, EID_ERROR, 0, "", "That friend is already at that end of your list."),
                 .not_found => sendEvent(c, EID_ERROR, 0, "", "That user is not on your friends list."),
             }
@@ -1347,7 +1373,7 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
             log.line(tag, "{s} friend-message to {d} friend(s)", .{ acct, sent });
             if (sent == 0) {
                 sendEvent(c, EID_INFO, 0, "", "None of your friends are online.");
-            } else sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "Message sent to {d} friend{s}.", .{ sent, if (sent == 1) "" else "s" }) catch "Message sent.");
+            } else sendEvent(c, EID_INFO, 0, "", std.mem.print(&rb, "Message sent to {d} friend{s}.", .{ sent, if (sent == 1) "" else "s" }) catch "Message sent.");
         },
         .list => {
             var infos: [friends.max_friends]friends.FriendInfo = undefined;
@@ -1736,6 +1762,7 @@ fn onAuthAccountLogon(c: *Conn, tag: []const u8) void {
     w.putU32(1); // 1 = account does not exist — clean NLS failure (realmd is OLS-only)
     finish(c, &w);
     log.line(tag, "authaccountlogon (NLS) -> rejected; realmd is OLS-only", .{});
+    metrics.logon(.nls_unsupported);
 }
 
 // Product code for an online friend (D2XP), little-endian 4 chars as the client expects.
@@ -1860,7 +1887,7 @@ fn expectEvent(pkt: []const u8, eid: u32, flags: u32, user: []const u8, text: []
     const body = pkt[4..];
     try std.testing.expectEqual(eid, std.mem.readInt(u32, body[0..4], .little));
     try std.testing.expectEqual(flags, std.mem.readInt(u32, body[4..8], .little));
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 16, body[8..24]);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), body[8..24]);
     try std.testing.expectEqualStrings(user, std.mem.sliceTo(body[24..], 0));
     try std.testing.expectEqualStrings(text, std.mem.sliceTo(body[24 + user.len + 1 ..], 0));
     try std.testing.expectEqual(@as(usize, 24 + user.len + 1 + text.len + 1), body.len);

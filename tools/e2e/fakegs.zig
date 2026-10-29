@@ -59,7 +59,7 @@ pub const FakeGS = struct {
     ev_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn key(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
-        return std.fmt.bufPrint(buf, fmt, args) catch buf[0..0];
+        return std.mem.print(buf, fmt, args) catch buf[0..0];
     }
 
     fn publish(self: *FakeGS, c: *gsstore.Client, live: u32) !void {

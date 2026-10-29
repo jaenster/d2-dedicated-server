@@ -23,7 +23,7 @@ fn at(comptime abs_addr: usize) usize {
 }
 
 /// All engine functions here are __stdcall (callconv `.x86_stdcall` in the recon).
-const StdcallConv = std.builtin.CallingConvention{ .x86_stdcall = .{} };
+const StdcallConv = std.lang.CallingConvention{ .x86_stdcall = .{} };
 
 fn stdcall(comptime abs_addr: usize, comptime Fn: type) *const Fn {
     return @ptrFromInt(at(abs_addr));
@@ -51,7 +51,7 @@ pub const GameType = enum(u32) {
 /// dispatch callbacks. Stores the instance in the global `pQServer`.
 ///   void QSERVER_CreateAndInit(eD2GSConnectionType, eD2GSGameType)
 pub fn QSERVER_CreateAndInit(conn: ConnectionType, game: GameType) void {
-    stdcall(0x0052b7a0, fn (u32, u32) callconv(StdcallConv) void)(@intFromEnum(conn), @intFromEnum(game)); // VERIFIED
+    stdcall(0x0052b7a0, fn (u32, u32) callconv(StdcallConv) void)(@backingInt(conn), @backingInt(game)); // VERIFIED
 }
 
 /// void NET_SetPlayersCount(int) — despite the name, sets D2QServerStrc.nPerIpConnectionLimit.

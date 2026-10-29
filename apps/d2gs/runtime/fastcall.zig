@@ -59,7 +59,7 @@ fn argToU32(comptime T: type, val: T) u32 {
             .@"fn" => if (val) |pp| @intFromPtr(pp) else 0,
             else => @bitCast(val),
         },
-        .@"enum" => @intFromEnum(val),
+        .@"enum" => @backingInt(val),
         .bool => if (val) @as(u32, 1) else 0,
         .int => @as(u32, @bitCast(@as(i32, @intCast(val)))),
         else => @compileError("unsupported fastcall arg type: " ++ @typeName(T)),
@@ -112,14 +112,14 @@ pub fn fastcall_call(comptime addr: usize, comptime FnType: type) type {
 /// rather than a hooked offset in a known image.
 pub fn fastcallAt(comptime FnType: type) type {
     const info = @typeInfo(FnType).@"fn";
-    const params = info.params;
+    const params = info.param_types;
     const n = params.len;
     const Ret = info.return_type orelse void;
     const Tuple = std.meta.ArgsTuple(FnType);
     return struct {
         pub inline fn call(addr: usize, args: Tuple) Ret {
             var buf: [if (n > 0) n else 1]u32 = undefined;
-            inline for (0..n) |i| buf[i] = argToU32(params[i].type.?, args[i]);
+            inline for (0..n) |i| buf[i] = argToU32(params[i].?, args[i]);
             const a = comptime buildCallAsm(n);
             const raw = asm volatile (a
                 : [ret] "={eax}" (-> u32),

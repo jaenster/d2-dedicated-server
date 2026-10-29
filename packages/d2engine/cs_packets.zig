@@ -408,7 +408,7 @@ test "a 1.14d join becomes a 1.10f join, field for field" {
 test "anything that is not a 1.14d join is left alone" {
     var dst: [64]u8 = @splat(0);
     try std.testing.expect(translateJoin114dTo110f(&[_]u8{0x67}, &dst) == null);
-    const wrong_len = [_]u8{join_114d} ** 20;
+    const wrong_len: [20]u8 = @splat(join_114d);
     try std.testing.expect(translateJoin114dTo110f(&wrong_len, &dst) == null);
 }
 

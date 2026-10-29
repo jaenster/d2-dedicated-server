@@ -105,7 +105,7 @@ pub fn bzero(dst: [*]u8, len: usize) callconv(.c) void {
 
 // errno
 
-const errnoLocation = switch (builtin.os.tag) {
+const errnoLocation = switch (builtin.target.os.tag) {
     .macos, .ios, .tvos, .watchos => struct {
         extern fn __error() *c_int;
     }.__error,
@@ -209,7 +209,7 @@ pub const RuneLocale = extern struct {
 /// conversion routed through this struct would call through a null pointer rather than convert.
 pub var DefaultRuneLocale: RuneLocale = .{
     .magic = "RuneMagi".*,
-    .encoding = ("NONE" ++ [_]u8{0} ** 28).*,
+    .encoding = ("NONE" ++ @as([28]u8, @splat(0))).*,
     .sgetrune = null,
     .sputrune = null,
     .invalid_rune = 0xFFFD,

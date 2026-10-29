@@ -311,11 +311,10 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
     // d2ingress can own the client-facing :4000 and splice through to us. Must precede the
     // QSERVER_CreateAndInit inside bootstrapRealmServer. No-op when gs_public_port == 4000.
     gsport.apply(gs_public_port);
-    // Reap empty games after a few seconds (default 5min) so abandoned games don't leak
-    // FOG pool managers (only 8 exist) and crash the GS with 0xe0000001 after ~8 creates.
+    // An empty game stays open for retail's five minutes so its players can rejoin it; the
+    // window shrinks while this GS is out of slots (gamereap.tune, in the loop below), because a
+    // game holds one of the engine's few pool managers until it is destroyed.
     {
-        // The empty-game reap window doubles as this GS's throughput limiter (a finished game
-        // holds its pool manager until it fires), so make it tunable rather than a constant.
         var tmp: [16]u8 = undefined;
         if (flagToken("reap-ms", &tmp) orelse envToken("D2GS_REAP_MS", &tmp)) |n| {
             const v = std.fmt.parseInt(u32, tmp[0..n], 10) catch 0;
@@ -414,6 +413,7 @@ fn serverThread(_: ?*anyopaque) callconv(.winapi) DWORD {
             tickstat.begin();
             server.tick();
             tickstat.end(if (use_realm) d2cs.liveGames() else 1);
+            if (use_realm) gamereap.tune(d2cs.liveGames(), gs_max_games);
         } else {
             idle_ticks +%= 1;
             if (idle_ticks % IDLE_TICKS_PER_SAFETY == 0) server.tick(); // ~1 Hz safety tick (accept + reap)

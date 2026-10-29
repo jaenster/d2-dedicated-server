@@ -14,6 +14,32 @@ extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: c_uint) c_int;
 pub extern "c" fn usleep(usec: c_uint) c_int;
+extern "c" fn __error() *c_int;
+extern "c" fn __errno_location() *c_int;
+
+fn errnoValue() c_int {
+    return switch (@import("builtin").os.tag) {
+        .macos => __error().*,
+        else => __errno_location().*,
+    };
+}
+
+/// What the harness is blocked on right now, for the message a timed-out scenario prints. A
+/// scenario that hangs says what it was waiting for, not just that it stopped.
+var waiting_buf: [192]u8 = undefined;
+var waiting_len: usize = 0;
+
+pub fn waitingOn(comptime fmt: []const u8, args: anytype) void {
+    const out = std.mem.print(&waiting_buf, fmt, args) catch waiting_buf[0..waiting_buf.len];
+    waiting_len = out.len;
+}
+
+pub fn waitingFor() []const u8 {
+    return waiting_buf[0..waiting_len];
+}
+
+/// How long any read may block unless a scenario asks for a different deadline.
+pub const default_recv_ms: u32 = 8000;
 
 /// Set SO_RCVTIMEO on `fd` so reads fail (instead of blocking forever) after
 /// `ms` milliseconds — keeps a missing chat event from hanging the harness.
@@ -36,6 +62,7 @@ pub fn connectLocal(port: u16) !Socket {
     addr.addr = std.mem.nativeToBig(u32, 0x7f00_0001); // 127.0.0.1, network order
     if (@hasField(posix.sockaddr.in, "len")) addr.len = @sizeOf(posix.sockaddr.in);
     if (connect(fd, &addr, @sizeOf(posix.sockaddr.in)) != 0) return error.ConnectFailed;
+    setRecvTimeout(fd, default_recv_ms);
     return fd;
 }
 
@@ -64,6 +91,7 @@ pub fn readFull(fd: Socket, buf: []u8) !void {
     var got: usize = 0;
     while (got < buf.len) {
         const n = read(fd, buf.ptr + got, buf.len - got);
+        if (n < 0 and errnoValue() == @backingInt(posix.E.AGAIN)) return error.Timeout;
         if (n <= 0) return error.SocketClosed;
         got += @intCast(n);
     }
@@ -126,14 +154,14 @@ pub fn httpRequest(port: u16, method: []const u8, path: []const u8, auth_token: 
     defer _ = close(fd);
 
     var hbuf: [1024]u8 = undefined;
-    var req = std.fmt.bufPrint(&hbuf, "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n", .{ method, path }) catch return error.RequestTooLong;
+    var req = std.mem.print(&hbuf, "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n", .{ method, path }) catch return error.RequestTooLong;
     var w = req.len;
     if (auth_token.len > 0) {
-        const seg = std.fmt.bufPrint(hbuf[w..], "Authorization: Bearer {s}\r\n", .{auth_token}) catch return error.RequestTooLong;
+        const seg = std.mem.print(hbuf[w..], "Authorization: Bearer {s}\r\n", .{auth_token}) catch return error.RequestTooLong;
         w += seg.len;
     }
     if (body.len > 0) {
-        const seg = std.fmt.bufPrint(hbuf[w..], "Content-Type: application/json\r\nContent-Length: {d}\r\n", .{body.len}) catch return error.RequestTooLong;
+        const seg = std.mem.print(hbuf[w..], "Content-Type: application/json\r\nContent-Length: {d}\r\n", .{body.len}) catch return error.RequestTooLong;
         w += seg.len;
     }
     if (w + 2 > hbuf.len) return error.RequestTooLong;

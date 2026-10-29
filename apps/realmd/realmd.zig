@@ -39,6 +39,8 @@ pub const state = @import("state.zig");
 pub const health = @import("health.zig");
 pub const admin = @import("admin.zig");
 pub const shutdown = @import("shutdown.zig");
+/// Counters an extension may add to, and what `GET /metrics` on the health port renders.
+pub const metrics = @import("metrics.zig");
 const xsha1 = @import("libd2").bnet.xsha1;
 
 /// The realm's own modules, re-exported so an extension can reach the server it extends: read a
@@ -53,6 +55,9 @@ pub const guilds = @import("guilds.zig");
 pub const friends = @import("friends.zig");
 pub const proto = @import("proto.zig");
 pub const d2s = @import("d2s.zig");
+/// The ladder every reader shares: the game's ladder screen through d2cs, and an extension that
+/// shows it elsewhere.
+pub const ladder = @import("ladder.zig");
 pub const Config = config.Config;
 
 fn hashStr(s: []const u8) u32 {

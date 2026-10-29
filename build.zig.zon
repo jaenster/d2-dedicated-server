@@ -5,8 +5,8 @@
     .version = "0.3.0",
     .dependencies = .{
         .pg = .{
-            .url = "git+https://github.com/karlseguin/pg.zig#4215baf19f7f61a94aab9f6c5893ea12aa9bce96",
-            .hash = "pg-0.0.0-Wp_7gYr_BgC1O2IRXa8tdwXhOZJLLSAl7F_ut1N07zF7",
+            .url = "git+https://github.com/karlseguin/pg.zig#0ccd7d9dabce32e4cee0dd789d8007934099a0f9",
+            .hash = "pg-0.0.0-Wp_7geJVBwDaf2o8erlmelEP5RBEuMESnFWWrNLQneEy",
             .lazy = true,
         },
         // The clean-room 1.14d core. d2gs consumes libd2 rather than carrying its own copy
@@ -19,8 +19,8 @@
         // every image build since the path landed failed on it. A pin also makes the version a
         // deliberate commit here rather than whatever happens to be checked out next door.
         .libd2 = .{
-            .url = "git+https://github.com/jaenster/libd2#1a70dce808bd83975f574dc5b70e0c00f2b3c7df",
-            .hash = "libd2-0.6.5-wboU7YFHqgGx0OBGGyhH4WykEbbPOKNcAVb1N6YLxAfC",
+            .url = "git+https://github.com/jaenster/libd2?ref=v0.7.0#89db01dffcead00f860e46a5d3497e85e65ac666",
+            .hash = "libd2-0.7.0-wboU7Y-H6QF2nXTOzWxeSGI4t0-_zQUxrdSAldJacpiw",
         },
         // The real GS-join + world-decode leg, for tools/stress-e2e: d2-realm and d2-session are
         // published from there specifically so a second Zig program can drive real games without
@@ -28,8 +28,8 @@
         // already a second, from-scratch implementation of the realm half of this). Lazy because
         // nothing else here needs it — a plain `zig build` for the deploy images shouldn't fetch it.
         .clientless = .{
-            .url = "git+https://github.com/jaenster/d2-clientless#a88236a8de4b92674e8af2a8fb4ac10e1658d2af",
-            .hash = "clientless-0.1.0-lyHu8trDAwCRejHjoT7r6W7wo9sM2xnHDJM2EL6NYzS4",
+            .url = "git+https://github.com/jaenster/d2-clientless#1d890a7bc68afc73d7e8a0b76f8a80fe2de61ec7",
+            .hash = "clientless-0.1.0-lyHu8uXOAwDzZid4iuK7U4UNdyieUej2nUZK2dIKCzBg",
             .lazy = true,
         },
     },

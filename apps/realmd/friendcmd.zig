@@ -76,9 +76,9 @@ pub fn listLine(buf: []u8, n: usize, name: []const u8, online: bool, dnd: bool, 
         "online";
     const withLoc = online and !dnd and !away and location.len > 0;
     return (if (withLoc)
-        std.fmt.bufPrint(buf, "{d}: {s}, {s} {s}", .{ n, name, where, location })
+        std.mem.print(buf, "{d}: {s}, {s} {s}", .{ n, name, where, location })
     else
-        std.fmt.bufPrint(buf, "{d}: {s}, {s}", .{ n, name, where })) catch buf[0..0];
+        std.mem.print(buf, "{d}: {s}, {s}", .{ n, name, where })) catch buf[0..0];
 }
 
 test "friend verbs and their one-letter forms" {

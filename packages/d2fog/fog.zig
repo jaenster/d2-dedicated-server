@@ -101,7 +101,7 @@ fn say(msg: []const u8) void {
 fn trace(comptime name: []const u8) void {
     call_seq += 1;
     var buf: [96]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "fog[{d}]: esp~0x{x} {s}", .{ call_seq, esp(), name }) catch return;
+    const s = std.mem.print(&buf, "fog[{d}]: esp~0x{x} {s}", .{ call_seq, esp(), name }) catch return;
     say(s);
 }
 
@@ -117,7 +117,7 @@ inline fn esp() usize {
 
 fn sayFmt(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    say(std.fmt.bufPrint(&buf, fmt, args) catch return);
+    say(std.mem.print(&buf, fmt, args) catch return);
 }
 
 fn cstr(p: ?[*:0]const u8) []const u8 {
@@ -142,12 +142,12 @@ fn cformat(buf: []u8, fmt: [*:0]const u8, ap: anytype) []const u8 {
         const rest = buf[n..];
         switch (fmt[i]) {
             0 => break,
-            's' => n += (std.fmt.bufPrint(rest, "{s}", .{cstr(@cVaArg(ap, ?[*:0]const u8))}) catch break).len,
-            'd', 'i' => n += (std.fmt.bufPrint(rest, "{d}", .{@cVaArg(ap, i32)}) catch break).len,
-            'u' => n += (std.fmt.bufPrint(rest, "{d}", .{@cVaArg(ap, u32)}) catch break).len,
-            'x' => n += (std.fmt.bufPrint(rest, "{x}", .{@cVaArg(ap, u32)}) catch break).len,
-            'X' => n += (std.fmt.bufPrint(rest, "{X}", .{@cVaArg(ap, u32)}) catch break).len,
-            'c' => n += (std.fmt.bufPrint(rest, "{c}", .{@as(u8, @truncate(@cVaArg(ap, u32)))}) catch break).len,
+            's' => n += (std.mem.print(rest, "{s}", .{cstr(@cVaArg(ap, ?[*:0]const u8))}) catch break).len,
+            'd', 'i' => n += (std.mem.print(rest, "{d}", .{@cVaArg(ap, i32)}) catch break).len,
+            'u' => n += (std.mem.print(rest, "{d}", .{@cVaArg(ap, u32)}) catch break).len,
+            'x' => n += (std.mem.print(rest, "{x}", .{@cVaArg(ap, u32)}) catch break).len,
+            'X' => n += (std.mem.print(rest, "{X}", .{@cVaArg(ap, u32)}) catch break).len,
+            'c' => n += (std.mem.print(rest, "{c}", .{@as(u8, @truncate(@cVaArg(ap, u32)))}) catch break).len,
             else => |c| {
                 buf[n] = c; // '%%' and anything we do not know, emitted as written
                 n += 1;
@@ -196,21 +196,21 @@ export var d2fog_alloc_linker_pop: u32 = fogabi.default.alloc_linker * 4;
 /// only our own host does, and mingw decorates a stdcall export as `name@4` — which neither the
 /// .def nor a GetProcAddress by plain name will match.
 export fn FOG_SetEngineVersion(v: u32) callconv(.c) i32 {
-    const tags = @typeInfo(fogabi.version_enum).@"enum".fields;
-    inline for (tags) |f| {
-        if (f.value == v) {
-            const abi = fogabi.ordinalArgs(@enumFromInt(f.value)) orelse {
-                sayFmt("fog: no measured Fog ABI for {s} — keeping 1.10f's", .{f.name});
+    const info = @typeInfo(fogabi.version_enum).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (field_value == v) {
+            const abi = fogabi.ordinalArgs(@fromBackingInt(field_value)) orelse {
+                sayFmt("fog: no measured Fog ABI for {s} — keeping 1.10f's", .{field_name});
                 return 0;
             };
             d2fog_alloc_linker_pop = @as(u32, abi.alloc_linker) * 4;
             // Unmeasured leaves the port's own shape rather than guessing from the neighbours; the
             // AllocLinker pop above already refused this version outright, so this cannot be
             // reached with a null.
-            bitstream.has_overflow = fogabi.bitstreamHasOverflow(@enumFromInt(f.value)) orelse
+            bitstream.has_overflow = fogabi.bitstreamHasOverflow(@fromBackingInt(field_value)) orelse
                 fogabi.default_bitstream_has_overflow;
             sayFmt("fog: ABI set for {s} (AllocLinker pops {d}, BitStream {d} bytes)", .{
-                f.name,
+                field_name,
                 d2fog_alloc_linker_pop,
                 @as(u32, if (bitstream.has_overflow) 20 else 16),
             });
@@ -413,9 +413,9 @@ fn assertArg(buf: []u8, v: usize) []const u8 {
         var i: usize = 0;
         while (i < n and p[i] >= 0x20 and p[i] <= 0x7e) : (i += 1) {}
         if (i != 0 and i < n and p[i] == 0)
-            return std.fmt.bufPrint(buf, "\"{s}\"", .{p[0..i]}) catch "(long)";
+            return std.mem.print(buf, "\"{s}\"", .{p[0..i]}) catch "(long)";
     }
-    return std.fmt.bufPrint(buf, "0x{x}", .{v}) catch "(?)";
+    return std.mem.print(buf, "0x{x}", .{v}) catch "(?)";
 }
 
 /// `from` is the engine's call site. It is the one field that means the same thing on every build,

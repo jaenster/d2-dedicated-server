@@ -159,6 +159,7 @@ rolls back via git).
 | `images.gs.tag=<engine>` | serve a different engine — any tag the pipeline publishes (`1.06b` … `1.13c`, `1.14d`, `1.14d-native`) |
 | `realmd.recreate=true` | force `strategy: Recreate` (not needed any more; RollingUpdate is the default) |
 | `d2ingress.pullSecret=<name>` | imagePullSecret for the (usually private) d2ingress image |
+| `realmd.pullSecret=<name>` | imagePullSecret for a private realmd build |
 
 The deployment namespace is the Helm release namespace (the hardcoded `realmd`
 namespace from the raw manifests is dropped — Helm sets it).

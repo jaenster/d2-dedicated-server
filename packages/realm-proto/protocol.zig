@@ -178,5 +178,5 @@ pub fn readCStr(body: []const u8, off: *usize) []const u8 {
 
 /// Build a header in-place for a packet of total length `size` and given type.
 pub fn header(t: Type, size: u16, seqno: u32) Header {
-    return .{ .size = size, .type = @intFromEnum(t), .seqno = seqno };
+    return .{ .size = size, .type = @backingInt(t), .seqno = seqno };
 }

@@ -11,6 +11,7 @@
 const std = @import("std");
 const patch = @import("../patch.zig");
 const trampoline = @import("../trampoline.zig");
+const hook_contract = @import("hook_contract.zig");
 const log = @import("../../log.zig");
 const evlog = @import("../evlog.zig");
 const obs = @import("obs");
@@ -22,6 +23,7 @@ const feature = @import("../../engine/feature.zig");
 extern "kernel32" fn GetEnvironmentVariableA(name: [*:0]const u8, buf: [*]u8, size: u32) callconv(.winapi) u32;
 extern "kernel32" fn EnterCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
 extern "kernel32" fn LeaveCriticalSection(lpCS: *anyopaque) callconv(.winapi) void;
+extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
 
 // decode helpers
 
@@ -180,7 +182,7 @@ pub var gsid: u32 = 0;
 /// ~1/sec per game rather than a per-frame flood.
 const TICK_EVERY: u64 = 100;
 
-var games: [32]usize = [_]usize{0} ** 32;
+var games: [32]usize = @splat(0);
 var tick_n: u64 = 0;
 
 fn trackGame(pg: usize) void {
@@ -206,6 +208,9 @@ pub fn serverTick() void {
     if (seed_loop_pending) {
         seed_loop_pending = false;
         runSeedLoop(seed_loop_pgame, seed_loop_nacts, seed_loop_lo, seed_loop_hi);
+        // The oracle's run is over: leave on purpose, so an exit 0 says it ended and a crash says it did not (the game
+        // the loop took the acts from would otherwise fall over on its next frame).
+        if (envOn("D2GS_DRLG_EXIT")) ExitProcess(0);
     }
     // Runtime collision (pColl) capture: dump each live game's rooms once it has a
     // player-loaded act. Off unless D2GS_DRLG_COLL=1.
@@ -441,7 +446,7 @@ fn onItemSpawn(pctx: usize, _: usize, _: usize) callconv(.c) void {
         if (fns.GetItemText.call(@bitCast(g.nItemClassId))) |it| {
             e.str("code", ascii(@intFromPtr(it) + 0x80, 4));
         }
-        e.int("quality", @intFromEnum(g.eQuality));
+        e.int("quality", @backingInt(g.eQuality));
         e.int("ilvl", g.nItemLevel);
         e.int("x", g.nPosX);
         e.int("y", g.nPosY);
@@ -840,6 +845,11 @@ fn emitLevel(pLevel: usize) void {
             }
             e.arrayEnd();
         }
+        // The list was empty before the dump built it: put it back, so the room's own first activation does what the
+        // engine does (InitNearRoomsAndVisTiles runs only for a room with no near rooms, and it makes the room's warp
+        // nodes). Left built, a room built later never got its nodes and DRLGROOMTILE_SetupWarpTile halted on it.
+        @as(*volatile u32, @ptrFromInt(room + 0x2C)).* = 0;
+        @as(*volatile u32, @ptrFromInt(room + 0x08)).* = 0;
         // Orth (orthogonal connection) count — walk pOrth->pNext (@0x14), capped.
         var orth: i32 = 0;
         var po = readU32(room, 0x00);
@@ -1083,14 +1093,20 @@ var seed_loop_hi: u32 = 0;
 /// All read live from the engine town-id table / data table — no hardcoded ids.
 fn actLevelRange(nActNo: u8) ?struct { lo: i32, hi: i32 } {
     if (nActNo > 4) return null;
+    const count = levelsTxtCount();
     const lo = s32(readU32(TOWN_ID_TABLE, @as(usize, nActNo) * 4));
     const hi = if (nActNo < 4)
         s32(readU32(TOWN_ID_TABLE, (@as(usize, nActNo) + 1) * 4)) - 1
     else
-        levelsTxtCount() - 1;
-    if (hi < lo) return null;
+        count - 1;
+    if (hi < lo or lo < 1 or lo >= count) return null;
     return .{ .lo = lo, .hi = hi };
 }
+
+/// Where the oracle's seed loop is, for the crash and halt reports: the engine dies in the middle of a level, and
+/// the log's last words are otherwise only an address. phase: 0 not looping, 1 generating a level's layout,
+/// 2 building a level's rooms, 3 between the seed's acts.
+pub var where: struct { seed: u32 = 0, diff: u8 = 0, act: u8 = 0, phase: u8 = 0, level: u32 = 0, room_x: u32 = 0, room_y: u32 = 0 } = .{};
 
 /// Force-generate every level of one act on its own pDrlg. For each level id:
 /// GetLevelAndAlloc, then InitLevel iff not yet generated (pRoomExFirst null).
@@ -1104,8 +1120,52 @@ fn dumpActLevels(pDrlg: usize) void {
     while (id <= range.hi) : (id += 1) {
         const pLevel = GetLevelAndAlloc(pDrlg, id);
         if (pLevel == 0) continue;
+        where.level = @intCast(id);
+        where.phase = 1;
         if (readU32(pLevel, 0x10) == 0) InitLevel(pLevel); // not yet generated
     }
+    where.phase = 3;
+}
+
+/// What the room build of one seed did: the levels and rooms it built, and the rooms that came back unbuilt.
+const BuildTally = struct { levels: u32 = 0, rooms: u32 = 0, unbuilt: u32 = 0, absent: u32 = 0 };
+
+/// Build every room of the levels from `from` up the way the automap reveal does (mapreveal.zig, and the client's
+/// own reveal): AddRoomData on each room without one, which runs the room's tile build, its warp tiles and its
+/// presets, then RemoveRoomData to give it back. Any level can be built so: the dump leaves each room's near list
+/// empty (emitLevel), so the room's first activation makes its warp nodes as in a walk.
+fn buildActRooms(pAct: usize, from: u32, tally: *BuildTally) void {
+    const act: *t.Act = @ptrFromInt(pAct);
+    const misc = act.pMisc orelse return;
+    var lvl = misc.pLevelFirst;
+    var lguard: u32 = 0;
+    while (lvl) |L| : (lvl = L.pNextLevel) {
+        lguard += 1;
+        if (lguard > 512) break;
+        const lno = L.dwLevelNo;
+        if (lno < from or lno >= 512) continue;
+        where.level = lno;
+        where.phase = 2;
+        if (L.pRoom2First == null) {
+            tally.absent += 1;
+            continue;
+        }
+        tally.levels += 1;
+        var r2 = L.pRoom2First;
+        var rguard: u32 = 0;
+        while (r2) |room2| : (r2 = room2.pRoom2Next) {
+            rguard += 1;
+            if (rguard > 4096) break;
+            where.room_x = room2.dwPosX;
+            where.room_y = room2.dwPosY;
+            const had = room2.pRoom1 != null;
+            if (!had) fns.AddRoomData.call(act, @intCast(lno), @intCast(room2.dwPosX), @intCast(room2.dwPosY), room2.pRoom1);
+            tally.rooms += 1;
+            if (room2.pRoom1 == null) tally.unbuilt += 1;
+            if (!had) fns.RemoveRoomData.call(act, @intCast(lno), @intCast(room2.dwPosX), @intCast(room2.dwPosY), room2.pRoom1);
+        }
+    }
+    where.phase = 3;
 }
 
 /// Drive DRLG generation for ALL FIVE acts in a single pass. The spawn act (whose town gen
@@ -1186,6 +1246,7 @@ fn drlgDiffOverride() ?u8 {
 /// Multi-seed capture range from D2GS_DRLG_SEED_LO + D2GS_DRLG_SEED_HI. Both must
 /// be set and parseable for multi-seed mode to activate; returns null otherwise.
 fn seedRange() ?struct { lo: u32, hi: u32 } {
+    if (seedListLoad()) |n| return .{ .lo = 0, .hi = n - 1 };
     var buf: [16]u8 = undefined;
     const nlo = GetEnvironmentVariableA("D2GS_DRLG_SEED_LO", &buf, buf.len);
     if (nlo == 0 or nlo >= buf.len) return null;
@@ -1195,6 +1256,25 @@ fn seedRange() ?struct { lo: u32, hi: u32 } {
     const hi = std.fmt.parseInt(u32, buf[0..nhi], 10) catch return null;
     if (hi < lo) return null;
     return .{ .lo = lo, .hi = hi };
+}
+
+/// A list of seeds instead of a range: D2GS_DRLG_SEEDS="1,2,17,1033089920". The seed loop then walks the list, and
+/// its lo/hi are positions in it. Null (and the range is read) when the variable is unset or holds no seed.
+var seed_list: [1024]u32 = undefined;
+var seed_list_n: u32 = 0;
+
+fn seedListLoad() ?u32 {
+    var buf: [12288]u8 = undefined;
+    const n = GetEnvironmentVariableA("D2GS_DRLG_SEEDS", &buf, buf.len);
+    if (n == 0 or n >= buf.len) return null;
+    seed_list_n = 0;
+    var it = std.mem.tokenizeScalar(u8, buf[0..n], ',');
+    while (it.next()) |tok| {
+        if (seed_list_n == seed_list.len) break;
+        seed_list[seed_list_n] = std.fmt.parseInt(u32, std.mem.trim(u8, tok, " "), 10) catch return null;
+        seed_list_n += 1;
+    }
+    return if (seed_list_n == 0) null else seed_list_n;
 }
 
 /// Emit a `drlg_seed` marker line so downstream consumers can split the JSONL stream
@@ -1213,6 +1293,10 @@ fn emitSeedMarker(seed: u32, diff: u8) void {
 /// InitDrlgAct -> AllocAct reads; we write it directly alongside GAME_SEED_GLOBAL so both agree.
 fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
     log.hex2("srvtrace: DRLG seed loop", lo, hi);
+    // The first pass (the game's own act, made before the difficulty is set) is not part of the loop's seeds: a consumer
+    // that reads the dump starts at this line.
+    var begin = evlog.Event.begin("drlg_loop");
+    begin.endRaw();
     // Hold pGame->lpCriticalSection (@0x18) across the entire seed loop.
     // TASK_GameTickCallback fires ServerGameLoop on the BNet task-scheduler thread;
     // without the lock it races with FreeAct/initDrlgAct and crashes at
@@ -1232,9 +1316,14 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
         @as(*volatile u8, @ptrFromInt(pGame + 0x6D)).* = savedDiff;
     };
     const curDiff: u8 = readU8(pGame, 0x6D);
-    var seed: u32 = lo;
-    while (seed <= hi) : (seed +%= 1) {
+    const build_from: u32 = @intCast(@max(envInt("D2GS_DRLG_BUILD_FROM"), 0));
+    var pos: u32 = lo;
+    while (pos <= hi) : (pos +%= 1) {
+        const seed: u32 = if (seed_list_n != 0) seed_list[pos] else pos;
         emitSeedMarker(seed, curDiff);
+        where.seed = seed;
+        where.diff = curDiff;
+        var built: BuildTally = .{};
         // Update both the engine's forced-seed global and the game's own pInitSeed.nSeedLow.
         // InitDrlgAct → AllocAct reads pGame->pInitSeed.nSeedLow directly (@0x7C);
         // GAME_SEED_GLOBAL is kept in sync so any internal DRLG path that re-reads it agrees.
@@ -1255,15 +1344,27 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
             // emitLevel (town). dumpall_done=true so no re-entry into runDumpAll.
             initDrlgAct(pGame, act);
             const pActNew = readU32(pGame, 0xBC + @as(usize, act) * 4);
+            where.act = act;
             if (pActNew != 0) {
                 const pDrlg = readU32(pActNew, 0x48);
                 // Force all non-town levels for this act; each InitLevel → hook → emitLevel.
                 if (pDrlg != 0) dumpActLevels(pDrlg);
+                if (build_from != 0) buildActRooms(pActNew, build_from, &built);
             }
+        }
+        {
+            var e = evlog.Event.begin("drlg_checked");
+            e.int("seed", seed);
+            e.int("diff", curDiff);
+            e.int("built_levels", built.levels);
+            e.int("built_rooms", built.rooms);
+            e.int("unbuilt", built.unbuilt);
+            e.int("absent", built.absent);
+            e.endRaw();
         }
         // Overflow guard: if hi == maxInt(u32), seed+%=1 wraps to 0 and the loop
         // never terminates — break early after processing the final seed.
-        if (seed == std.math.maxInt(u32)) break;
+        if (pos == std.math.maxInt(u32)) break;
     }
     // Tear down all acts BEFORE releasing the game lock (the defer above fires on
     // return). This leaves the game with no acts so that when TASK_GameTickCallback
@@ -1282,7 +1383,11 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
         }
     }
     log.hex("srvtrace: DRLG seed loop done, seeds captured up to 0x", hi);
+    where.phase = 0;
+    var e = evlog.Event.begin("drlg_done");
+    e.endRaw();
 }
+
 
 // Runtime CollMap (pColl) capture
 // The DRLG oracle above dumps the LAYOUT layer, where the runtime collision map doesn't exist
@@ -1300,7 +1405,14 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
 const UNITLIST_OFF: usize = 0x1120; // D2GameStrc.pUnitList[5][128]; type 0 = players
 const COLL_ROWS_BUDGET: u32 = 20000; // cells per drlg_coll line (row-strip), keeps EventN(131072) from overflowing
 
-var coll_done_games: [32]usize = [_]usize{0} ** 32;
+var coll_done_games: [32]usize = @splat(0);
+
+fn envInt(comptime name: [*:0]const u8) i32 {
+    var buf: [12]u8 = undefined;
+    const n = GetEnvironmentVariableA(name, &buf, buf.len);
+    if (n == 0 or n >= buf.len) return 0;
+    return std.fmt.parseInt(i32, buf[0..n], 10) catch 0;
+}
 
 fn envOn(comptime name: [*:0]const u8) bool {
     var buf: [8]u8 = undefined;
@@ -1483,6 +1595,7 @@ fn drlgCaptureOn() bool {
         var buf: [8]u8 = undefined;
         S.on = dumpAllEnabled() or
             GetEnvironmentVariableA("D2GS_DRLG_SEED_LO", &buf, buf.len) != 0 or
+            GetEnvironmentVariableA("D2GS_DRLG_SEEDS", &buf, buf.len) != 0 or
             GetEnvironmentVariableA("D2GS_DRLG_SEED", &buf, buf.len) != 0 or
             GetEnvironmentVariableA("D2GS_DRLG_DUMP", &buf, buf.len) != 0;
     }
@@ -1524,34 +1637,8 @@ fn pinDrlgSeed() void {
 
 // hook framework
 
-/// Where a captured value comes from at function entry. `.stack` is the original
-/// [esp+k] BEFORE the shim pushed anything (we correct for pushal/pushfl + our own
-/// pushes). `.deref_*` captures the byte at [reg].
-const Src = union(enum) {
-    none,
-    ecx,
-    edx,
-    esi,
-    edi,
-    ebx,
-    deref_ecx,
-    deref_edx,
-    stack: usize,
-};
-
-fn pushAsm(comptime s: Src, comptime pushed: usize) []const u8 {
-    return switch (s) {
-        .none => "pushl $0\n",
-        .ecx => "push %ecx\n",
-        .edx => "push %edx\n",
-        .esi => "push %esi\n",
-        .edi => "push %edi\n",
-        .ebx => "push %ebx\n",
-        .deref_ecx => "movzbl (%ecx), %eax\npush %eax\n",
-        .deref_edx => "movzbl (%edx), %eax\npush %eax\n",
-        .stack => |k| std.fmt.comptimePrint("pushl {d}(%esp)\n", .{36 + pushed + k}),
-    };
-}
+const Src = hook_contract.Src;
+const pushAsm = hook_contract.pushAsm;
 
 const Handler = *const fn (usize, usize, usize) callconv(.c) void;
 
@@ -1576,6 +1663,9 @@ const Hook = struct {
 
 fn TraceHook(comptime h: Hook) type {
     return struct {
+        comptime {
+            hook_contract.checkHook(h.label, h.addr, &.{ h.game, h.a1, h.a2, h.a3 });
+        }
         var tramp: usize = 0;
 
         fn shim() callconv(.naked) void {
@@ -1591,12 +1681,13 @@ fn TraceHook(comptime h: Hook) type {
                     "call %[f:P]\n" ++
                     "add $12, %%esp\n" ++
                     "popfl\npopal\n" ++
-                    "mov %[tramp], %%eax\n" ++
-                    "jmp *(%%eax)\n"
+                    // Through the trampoline pointer in memory, so EAX reaches the engine as it came:
+                    // some hooked functions take an argument in it.
+                    "jmp *%[tramp:P]\n"
                 :
                 : [sg] "X" (&setCurGame),
                   [f] "X" (h.handler),
-                  [tramp] "X" (&tramp),
+                  [tramp] "i" (&tramp),
             );
         }
 

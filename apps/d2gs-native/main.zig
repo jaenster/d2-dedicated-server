@@ -107,10 +107,10 @@ pub fn main(init: std.process.Init) !void {
 
     // The image is i386 code with i386 calling conventions; there is nothing to jump to anywhere
     // else, and a wrong-host jump would just be a crash with a worse message.
-    if (builtin.cpu.arch != .x86 or builtin.os.tag != .linux) {
+    if (builtin.target.cpu.arch != .x86 or builtin.target.os.tag != .linux) {
         std.debug.print(
             "d2gs-native: running the image needs an i386 Linux host (this is {s}-{s}); use --dry-run here\n",
-            .{ @tagName(builtin.cpu.arch), @tagName(builtin.os.tag) },
+            .{ @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag) },
         );
         std.process.exit(2);
     }
@@ -277,7 +277,7 @@ fn setCommandLine(loaded: *const macho.load.Loaded, cmdline: []const u8) void {
 /// Unbuffered on purpose: this exists to survive a segfault, and anything buffered is lost.
 fn note(comptime fmt: []const u8, args: anytype) void {
     var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.mem.print(&buf, fmt, args) catch return;
     _ = std.c.write(2, s.ptr, s.len);
 }
 

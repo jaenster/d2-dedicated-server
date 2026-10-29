@@ -45,8 +45,11 @@ top.
 **Seven concurrent games per `Game.exe`, and that is a hard engine limit.** Fog's allocator has
 a fixed table of 8 pool managers (`Fog/Memory.cpp` raises `0xe0000001` on the 9th) and one is
 held permanently by the global pool system. A game holds its manager until it is destroyed, and
-an empty game is destroyed after an idle window (`--reap-ms`, default 5s), so a server also has
-a *throughput* ceiling of roughly `7 / window` new games per second.
+an empty game stays open for retail's five minutes (`--reap-ms`, default 300000) so its players can
+rejoin it. Empty games hold their slots, so while fewer than two slots are free the window drops to
+5 s (`packages/gs-reap`), which keeps a create from being refused by a server full of empty games.
+Retail also destroys an empty game one to five minutes old at once; the server drops that rule,
+so a run its player just left waits out the window like any other game.
 
 It is the same engine either way, so `d2gs-native` inherits the same seven -- but it ships capped
 at one game (`D2GS_MAX_GAMES`), so today its capacity comes from running more of them.

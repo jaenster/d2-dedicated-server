@@ -984,7 +984,7 @@ fn trace(f: *const OpenFile, at: u64, len: usize) void {
     };
     if (!on or len == 0) return;
     var buf: [128]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "io {s} {d} {d}\n", .{ f.leaf[0..f.leaf_len], at, len }) catch return;
+    const s = std.mem.print(&buf, "io {s} {d} {d}\n", .{ f.leaf[0..f.leaf_len], at, len }) catch return;
     _ = std.c.write(2, s.ptr, s.len);
 }
 
@@ -1199,7 +1199,7 @@ test "a folder the caller asked to have created is on disk before it is reported
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [path_max]u8 = undefined;
-    const missing = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/Temporary Items", .{tmp.sub_path});
+    const missing = try std.mem.print(&buf, ".zig-cache/tmp/{s}/Temporary Items", .{tmp.sub_path});
 
     // Without the flag the answer is the truth about the file system, not a directory id.
     try testing.expectEqual(fnfErr, ensureFolder(missing, 0));
@@ -1250,7 +1250,7 @@ test "a Pascal string is a length byte and its characters, and it cannot outgrow
     try testing.expectEqual(@as(u8, 10), buf[0]);
     try testing.expectEqualStrings("d2data.mpq", pascalRead(&buf));
 
-    pascalWrite(&buf, "x" ** 200);
+    pascalWrite(&buf, &@as([200]u8, @splat('x')));
     try testing.expectEqual(@as(u8, 63), buf[0]);
     try testing.expectEqual(@as(usize, 63), pascalRead(&buf).len);
 

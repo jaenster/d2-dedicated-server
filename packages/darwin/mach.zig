@@ -66,7 +66,7 @@ pub var mach_task_self_: mach_port_t = 0x0103;
 
 const host_port: mach_port_t = 0x0203;
 
-const hostThreadId = switch (builtin.os.tag) {
+const hostThreadId = switch (builtin.target.os.tag) {
     .linux => struct {
         fn get() u32 {
             return @bitCast(std.os.linux.gettid());
@@ -125,7 +125,7 @@ const PROT = struct {
 const MAP = struct {
     const PRIVATE: c_int = 0x02;
     const FIXED: c_int = 0x10;
-    const ANONYMOUS: c_int = if (builtin.os.tag == .linux) 0x20 else 0x1000;
+    const ANONYMOUS: c_int = if (builtin.target.os.tag == .linux) 0x20 else 0x1000;
 };
 
 const VM_FLAGS_ANYWHERE: c_int = 0x0001;

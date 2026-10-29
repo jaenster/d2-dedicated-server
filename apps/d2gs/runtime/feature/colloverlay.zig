@@ -147,9 +147,9 @@ pub fn gamePostDraw() void {
     // HUD: count + vector to the nearest mismatch (world dx,dy — walk that way).
     var buf: [96]u8 = undefined;
     const s = if (on_level == 0)
-        std.fmt.bufPrint(&buf, "colldiff L{d}: clean", .{lvl}) catch return
+        std.mem.print(&buf, "colldiff L{d}: clean", .{lvl}) catch return
     else
-        std.fmt.bufPrint(&buf, "colldiff L{d}: {d} cells, nearest {d},{d}", .{ lvl, on_level, nearest_dx, nearest_dy }) catch return;
+        std.mem.print(&buf, "colldiff L{d}: {d} cells, nearest {d},{d}", .{ lvl, on_level, nearest_dx, nearest_dy }) catch return;
     var w: [96:0]u16 = undefined;
     for (s, 0..) |c, j| w[j] = c;
     w[s.len] = 0;

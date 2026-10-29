@@ -258,6 +258,11 @@ pub const Ext = struct {
     pub fn cacheDel(e: Ext, key: []const u8) void {
         redis.delExtCache(e.name, key);
     }
+    /// Append to a shared list, keeping the newest `cap` entries: a queue for a consumer outside
+    /// the realm, which drains `realmd:ext:<name>:<key>` with LPOP.
+    pub fn cachePush(e: Ext, key: []const u8, value: []const u8, cap: u32) bool {
+        return redis.pushExtList(e.name, key, value, cap);
+    }
     /// Add to a shared counter and read back the new total. The TTL arms only on the increment
     /// that creates the key, so a rate-limit window ends rather than sliding forever.
     pub fn incr(e: Ext, key: []const u8, by: i64, ttl_s: u32) ?i64 {
@@ -324,14 +329,15 @@ pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8, mode
     var buf: [max_d2s]u8 = undefined;
     @memcpy(buf[0..bytes.len], bytes);
     if (!d2s.setName(buf[0..bytes.len], name)) return false;
-    if (!d2s.setMode(buf[0..bytes.len], mode)) return false; // also repairs the checksum
+    // clears the new-character bit on a full save, sets the mode, repairs the checksum
+    if (!d2s.prepareImport(buf[0..bytes.len], mode)) return false;
     return saveCharD2s(account, name, buf[0..bytes.len]);
 }
 
 /// The hardcore/ladder flags the account's most recently played character of the given expansion
 /// type carries, or null if it has none of that type. Reads headers only.
 pub fn accountDefaultMode(account: []const u8, expansion: bool) ?u8 {
-    var names: [max_chars]Name = [_]Name{.{}} ** max_chars;
+    var names: [max_chars]Name = @splat(.{});
     const n = listChars(account, &names);
     var bufs: [max_chars][1024]u8 = undefined;
     var saves: [max_chars][]const u8 = undefined;
@@ -754,7 +760,7 @@ pub fn releaseGameName(name: []const u8) void {
 /// The owner id a game uses for the characters it holds. Stable across instances, because any
 /// realmd may be the one that closes the game.
 pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {
-    return std.fmt.bufPrint(buf, "game:{d}", .{gameid}) catch buf[0..0];
+    return std.mem.print(buf, "game:{d}", .{gameid}) catch buf[0..0];
 }
 
 pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: u32) redis.SeatResult {
@@ -912,7 +918,7 @@ fn setName(n: *Name, v: []const u8) void {
 }
 
 test "mergeOldestFirst puts unflushed characters last, in name order" {
-    var names: [5]Name = [_]Name{.{}} ** 5;
+    var names: [5]Name = @splat(.{});
     setName(&names[0], "Old");
     setName(&names[1], "Older");
     var cached: [3]Name = .{ .{}, .{}, .{} };
@@ -928,7 +934,7 @@ test "mergeOldestFirst puts unflushed characters last, in name order" {
 }
 
 test "mergeOldestFirst drops the newest when the list is full" {
-    var names: [2]Name = [_]Name{.{}} ** 2;
+    var names: [2]Name = @splat(.{});
     setName(&names[0], "A");
     setName(&names[1], "B");
     var cached: [1]Name = .{.{}};

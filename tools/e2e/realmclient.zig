@@ -52,6 +52,7 @@ const MCP_GAMELIST = 0x05;
 const MCP_GAMEINFO = 0x06;
 const MCP_CHARLOGON = 0x07;
 const MCP_LADDERDATA = 0x11;
+const MCP_CHARRANK = 0x16;
 const MCP_JOINGAME = 0x04;
 const MCP_CHARDELETE = 0x0a;
 const MCP_CHARLIST2 = 0x19;
@@ -83,6 +84,7 @@ fn bncsSend(fd: Socket, id: u8, body: []const u8) !void {
 /// Read a BNCS packet body into `buf`; returns (id, body slice into buf).
 fn bncsRecv(fd: Socket, buf: []u8) !struct { id: u8, body: []const u8 } {
     var hdr: [4]u8 = undefined;
+    net.waitingOn("a BNCS packet from realmd (fd {d})", .{fd});
     try net.readFull(fd, &hdr);
     if (hdr[0] != 0xFF) return error.BadBncsHeader;
     const id = hdr[1];
@@ -104,6 +106,7 @@ fn mcpSend(fd: Socket, id: u8, body: []const u8) !void {
 
 fn mcpRecv(fd: Socket, buf: []u8) !struct { id: u8, body: []const u8 } {
     var hdr: [3]u8 = undefined;
+    net.waitingOn("an MCP packet from realmd (fd {d})", .{fd});
     try net.readFull(fd, &hdr);
     const ln = net.rdU16(&hdr, 0);
     const id = hdr[2];
@@ -127,6 +130,7 @@ pub const Ctl = struct { typ: u16, seq: u32, body: []const u8 };
 
 pub fn ctlRecv(fd: Socket, buf: []u8) !Ctl {
     var hdr: [8]u8 = undefined;
+    net.waitingOn("a control packet (fd {d})", .{fd});
     try net.readFull(fd, &hdr);
     const size = net.rdU16(&hdr, 0);
     const typ = net.rdU16(&hdr, 2);
@@ -173,10 +177,10 @@ pub const GameDetail = struct {
     max_players: u8 = 0,
     players: u8 = 0,
     /// Parallel to `names`: class id and level of each listed player.
-    classes: [16]u8 = [_]u8{0} ** 16,
-    levels: [16]u8 = [_]u8{0} ** 16,
+    classes: [16]u8 = @splat(0),
+    levels: [16]u8 = @splat(0),
     description: []const u8 = "",
-    names: [8][]const u8 = [_][]const u8{""} ** 8,
+    names: [8][]const u8 = @splat(""),
 };
 
 /// One row of the join-screen game list.
@@ -193,6 +197,8 @@ pub const LadderEntry = struct {
     class_id: u8 = 0,
     experience: u32 = 0,
 };
+
+pub const CharList = struct { total: u32, count: usize };
 
 pub const CharEntry = struct {
     name: []const u8, // slice into the caller's recv buffer
@@ -548,6 +554,11 @@ pub const AdInfo = struct {
         net.setRecvTimeout(self.bnet.?, ms);
     }
 
+    /// The same for the realm connection, for a request the realm itself is allowed to sit on.
+    pub fn setD2csTimeout(self: *RealmClient, ms: u32) void {
+        net.setRecvTimeout(self.d2cs.?, ms);
+    }
+
     pub fn connectD2cs(self: *RealmClient) !void {
         const fd = try net.connectLocal(if (self.d2cs_port != 0) self.d2cs_port else HOST_D2CS);
         try net.writeAll(fd, &[_]u8{0x01});
@@ -573,10 +584,15 @@ pub const AdInfo = struct {
 
     /// MCP_CHARLIST2 -> total; fills `out` with up to out.len entries, returns
     /// (total, count). Names/statstrings are sliced from `dst` (caller-owned).
-    pub fn charList(self: *RealmClient, out: []CharEntry, dst: []u8) !struct { total: u32, count: usize } {
+    pub fn charList(self: *RealmClient, out: []CharEntry, dst: []u8) !CharList {
+        return self.charListAsking(64, out, dst);
+    }
+
+    /// The same, asking for `requested` characters, as the game does (its own request carries the count).
+    pub fn charListAsking(self: *RealmClient, requested: u32, out: []CharEntry, dst: []u8) !CharList {
         const fd = self.d2cs.?;
         var rq: [4]u8 = undefined;
-        std.mem.writeInt(u32, &rq, 64, .little);
+        std.mem.writeInt(u32, &rq, requested, .little);
         try mcpSend(fd, MCP_CHARLIST2, &rq);
         const r = try mcpRecv(fd, &self.rxbuf);
         if (r.id != MCP_CHARLIST2) return error.CharListBadId;
@@ -632,22 +648,74 @@ pub const AdInfo = struct {
         return self.charCreate(class, flags, charname);
     }
 
-    /// MCP_LADDERDATA (0x11): request the ladder, parse the entry buffer into `out`
-    /// (names copied into `dst`), return the entry count. Mirrors NET_MCP_CLIENT_Incoming0x11:
-    /// body = [u8 flag][u16 total][u16 chunk][u16 offset][u32 rankBase][u32 count][u32 entrySize]
-    /// then count × [u32 expLo][u32 expHi][u32 stats][entrySize-byte name].
-    pub fn ladderData(self: *RealmClient, mode: u8, out: []LadderEntry, dst: []u8) !usize {
+    /// MCP_LADDERDATA (0x11): ask for one of the ladder screen's lists from row `start`, put the
+    /// pieces back together the way NET_MCP_CLIENT_Incoming0x11 does, and parse the block into
+    /// `out` (names copied into `dst`). Each packet body = [u8 mode][u16 total][u16 chunk]
+    /// [u16 offset][chunk bytes of the block]; the block = [u32 rankBase][u32 count][u32 entrySize]
+    /// then count x [u32 expLo][u32 expHi][u32 stats][entrySize-byte name]. An empty list gets no
+    /// reply at all, so a quiet second is 0 entries. Fails if any packet is longer than the 1024
+    /// bytes the client reads in one go.
+    pub fn ladderData(self: *RealmClient, mode: u8, start: u16, out: []LadderEntry, dst: []u8) !usize {
         const fd = self.d2cs.?;
-        var body: [4]u8 = undefined;
+        var body: [3]u8 = undefined;
         var w = net.Writer.init(&body);
         w.u8v(mode);
-        w.u16v(0); // reqid
+        w.u16v(start);
         try mcpSend(fd, MCP_LADDERDATA, w.slice());
-        const r = try mcpRecv(fd, &self.rxbuf);
-        if (r.id != MCP_LADDERDATA) return error.LadderBadId;
-        if (r.body.len < 7 or net.rdU16(r.body, 1) < 12) return 0; // empty ladder
-        const data = r.body[7..];
+        return self.readLadder(mode, out, dst);
+    }
+
+    /// MCP_CHARRANK (0x16): the ladder screen's search. Body: [u32 hardcore][u32 expansion]
+    /// [cstr name]. The answer is a 0x11 for that group's overall list, from the page the
+    /// character is on; `rank_base` is set to that page's first rank. A name that is not on the
+    /// ladder gets the all-zero 0x11, returned here as 0 entries.
+    pub fn charRank(self: *RealmClient, hardcore: bool, expansion: bool, name: []const u8, out: []LadderEntry, dst: []u8, rank_base: *u32) !usize {
+        const fd = self.d2cs.?;
+        var body: [64]u8 = undefined;
+        var w = net.Writer.init(&body);
+        w.u32v(@intFromBool(hardcore));
+        w.u32v(@intFromBool(expansion));
+        for (name) |ch| w.u8v(ch);
+        w.u8v(0);
+        try mcpSend(fd, MCP_CHARRANK, w.slice());
+        const mode: u8 = if (expansion) (if (hardcore) 0x13 else 0x1b) else (if (hardcore) 0x00 else 0x09);
+        return self.readLadderAt(mode, out, dst, rank_base);
+    }
+
+    fn readLadder(self: *RealmClient, mode: u8, out: []LadderEntry, dst: []u8) !usize {
+        var base: u32 = 0;
+        return self.readLadderAt(mode, out, dst, &base);
+    }
+
+    fn readLadderAt(self: *RealmClient, mode: u8, out: []LadderEntry, dst: []u8, rank_base: *u32) !usize {
+        const fd = self.d2cs.?;
+        var block: [8192]u8 = undefined;
+        var total: usize = 0;
+        var got: usize = 0;
+        net.setRecvTimeout(fd, 1500);
+        defer net.setRecvTimeout(fd, net.default_recv_ms);
+        while (true) {
+            const r = mcpRecv(fd, &self.rxbuf) catch |e| switch (e) {
+                error.Timeout => if (got == 0) return 0 else return error.LadderIncomplete,
+                else => return e,
+            };
+            if (r.id != MCP_LADDERDATA) return error.LadderBadId;
+            if (r.body.len + 3 - 2 > 1024) return error.LadderPacketTooBigForClient;
+            if (r.body.len < 7) return error.LadderShort;
+            const t = net.rdU16(r.body, 1);
+            const chunk = net.rdU16(r.body, 3);
+            const off = net.rdU16(r.body, 5);
+            if (t == 0 and chunk == 0 and off == 0) return 0; // "not on the ladder"
+            if (r.body[0] != mode) return error.LadderWrongMode;
+            if (off + chunk > t or chunk != r.body.len - 7 or t > block.len) return error.LadderBadChunk;
+            total = t;
+            @memcpy(block[off..][0..chunk], r.body[7..][0..chunk]);
+            got += chunk;
+            if (got >= total) break;
+        }
+        const data = block[0..total];
         if (data.len < 12) return 0;
+        rank_base.* = net.rdU32(data, 0);
         const count = net.rdU32(data, 4);
         const entry_size = net.rdU32(data, 8);
         var off: usize = 12;
@@ -658,6 +726,7 @@ pub const AdInfo = struct {
             const experience = net.rdU32(data, off + 0);
             const stats = net.rdU32(data, off + 8);
             const nm = std.mem.sliceTo(data[off + 12 .. off + 12 + entry_size], 0);
+            if (di + nm.len > dst.len) break;
             @memcpy(dst[di .. di + nm.len], nm);
             out[n] = .{ .name = dst[di .. di + nm.len], .level = stats >> 16, .class_id = @intCast(stats & 0xf), .experience = experience };
             di += nm.len;
@@ -877,7 +946,7 @@ pub fn storeCharVersion(account: []const u8, charname: []const u8) !u64 {
     var c = try gsstore.Client.connect(fakegs.redis_port);
     defer c.close();
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
     return switch (try c.cmd(&.{ "GET", verkey })) {
         .bulk => |b| if (b) |v| std.fmt.parseInt(u64, v, 10) catch 0 else 0,
         else => 0,
@@ -894,15 +963,15 @@ pub fn storePutCharFenced(account: []const u8, charname: []const u8, d2s: []cons
     var c = try gsstore.Client.connect(fakegs.redis_port);
     defer c.close();
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
     var mb: [192]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
     var eb: [24]u8 = undefined;
-    const expect_s = std.fmt.bufPrint(&eb, "{d}", .{expect}) catch return error.NameTooLong;
+    const expect_s = std.mem.print(&eb, "{d}", .{expect}) catch return error.NameTooLong;
     const script =
         \\local cur = tonumber(redis.call('GET', KEYS[2]) or '0')
         \\if cur ~= 0 and cur ~= tonumber(ARGV[1]) then return -(cur + 1) end
@@ -926,18 +995,18 @@ pub fn storePutChar(account: []const u8, charname: []const u8, d2s: []const u8) 
     var c = try gsstore.Client.connect(fakegs.redis_port);
     defer c.close();
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
     _ = try c.cmdBig(&.{ "SET", key }, d2s);
     // The account's character set, exactly as the game server's own `putChar` writes it: that
     // set is what CHARLIST reads for anything postgres has not caught up with yet, so a harness
     // that skipped it would be testing a save path the server does not have.
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
     _ = try c.cmd(&.{ "SADD", setkey, charname });
     var vb: [192]u8 = undefined;
-    _ = try c.cmd(&.{ "INCR", std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong });
+    _ = try c.cmd(&.{ "INCR", std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong });
     var mb: [128]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
     _ = try c.cmd(&.{ "SADD", "realmd:dirty", member });
 
     var waited: u32 = 0;

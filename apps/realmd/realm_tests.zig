@@ -12,11 +12,13 @@ test {
     _ = @import("admin.zig");
     _ = @import("proto.zig");
     _ = @import("fleet.zig");
+    _ = @import("ladder.zig");
     _ = @import("store.zig");
     _ = @import("d2cs.zig");
     _ = @import("bncs.zig");
     _ = @import("chat.zig");
     _ = @import("gameedge.zig");
+    _ = @import("metrics.zig");
     // Shared infrastructure every listener sits on.
     _ = @import("realm_infra").lock;
     _ = @import("realm_infra").log;

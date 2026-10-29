@@ -56,7 +56,7 @@ const forwarded_names = [_][:0]const u8{
 };
 
 var real_dbghelp: ?HMODULE = null;
-var resolved: [forwarded_names.len]usize = .{0} ** forwarded_names.len;
+var resolved: [forwarded_names.len]usize = @splat(0);
 
 fn loadRealDbgHelp() ?HMODULE {
     if (real_dbghelp) |h| return h;

@@ -57,7 +57,7 @@ pub fn nearestVendor() ?Unit {
 /// Right-click / talk to an NPC: the server auto-walks the player into range and
 /// opens the conversation. Headless-safe (no viewport).
 pub fn interact(npc: Unit) void {
-    var buf = [_]u8{0} ** 9;
+    var buf: [9]u8 = @splat(0);
     buf[0] = PKT_NPC_INTERACT;
     writeU32(&buf, 1, 0); // unk
     writeU32(&buf, 5, npc.unitId());
@@ -66,7 +66,7 @@ pub fn interact(npc: Unit) void {
 
 /// Send an NPC menu selection (the raw 0x38 packet) for a specific menu id.
 fn sendNpcMenu(npc: Unit, menu_id: u16) void {
-    var buf = [_]u8{0} ** 13;
+    var buf: [13]u8 = @splat(0);
     buf[0] = PKT_NPC_MENU;
     writeU32(&buf, 1, npc.unitId());
     writeU32(&buf, 5, menu_id);

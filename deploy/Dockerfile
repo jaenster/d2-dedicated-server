@@ -35,7 +35,7 @@
 # difference between a native build and an emulated one.
 FROM --platform=$BUILDPLATFORM alpine:3.20 AS zig
 RUN apk add --no-cache curl xz
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 # --retry, because ziglang.org is one small server and this matrix asks it for 55 MB several times
 # at once: a dropped connection failed a whole image build in 14 seconds while the identical
 # download in the job beside it succeeded. --fail so an error page is reported as one instead of

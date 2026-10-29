@@ -13,7 +13,7 @@ const blob = @embedFile("webui_blob");
 
 fn respondHtml(fd: net.Socket, body: []const u8) void {
     var hdr: [256]u8 = undefined;
-    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{body.len}) catch return;
+    const h = std.mem.print(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{body.len}) catch return;
     _ = net.writeAll(fd, h);
     _ = net.writeAll(fd, body);
 }

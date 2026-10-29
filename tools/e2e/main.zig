@@ -41,7 +41,7 @@ fn envOr(name: [*:0]const u8, default: [:0]const u8) [:0]const u8 {
 }
 
 const Status = enum { pass, fail, skip };
-const Result = struct { name: []const u8, status: Status, msg: []const u8 };
+const Result = struct { name: []const u8, status: Status, msg: []const u8, ms: u64 = 0 };
 
 const alloc = std.heap.c_allocator;
 
@@ -50,7 +50,7 @@ const ADMIN_TOKEN = "testtoken";
 var HEALTH_PORT: u16 = 18080;
 
 fn msg(comptime fmt: []const u8, args: anytype) []const u8 {
-    return std.fmt.allocPrint(alloc, fmt, args) catch "(alloc failed)";
+    return alloc.print(fmt, args) catch "(alloc failed)";
 }
 
 // --- crafts: minimal_d2s ---
@@ -206,7 +206,7 @@ fn scCharCopy() Result {
 
     // Clone Original -> CopyCat within the same account via the admin API.
     var jb: [160]u8 = undefined;
-    const json = std.fmt.bufPrint(&jb, "{{\"src_account\":\"{s}\",\"src_char\":\"{s}\",\"dst_char\":\"{s}\"}}", .{ acct, src, dst }) catch return fail(name, "json", .{});
+    const json = std.mem.print(&jb, "{{\"src_account\":\"{s}\",\"src_char\":\"{s}\",\"dst_char\":\"{s}\"}}", .{ acct, src, dst }) catch return fail(name, "json", .{});
     var rxbuf: [2048]u8 = undefined;
     const r = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/copy", ADMIN_TOKEN, json, &rxbuf) catch |e| return fail(name, "copy {s}", .{@errorName(e)});
     if (r.status != 200) return fail(name, "copy status={d} body={s}", .{ r.status, r.body });
@@ -265,27 +265,85 @@ fn scClassicChar() Result {
     return .{ .name = name, .status = .pass, .msg = msg("classic Barbarian ok, classic Druid rejected (0x{x}), expansion Druid ok", .{cdruid}) };
 }
 
+/// A ladder character's save: `d2sWithExperience` with the status byte set (ladder 0x40,
+/// expansion 0x20, hardcore 0x04).
+fn ladderSave(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, experience: u32, status: u8) []const u8 {
+    const out = d2sWithExperience(buf, name, class_id, level, experience);
+    buf[0x24] = status;
+    return out;
+}
+
+/// The realm ranks on a board it rebuilds every few seconds, so a character saved a moment ago
+/// shows up on the next build. Ask until `who` is on the list or the wait is clearly too long.
+fn ladderWithin(c: *rc.RealmClient, mode: u8, who: []const u8, out: []rc.LadderEntry, dst: []u8) !usize {
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        const cnt = try c.ladderData(mode, 0, out, dst);
+        for (out[0..cnt]) |e| if (std.mem.eql(u8, e.name, who)) return cnt;
+        if (tries >= 15) return cnt;
+        _ = net.usleep(1_000_000);
+    }
+}
+
+fn ladderClient(c: *rc.RealmClient, acct: []const u8) ?[]const u8 {
+    c.connectBnet() catch |e| return @errorName(e);
+    c.auth() catch |e| return @errorName(e);
+    c.login(acct) catch |e| return @errorName(e);
+    c.enterRealm() catch |e| return @errorName(e);
+    c.connectD2cs() catch |e| return @errorName(e);
+    if ((c.startup() catch 1) != 0) return "d2cs startup failed";
+    return null;
+}
+
+/// The ladder screen's lists: only ladder characters, each group and class apart, the whole list
+/// in packets the client can read (it drops one over 1024 bytes, which is what emptied the
+/// realm's ladder once it had more than about 35 characters), and the search for one name.
 fn scLadder() Result {
     const name = "ladder_list";
     const acct = "LadderAcct";
-    var d2s: [0x40]u8 = undefined;
-    const king = rc.storePutChar(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (king != 0) return fail(name, "save LadderKing result={d}", .{king});
-    const pawn = rc.storePutChar(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (pawn != 0) return fail(name, "save LadderPawn result={d}", .{pawn});
+    const ladder_sc: u8 = 0x40 | 0x20;
+    var b: [0x80]u8 = undefined;
+    const saves = [_]struct { n: []const u8, class: u8, level: u8, exp: u32, status: u8 }{
+        .{ .n = "LadderKing", .class = 1, .level = 99, .exp = 3_500_000_000, .status = ladder_sc },
+        .{ .n = "LadderPawn", .class = 1, .level = 1, .exp = 0, .status = ladder_sc },
+        .{ .n = "LadderBarb", .class = 4, .level = 50, .exp = 30_000_000, .status = ladder_sc },
+        .{ .n = "LadderNot", .class = 1, .level = 98, .exp = 3_400_000_000, .status = 0x20 },
+        .{ .n = "LadderHard", .class = 1, .level = 97, .exp = 3_300_000_000, .status = ladder_sc | 0x04 },
+    };
+    for (saves) |sv| {
+        const r = rc.storePutChar(acct, sv.n, ladderSave(&b, sv.n, sv.class, sv.level, sv.exp, sv.status)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (r != 0) return fail(name, "save {s} result={d}", .{ sv.n, r });
+    }
+    // Enough ladder characters that the overall list cannot fit one 1024-byte packet, over five
+    // accounts (an account holds sixteen). The ladder walks the realm's accounts, so each is
+    // logged on once to exist.
+    var fa_i: usize = 0;
+    while (fa_i < 5) : (fa_i += 1) {
+        var ab: [16]u8 = undefined;
+        const fa = std.mem.print(&ab, "LadFillAcct{d}", .{fa_i}) catch unreachable;
+        var lc = rc.RealmClient{};
+        defer lc.close();
+        lc.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        lc.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        lc.login(fa) catch |e| return fail(name, "log on {s}: {s}", .{ fa, @errorName(e) });
+    }
+    var fill: usize = 0;
+    while (fill < 60) : (fill += 1) {
+        var ab: [16]u8 = undefined;
+        var nb: [16]u8 = undefined;
+        const fa = std.mem.print(&ab, "LadFillAcct{d}", .{fill / 12}) catch unreachable;
+        const fnm = std.mem.print(&nb, "LadFill{d:0>2}", .{fill}) catch unreachable;
+        const r = rc.storePutChar(fa, fnm, ladderSave(&b, fnm, @intCast(fill % 7), 10, @intCast(1000 + fill), ladder_sc)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (r != 0) return fail(name, "save {s} result={d}", .{ fnm, r });
+    }
 
     var c = rc.RealmClient{};
     defer c.close();
-    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    if (ladderClient(&c, acct)) |why| return fail(name, "{s}", .{why});
 
     var entries: [256]rc.LadderEntry = undefined;
     var dst: [8192]u8 = undefined;
-    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cnt = ladderWithin(&c, 0x1b, "LadderKing", &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     var king_rank: ?usize = null;
     var pawn_rank: ?usize = null;
     var king_level: u32 = 0;
@@ -295,12 +353,45 @@ fn scLadder() Result {
             king_level = e.level;
         }
         if (std.mem.eql(u8, e.name, "LadderPawn")) pawn_rank = i;
+        if (std.mem.eql(u8, e.name, "LadderNot")) return fail(name, "a non-ladder character is on the ladder", .{});
+        if (std.mem.eql(u8, e.name, "LadderHard")) return fail(name, "a hardcore character is on the softcore list", .{});
     }
     const kr = king_rank orelse return fail(name, "LadderKing not on ladder (cnt={d})", .{cnt});
     const pr = pawn_rank orelse return fail(name, "LadderPawn not on ladder (cnt={d})", .{cnt});
+    if (cnt < 63) return fail(name, "the list has {d} rows, want all 63 ladder characters", .{cnt});
     if (king_level != 99) return fail(name, "LadderKing level={d} want 99", .{king_level});
-    if (kr >= pr) return fail(name, "not ranked by level: King@{d} not before Pawn@{d}", .{ kr, pr });
-    return .{ .name = name, .status = .pass, .msg = msg("ladder lists {d}; LadderKing(99)@{d} ranked above LadderPawn(1)@{d}", .{ cnt, kr, pr }) };
+    if (kr >= pr) return fail(name, "not ranked: King@{d} not before Pawn@{d}", .{ kr, pr });
+
+    // One class: the Sorceress list has the King and not the Barbarian.
+    const sorcs = c.ladderData(0x1b + 2, 0, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var sorc_king = false;
+    for (entries[0..sorcs]) |e| {
+        if (e.class_id != 1) return fail(name, "{s} (class {d}) on the Sorceress list", .{ e.name, e.class_id });
+        if (std.mem.eql(u8, e.name, "LadderKing")) sorc_king = true;
+    }
+    if (!sorc_king) return fail(name, "LadderKing missing from the Sorceress list", .{});
+
+    // The hardcore list holds the hardcore character.
+    const hard = c.ladderData(0x13, 0, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var found_hard = false;
+    for (entries[0..hard]) |e| if (std.mem.eql(u8, e.name, "LadderHard")) {
+        found_hard = true;
+    };
+    if (!found_hard) return fail(name, "LadderHard missing from the hardcore list ({d} rows)", .{hard});
+
+    // The search finds a ladder character on its page, and says nobody for one that is not.
+    var base: u32 = 999;
+    const page = c.charRank(false, true, "LadderPawn", &entries, &dst, &base) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var pawn_on_page = false;
+    for (entries[0..page]) |e| if (std.mem.eql(u8, e.name, "LadderPawn")) {
+        pawn_on_page = true;
+    };
+    if (!pawn_on_page) return fail(name, "search for LadderPawn: not on the page it was sent ({d} rows from {d})", .{ page, base });
+    if (base != pr - pr % 16) return fail(name, "search for LadderPawn (rank {d}) started at {d}, want {d}", .{ pr, base, pr - pr % 16 });
+    const none = c.charRank(false, true, "LadderNot", &entries, &dst, &base) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (none != 0) return fail(name, "search for a non-ladder character found {d} rows", .{none});
+
+    return .{ .name = name, .status = .pass, .msg = msg("{d} rows in pieces under 1024 bytes; King@{d} above Pawn@{d}; class, hardcore and search lists right", .{ cnt, kr, pr }) };
 }
 
 /// A ladder is ordered by experience, which is not in the save header — it lives in the
@@ -310,23 +401,18 @@ fn scLadderExperience() Result {
     const name = "ladder_experience";
     const acct = "ExpAcct";
     var buf: [0x80]u8 = undefined;
-    const ahead = rc.storePutChar(acct, "ExpAhead", d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const ahead = rc.storePutChar(acct, "ExpAhead", ladderSave(&buf, "ExpAhead", 1, 90, 1_900_000_000, 0x60)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (ahead != 0) return fail(name, "save ExpAhead result={d}", .{ahead});
-    const behind = rc.storePutChar(acct, "ExpBehind", d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const behind = rc.storePutChar(acct, "ExpBehind", ladderSave(&buf, "ExpBehind", 1, 90, 1_200_000_000, 0x60)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (behind != 0) return fail(name, "save ExpBehind result={d}", .{behind});
 
     var c = rc.RealmClient{};
     defer c.close();
-    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    if (ladderClient(&c, acct)) |why| return fail(name, "{s}", .{why});
 
     var entries: [256]rc.LadderEntry = undefined;
     var dst: [8192]u8 = undefined;
-    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cnt = ladderWithin(&c, 0x1b, "ExpBehind", &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     var ahead_rank: ?usize = null;
     var behind_rank: ?usize = null;
     var ahead_exp: u32 = 0;
@@ -342,6 +428,54 @@ fn scLadderExperience() Result {
     if (ahead_exp != 1_900_000_000) return fail(name, "ExpAhead experience={d}, want 1900000000 (decoded from the attribute list)", .{ahead_exp});
     if (ar >= br) return fail(name, "same level, more experience did not rank first: ExpAhead@{d} vs ExpBehind@{d}", .{ ar, br });
     return .{ .name = name, .status = .pass, .msg = msg("equal level 90: exp {d} @{d} ranked above exp 1200000000 @{d}", .{ ahead_exp, ar, br }) };
+}
+
+/// An account holds sixteen characters, and the list the game asks for (it asks for sixteen) carries
+/// all of them. A seventeenth is refused, and so is it by name: it must not exist and go unlisted.
+fn scCharsSixteen() Result {
+    const name = "chars_sixteen";
+    const acct = "SixteenAcct";
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var names: [17][8]u8 = undefined; // "Sx00Char"
+    var n: usize = 0;
+    while (n < 17) : (n += 1) {
+        const nm = std.mem.print(&names[n], "Sx{d:0>2}Char", .{n}) catch unreachable;
+        const res = c.charCreateFresh(@intCast(n % 7), 0x20, nm) catch |e| return fail(name, "create {d}: {s}", .{ n + 1, @errorName(e) });
+        if (n < 16 and res != 0) return fail(name, "create {d} of 16 result=0x{x}", .{ n + 1, res });
+        if (n == 16) {
+            if (res == 0) return fail(name, "a seventeenth character was created", .{});
+            break;
+        }
+        // The list the game asks for is complete at every count, the ninth to the sixteenth included.
+        var chars: [16]rc.CharEntry = undefined;
+        var dst: [4096]u8 = undefined;
+        const got = c.charListAsking(16, &chars, &dst) catch |e| return fail(name, "list after {d}: {s}", .{ n + 1, @errorName(e) });
+        if (got.total != n + 1 or got.count != n + 1) return fail(name, "after {d} characters the list says total={d} returned={d}", .{ n + 1, got.total, got.count });
+    }
+    var chars: [16]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const got = c.charListAsking(16, &chars, &dst) catch |e| return fail(name, "final list: {s}", .{@errorName(e)});
+    if (got.total != 16 or got.count != 16) return fail(name, "refused seventeenth changed the list: total={d} returned={d}", .{ got.total, got.count });
+    var gone: [17]bool = @splat(false);
+    for (chars[0..got.count]) |e| {
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            if (std.mem.eql(u8, e.name, &names[i])) gone[i] = true;
+        }
+    }
+    for (gone[0..16], 0..) |g, i| if (!g) return fail(name, "character {d} is missing from the list of sixteen", .{i + 1});
+    // The old request of eight still gets eight, the rest left for a client that asks for more.
+    const eight = c.charListAsking(8, &chars, &dst) catch |e| return fail(name, "list of eight: {s}", .{@errorName(e)});
+    if (eight.total != 16 or eight.count != 8) return fail(name, "asked for 8: total={d} returned={d}", .{ eight.total, eight.count });
+    return .{ .name = name, .status = .pass, .msg = msg("1..16 created and listed at every count; the 17th refused; a request of 8 returns 8 of 16", .{}) };
 }
 
 /// CHARUPGRADE has to actually convert the save. It used to ack success and change
@@ -975,7 +1109,7 @@ fn scSeatReleasedOnLeave() Result {
     var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
     defer rcl.close();
     var gcb: [64]u8 = undefined;
-    const gamechars = std.fmt.bufPrint(&gcb, "realmd:gamechars:{d}", .{gid}) catch unreachable;
+    const gamechars = std.mem.print(&gcb, "realmd:gamechars:{d}", .{gid}) catch unreachable;
     const lockkey = "realmd:charlock:" ++ acct ++ "/" ++ char;
 
     const cg = c.createGame("seatgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1157,7 +1291,7 @@ fn scGameInfo() Result {
     var dst: [512]u8 = undefined;
 
     // A game nobody made must still answer, with the "no info" token rather than silence.
-    const none = c.gameInfo("ghostgame", &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const none = c.gameInfo("game-nobody-made", &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (none.token != 0xFFFF_FFFF) return fail(name, "unknown game -> token 0x{x}, want 0xffffffff (no info)", .{none.token});
 
     const cg = c.createGame("infogame", "detail me") catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1235,7 +1369,7 @@ fn scGameMaxPlayers() Result {
         var abuf: [9][24]u8 = undefined;
         var i: usize = 0;
         while (i < cs.seats + 1) : (i += 1) {
-            const acct = std.fmt.bufPrint(&abuf[i], "Mp{d}x{d}", .{ round, i }) catch unreachable;
+            const acct = std.mem.print(&abuf[i], "Mp{d}x{d}", .{ round, i }) catch unreachable;
             if (clients[i].d2cs != null) clients[i].close();
             openLobby(&clients[i], acct) catch |e| return fail(name, "{s}: lobby for {s}: {s}", .{ cs.game, acct, @errorName(e) });
         }
@@ -1381,7 +1515,7 @@ fn scSilentServerFallsBack() Result {
     var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
     defer rcl.close();
     var kb: [64]u8 = undefined;
-    const qk = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gs_a.gsid}) catch unreachable;
+    const qk = std.mem.print(&kb, "realmd:gsq:{x}", .{gs_a.gsid}) catch unreachable;
     const len = rcl.cmd(&.{ "LLEN", qk }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
     if (len != .int or len.int != 0) return fail(name, "the silent server's request must be taken back, or it creates a stale game when it revives", .{});
     return .{ .name = name, .status = .pass, .msg = msg("silent a skipped (queue emptied), hosted on b", .{}) };
@@ -1595,15 +1729,16 @@ fn scGameListFiltered() Result {
     defer for (clients[0..opened]) |*c| c.close();
     for (list_kinds, 0..) |k, i| {
         var acct: [24]u8 = undefined;
-        const an = std.fmt.bufPrint(&acct, "ListAcct{d}", .{i}) catch unreachable;
+        const an = std.mem.print(&acct, "ListAcct{d}", .{i}) catch unreachable;
         clients[i] = clientWithChar(an, k.char, k.status) catch |e| return fail(name, "{s} {s}", .{ k.char, @errorName(e) });
         opened += 1;
         const cg = clients[i].createGame(k.game, "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
         if (cg.result != 0) return fail(name, "{s} create result={d}", .{ k.char, cg.result });
     }
     for (list_kinds, 0..) |k, i| {
-        var rows: [16]rc.GameEntry = undefined;
-        var dst: [1024]u8 = undefined;
+        // room for every game the earlier scenarios left behind, so the list is never cut short
+        var rows: [512]rc.GameEntry = undefined;
+        var dst: [32768]u8 = undefined;
         const n = clients[i].gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
         // Other scenarios leave games behind; only this one's ("g-...") are judged.
         var mine: usize = 0;
@@ -1622,7 +1757,33 @@ fn scGameListFiltered() Result {
         const info = clients[i].gameInfo(other, &d) catch |e| return fail(name, "{s}", .{@errorName(e)});
         if (info.token != 0xFFFF_FFFF) return fail(name, "{s}: game info of '{s}' answered (token 0x{x})", .{ k.char, other, info.token });
     }
-    return .{ .name = name, .status = .pass, .msg = msg("classic/expansion x ladder x hardcore: each of 6 kinds lists only its own game, and no detail for the others", .{}) };
+
+    // A game with a password is left out of everyone's list, still joins with the password, and
+    // refuses a wrong one.
+    var owner = clientWithChar("PrivOwner", "PrivOwnerC", 0x00) catch |e| return fail(name, "owner {s}", .{@errorName(e)});
+    defer owner.close();
+    var friend = clientWithChar("PrivFriend", "PrivFriendC", 0x00) catch |e| return fail(name, "friend {s}", .{@errorName(e)});
+    defer friend.close();
+    const pg = owner.createGameWithPassword("p-private", "d", "sesame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (pg.result != 0) return fail(name, "private create result={d}", .{pg.result});
+    const og = owner.createGame("p-open", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = og;
+    for ([_]*rc.RealmClient{ &friend, &clients[0] }) |viewer| {
+        var rows: [512]rc.GameEntry = undefined;
+        var dst: [32768]u8 = undefined;
+        const n = viewer.gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        var open_seen = false;
+        for (rows[0..n]) |g| {
+            if (std.mem.eql(u8, g.name, "p-private")) return fail(name, "a password game is in the list", .{});
+            if (std.mem.eql(u8, g.name, "p-open")) open_seen = true;
+        }
+        if (!open_seen) return fail(name, "the open game left the list too", .{});
+    }
+    const wrong = friend.joinGameWithPassword("p-private", "nope") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (wrong.result != 0x29) return fail(name, "wrong password -> 0x{x}, want 0x29", .{wrong.result});
+    const right = friend.joinGameWithPassword("p-private", "sesame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (right.result != 0) return fail(name, "right password -> 0x{x}, want 0", .{right.result});
+    return .{ .name = name, .status = .pass, .msg = msg("classic/expansion x ladder x hardcore: each of 6 kinds lists only its own game, and no detail for the others; a password game is unlisted but joins by name and password", .{}) };
 }
 
 /// An expansion character that asks to join a classic game by name is told so with the code the
@@ -1672,12 +1833,12 @@ fn scGetFileTime() Result {
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
 
     var cmd: [512]u8 = undefined;
-    const staged = std.fmt.bufPrintZ(&cmd, "mkdir -p '{s}/bnftp' && printf gateways > '{s}/bnftp/bnserver-D2DV.ini'", .{ data_dir, data_dir }) catch
+    const staged = std.mem.printSentinel(&cmd, "mkdir -p '{s}/bnftp' && printf gateways > '{s}/bnftp/bnserver-D2DV.ini'", .{ data_dir, data_dir }, 0) catch
         return fail(name, "could not build the staging command", .{});
     const rc_stage = system(staged.ptr);
     if (rc_stage != 0) return fail(name, "staging the file failed (rc={d}): {s}", .{ rc_stage, staged });
     var vcmd: [512]u8 = undefined;
-    const verify = std.fmt.bufPrintZ(&vcmd, "test -f '{s}/bnftp/bnserver-D2DV.ini'", .{data_dir}) catch return fail(name, "fmt", .{});
+    const verify = std.mem.printSentinel(&vcmd, "test -f '{s}/bnftp/bnserver-D2DV.ini'", .{data_dir}, 0) catch return fail(name, "fmt", .{});
     if (system(verify.ptr) != 0) return fail(name, "the staged file is not there: {s}", .{verify});
 
     var c = rc.RealmClient{};
@@ -1714,7 +1875,7 @@ const StressWorker = struct {
 
     fn run(self: *StressWorker) void {
         var nb: [32]u8 = undefined;
-        const acct = std.fmt.bufPrint(&nb, "Stress{d:0>3}", .{self.index}) catch return;
+        const acct = std.mem.print(&nb, "Stress{d:0>3}", .{self.index}) catch return;
         var c = rc.RealmClient{};
         defer c.close();
         c.connectBnet() catch return;
@@ -1725,7 +1886,7 @@ const StressWorker = struct {
         // Say something, so other workers' broadcast paths run while this one is mutating
         // the registry — the contention this is here to create.
         var mb: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&mb, "worker {d} reporting", .{self.index}) catch return;
+        const line = std.mem.print(&mb, "worker {d} reporting", .{self.index}) catch return;
         c.chatCommand(line) catch return;
         c.chatCommand("/whois Stress000") catch return;
         self.ok = true;
@@ -1807,9 +1968,9 @@ fn scFriendsListLoad() Result {
     var i: usize = 0;
     while (i < want) : (i += 1) {
         var nb: [32]u8 = undefined;
-        const friend = std.fmt.bufPrint(&nb, "LoadFriend{d:0>2}xxxx", .{i}) catch return fail(name, "fmt", .{});
+        const friend = std.mem.print(&nb, "LoadFriend{d:0>2}xxxx", .{i}) catch return fail(name, "fmt", .{});
         var cb: [64]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cb, "/f add {s}", .{friend}) catch return fail(name, "fmt", .{});
+        const cmd = std.mem.print(&cb, "/f add {s}", .{friend}) catch return fail(name, "fmt", .{});
         owner.chatCommand(cmd) catch |e| return fail(name, "{s}", .{@errorName(e)});
         added += 1;
     }
@@ -1823,7 +1984,7 @@ fn scFriendsListLoad() Result {
     var k: usize = 0;
     while (k < online.len) : (k += 1) {
         var nb: [32]u8 = undefined;
-        const who = std.fmt.bufPrint(&nb, "LoadFriend{d:0>2}xxxx", .{k}) catch return fail(name, "fmt", .{});
+        const who = std.mem.print(&nb, "LoadFriend{d:0>2}xxxx", .{k}) catch return fail(name, "fmt", .{});
         online[k] = rc.RealmClient{};
         opened = k + 1;
         online[k].connectBnet() catch |e| return fail(name, "friend {s}", .{@errorName(e)});
@@ -2021,7 +2182,7 @@ fn scChatCommands() Result {
     const aliases = [_][]const u8{ "/w", "/whisper", "/m", "/msg", "/W", "/Msg" };
     for (aliases) |alias| {
         var buf: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "{s} CmdBob via{s}", .{ alias, alias }) catch return fail(name, "fmt", .{});
+        const line = std.mem.print(&buf, "{s} CmdBob via{s}", .{ alias, alias }) catch return fail(name, "fmt", .{});
         a.chatCommand(line) catch |e| return fail(name, "A {s}", .{@errorName(e)});
 
         var got = false;
@@ -2039,7 +2200,7 @@ fn scChatCommands() Result {
     const replies = [_][]const u8{ "/r", "/reply", "/R" };
     for (replies) |verb| {
         var buf: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "{s} back{s}", .{ verb, verb }) catch return fail(name, "fmt", .{});
+        const line = std.mem.print(&buf, "{s} back{s}", .{ verb, verb }) catch return fail(name, "fmt", .{});
         b.chatCommand(line) catch |e| return fail(name, "B {s}", .{@errorName(e)});
 
         var got = false;
@@ -2412,7 +2573,11 @@ fn scAdminApi() Result {
 }
 
 fn fail(name: []const u8, comptime fmt: []const u8, args: anytype) Result {
-    return .{ .name = name, .status = .fail, .msg = msg(fmt, args) };
+    const text = msg(fmt, args);
+    // A read that hit its deadline says what it was waiting for, not just that it waited.
+    if (std.mem.indexOf(u8, text, "Timeout") != null and net.waitingFor().len > 0)
+        return .{ .name = name, .status = .fail, .msg = msg("{s} (waiting for {s})", .{ text, net.waitingFor() }) };
+    return .{ .name = name, .status = .fail, .msg = text };
 }
 
 fn skip(name: []const u8, m: []const u8) Result {
@@ -2483,21 +2648,94 @@ fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
 // The realm runs ephemeral state (sessions + games + token routes) in redis, and the
 // d2ingress reads token routes from it asynchronously — so the harness brings up a real
 // redis in docker, points realmd + d2ingress at it, and flushes it for a clean slate.
-const REDIS_HOST_PORT: u16 = 6399;
-const PG_HOST_PORT: u16 = 55499;
+// The stores' host ports and container names follow E2E_PORT_BASE, so a run moved off the default
+// ports shares nothing with one that was not, containers included.
+var REDIS_HOST_PORT: u16 = 6399;
+var PG_HOST_PORT: u16 = 55499;
+var redis_name: []const u8 = "e2e-redis";
+var pg_name: []const u8 = "e2e-postgres";
+
+fn sh(comptime fmt: []const u8, args: anytype) c_int {
+    var buf: [512]u8 = undefined;
+    const cmd = std.mem.printSentinel(&buf, fmt, args, 0) catch return -1;
+    return system(cmd.ptr);
+}
+
+fn followPortBase(base: u16) void {
+    REDIS_HOST_PORT = base + 287; // 6112 -> 6399
+    PG_HOST_PORT = base + 49387; // 6112 -> 55499
+    fakegs.redis_port = REDIS_HOST_PORT;
+    redis_name = msg("e2e-redis-{d}", .{base});
+    pg_name = msg("e2e-postgres-{d}", .{base});
+}
 
 /// Bring up the two stores realmd needs. Both, always: there is no filesystem fallback to fall
 /// back to, which is the point — a harness that could run without them would be testing a
 /// configuration that does not exist.
+// The stores run in containers with fixed names and ports, and scenarios start realmds on fixed
+// ports, so two runs on one machine would remove each other's containers and fail in ways that
+// read as realm bugs. One run at a time: the second waits for the first and says so.
+const run_lock_dir = "/tmp/realmd-e2e.lock";
+const run_lock_pid = run_lock_dir ++ "/pid";
+extern "c" fn rmdir(path: [*:0]const u8) c_int;
+extern "c" fn getpid() c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
+
+fn lockHolder() ?c_int {
+    var buf: [32]u8 = undefined;
+    const fd = open(run_lock_pid, 0);
+    if (fd < 0) return null;
+    defer _ = close(fd);
+    const n = read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    return std.fmt.parseInt(c_int, std.mem.trim(u8, buf[0..@intCast(n)], " \n"), 10) catch null;
+}
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+
+fn takeRunLock() void {
+    var waited_s: u32 = 0;
+    while (true) {
+        if (mkdir(run_lock_dir, 0o755) == 0) {
+            var buf: [32]u8 = undefined;
+            const text = std.mem.print(&buf, "{d}\n", .{getpid()}) catch return;
+            const fd = open(run_lock_pid, 0x601, @as(c_uint, 0o644)); // O_WRONLY|O_CREAT|O_TRUNC
+            if (fd >= 0) {
+                _ = write(fd, text.ptr, text.len);
+                _ = close(fd);
+            }
+            return;
+        }
+        const holder = lockHolder();
+        if (holder == null or kill(holder.?, 0) != 0) {
+            // the run that took it is gone
+            _ = unlink(run_lock_pid);
+            _ = rmdir(run_lock_dir);
+            continue;
+        }
+        if (waited_s % 10 == 0) std.debug.print("another e2e run (pid {d}) holds {s}; waiting for it\n", .{ holder.?, run_lock_dir });
+        if (waited_s >= 900) {
+            std.debug.print("ERROR: gave up after {d}s waiting for the e2e run of pid {d}\n", .{ waited_s, holder.? });
+            std.process.exit(2);
+        }
+        _ = net.usleep(1_000_000);
+        waited_s += 1;
+    }
+}
+
+fn releaseRunLock() void {
+    _ = unlink(run_lock_pid);
+    _ = rmdir(run_lock_dir);
+}
+
 fn startStores() void {
-    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1"); // clear stale containers
-    if (system("docker run -d --rm --name e2e-redis -p 6399:6379 redis:7-alpine >/dev/null 2>&1") != 0) {
+    _ = sh("docker rm -f {s} {s} >/dev/null 2>&1", .{ redis_name, pg_name }); // clear stale containers
+    if (sh("docker run -d --rm --name {s} -p {d}:6379 redis:7-alpine >/dev/null 2>&1", .{ redis_name, REDIS_HOST_PORT }) != 0) {
         std.debug.print("ERROR: could not start the redis container (docker is required).\n", .{});
         std.process.exit(2);
     }
-    if (system("docker run -d --rm --name e2e-postgres -p 55499:5432 " ++
+    if (sh("docker run -d --rm --name {s} -p {d}:5432 " ++
         "-e POSTGRES_USER=realmd -e POSTGRES_PASSWORD=realmd -e POSTGRES_DB=realmd " ++
-        "postgres:16-alpine >/dev/null 2>&1") != 0)
+        "postgres:16-alpine >/dev/null 2>&1", .{ pg_name, PG_HOST_PORT }) != 0)
     {
         std.debug.print("ERROR: could not start the postgres container (docker is required).\n", .{});
         stopStores();
@@ -2508,9 +2746,9 @@ fn startStores() void {
         stopStores();
         std.process.exit(2);
     }
-    _ = system("docker exec e2e-redis redis-cli FLUSHALL >/dev/null 2>&1"); // clean slate
-    _ = setenv("REALMD_REDIS_ADDR", "127.0.0.1:6399", 1);
-    _ = setenv("REALMD_PG_DSN", "postgres://realmd:realmd@127.0.0.1:55499/realmd", 1);
+    _ = sh("docker exec {s} redis-cli FLUSHALL >/dev/null 2>&1", .{redis_name}); // clean slate
+    _ = setenv("REALMD_REDIS_ADDR", (alloc.printSentinel("127.0.0.1:{d}", .{REDIS_HOST_PORT}, 0) catch return).ptr, 1);
+    _ = setenv("REALMD_PG_DSN", (alloc.printSentinel("postgres://realmd:realmd@127.0.0.1:{d}/realmd", .{PG_HOST_PORT}, 0) catch return).ptr, 1);
     // The port being open is not the same as the server accepting connections, and neither is
     // `pg_isready`.
     //
@@ -2527,7 +2765,7 @@ fn startStores() void {
     var waited: u32 = 0;
     var pg_ready = false;
     while (waited < 60_000) : (waited += 250) {
-        if (system("docker exec e2e-postgres psql -U realmd -h 127.0.0.1 -d realmd -c 'select 1' >/dev/null 2>&1") == 0) {
+        if (sh("docker exec {s} psql -U realmd -h 127.0.0.1 -d realmd -c 'select 1' >/dev/null 2>&1", .{pg_name}) == 0) {
             pg_ready = true;
             break;
         }
@@ -2540,32 +2778,26 @@ fn startStores() void {
         stopStores();
         std.process.exit(2);
     }
-    std.debug.print("started e2e-redis :{d} and e2e-postgres :{d} (postgres answered a query)\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
+    std.debug.print("started {s} :{d} and {s} :{d} (postgres answered a query)\n", .{ redis_name, REDIS_HOST_PORT, pg_name, PG_HOST_PORT });
 }
 
 fn stopStores() void {
-    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1");
+    _ = sh("docker rm -f {s} {s} >/dev/null 2>&1", .{ redis_name, pg_name });
 }
 
 fn maybeStartRealmd() !?c_int {
     if (net.portOpen(rc.HOST_BNET)) {
-        // Reusing whatever answers on the port is convenient when iterating against a realm
-        // already up, and a trap otherwise: that server isn't the binary just built, wasn't
-        // given this harness's data dir/admin token/permissive-auth, and carries other state.
-        // Set E2E_NO_REUSE=1 to refuse instead of guessing.
-        std.debug.print(
-            \\
-            \\!! REUSING an existing realmd on 127.0.0.1:{d} — NOT the freshly built one.
-            \\!! It has its own data dir and env, so failures below may say nothing about
-            \\!! your changes. Stop that process (or set E2E_NO_REUSE=1) for a real run.
-            \\
-            \\
-        , .{rc.HOST_BNET});
-        if (std.mem.eql(u8, envOr("E2E_NO_REUSE", "0"), "1")) {
-            std.debug.print("E2E_NO_REUSE=1 and port {d} is taken — refusing to test a server I did not start.\n", .{rc.HOST_BNET});
-            std.process.exit(2);
+        // Whatever answers on the port is not the binary just built, was not given this harness's
+        // data dir, admin token or permissive auth, and carries other state: failures against it
+        // say nothing about the change. Refuse unless asked.
+        if (std.mem.eql(u8, envOr("E2E_REUSE", "0"), "1")) {
+            std.debug.print("!! REUSING the realmd on 127.0.0.1:{d}; it is not the freshly built one.\n", .{rc.HOST_BNET});
+            return null;
         }
-        return null;
+        std.debug.print("port {d} is taken, refusing to test a server I did not start (E2E_PORT_BASE moves this run, E2E_REUSE=1 uses it)\n", .{rc.HOST_BNET});
+        stopStores();
+        releaseRunLock();
+        std.process.exit(2);
     }
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
@@ -2574,11 +2806,11 @@ fn maybeStartRealmd() !?c_int {
     // meant the base override started a child that tried to bind whatever else owned 18080,
     // failed, and left every scenario reporting ConnectFailed as though the server were broken.
     var health_buf: [8]u8 = undefined;
-    const health = envOr("REALMD_HEALTH_PORT", std.fmt.bufPrintZ(&health_buf, "{d}", .{HEALTH_PORT}) catch "18080");
+    const health = envOr("REALMD_HEALTH_PORT", std.mem.printSentinel(&health_buf, "{d}", .{HEALTH_PORT}, 0) catch "18080");
     // Fresh data dir each run — accounts/chars/games persist otherwise and break
     // isolation (e.g. a re-created account would already exist on the 2nd run).
     var rmbuf: [512]u8 = undefined;
-    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+    if (std.mem.printSentinel(&rmbuf, "rm -rf {s}", .{data_dir}, 0)) |cmd| {
         _ = system(cmd.ptr);
     } else |_| {}
     _ = mkdir(data_dir, 0o755); // ignore EEXIST; realmd creates subdirs itself
@@ -2591,7 +2823,7 @@ fn maybeStartRealmd() !?c_int {
         .{ .name = "REALMD_BNET_PORT", .port = rc.HOST_BNET },
     };
     for (ports, 0..) |pp, i| {
-        if (std.fmt.bufPrintZ(&pbuf[i], "{d}", .{pp.port})) |v| {
+        if (std.mem.printSentinel(&pbuf[i], "{d}", .{pp.port}, 0)) |v| {
             _ = setenv(pp.name, v.ptr, 1);
         } else |_| {}
     }
@@ -2681,7 +2913,7 @@ fn scBannerAd() Result {
 
     // The ad file has to be fetchable, so drop it where BNFTP serves from.
     var cmd: [512]u8 = undefined;
-    if (std.fmt.bufPrintZ(&cmd, "mkdir -p {s}/bnftp && printf 'BANNERPIXELS' > {s}/bnftp/banner.pcx", .{ data_dir, data_dir })) |c| {
+    if (std.mem.printSentinel(&cmd, "mkdir -p {s}/bnftp && printf 'BANNERPIXELS' > {s}/bnftp/banner.pcx", .{ data_dir, data_dir }, 0)) |c| {
         _ = system(c.ptr);
     } else |_| return fail(name, "could not stage the ad file", .{});
 
@@ -2768,10 +3000,10 @@ fn scSaveDurability() Result {
     var c = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
     defer c.close();
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ acct, char }) catch return fail(name, "key", .{});
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ acct, char }) catch return fail(name, "key", .{});
     _ = c.cmd(&.{ "DEL", key }) catch |e| return fail(name, "del {s}", .{@errorName(e)});
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{acct}) catch return fail(name, "key", .{});
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{acct}) catch return fail(name, "key", .{});
     _ = c.cmd(&.{ "SREM", setkey, char }) catch |e| return fail(name, "srem {s}", .{@errorName(e)});
 
     var cl = rc.RealmClient{};
@@ -2804,7 +3036,7 @@ fn scFriendsPersist() Result {
     // must not share a store with anything else, and must not depend on the main harness
     // instance (which may be a realmd the harness merely found running).
     var cmd: [256]u8 = undefined;
-    if (std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{data_dir})) |rm| _ = system(rm.ptr) else |_| {}
+    if (std.mem.printSentinel(&cmd, "rm -rf {s}", .{data_dir}, 0)) |rm| _ = system(rm.ptr) else |_| {}
 
     const base = [_]EnvVar{
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
@@ -2886,14 +3118,12 @@ fn scFriendsPersist() Result {
     var i: usize = 0;
     while (i < 16) : (i += 1) {
         const ev = c.readChatEvent() catch break;
-        // Gheed also generates a channel-JOIN on this connection; only the INFO lines are
-        // the /f list reply.
-        if (ev.eid != rc.EID_INFO or !std.mem.eql(u8, ev.username, "Gheed")) continue;
-        if (std.mem.indexOf(u8, ev.text, "Diablo II") != null) {
-            located = true;
-            break;
-        }
-        return fail(name, "/f list says Gheed is '{s}' — should name the channel they are in", .{ev.text});
+        // The reply is chat text, one INFO line per friend: "1: Gheed, online in Diablo II".
+        if (ev.eid != rc.EID_INFO or std.mem.indexOf(u8, ev.text, ": Gheed,") == null) continue;
+        if (std.mem.indexOf(u8, ev.text, "online in Diablo II") == null)
+            return fail(name, "/f list says '{s}', want Gheed online in Diablo II", .{ev.text});
+        located = true;
+        break;
     }
     if (!located) return fail(name, "/f list never reported where Gheed is", .{});
 
@@ -3024,7 +3254,7 @@ fn scMultiInstance() Result {
     // Shared data dir, fresh each run (isolation: accounts/sessions persist on fs).
     const data_dir = "/tmp/e2e-realmd-shared";
     var rmbuf: [256]u8 = undefined;
-    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+    if (std.mem.printSentinel(&rmbuf, "rm -rf {s}", .{data_dir}, 0)) |cmd| {
         _ = system(cmd.ptr);
     } else |_| {}
     _ = mkdir(data_dir, 0o755);
@@ -3097,7 +3327,8 @@ fn scMultiInstance() Result {
     const cg = a.createGame("fleetgame", "d") catch |e| return fail(name, "A create {s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "A create result={d}", .{cg.result});
     // ...and confirm B's admin API lists it (shared-store snapshotGames, not A's memory).
-    var rxbuf: [16384]u8 = undefined;
+    // every game the scenarios before this one left in the shared store is in the answer too
+    var rxbuf: [262144]u8 = undefined;
     const lg = net.httpRequest(17118, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "B admin games {s}", .{@errorName(e)});
     if (lg.status != 200) return fail(name, "B admin games status={d}", .{lg.status});
     if (std.mem.indexOf(u8, lg.body, "fleetgame") == null)
@@ -3203,7 +3434,7 @@ fn spawnD2ingress(ingress_port: u16) !c_int {
     const bin = envOr("REALMD_D2INGRESS_BIN", "./zig-out/bin/d2ingress");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
     var pbuf: [8]u8 = undefined;
-    const portz = std.fmt.bufPrintZ(&pbuf, "{d}", .{ingress_port}) catch return error.BadPort;
+    const portz = std.mem.printSentinel(&pbuf, "{d}", .{ingress_port}, 0) catch return error.BadPort;
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
     _ = setenv("REALMD_INGRESS_PORT", portz.ptr, 1);
     const pid = fork();
@@ -3331,7 +3562,7 @@ fn scEmbeddedGameEdge() Result {
 
     const data_dir = "/tmp/e2e-realmd-edge";
     var rmbuf: [256]u8 = undefined;
-    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+    if (std.mem.printSentinel(&rmbuf, "rm -rf {s}", .{data_dir}, 0)) |cmd| {
         _ = system(cmd.ptr);
     } else |_| {}
     _ = mkdir(data_dir, 0o755);
@@ -3431,23 +3662,122 @@ fn resetFixtures() void {
     var rxbuf: [4096]u8 = undefined;
     for (fixture_accounts) |acct| {
         var json: [128]u8 = undefined;
-        const body = std.fmt.bufPrint(&json, "{{\"name\":\"{s}\"}}", .{acct}) catch continue;
+        const body = std.mem.print(&json, "{{\"name\":\"{s}\"}}", .{acct}) catch continue;
         _ = net.httpRequest(HEALTH_PORT, "POST", "/admin/accounts/delete", ADMIN_TOKEN, body, &rxbuf) catch continue;
     }
     for (fixture_chars) |fc| {
         var json: [160]u8 = undefined;
-        const body = std.fmt.bufPrint(&json, "{{\"account\":\"{s}\",\"char\":\"{s}\"}}", .{ fc.account, fc.char }) catch continue;
+        const body = std.mem.print(&json, "{{\"account\":\"{s}\",\"char\":\"{s}\"}}", .{ fc.account, fc.char }) catch continue;
         _ = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/delete", ADMIN_TOKEN, body, &rxbuf) catch continue;
     }
 }
 
+extern "c" fn pipe(fds: *[2]c_int) c_int;
+extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+extern "c" fn alarm(seconds: c_uint) c_uint;
+extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) usize;
+extern "c" fn _exit(code: c_int) noreturn;
+extern "c" fn setpgid(pid: c_int, pgid: c_int) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
+extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
+extern "c" fn close(fd: c_int) c_int;
+const PollFd = extern struct { fd: c_int, events: c_short, revents: c_short };
+extern "c" fn poll(fds: [*]PollFd, n: c_ulong, timeout_ms: c_int) c_int;
+
+/// Longest a scenario may run. They finish in seconds; this is the hang detector, not a budget.
+const scenario_timeout_s: c_uint = 60;
+
+var report_fd: c_int = -1;
+var running_scenario: []const u8 = "";
+
+fn reportResult(status: Status, text: []const u8) void {
+    var head = [_]u8{@as(u8, @backingInt(status))};
+    _ = write(report_fd, &head, 1);
+    _ = write(report_fd, text.ptr, text.len);
+}
+
+/// The scenario's own alarm. It runs in the scenario's process, so what it reports is what that
+/// process was last blocked on.
+fn onScenarioTimeout(_: c_int) callconv(.c) void {
+    var buf: [320]u8 = undefined;
+    const text = std.mem.print(&buf, "TIMEOUT after {d}s, still waiting for {s}", .{
+        scenario_timeout_s,
+        if (net.waitingFor().len > 0) net.waitingFor() else "(nothing recorded)",
+    }) catch "TIMEOUT";
+    reportResult(.fail, text);
+    _exit(0);
+}
+
+/// Each scenario runs in a process of its own: a hang is cut off by a hard deadline that names the
+/// scenario, one scenario cannot leave state in the harness for the next, and any subset or order
+/// is the same run. The server and the stores are outside, shared, so scenarios still need names
+/// of their own on the server side.
+fn runIsolated(comptime id: []const u8, comptime run: fn () Result) Result {
+    const t_start = nowMs();
+    var r = runIsolatedInner(id, run);
+    r.ms = nowMs() - t_start;
+    return r;
+}
+
+fn nowMs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+fn runIsolatedInner(comptime id: []const u8, comptime run: fn () Result) Result {
+    var fds: [2]c_int = undefined;
+    if (pipe(&fds) != 0) return .{ .name = id, .status = .fail, .msg = "pipe failed" };
+    const pid = fork();
+    if (pid < 0) return .{ .name = id, .status = .fail, .msg = "fork failed" };
+    if (pid == 0) {
+        _ = setpgid(0, 0); // whatever the scenario spawns dies with it
+        _ = close(fds[0]);
+        _ = fcntl(fds[1], 2, @as(c_int, 1)); // F_SETFD FD_CLOEXEC: a spawned realmd must not hold the report open
+        report_fd = fds[1];
+        running_scenario = id;
+        _ = signal(14, onScenarioTimeout); // SIGALRM
+        _ = alarm(scenario_timeout_s);
+        const r = run();
+        reportResult(r.status, r.msg);
+        _exit(0);
+    }
+    _ = close(fds[1]);
+    var got: [2048]u8 = undefined;
+    var n: usize = 0;
+    // The child's own alarm fires first; this deadline only covers a child too stuck to report.
+    var deadline_ms: c_int = @intCast((scenario_timeout_s + 15) * 1000);
+    while (n < got.len) {
+        var pfd = [_]PollFd{.{ .fd = fds[0], .events = 1, .revents = 0 }};
+        const t0 = deadline_ms;
+        if (poll(&pfd, 1, t0) <= 0) break;
+        const r = read(fds[0], got[n..].ptr, got.len - n);
+        if (r <= 0) break;
+        n += @intCast(r);
+        deadline_ms = 5000;
+    }
+    _ = close(fds[0]);
+    _ = kill(-pid, 9);
+    var wstatus: c_int = 0;
+    _ = kill(pid, 9);
+    _ = waitpid(pid, &wstatus, 0);
+    if (n == 0) {
+        const sig = wstatus & 0x7f;
+        return .{ .name = id, .status = .fail, .msg = if (sig == 9) "TIMEOUT, the scenario never reported" else msg("the scenario process died (wait status {d}) before reporting", .{wstatus}) };
+    }
+    const status: Status = @fromBackingInt(@intCast(got[0]));
+    return .{ .name = id, .status = status, .msg = alloc.dupe(u8, got[1..n]) catch "(alloc failed)" };
+}
+
+const not_selected = "not in E2E_ONLY";
+
 /// `E2E_ONLY=scName[,scName...]` runs just those scenarios; the rest report as skipped.
 fn only(comptime id: []const u8, comptime run: fn () Result) Result {
     const want = envOr("E2E_ONLY", "");
-    if (want.len == 0) return run();
+    if (want.len == 0) return runIsolated(id, run);
     var it = std.mem.splitScalar(u8, want, ',');
-    while (it.next()) |w| if (std.mem.eql(u8, std.mem.trim(u8, w, " "), id)) return run();
-    return .{ .name = id, .status = .skip, .msg = "not in E2E_ONLY" };
+    while (it.next()) |w| if (std.mem.eql(u8, std.mem.trim(u8, w, " "), id)) return runIsolated(id, run);
+    return .{ .name = id, .status = .skip, .msg = not_selected };
 }
 
 pub fn main() !void {
@@ -3457,8 +3787,13 @@ pub fn main() !void {
     if (port_base != 0) {
         rc.setPortBase(port_base);
         HEALTH_PORT = port_base + 1968; // keeps the usual 6112 -> 18080 relationship
+        followPortBase(port_base);
         std.debug.print("port base overridden: bnet={d} health={d}\n", .{ rc.HOST_BNET, HEALTH_PORT });
     }
+    // Every realmd this run starts is stopped with SIGTERM, and the production drain is 5 s of
+    // waiting for the load balancer, which a test has none of.
+    _ = setenv("REALMD_SHUTDOWN_GRACE_MS", "100", 1);
+    takeRunLock();
     startStores();
     const child = try maybeStartRealmd();
     resetFixtures();
@@ -3495,6 +3830,7 @@ pub fn main() !void {
         only("scLadder", scLadder),
         only("scLadderExperience", scLadderExperience),
         only("scCharUpgrade", scCharUpgrade),
+        only("scCharsSixteen", scCharsSixteen),
         only("scCharDelete", scCharDelete),
         only("scCharCopy", scCharCopy),
         only("scLobbyChatAtoB", scLobbyChatAtoB),
@@ -3526,6 +3862,7 @@ pub fn main() !void {
         _ = waitpid(pid, null, 0);
     }
     stopStores();
+    releaseRunLock();
 
     var npass: u32 = 0;
     var nfail: u32 = 0;
@@ -3536,7 +3873,8 @@ pub fn main() !void {
             .fail => "FAIL",
             .skip => "SKIP",
         };
-        std.debug.print("[{s}] {s}: {s}\n", .{ tag, r.name, r.msg });
+        if (r.status == .skip and std.mem.eql(u8, r.msg, not_selected)) continue;
+        std.debug.print("[{s}] {s} ({d} ms): {s}\n", .{ tag, r.name, r.ms, r.msg });
         switch (r.status) {
             .pass => npass += 1,
             .fail => nfail += 1,

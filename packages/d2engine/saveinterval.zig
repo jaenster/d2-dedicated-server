@@ -250,7 +250,7 @@ test "the fixup is found after its mask, and only within the window" {
 }
 
 test "scanning a slice with no matches is not an error" {
-    const noise = [_]u8{0x90} ** 64;
+    const noise: [64]u8 = @splat(0x90);
     var sites: [4]Site = undefined;
     try testing.expectEqual(@as(usize, 0), findMaskSites(&noise, stock_frames, &sites));
     try testing.expect(findFixupAfter(&noise, 0, stock_frames, 64) == null);

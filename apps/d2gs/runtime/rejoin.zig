@@ -121,7 +121,7 @@ fn disconnectClient(game: usize, client: usize, reason: u32) void {
 /// connection. That is the whole question this file turns on: a seat whose connection is gone is
 /// a leftover, and a seat whose connection is still there is somebody playing.
 fn connectionToken(client_no: u32) u32 {
-    const f: *const fn (u32) callconv(std.builtin.CallingConvention{ .x86_stdcall = .{} }) u32 =
+    const f: *const fn (u32) callconv(std.lang.CallingConvention{ .x86_stdcall = .{} }) u32 =
         @ptrFromInt(0x0052b610);
     return f(client_no);
 }

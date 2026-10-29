@@ -9,6 +9,7 @@
 const std = @import("std");
 const patch = @import("../patch.zig");
 const trampoline = @import("../trampoline.zig");
+const hook_contract = @import("hook_contract.zig");
 const log = @import("../../log.zig");
 const d2types = @import("../../engine/d2types.zig");
 const d2 = @import("../../engine/d2/types.zig");
@@ -173,17 +174,8 @@ fn onDeath(pGame: usize, pVictim: usize, _: usize) callconv(.c) void {
 // entry-hook machinery (modeled on srvtrace.zig: relocate the prologue into a
 //    trampoline, JMP the entry to a naked shim that captures args, calls our
 // cdecl handler, then resumes the original)
-const Src = union(enum) { none, ecx, edx, stack: usize };
-
-fn pushAsm(comptime s: Src, comptime pushed: usize) []const u8 {
-    return switch (s) {
-        .none => "pushl $0\n",
-        .ecx => "push %ecx\n",
-        .edx => "push %edx\n",
-        // 32 (pushal) + 4 (pushfl) + bytes pushed so far + the original k.
-        .stack => |k| std.fmt.comptimePrint("pushl {d}(%esp)\n", .{36 + pushed + k}),
-    };
-}
+const Src = hook_contract.Src;
+const pushAsm = hook_contract.pushAsm;
 
 const Handler = *const fn (usize, usize, usize) callconv(.c) void;
 
@@ -196,6 +188,9 @@ fn EntryHook(
     comptime handler: Handler,
 ) type {
     return struct {
+        comptime {
+            hook_contract.checkHook("arena entry hook", addr, &.{ a1, a2, a3 });
+        }
         var tramp: usize = 0;
 
         fn shim() callconv(.naked) void {
@@ -205,11 +200,11 @@ fn EntryHook(
                     "call %[f:P]\n" ++
                     "add $12, %%esp\n" ++
                     "popfl\npopal\n" ++
-                    "mov %[tramp], %%eax\n" ++
-                    "jmp *(%%eax)\n"
+                    // Through the trampoline pointer in memory, so EAX reaches the engine as it came.
+                    "jmp *%[tramp:P]\n"
                 :
                 : [f] "X" (handler),
-                  [tramp] "X" (&tramp),
+                  [tramp] "i" (&tramp),
             );
         }
 

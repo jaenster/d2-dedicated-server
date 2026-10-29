@@ -84,6 +84,9 @@ extensions behaves exactly as it does today.
 - `charCompatible(account, charname, char_version, client_version) ?bool` — OVERRIDE whether a
   character may be played by the client asking for it.
 - `charLogon(account, charname) void` — OBSERVE.
+- `charCreated(account, charname, class, status) void` — OBSERVE a character that now exists;
+  `status` is its .d2s status byte (hardcore 0x04, expansion 0x20, ladder 0x40).
+- `charDeleted(account, charname) void` — OBSERVE.
 - `charSave(account, charname, bytes) void` — OBSERVE the `.d2s` on its way to the store. Read it;
   do not keep the slice.
 
@@ -91,6 +94,12 @@ extensions behaves exactly as it does today.
 
 - `gameCreate(account, charname, gamename, difficulty) ?u32` — VETO.
 - `gameJoin(account, charname, gamename) ?u32` — VETO.
+- `gameStarted(g: hook.GameStarted) void` — OBSERVE a create that succeeded: name, gameid, gsid,
+  difficulty and the hardcore/expansion/ladder flags. The password is not in it.
+- `gamePlayer(p: hook.GamePlayer) void` — OBSERVE a player entering or leaving, as the game server
+  reported it, with the population after the change. Once across the realm.
+- `gameClosed(gameid) void` — OBSERVE a game ending, before the realm forgets it. Once across the
+  realm.
 - `gameVisible(account, gamename, gameid) ?bool` — OVERRIDE what the join list shows this player.
   Hiding is cosmetic: a player who knows the name can still try to join, and `gameJoin` is where
   that is actually refused.
@@ -228,6 +237,7 @@ db.cachePut("hot", bytes, 60);      // in flight — Redis, shared across instan
 db.cacheGet("hot", &buf);
 db.cacheDel("hot");
 db.incr("kills", 1, 3600);          // shared counter; the TTL arms only on creation
+db.cachePush("events", json, 1000); // queue for a consumer outside the realm, newest 1000 kept
 ```
 
 Durable is where a ladder's standings belong. The cache is for what you are willing to lose on a

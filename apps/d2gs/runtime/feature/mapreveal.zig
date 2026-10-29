@@ -41,7 +41,7 @@ var in_game: bool = false;
 
 var level_labels: [256]LevelLabel = undefined;
 var label_count: usize = 0;
-var reveal_data: [256]RevealState = [_]RevealState{.{}} ** 256;
+var reveal_data: [256]RevealState = @splat(.{});
 
 // Arcane Sanctuary warp direction indicator
 var arcane_warp: ?struct { x: f64, y: f64 } = null;
@@ -66,7 +66,7 @@ pub fn gameFrame() void {
     if (level_no != current_level) {
         current_level = level_no;
         reveal_start = GetTickCount();
-        reveal_data = [_]RevealState{.{}} ** 256;
+        reveal_data = @as([256]RevealState, @splat(.{}));
         label_count = 0;
         arcane_warp = null;
         // level changed

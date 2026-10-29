@@ -62,8 +62,8 @@ const IMAGE_LO: u32 = 0x0040_0000;
 const IMAGE_HI: u32 = 0x0090_0000;
 
 const SLOTS = 8192;
-var keys: [SLOTS]u32 = .{0} ** SLOTS;
-var usecs: [SLOTS]u64 = .{0} ** SLOTS;
+var keys: [SLOTS]u32 = @splat(0);
+var usecs: [SLOTS]u64 = @splat(0);
 
 const MAX_THREADS = 64;
 const Tracked = struct {
@@ -73,7 +73,7 @@ const Tracked = struct {
     in_engine_us: u64 = 0,
     in_host_us: u64 = 0,
 };
-var threads = [_]Tracked{.{}} ** MAX_THREADS;
+var threads: [MAX_THREADS]Tracked = @splat(.{});
 var thread_n: usize = 0;
 
 var engine_us: u64 = 0;
@@ -190,7 +190,7 @@ pub fn dump() void {
         log.hex3("eipprof:   tid / in-engine / in-host:", t.tid, @intCast(t.in_engine_us), @intCast(t.in_host_us));
     }
     var shown: usize = 0;
-    var used: [SLOTS]bool = .{false} ** SLOTS;
+    var used: [SLOTS]bool = @splat(false);
     while (shown < 25) : (shown += 1) {
         var best: usize = SLOTS;
         var best_us: u64 = 0;

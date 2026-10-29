@@ -27,11 +27,11 @@ pub const Version = enum {
     v114d,
 
     pub fn parse(s: []const u8) ?Version {
-        inline for (@typeInfo(Version).@"enum".fields) |f| {
+        inline for (@typeInfo(Version).@"enum".field_names, @typeInfo(Version).@"enum".field_values) |field_name, field_value| {
             // accept both "v109d" and the "1.09d" spelling the install dirs use
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-            if (s.len == f.name.len and s[1] == '.' and s[0] == f.name[1] and
-                std.mem.eql(u8, s[2..], f.name[2..])) return @enumFromInt(f.value);
+            if (std.mem.eql(u8, s, field_name)) return @fromBackingInt(field_value);
+            if (s.len == field_name.len and s[1] == '.' and s[0] == field_name[1] and
+                std.mem.eql(u8, s[2..], field_name[2..])) return @fromBackingInt(field_value);
         }
         return null;
     }

@@ -90,6 +90,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("packages/gs-health/gs_health.zig"),
     });
 
+    // How long an empty game is kept: pure policy the engine patch is driven by.
+    const gs_reap = b.addModule("gs_reap", .{
+        .root_source_file = b.path("packages/gs-reap/gs_reap.zig"),
+    });
+
     // Host-side infrastructure (net/log/config/lock/store types) for the NATIVE binaries.
     // Deliberately NOT given to the DLL, so libc-socket / POSIX code never enters that build.
     const realm_infra = b.addModule("realm_infra", .{
@@ -157,6 +162,7 @@ pub fn build(b: *std.Build) void {
     d2gs.root_module.addImport("gs_store", gs_store);
     d2gs.root_module.addImport("gs_seats", gs_seats);
     d2gs.root_module.addImport("gs_health", gs_health);
+    d2gs.root_module.addImport("gs_reap", gs_reap);
     d2gs.root_module.addImport("obs", obs);
     d2gs.root_module.addImport("d2engine", d2engine);
     // As a module, not a relative import: the same file is the root of the `fastcall` module that
@@ -313,7 +319,7 @@ pub fn build(b: *std.Build) void {
     // need no Node. webui.zig @embedFile's the "webui_blob" import either way.
     const webui_enabled = b.option(bool, "webui", "Build and embed the admin web UI (requires Node)") orelse false;
     const webui_blob: std.Build.LazyPath = if (webui_enabled) blk: {
-        const cmd = b.addSystemCommand(&.{ "sh", "-c", "set -e; npm --prefix \"$1\" ci && npm --prefix \"$1\" run build && cp \"$1/dist/index.html\" \"$2\"", "realmd-webui", b.pathFromRoot("webui") });
+        const cmd = b.addSystemCommand(&.{ "sh", "-c", "set -e; npm --prefix \"$1\" ci && npm --prefix \"$1\" run build && cp \"$1/dist/index.html\" \"$2\"", "realmd-webui", b.root.joinString(b.allocator, "webui") catch @panic("OOM") });
         cmd.has_side_effects = true; // npm/vite do their own incremental builds
         break :blk cmd.addOutputFileArg("index.html");
     } else b.path("apps/realmd/webui_stub.html");
@@ -447,6 +453,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(gs_health_tests).step);
 
+    const gs_reap_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/gs-reap/gs_reap.zig"),
+            .target = host,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(gs_reap_tests).step);
+
     // d2ingress's pure wire logic (the 0xAF greeting strip it applies to the GS→client splice),
     // rooted at the binary itself with its infra import.
     const ingress_tests = b.addTest(.{
@@ -507,6 +522,10 @@ pub fn build(b: *std.Build) void {
         // of keys opens. Each rule takes its rolls from the boss's seed in a fixed order, and these
         // tests pin that order, which a refactor of the engine glue could otherwise quietly change.
         .{ "apps/d2gs/runtime/feature/ubers_policy.zig", false, false },
+        // Which `--loaddll` mods /metrics asks for their own families.
+        .{ "apps/d2gs/runtime/feature/mod_metrics.zig", false, false },
+        // Where the entry hooks read their values, and the register contract of every hooked 1.14d function.
+        .{ "apps/d2gs/runtime/feature/hook_contract.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -519,6 +538,7 @@ pub fn build(b: *std.Build) void {
         mod_tests.root_module.addImport("obs", obs);
         mod_tests.root_module.addImport("resp", resp);
         mod_tests.root_module.addImport("fastcall", fastcall_mod);
+        mod_tests.root_module.addImport("gs_health", gs_health);
         mod_tests.root_module.addAnonymousImport("served_engines", .{ .root_source_file = b.path("deploy/e2e-engines.txt") });
         if (spec[1]) mod_tests.root_module.addImport("realm_infra", realm_infra);
         if (spec[2]) {
@@ -658,11 +678,32 @@ pub fn build(b: *std.Build) void {
         // it (addRunArtifact alone runs from the build cache, never touching zig-out).
         const install_stress_e2e = b.addInstallArtifact(stress_e2e, .{});
         const run_stress_e2e = b.addRunArtifact(stress_e2e);
-        if (b.args) |args| run_stress_e2e.addArgs(args);
+        run_stress_e2e.addPassthruArgs();
         const stress_e2e_step = b.step("stress-e2e", "Round-loop real-GS stress test");
         stress_e2e_step.dependOn(&install_stress_e2e.step);
         stress_e2e_step.dependOn(&run_stress_e2e.step);
     }
+
+    // join-probe - one clientless player joining a game, for a character of any account (tools/join-probe)
+    if (b.lazyDependency("clientless", .{ .target = host, .optimize = optimize })) |clientless_dep| {
+        const exe = b.addExecutable(.{
+            .name = "join-probe",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/join-probe/main.zig"),
+                .target = host,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        exe.root_module.addImport("d2-realm", clientless_dep.module("d2-realm"));
+        exe.root_module.addImport("d2-session", clientless_dep.module("d2-session"));
+        const run = b.addRunArtifact(exe);
+        run.addPassthruArgs();
+        const step = b.step("join-probe", "one clientless player joining a game with a given account and character");
+        step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        step.dependOn(&run.step);
+    }
+
 
     // gamestress — create N games against a RUNNING realm/GS (manual: `zig build gamestress`).
     // Used to verify the empty-game reaper fix (the GS shouldn't OOM past ~8 games).
@@ -693,7 +734,7 @@ pub fn build(b: *std.Build) void {
     probe.root_module.addImport("libd2", libd2); // the BNFTP wire, shared with realmd's server side
     b.installArtifact(probe);
     const run_probe = b.addRunArtifact(probe);
-    if (b.args) |args| run_probe.addArgs(args);
+    run_probe.addPassthruArgs();
     b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
 
     // checkrev-probe — clientless BNCS *version-check* client (selector 0x01): runs
@@ -711,7 +752,7 @@ pub fn build(b: *std.Build) void {
     crprobe.root_module.addImport("libd2", libd2);
     b.installArtifact(crprobe);
     const run_crprobe = b.addRunArtifact(crprobe);
-    if (b.args) |args| run_crprobe.addArgs(args);
+    run_crprobe.addPassthruArgs();
     b.step("checkrev-probe", "Replay the BNCS version-check against a real Battle.net").dependOn(&run_crprobe.step);
 
     // char-forge - a .d2s of a given class and level from the game's own tables (tools/char-forge)
@@ -740,7 +781,7 @@ pub fn build(b: *std.Build) void {
 
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_realmd.addArgs(args);
+    run_realmd.addPassthruArgs();
     const run_step = b.step("realmd", "Run the realm server");
     run_step.dependOn(&run_realmd.step);
 }

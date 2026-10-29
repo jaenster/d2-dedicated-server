@@ -53,6 +53,19 @@ pub fn setMode(data: []u8, mode: u8) bool {
     return true;
 }
 
+/// Set by the realm's character creation on a header-only save: the game writes the body on first join.
+/// 1.14d refuses a full save that still carries it ("Bad header").
+pub const status_new: u8 = 0x01;
+
+/// Get a save that arrived from outside ready for the store: hardcore/ladder set to `mode` and the
+/// checksum repaired, as `setMode` does. A save longer than a header-only one has a body, so the
+/// new-character bit is cleared; a header-only save keeps it. False if the buffer is not a save.
+pub fn prepareImport(data: []u8, mode: u8) bool {
+    const st = status(data) orelse return false;
+    if (data.len > new_save_size) setStatus(data, st & ~status_new);
+    return setMode(data, mode);
+}
+
 /// What a character's item section holds, for the audit line an operator action leaves behind:
 /// how many items the player's own list declares, and a digest of everything from that list to
 /// the end of the file (belt, corpse, mercenary, golem). Moving a character between ladder and
@@ -60,7 +73,7 @@ pub fn setMode(data: []u8, mode: u8) bool {
 pub const Items = struct { count: ?u16, digest: [8]u8 };
 
 pub fn items(data: []const u8) Items {
-    var out = Items{ .count = null, .digest = [_]u8{'0'} ** 8 };
+    var out = Items{ .count = null, .digest = @as([8]u8, @splat('0')) };
     const gf = std.mem.indexOf(u8, data, "gf") orelse return out;
     const sk = std.mem.indexOfPos(u8, data, gf + 2, "if") orelse return out;
     const jm = sk + 32; // the skill section is "if" plus 30 bytes
@@ -68,7 +81,7 @@ pub fn items(data: []const u8) Items {
     out.count = std.mem.readInt(u16, data[jm + 2 ..][0..2], .little);
     var h: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data[jm..], &h, .{});
-    _ = std.fmt.bufPrint(&out.digest, "{x}", .{h[0..4]}) catch {};
+    _ = std.mem.print(&out.digest, "{x}", .{h[0..4]}) catch {};
     return out;
 }
 
@@ -172,7 +185,7 @@ test "the attribute widths agree with libd2's" {
 test "attribute walks the packed list and finds experience" {
     // Build a "gf" section by hand: level(12)=87, experience(13)=1_500_000, then the
     // terminator, packed LSB-first exactly as the game writes it.
-    var save = [_]u8{0} ** 64;
+    var save: [64]u8 = @splat(0);
     @memcpy(save[0..8], "HEADERgf");
     var bit: usize = 0;
     const put = struct {
@@ -231,8 +244,24 @@ test "setMode never touches expansion or died" {
     try std.testing.expectEqual(status_ladder | status_hardcore, st & mode_mask);
 }
 
+test "prepareImport clears the new-character bit on a full save only" {
+    var full: [new_save_size + 64]u8 = undefined;
+    @memset(&full, 0);
+    try std.testing.expect(newSave(full[0..new_save_size], "Imp", 3, status_expansion, 1));
+    try std.testing.expect(status(&full).? & status_new != 0);
+    try std.testing.expect(prepareImport(&full, status_ladder));
+    try std.testing.expectEqual(status_expansion | status_ladder, status(&full).?);
+    try std.testing.expect(formats.d2s.verifyChecksum(&full));
+
+    var header: [new_save_size]u8 = undefined;
+    try std.testing.expect(newSave(&header, "Imp", 3, status_expansion, 1));
+    try std.testing.expect(prepareImport(&header, 0));
+    try std.testing.expectEqual(status_new | status_expansion, status(&header).?);
+    try std.testing.expect(formats.d2s.verifyChecksum(&header));
+}
+
 test "items reads the count and digests the tail" {
-    var save = [_]u8{0} ** 120;
+    var save: [120]u8 = @splat(0);
     @memcpy(save[10..12], "gf");
     @memcpy(save[40..42], "if");
     @memcpy(save[72..74], "JM");

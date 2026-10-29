@@ -34,7 +34,7 @@ pub const linux_i386_mutex_size = 24;
 comptime {
     std.debug.assert(@sizeOf(DarwinCond) == 28);
     std.debug.assert(@sizeOf(DarwinMutex) == 44);
-    if (builtin.os.tag == .linux and @sizeOf(usize) == 4) {
+    if (builtin.target.os.tag == .linux and @sizeOf(usize) == 4) {
         std.debug.assert(@sizeOf(std.c.pthread_cond_t) == linux_i386_cond_size);
         std.debug.assert(@sizeOf(std.c.pthread_mutex_t) == linux_i386_mutex_size);
     }
@@ -281,7 +281,7 @@ pub fn mutexattrSettype(attr: *anyopaque, kind: c_int) callconv(.c) c_int {
 }
 
 fn hostMutexType(darwin_kind: c_int) ?c_int {
-    if (builtin.os.tag != .linux) return switch (darwin_kind) {
+    if (builtin.target.os.tag != .linux) return switch (darwin_kind) {
         0, 1, 2 => darwin_kind,
         else => null,
     };
@@ -295,7 +295,7 @@ fn hostMutexType(darwin_kind: c_int) ?c_int {
 
 // the Darwin-only _np calls
 
-const hostSetName = switch (builtin.os.tag) {
+const hostSetName = switch (builtin.target.os.tag) {
     .linux => struct {
         extern fn pthread_setname_np(thread: std.c.pthread_t, name: [*:0]const u8) c_int;
     }.pthread_setname_np,
@@ -307,7 +307,7 @@ const hostSetName = switch (builtin.os.tag) {
 /// Darwin's takes one argument and always names the calling thread; Linux's takes the thread too,
 /// and rejects anything over 15 characters rather than truncating, so the truncation is done here.
 pub fn setnameNp(name: [*:0]const u8) callconv(.c) c_int {
-    if (builtin.os.tag != .linux) return hostSetName(name);
+    if (builtin.target.os.tag != .linux) return hostSetName(name);
 
     var buf: [16]u8 = undefined;
     const n = @min(std.mem.len(name), buf.len - 1);
@@ -354,7 +354,7 @@ const darwin_stack = struct {
     }
 };
 
-const hostStack = if (builtin.os.tag == .linux) linux_stack.get else darwin_stack.get;
+const hostStack = if (builtin.target.os.tag == .linux) linux_stack.get else darwin_stack.get;
 
 /// Darwin reports the high end of the stack, the address it grows down from. Linux reports the low
 /// end plus a size, so the two are added back together here.
@@ -401,8 +401,8 @@ test "the sizes the shim exists to protect" {
 }
 
 test "the recursive constant is translated, not passed through" {
-    try testing.expectEqual(@as(?c_int, if (builtin.os.tag == .linux) 1 else 2), hostMutexType(2));
-    try testing.expectEqual(@as(?c_int, if (builtin.os.tag == .linux) 2 else 1), hostMutexType(1));
+    try testing.expectEqual(@as(?c_int, if (builtin.target.os.tag == .linux) 1 else 2), hostMutexType(2));
+    try testing.expectEqual(@as(?c_int, if (builtin.target.os.tag == .linux) 2 else 1), hostMutexType(1));
     try testing.expectEqual(@as(?c_int, 0), hostMutexType(0));
     try testing.expectEqual(@as(?c_int, null), hostMutexType(7));
 }

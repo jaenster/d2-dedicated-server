@@ -16,38 +16,38 @@ pub const max_ignores = 32; // per-user squelch (/ignore) list size
 pub const Member = struct {
     fd: net.Socket = -1,
     in_use: bool = false,
-    name: [max_name]u8 = [_]u8{0} ** max_name,
+    name: [max_name]u8 = @splat(0),
     name_len: u8 = 0,
-    channel: [max_channel]u8 = [_]u8{0} ** max_channel,
+    channel: [max_channel]u8 = @splat(0),
     channel_len: u8 = 0,
     /// The game they went off to play, if any. A player in a game is still connected to
     /// bnetd — whispers must reach them — but they are no longer in the channel, so
     /// channel talk must not. Set from SID_NOTIFYJOIN, cleared when they rejoin a channel.
-    game: [max_channel]u8 = [_]u8{0} ** max_channel,
+    game: [max_channel]u8 = @splat(0),
     game_len: u8 = 0,
     flags: u32 = 0, // SID_CHATEVENT user flags (operator/admin/...) for this user
     // The client's SID_ENTERCHAT statstring — for D2 it encodes the character
     // (name/class/level/gear) the channel user-list draws via
     // COMCALLBACK_FormatChannelUserData. Replayed in EID_SHOWUSER/EID_JOIN.
-    stat: [max_stat]u8 = [_]u8{0} ** max_stat,
+    stat: [max_stat]u8 = @splat(0),
     stat_len: u8 = 0,
     // How this user is NAMED in chat events, as opposed to how they are looked up. The
     // 1.14d client splits a channel username on '*' — the part after it is the character
     // it draws, the part before is the clan (COMCALLBACK_FormatChannelUserData @0x4471b0).
     // A bare account name has no '*', so the client shows the account where the character
     // should be. `name` stays the account so whispers and /ignore keep working.
-    display: [max_name]u8 = [_]u8{0} ** max_name,
+    display: [max_name]u8 = @splat(0),
     display_len: u8 = 0,
     // Social state, visible cross-connection (whisper auto-reply + message filtering).
-    away: [max_status]u8 = [_]u8{0} ** max_status,
+    away: [max_status]u8 = @splat(0),
     away_len: u8 = 0, // 0 = not away
-    dnd: [max_status]u8 = [_]u8{0} ** max_status,
+    dnd: [max_status]u8 = @splat(0),
     dnd_len: u8 = 0, // 0 = not in Do-Not-Disturb
-    ignores: [max_ignores][max_name]u8 = [_][max_name]u8{[_]u8{0} ** max_name} ** max_ignores,
-    ignore_lens: [max_ignores]u8 = [_]u8{0} ** max_ignores,
+    ignores: [max_ignores][max_name]u8 = @splat(@as([max_name]u8, @splat(0))),
+    ignore_lens: [max_ignores]u8 = @splat(0),
     ignore_count: u8 = 0,
     /// Who whispered this member last, by account name, so "/r" has someone to answer.
-    last_whisper: [max_name]u8 = [_]u8{0} ** max_name,
+    last_whisper: [max_name]u8 = @splat(0),
     last_whisper_len: u8 = 0,
     send_lock: Lock = .{},
 
@@ -103,7 +103,7 @@ pub fn countInChannel(channel: []const u8, exclude_fd: net.Socket) usize {
 
 const Registry = struct {
     lock: Lock = .{},
-    members: [1024]Member = [_]Member{.{}} ** 1024,
+    members: [1024]Member = @splat(.{}),
 };
 
 var reg: Registry = .{};
@@ -176,12 +176,37 @@ pub fn leave(fd: net.Socket) void {
                 break;
             }
         }
+        // The same player on another connection of ours (the chat link a game keeps after the realm
+        // connection closed, or the realm connection that replaced it): what is shared under their
+        // name is theirs now, not this connection's to take down.
+        if (name_len > 0 and heldByLocked(name[0..name_len])) return;
     }
     // Outside the lock: a disconnect must not hold up the channel it is leaving. `gone` — the
     // connection is over, so the by-name index goes too and a whisper stops finding them.
     if (name_len > 0) unpublish(chan[0..chan_len], name[0..name_len], true);
     var kb: [max_name + 2]u8 = undefined;
     if (aliasKey(&kb, disp[0..disp_len])) |k| store.chatDelMember(chan[0..chan_len], k, true);
+}
+
+fn heldByLocked(name: []const u8) bool {
+    for (&reg.members) |*m| {
+        if (m.in_use and std.ascii.eqlIgnoreCase(m.nameSlice(), name)) return true;
+    }
+    return false;
+}
+
+/// Is a connection of this instance registered under `name` (an account)?
+pub fn held(name: []const u8) bool {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    return heldByLocked(name);
+}
+
+/// Is this connection registered (it joined a channel, or went into a game)?
+pub fn registered(fd: net.Socket) bool {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    return findByFdLocked(fd) != null;
 }
 
 /// Write bytes to a member under its send_lock.
@@ -410,12 +435,12 @@ pub fn lastWhisperOf(fd: net.Socket, out: []u8) ?[]const u8 {
 /// not in chat (offline, or in a game rather than the lobby).
 pub const Presence = struct {
     /// Channel they are sitting in, empty when they are not in one.
-    channel: [max_channel]u8 = [_]u8{0} ** max_channel,
+    channel: [max_channel]u8 = @splat(0),
     channel_len: u8 = 0,
     /// The game they went off to play, if any. A player in a game is still connected to
     /// bnetd — whispers must reach them — but they are no longer in the channel, so
     /// channel talk must not. Set from SID_NOTIFYJOIN, cleared when they rejoin a channel.
-    game: [max_channel]u8 = [_]u8{0} ** max_channel,
+    game: [max_channel]u8 = @splat(0),
     game_len: u8 = 0,
     away: bool = false,
     dnd: bool = false,
@@ -862,4 +887,19 @@ fn refreshAll() void {
     // Snapshot first, then publish outside the lock: refreshing a busy channel would otherwise
     // hold every broadcast on this instance for one store round trip per member.
     for (fds[0..n]) |fd| publishByFd(fd);
+}
+
+test "a player on a second connection stays held when the first one leaves" {
+    const a: net.Socket = 9001;
+    const b: net.Socket = 9002;
+    try std.testing.expect(!registered(a));
+    _ = join(a, "Holder", "Holder", "", 0, "");
+    _ = join(b, "holder", "Holder", "", 0, "");
+    try std.testing.expect(registered(a));
+    try std.testing.expect(held("Holder"));
+    // The first connection's slot is freed and the shared state under the name is left alone.
+    leave(a);
+    try std.testing.expect(!registered(a));
+    try std.testing.expect(held("Holder"));
+    try std.testing.expect(registered(b));
 }

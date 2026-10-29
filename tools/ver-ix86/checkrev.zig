@@ -85,7 +85,7 @@ fn hostVersion(out: []u8) []const u8 {
     const root = [_:0]u16{'\\'};
     if (VerQueryValueW(&blk, &root, &ffi, &flen) == 0 or flen == 0) return "0.0.0.0";
     const v: *VS_FIXEDFILEINFO = @ptrCast(@alignCast(ffi));
-    const r = std.fmt.bufPrint(out, "{d}.{d}.{d}.{d}", .{
+    const r = std.mem.print(out, "{d}.{d}.{d}.{d}", .{
         (v.dwFileVersionMS >> 16) & 0xFFFF,
         v.dwFileVersionMS & 0xFFFF,
         (v.dwFileVersionLS >> 16) & 0xFFFF,

@@ -27,12 +27,12 @@ var shared_ctr = std.atomic.Value(u32).init(1);
 
 pub const Session = struct {
     id: u64 = 0,
-    account: [max_name + 1]u8 = [_]u8{0} ** (max_name + 1),
+    account: [max_name + 1]u8 = @splat(0),
     account_len: u8 = 0,
     /// The engine the client that logged in is running. It is carried on the session because MCP
     /// arrives on a DIFFERENT connection from the login that learned it, and the session token is
     /// the only thing tying the two together.
-    version: [max_version]u8 = [_]u8{0} ** max_version,
+    version: [max_version]u8 = @splat(0),
     version_len: u8 = 0,
     in_use: bool = false,
 
@@ -45,7 +45,7 @@ pub const Session = struct {
 /// hosting GS's UPDATEGAMEINFO — realmd sees a request to join, not an arrival, so this is
 /// the only honest source for who is actually in there.
 pub const Member = struct {
-    name: [16]u8 = [_]u8{0} ** 16,
+    name: [16]u8 = @splat(0),
     name_len: u8 = 0,
     level: u8 = 0,
     class: u8 = 0,
@@ -64,13 +64,13 @@ pub const max_members = 8;
 pub const Roster = struct {
     gameid: u32 = 0,
     created: i64 = 0,
-    members: [max_members]Member = [_]Member{.{}} ** max_members,
+    members: [max_members]Member = @splat(.{}),
     count: u8 = 0,
     in_use: bool = false,
 };
 
 pub const Game = struct {
-    name: [max_name + 1]u8 = [_]u8{0} ** (max_name + 1),
+    name: [max_name + 1]u8 = @splat(0),
     name_len: u8 = 0,
     gameid: u32 = 0, // engine server token (= the token the client passes to the GS)
     gs_ip: [4]u8 = .{ 0, 0, 0, 0 }, // d2gs address the client connects to
@@ -80,9 +80,9 @@ pub const Game = struct {
     status: u8 = 0, // creator's .d2s status bits — what kind of game a joiner must match
     difficulty: u8 = 0, // 0 Normal, 1 Nightmare, 2 Hell
     max_players: u8 = 8, // what the creator chose, 1..8
-    password: [16]u8 = [_]u8{0} ** 16, // join password (empty = open game)
+    password: [16]u8 = @splat(0), // join password (empty = open game)
     pw_len: u8 = 0,
-    description: [32]u8 = [_]u8{0} ** 32, // creator's blurb, shown beside the name
+    description: [32]u8 = @splat(0), // creator's blurb, shown beside the name
     desc_len: u8 = 0,
     in_use: bool = false,
 
@@ -99,10 +99,10 @@ pub const Game = struct {
 
 pub const State = struct {
     lock: Lock = .{},
-    sessions: [1024]Session = [_]Session{.{}} ** 1024,
+    sessions: [1024]Session = @splat(.{}),
     next_id: u64 = 1,
-    games: [512]Game = [_]Game{.{}} ** 512,
-    rosters: [256]Roster = [_]Roster{.{}} ** 256,
+    games: [512]Game = @splat(.{}),
+    rosters: [256]Roster = @splat(.{}),
 
     /// Mint a session for `account`, returning its id (0 on failure). `version` is the engine the
     /// logging-in client runs, empty when the realm could not name it.
@@ -411,7 +411,7 @@ pub var global: State = .{};
 
 /// Read-only view of one active game, for the admin API.
 pub const GameInfo = struct {
-    name: [max_name + 1]u8 = [_]u8{0} ** (max_name + 1),
+    name: [max_name + 1]u8 = @splat(0),
     name_len: u8 = 0,
     gameid: u32 = 0,
     gsid: u32 = 0,
@@ -421,9 +421,14 @@ pub const GameInfo = struct {
     /// Creator's character status bits — what kind of game it is (hardcore/expansion/ladder).
     status: u8 = 0,
     difficulty: u8 = 0,
-    description: [32]u8 = [_]u8{0} ** 32,
+    description: [32]u8 = @splat(0),
     desc_len: u8 = 0,
+    password: [16]u8 = @splat(0),
+    pw_len: u8 = 0,
 
+    pub fn pw(g: *const GameInfo) []const u8 {
+        return g.password[0..g.pw_len];
+    }
     pub fn name_slice(g: *const GameInfo) []const u8 {
         return g.name[0..g.name_len];
     }
@@ -442,7 +447,7 @@ pub fn snapshotGames(buf: []GameInfo) usize {
         const cap = @min(buf.len, tmp.len);
         const m = store.snapshotGames(tmp[0..cap]);
         for (tmp[0..m], 0..) |ng, i| {
-            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port, .players = ng.players, .status = ng.status, .difficulty = ng.difficulty };
+            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port, .players = ng.players, .status = ng.status, .difficulty = ng.difficulty, .password = ng.password, .pw_len = ng.pw_len };
             const ln: u8 = @intCast(@min(ng.name_len, max_name));
             @memcpy(gi.name[0..ln], ng.name[0..ln]);
             gi.name_len = ln;
@@ -459,7 +464,7 @@ pub fn snapshotGames(buf: []GameInfo) usize {
     for (&global.games) |*g| {
         if (n >= buf.len) break;
         if (!g.in_use) continue;
-        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .players = g.players, .status = g.status, .difficulty = g.difficulty, .name_len = g.name_len, .desc_len = g.desc_len };
+        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .players = g.players, .status = g.status, .difficulty = g.difficulty, .name_len = g.name_len, .desc_len = g.desc_len, .password = g.password, .pw_len = g.pw_len };
         @memcpy(gi.name[0..g.name_len], g.name[0..g.name_len]);
         @memcpy(gi.description[0..g.desc_len], g.description[0..g.desc_len]);
         buf[n] = gi;

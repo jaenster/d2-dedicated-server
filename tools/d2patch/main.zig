@@ -446,7 +446,7 @@ test "a delta refuses a source that is the right length but the wrong file" {
     const gpa = std.testing.allocator;
     const src = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
-    var rec = [_]u8{0} ** 0x18;
+    var rec: [0x18]u8 = @splat(0);
     std.mem.writeInt(u16, rec[0..2], 0x18, .little);
     std.mem.writeInt(u16, rec[2..4], 0x0004, .little);
     std.mem.writeInt(u32, rec[4..8], std.hash.Crc32.hash(&src) ^ 1, .little); // not this file

@@ -151,7 +151,7 @@ fn list(mpq: HANDLE) u8 {
         var offset: u64 = 0;
         var fh: HANDLE = null;
         _ = SFileSetLocale(d.locale);
-        const cname = gpa.dupeZ(u8, span(&d.name)) catch return 1;
+        const cname = gpa.dupeSentinel(u8, span(&d.name), 0) catch return 1;
         defer gpa.free(cname);
         if (SFileOpenFileEx(mpq, cname.ptr, 0, &fh)) {
             _ = SFileGetFileInfo(fh, info_byte_offset, &offset, @sizeOf(u64), null);
@@ -208,7 +208,7 @@ fn addUnlisted(
         const take = if (wanted) |w| w.contains(name) else keeps(name);
         if (!take) continue;
 
-        const cname = try gpa.dupeZ(u8, name);
+        const cname = try gpa.dupeSentinel(u8, name, 0);
         defer gpa.free(cname);
         var fh: HANDLE = null;
         if (!SFileOpenFileEx(mpq, cname.ptr, 0, &fh)) continue;
@@ -273,7 +273,7 @@ fn pack(src: HANDLE, dst_path: [*:0]const u8, wanted: ?*const std.StringHashMap(
     var bytes: u64 = 0;
     for (members.items) |m| {
         const name = span(&m.name);
-        const cname = try gpa.dupeZ(u8, name);
+        const cname = try gpa.dupeSentinel(u8, name, 0);
         defer gpa.free(cname);
         const whole = readMember(src, cname.ptr, m.locale) orelse {
             std.debug.print("skipped (unreadable): {s}\n", .{name});
@@ -342,7 +342,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             keep_ui = true;
         } else if (std.mem.eql(u8, first, "--listfile")) {
             const p = it.next() orelse return usage();
-            listfile = (gpa.dupeZ(u8, p) catch return 1).ptr;
+            listfile = (gpa.dupeSentinel(u8, p, 0) catch return 1).ptr;
         } else if (std.mem.eql(u8, first, "--keep")) {
             const p = it.next() orelse return usage();
             keep_list = readKeepList(p.ptr) catch |e| {

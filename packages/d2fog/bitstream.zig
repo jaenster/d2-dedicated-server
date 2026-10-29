@@ -188,7 +188,7 @@ test "a pre-1.10 stream leaves the overflow field completely alone" {
     // survives says that, and it survives on any host, which a frame modelled in raw bytes would not
     // (`cur` is eight bytes off i386 and every offset after it moves).
     const sentinel: i32 = @bitCast(@as(u32, 0xC0FFEE));
-    var buf = [_]u8{0} ** 4;
+    var buf: [4]u8 = @splat(0);
     var st: BitStream = .{ .overflow = sentinel };
 
     has_overflow = false;
@@ -208,7 +208,7 @@ test "a pre-1.10 stream leaves the overflow field completely alone" {
 }
 
 test "bits land LSB-first, in the bytes the engine puts them in" {
-    var buf = [_]u8{0xAA} ** 8;
+    var buf: [8]u8 = @splat(0xAA);
     var st: BitStream = .{};
     init(&st, &buf, buf.len);
     write(&st, 0b101, 3);
@@ -222,7 +222,7 @@ test "bits land LSB-first, in the bytes the engine puts them in" {
 }
 
 test "a write clears the bytes it lands in, so a dirty buffer does not leak through" {
-    var buf = [_]u8{0xFF} ** 4;
+    var buf: [4]u8 = @splat(0xFF);
     var st: BitStream = .{};
     init(&st, &buf, buf.len);
     write(&st, 0, 16);
@@ -232,7 +232,7 @@ test "a write clears the bytes it lands in, so a dirty buffer does not leak thro
 test "every width round-trips, signed and unsigned" {
     // 1+2+...+32 = 528 bits, so 66 bytes is the minimum — at 64 the writes overflow and the
     // stream stops taking them, which is what the first version of this test actually measured.
-    var buf = [_]u8{0} ** 96;
+    var buf: [96]u8 = @splat(0);
     var st: BitStream = .{};
     init(&st, &buf, buf.len);
     var w: i32 = 1;
@@ -251,7 +251,7 @@ test "every width round-trips, signed and unsigned" {
 }
 
 test "readSigned sign-extends from the top bit of the field" {
-    var buf = [_]u8{0} ** 4;
+    var buf: [4]u8 = @splat(0);
     var st: BitStream = .{};
     init(&st, &buf, buf.len);
     write(&st, 0b1011, 4); // -5 in four bits
@@ -263,7 +263,7 @@ test "readSigned sign-extends from the top bit of the field" {
 }
 
 test "a write past the end writes NOTHING and latches overflow" {
-    var buf = [_]u8{0} ** 2;
+    var buf: [2]u8 = @splat(0);
     var st: BitStream = .{};
     init(&st, &buf, buf.len);
     write(&st, 0xFF, 8);
@@ -284,7 +284,7 @@ test "a read past the end is clamped to what is there, not refused" {
 }
 
 test "goToNextByte aligns a partial byte and leaves an aligned one untouched" {
-    var buf = [_]u8{0} ** 4;
+    var buf: [4]u8 = @splat(0);
     var st: BitStream = .{};
     init(&st, &buf, buf.len);
     write(&st, 1, 1);
@@ -298,7 +298,7 @@ test "goToNextByte aligns a partial byte and leaves an aligned one untouched" {
 }
 
 test "the bit pokes address the array the way the engine's do" {
-    var buf = [_]u8{0} ** 4;
+    var buf: [4]u8 = @splat(0);
     setBit(&buf, 0);
     setBit(&buf, 9);
     setBit(&buf, 23);

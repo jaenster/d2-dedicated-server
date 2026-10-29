@@ -65,7 +65,7 @@ const CANT_SOUND: u32 = 0x14; // the cube's "I can't" event, as CUBE_SpecialOutp
 /// row per game, claimed when the game is made and freed when it ends.
 const Opened = struct { keys: [3]bool = .{ false, false, false }, tristram: bool = false };
 const Row = struct { game: ?*Game = null, opened: Opened = .{} };
-var rows: [256]Row = [_]Row{.{}} ** 256;
+var rows: [256]Row = @splat(.{});
 
 fn rowFor(game: *Game) ?*Row {
     for (&rows) |*r| if (r.game == game) return r;

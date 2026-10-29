@@ -40,7 +40,7 @@ pub fn startup(cfg: anytype) !void {
     const n = db.get("season", &buf);
     if (n == 0) {
         var sb: [16]u8 = undefined;
-        _ = db.put("season", std.fmt.bufPrint(&sb, "{d}", .{season}) catch return error.SeasonUnwritable);
+        _ = db.put("season", std.mem.print(&sb, "{d}", .{season}) catch return error.SeasonUnwritable);
     }
     // Our listener's port comes from the environment, so a realm can move it and a second instance
     // can be given a different one. Unset (0) means this extension binds nothing.
@@ -62,7 +62,7 @@ pub fn startup(cfg: anytype) !void {
 pub fn authenticate(req: realmd.hook.AuthRequest) ?realmd.hook.Auth {
     var buf: [8]u8 = undefined;
     var key: [128]u8 = undefined;
-    const k = std.fmt.bufPrint(&key, "banned:{s}", .{req.account}) catch return null;
+    const k = std.mem.print(&key, "banned:{s}", .{req.account}) catch return null;
     if (db.get(k, &buf) != 0) {
         realmd.log.line(name, "refused banned account {s} (client {s})", .{ req.account, req.client_version });
         return .reject_no_account;
@@ -81,7 +81,7 @@ pub fn authenticate(req: realmd.hook.AuthRequest) ?realmd.hook.Auth {
     // shape a realm behind an existing account database has: we keep the hash, the realm keeps the
     // wire, and neither has to know the other's business.
     var stored: [20]u8 = undefined;
-    const pk = std.fmt.bufPrint(&key, "pw:{s}", .{req.account}) catch return null;
+    const pk = std.mem.print(&key, "pw:{s}", .{req.account}) catch return null;
     if (db.get(pk, &stored) != stored.len) return null; // not ours: let the realm answer
     return if (realmd.auth.verify(stored, req)) .accept else .reject_password;
 }
@@ -114,6 +114,16 @@ pub fn charLogon(account: []const u8, charname: []const u8) void {
     realmd.log.line(name, "{s}/{s} entered", .{ account, charname });
 }
 
+/// OBSERVE a character that was created and stored; `status` is its .d2s status byte.
+pub fn charCreated(account: []const u8, charname: []const u8, class: u8, status: u8) void {
+    realmd.log.line(name, "{s}/{s} created (class {d}, status 0x{x:0>2})", .{ account, charname, class, status });
+}
+
+/// OBSERVE a character that was deleted.
+pub fn charDeleted(account: []const u8, charname: []const u8) void {
+    realmd.log.line(name, "{s}/{s} deleted", .{ account, charname });
+}
+
 /// OVERRIDE which engine a new character belongs to. The realm's own answer is the engine of the
 /// client that created it; return a tag to decide differently — an account pinned to an era, a
 /// launcher that said which one, a season that only runs one.
@@ -142,9 +152,9 @@ pub fn charCompatible(account: []const u8, charname: []const u8, char_version: [
 /// the slice; it is not yours after this returns.
 pub fn charSave(account: []const u8, charname: []const u8, bytes: []const u8) void {
     var key: [128]u8 = undefined;
-    const k = std.fmt.bufPrint(&key, "lastsave:{s}:{s}", .{ account, charname }) catch return;
+    const k = std.mem.print(&key, "lastsave:{s}:{s}", .{ account, charname }) catch return;
     var sz: [16]u8 = undefined;
-    _ = db.put(k, std.fmt.bufPrint(&sz, "{d}", .{bytes.len}) catch return);
+    _ = db.put(k, std.mem.print(&sz, "{d}", .{bytes.len}) catch return);
 }
 
 // games
@@ -164,6 +174,21 @@ pub fn gameJoin(account: []const u8, charname: []const u8, gamename: []const u8)
     _ = charname;
     _ = gamename;
     return null;
+}
+
+/// OBSERVE a game that now exists. No password: an observer has no business with it.
+pub fn gameStarted(g: realmd.hook.GameStarted) void {
+    realmd.log.line(name, "game '{s}' started by {s} (id {d}, difficulty {d})", .{ g.gamename, g.charname, g.gameid, g.difficulty });
+}
+
+/// OBSERVE a player entering or leaving a game, as its server reported it.
+pub fn gamePlayer(p: realmd.hook.GamePlayer) void {
+    realmd.log.line(name, "{s} {s} game {d} ({d} now)", .{ p.charname, if (p.entered) "entered" else "left", p.gameid, p.players });
+}
+
+/// OBSERVE a game that ended.
+pub fn gameClosed(gameid: u32) void {
+    realmd.log.line(name, "game {d} closed", .{gameid});
 }
 
 /// OVERRIDE what the join list shows this player. False hides a game, true forces it visible,
@@ -207,7 +232,7 @@ pub fn chatCommand(c: *realmd.bncs.Conn, tag: []const u8, text: []const u8) bool
     var buf: [32]u8 = undefined;
     const n = db.get("season", &buf);
     var line: [64]u8 = undefined;
-    c.tell(std.fmt.bufPrint(&line, "Season {s}. {s}", .{ buf[0..n], greeting }) catch "Season unknown.");
+    c.tell(std.mem.print(&line, "Season {s}. {s}", .{ buf[0..n], greeting }) catch "Season unknown.");
     return true;
 }
 
@@ -282,19 +307,19 @@ fn serveApi(fd: realmd.net.Socket, tag: []const u8) void {
         const ticket = realmd.auth.issueTicket(account, 300, &tb) orelse return;
         realmd.log.line(tag, "issued a login ticket for {s}", .{account});
         var tbody: [96]u8 = undefined;
-        const tpayload = std.fmt.bufPrint(&tbody, "{{\"ticket\":\"{s}\"}}", .{ticket}) catch return;
+        const tpayload = std.mem.print(&tbody, "{{\"ticket\":\"{s}\"}}", .{ticket}) catch return;
         return respond(fd, tpayload);
     }
 
     var seasonb: [32]u8 = undefined;
     const sn = db.get("season", &seasonb);
     var body: [64]u8 = undefined;
-    const payload = std.fmt.bufPrint(&body, "{{\"season\":\"{s}\"}}", .{seasonb[0..sn]}) catch return;
+    const payload = std.mem.print(&body, "{{\"season\":\"{s}\"}}", .{seasonb[0..sn]}) catch return;
     respond(fd, payload);
 }
 
 fn respond(fd: realmd.net.Socket, payload: []const u8) void {
     var head: [160]u8 = undefined;
-    const resp = std.fmt.bufPrint(&head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload }) catch return;
+    const resp = std.mem.print(&head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload }) catch return;
     _ = realmd.net.writeAll(fd, resp);
 }

@@ -49,7 +49,7 @@ pub fn pack(a: u8, b: u8, c: u8, d: u8) u32 {
 /// Render a version dword the way Blizzard writes it, for logs and for the setting the operator
 /// has to paste it into.
 pub fn quad(exe_version: u32, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+    return std.mem.print(buf, "{d}.{d}.{d}.{d}", .{
         @as(u8, @truncate(exe_version >> 24)),
         @as(u8, @truncate(exe_version >> 16)),
         @as(u8, @truncate(exe_version >> 8)),
@@ -156,7 +156,7 @@ pub fn resolve(exe_version: u32, verbyte: u8) ?[]const u8 {
 // Unknown clients are logged once each rather than per connection: on a realm whose map is
 // incomplete this fires on every single login, and a warning that repeats forever is a warning
 // nobody reads.
-var seen_unknown: [32]u32 = [_]u32{0} ** 32;
+var seen_unknown: [32]u32 = @splat(0);
 var seen_n: usize = 0;
 
 pub fn noteUnknown(exe_version: u32, verbyte: u8) void {

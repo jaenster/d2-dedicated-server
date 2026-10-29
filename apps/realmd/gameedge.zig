@@ -46,9 +46,9 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
 
     // Dial the owning GS (internal address) and replay the rewritten first packet.
     var ipbuf: [16]u8 = undefined;
-    const ipz = std.fmt.bufPrintZ(&ipbuf, "{d}.{d}.{d}.{d}", .{
+    const ipz = std.mem.printSentinel(&ipbuf, "{d}.{d}.{d}.{d}", .{
         route.gs_ip[0], route.gs_ip[1], route.gs_ip[2], route.gs_ip[3],
-    }) catch return;
+    }, 0) catch return;
     const gs = net.connectTcp(ipz, route.gs_port) catch {
         log.line(tag, "game edge: dial GS {s}:{d} failed", .{ ipz, route.gs_port });
         return;
@@ -60,9 +60,11 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     // Bidirectional splice: a thread pumps GS→client; this thread pumps client→GS. On
     // either side's EOF the pump shuts BOTH fds down so the partner unblocks and returns.
     var sp = Splice{ .cli = fd, .gs = gs };
-    const t = std.Thread.spawn(.{}, pump, .{ &sp, gs, fd }) catch return;
-    pump(&sp, fd, gs);
+    sp.up.store(len, .monotonic);
+    const t = std.Thread.spawn(.{}, pump, .{ &sp, gs, fd, tag, "GS->client" }) catch return;
+    pump(&sp, fd, gs, tag, "client->GS");
     t.join();
+    log.line(tag, "game edge: token {d} closed, {d} bytes client->GS, {d} bytes GS->client", .{ token, sp.up.load(.monotonic), sp.down.load(.monotonic) });
 }
 
 /// How many leading bytes of the GS's first output are its 0xAF greeting frame: 2 for 0xAF00, else byte[1]+1 (the
@@ -82,11 +84,18 @@ test "greetingStripLen: the engine's greeting is dropped, its payload kept" {
     try std.testing.expectEqual(@as(usize, 0), greetingStripLen(&.{ 0x01, 0xaf }));
 }
 
-const Splice = struct { cli: net.Socket, gs: net.Socket };
+const Splice = struct {
+    cli: net.Socket,
+    gs: net.Socket,
+    up: std.atomic.Value(usize) = .init(0),
+    down: std.atomic.Value(usize) = .init(0),
+};
 
-fn pump(sp: *Splice, from: net.Socket, to: net.Socket) void {
+fn pump(sp: *Splice, from: net.Socket, to: net.Socket, tag: []const u8, dir: []const u8) void {
     var buf: [16384]u8 = undefined;
     var first = from == sp.gs; // the engine's greeting leads its first output only
+    const counter = if (from == sp.cli) &sp.up else &sp.down;
+    var seen: usize = 0;
     while (true) {
         const n = net.readSome(from, &buf);
         if (n == 0) break;
@@ -96,6 +105,12 @@ fn pump(sp: *Splice, from: net.Socket, to: net.Socket) void {
             off = greetingStripLen(buf[0..n]);
         }
         if (off < n and !net.writeAll(to, buf[off..n])) break;
+        // The first few chunks each way are logged (opcode and length): what a join looks like on the wire.
+        if (seen < 8) {
+            seen += 1;
+            log.line(tag, "game edge: {s} chunk {d}: {d} bytes, first byte 0x{x:0>2}", .{ dir, seen, n, buf[0] });
+        }
+        _ = counter.fetchAdd(n, .monotonic);
     }
     net.shutdownSocket(sp.cli);
     net.shutdownSocket(sp.gs);
