@@ -4,6 +4,7 @@
 
 const patch = @import("../patch.zig");
 const log = @import("../../log.zig");
+const crash = @import("crash.zig");
 
 const HALT_ADDR: usize = 0x00408a60;
 
@@ -24,9 +25,11 @@ pub fn enableSuppress() void {
     log.print("halt: suppress mode ON (asserts will be swallowed)");
 }
 
-fn logHalt(retaddr: usize, nLine: usize) callconv(.c) void {
+fn logHalt(retaddr: usize, nLine: usize, esp: usize, ebp: usize) callconv(.c) void {
     log.hex("halt: assert caller=0x", retaddr);
     log.hex("halt: nLine=0x", nLine);
+    crash.logWhere("halt");
+    crash.stackTrace("halt", esp, ebp);
 }
 
 fn finish() callconv(.c) noreturn {
@@ -47,10 +50,13 @@ fn handler() callconv(.naked) void {
     asm volatile (
         \\mov (%%esp), %%eax
         \\mov 0xc(%%esp), %%edx
+        \\mov %%esp, %%ecx
+        \\push %%ebp
+        \\push %%ecx
         \\push %%edx
         \\push %%eax
         \\call %[f:P]
-        \\add $8, %%esp
+        \\add $16, %%esp
         \\mov %[flag], %%eax
         \\movb (%%eax), %%al
         \\testb %%al, %%al
