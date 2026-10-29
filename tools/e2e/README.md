@@ -33,6 +33,12 @@ stops it afterward — recommended, because the FakeGS scenarios are sensitive t
 *stale* GS registrations left behind by other smoke tests sharing a long-lived
 realmd. If a realmd is already listening on 6112, the harness uses it.
 
+Each scenario runs in its own process with a 60 s hard deadline; a hang fails with the
+scenario's name and what it was waiting for. Reads time out after 8 s unless a scenario
+sets its own. A run takes `/tmp/realmd-e2e.lock` (one run at a time, the stores have fixed
+names), refuses to test a realmd it did not start unless `E2E_REUSE=1`, and
+`E2E_PORT_BASE=n` moves its ports and store containers off the defaults.
+
 Env (the auto-started realmd):
 
 - `REALMD_BIN`         path to the realmd binary (default `./zig-out/bin/realmd`)

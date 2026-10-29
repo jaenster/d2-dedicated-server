@@ -41,7 +41,7 @@ fn envOr(name: [*:0]const u8, default: [:0]const u8) [:0]const u8 {
 }
 
 const Status = enum { pass, fail, skip };
-const Result = struct { name: []const u8, status: Status, msg: []const u8 };
+const Result = struct { name: []const u8, status: Status, msg: []const u8, ms: u64 = 0 };
 
 const alloc = std.heap.c_allocator;
 
@@ -320,7 +320,7 @@ fn scLadder() Result {
     var fa_i: usize = 0;
     while (fa_i < 5) : (fa_i += 1) {
         var ab: [16]u8 = undefined;
-        const fa = std.fmt.bufPrint(&ab, "LadFillAcct{d}", .{fa_i}) catch unreachable;
+        const fa = std.mem.print(&ab, "LadFillAcct{d}", .{fa_i}) catch unreachable;
         var lc = rc.RealmClient{};
         defer lc.close();
         lc.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -331,8 +331,8 @@ fn scLadder() Result {
     while (fill < 60) : (fill += 1) {
         var ab: [16]u8 = undefined;
         var nb: [16]u8 = undefined;
-        const fa = std.fmt.bufPrint(&ab, "LadFillAcct{d}", .{fill / 12}) catch unreachable;
-        const fnm = std.fmt.bufPrint(&nb, "LadFill{d:0>2}", .{fill}) catch unreachable;
+        const fa = std.mem.print(&ab, "LadFillAcct{d}", .{fill / 12}) catch unreachable;
+        const fnm = std.mem.print(&nb, "LadFill{d:0>2}", .{fill}) catch unreachable;
         const r = rc.storePutChar(fa, fnm, ladderSave(&b, fnm, @intCast(fill % 7), 10, @intCast(1000 + fill), ladder_sc)) catch |e| return fail(name, "{s}", .{@errorName(e)});
         if (r != 0) return fail(name, "save {s} result={d}", .{ fnm, r });
     }
@@ -1291,7 +1291,7 @@ fn scGameInfo() Result {
     var dst: [512]u8 = undefined;
 
     // A game nobody made must still answer, with the "no info" token rather than silence.
-    const none = c.gameInfo("ghostgame", &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const none = c.gameInfo("game-nobody-made", &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (none.token != 0xFFFF_FFFF) return fail(name, "unknown game -> token 0x{x}, want 0xffffffff (no info)", .{none.token});
 
     const cg = c.createGame("infogame", "detail me") catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1736,8 +1736,9 @@ fn scGameListFiltered() Result {
         if (cg.result != 0) return fail(name, "{s} create result={d}", .{ k.char, cg.result });
     }
     for (list_kinds, 0..) |k, i| {
-        var rows: [16]rc.GameEntry = undefined;
-        var dst: [1024]u8 = undefined;
+        // room for every game the earlier scenarios left behind, so the list is never cut short
+        var rows: [512]rc.GameEntry = undefined;
+        var dst: [32768]u8 = undefined;
         const n = clients[i].gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
         // Other scenarios leave games behind; only this one's ("g-...") are judged.
         var mine: usize = 0;
@@ -2572,7 +2573,11 @@ fn scAdminApi() Result {
 }
 
 fn fail(name: []const u8, comptime fmt: []const u8, args: anytype) Result {
-    return .{ .name = name, .status = .fail, .msg = msg(fmt, args) };
+    const text = msg(fmt, args);
+    // A read that hit its deadline says what it was waiting for, not just that it waited.
+    if (std.mem.indexOf(u8, text, "Timeout") != null and net.waitingFor().len > 0)
+        return .{ .name = name, .status = .fail, .msg = msg("{s} (waiting for {s})", .{ text, net.waitingFor() }) };
+    return .{ .name = name, .status = .fail, .msg = text };
 }
 
 fn skip(name: []const u8, m: []const u8) Result {
@@ -2643,21 +2648,94 @@ fn spawnRealmd(bin: [:0]const u8, envs: []const EnvVar, wait_port: u16) !c_int {
 // The realm runs ephemeral state (sessions + games + token routes) in redis, and the
 // d2ingress reads token routes from it asynchronously — so the harness brings up a real
 // redis in docker, points realmd + d2ingress at it, and flushes it for a clean slate.
-const REDIS_HOST_PORT: u16 = 6399;
-const PG_HOST_PORT: u16 = 55499;
+// The stores' host ports and container names follow E2E_PORT_BASE, so a run moved off the default
+// ports shares nothing with one that was not, containers included.
+var REDIS_HOST_PORT: u16 = 6399;
+var PG_HOST_PORT: u16 = 55499;
+var redis_name: []const u8 = "e2e-redis";
+var pg_name: []const u8 = "e2e-postgres";
+
+fn sh(comptime fmt: []const u8, args: anytype) c_int {
+    var buf: [512]u8 = undefined;
+    const cmd = std.mem.printSentinel(&buf, fmt, args, 0) catch return -1;
+    return system(cmd.ptr);
+}
+
+fn followPortBase(base: u16) void {
+    REDIS_HOST_PORT = base + 287; // 6112 -> 6399
+    PG_HOST_PORT = base + 49387; // 6112 -> 55499
+    fakegs.redis_port = REDIS_HOST_PORT;
+    redis_name = msg("e2e-redis-{d}", .{base});
+    pg_name = msg("e2e-postgres-{d}", .{base});
+}
 
 /// Bring up the two stores realmd needs. Both, always: there is no filesystem fallback to fall
 /// back to, which is the point — a harness that could run without them would be testing a
 /// configuration that does not exist.
+// The stores run in containers with fixed names and ports, and scenarios start realmds on fixed
+// ports, so two runs on one machine would remove each other's containers and fail in ways that
+// read as realm bugs. One run at a time: the second waits for the first and says so.
+const run_lock_dir = "/tmp/realmd-e2e.lock";
+const run_lock_pid = run_lock_dir ++ "/pid";
+extern "c" fn rmdir(path: [*:0]const u8) c_int;
+extern "c" fn getpid() c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
+
+fn lockHolder() ?c_int {
+    var buf: [32]u8 = undefined;
+    const fd = open(run_lock_pid, 0);
+    if (fd < 0) return null;
+    defer _ = close(fd);
+    const n = read(fd, &buf, buf.len);
+    if (n <= 0) return null;
+    return std.fmt.parseInt(c_int, std.mem.trim(u8, buf[0..@intCast(n)], " \n"), 10) catch null;
+}
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+
+fn takeRunLock() void {
+    var waited_s: u32 = 0;
+    while (true) {
+        if (mkdir(run_lock_dir, 0o755) == 0) {
+            var buf: [32]u8 = undefined;
+            const text = std.mem.print(&buf, "{d}\n", .{getpid()}) catch return;
+            const fd = open(run_lock_pid, 0x601, @as(c_uint, 0o644)); // O_WRONLY|O_CREAT|O_TRUNC
+            if (fd >= 0) {
+                _ = write(fd, text.ptr, text.len);
+                _ = close(fd);
+            }
+            return;
+        }
+        const holder = lockHolder();
+        if (holder == null or kill(holder.?, 0) != 0) {
+            // the run that took it is gone
+            _ = unlink(run_lock_pid);
+            _ = rmdir(run_lock_dir);
+            continue;
+        }
+        if (waited_s % 10 == 0) std.debug.print("another e2e run (pid {d}) holds {s}; waiting for it\n", .{ holder.?, run_lock_dir });
+        if (waited_s >= 900) {
+            std.debug.print("ERROR: gave up after {d}s waiting for the e2e run of pid {d}\n", .{ waited_s, holder.? });
+            std.process.exit(2);
+        }
+        _ = net.usleep(1_000_000);
+        waited_s += 1;
+    }
+}
+
+fn releaseRunLock() void {
+    _ = unlink(run_lock_pid);
+    _ = rmdir(run_lock_dir);
+}
+
 fn startStores() void {
-    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1"); // clear stale containers
-    if (system("docker run -d --rm --name e2e-redis -p 6399:6379 redis:7-alpine >/dev/null 2>&1") != 0) {
+    _ = sh("docker rm -f {s} {s} >/dev/null 2>&1", .{ redis_name, pg_name }); // clear stale containers
+    if (sh("docker run -d --rm --name {s} -p {d}:6379 redis:7-alpine >/dev/null 2>&1", .{ redis_name, REDIS_HOST_PORT }) != 0) {
         std.debug.print("ERROR: could not start the redis container (docker is required).\n", .{});
         std.process.exit(2);
     }
-    if (system("docker run -d --rm --name e2e-postgres -p 55499:5432 " ++
+    if (sh("docker run -d --rm --name {s} -p {d}:5432 " ++
         "-e POSTGRES_USER=realmd -e POSTGRES_PASSWORD=realmd -e POSTGRES_DB=realmd " ++
-        "postgres:16-alpine >/dev/null 2>&1") != 0)
+        "postgres:16-alpine >/dev/null 2>&1", .{ pg_name, PG_HOST_PORT }) != 0)
     {
         std.debug.print("ERROR: could not start the postgres container (docker is required).\n", .{});
         stopStores();
@@ -2668,9 +2746,9 @@ fn startStores() void {
         stopStores();
         std.process.exit(2);
     }
-    _ = system("docker exec e2e-redis redis-cli FLUSHALL >/dev/null 2>&1"); // clean slate
-    _ = setenv("REALMD_REDIS_ADDR", "127.0.0.1:6399", 1);
-    _ = setenv("REALMD_PG_DSN", "postgres://realmd:realmd@127.0.0.1:55499/realmd", 1);
+    _ = sh("docker exec {s} redis-cli FLUSHALL >/dev/null 2>&1", .{redis_name}); // clean slate
+    _ = setenv("REALMD_REDIS_ADDR", (alloc.printSentinel("127.0.0.1:{d}", .{REDIS_HOST_PORT}, 0) catch return).ptr, 1);
+    _ = setenv("REALMD_PG_DSN", (alloc.printSentinel("postgres://realmd:realmd@127.0.0.1:{d}/realmd", .{PG_HOST_PORT}, 0) catch return).ptr, 1);
     // The port being open is not the same as the server accepting connections, and neither is
     // `pg_isready`.
     //
@@ -2687,7 +2765,7 @@ fn startStores() void {
     var waited: u32 = 0;
     var pg_ready = false;
     while (waited < 60_000) : (waited += 250) {
-        if (system("docker exec e2e-postgres psql -U realmd -h 127.0.0.1 -d realmd -c 'select 1' >/dev/null 2>&1") == 0) {
+        if (sh("docker exec {s} psql -U realmd -h 127.0.0.1 -d realmd -c 'select 1' >/dev/null 2>&1", .{pg_name}) == 0) {
             pg_ready = true;
             break;
         }
@@ -2700,32 +2778,26 @@ fn startStores() void {
         stopStores();
         std.process.exit(2);
     }
-    std.debug.print("started e2e-redis :{d} and e2e-postgres :{d} (postgres answered a query)\n", .{ REDIS_HOST_PORT, PG_HOST_PORT });
+    std.debug.print("started {s} :{d} and {s} :{d} (postgres answered a query)\n", .{ redis_name, REDIS_HOST_PORT, pg_name, PG_HOST_PORT });
 }
 
 fn stopStores() void {
-    _ = system("docker rm -f e2e-redis e2e-postgres >/dev/null 2>&1");
+    _ = sh("docker rm -f {s} {s} >/dev/null 2>&1", .{ redis_name, pg_name });
 }
 
 fn maybeStartRealmd() !?c_int {
     if (net.portOpen(rc.HOST_BNET)) {
-        // Reusing whatever answers on the port is convenient when iterating against a realm
-        // already up, and a trap otherwise: that server isn't the binary just built, wasn't
-        // given this harness's data dir/admin token/permissive-auth, and carries other state.
-        // Set E2E_NO_REUSE=1 to refuse instead of guessing.
-        std.debug.print(
-            \\
-            \\!! REUSING an existing realmd on 127.0.0.1:{d} — NOT the freshly built one.
-            \\!! It has its own data dir and env, so failures below may say nothing about
-            \\!! your changes. Stop that process (or set E2E_NO_REUSE=1) for a real run.
-            \\
-            \\
-        , .{rc.HOST_BNET});
-        if (std.mem.eql(u8, envOr("E2E_NO_REUSE", "0"), "1")) {
-            std.debug.print("E2E_NO_REUSE=1 and port {d} is taken — refusing to test a server I did not start.\n", .{rc.HOST_BNET});
-            std.process.exit(2);
+        // Whatever answers on the port is not the binary just built, was not given this harness's
+        // data dir, admin token or permissive auth, and carries other state: failures against it
+        // say nothing about the change. Refuse unless asked.
+        if (std.mem.eql(u8, envOr("E2E_REUSE", "0"), "1")) {
+            std.debug.print("!! REUSING the realmd on 127.0.0.1:{d}; it is not the freshly built one.\n", .{rc.HOST_BNET});
+            return null;
         }
-        return null;
+        std.debug.print("port {d} is taken, refusing to test a server I did not start (E2E_PORT_BASE moves this run, E2E_REUSE=1 uses it)\n", .{rc.HOST_BNET});
+        stopStores();
+        releaseRunLock();
+        std.process.exit(2);
     }
     const bin = envOr("REALMD_BIN", "./zig-out/bin/realmd");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
@@ -3046,14 +3118,12 @@ fn scFriendsPersist() Result {
     var i: usize = 0;
     while (i < 16) : (i += 1) {
         const ev = c.readChatEvent() catch break;
-        // Gheed also generates a channel-JOIN on this connection; only the INFO lines are
-        // the /f list reply.
-        if (ev.eid != rc.EID_INFO or !std.mem.eql(u8, ev.username, "Gheed")) continue;
-        if (std.mem.indexOf(u8, ev.text, "Diablo II") != null) {
-            located = true;
-            break;
-        }
-        return fail(name, "/f list says Gheed is '{s}' — should name the channel they are in", .{ev.text});
+        // The reply is chat text, one INFO line per friend: "1: Gheed, online in Diablo II".
+        if (ev.eid != rc.EID_INFO or std.mem.indexOf(u8, ev.text, ": Gheed,") == null) continue;
+        if (std.mem.indexOf(u8, ev.text, "online in Diablo II") == null)
+            return fail(name, "/f list says '{s}', want Gheed online in Diablo II", .{ev.text});
+        located = true;
+        break;
     }
     if (!located) return fail(name, "/f list never reported where Gheed is", .{});
 
@@ -3257,7 +3327,8 @@ fn scMultiInstance() Result {
     const cg = a.createGame("fleetgame", "d") catch |e| return fail(name, "A create {s}", .{@errorName(e)});
     if (cg.result != 0) return fail(name, "A create result={d}", .{cg.result});
     // ...and confirm B's admin API lists it (shared-store snapshotGames, not A's memory).
-    var rxbuf: [16384]u8 = undefined;
+    // every game the scenarios before this one left in the shared store is in the answer too
+    var rxbuf: [262144]u8 = undefined;
     const lg = net.httpRequest(17118, "GET", "/admin/games", ADMIN_TOKEN, "", &rxbuf) catch |e| return fail(name, "B admin games {s}", .{@errorName(e)});
     if (lg.status != 200) return fail(name, "B admin games status={d}", .{lg.status});
     if (std.mem.indexOf(u8, lg.body, "fleetgame") == null)
@@ -3601,13 +3672,112 @@ fn resetFixtures() void {
     }
 }
 
+extern "c" fn pipe(fds: *[2]c_int) c_int;
+extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+extern "c" fn alarm(seconds: c_uint) c_uint;
+extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) usize;
+extern "c" fn _exit(code: c_int) noreturn;
+extern "c" fn setpgid(pid: c_int, pgid: c_int) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
+extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
+extern "c" fn close(fd: c_int) c_int;
+const PollFd = extern struct { fd: c_int, events: c_short, revents: c_short };
+extern "c" fn poll(fds: [*]PollFd, n: c_ulong, timeout_ms: c_int) c_int;
+
+/// Longest a scenario may run. They finish in seconds; this is the hang detector, not a budget.
+const scenario_timeout_s: c_uint = 60;
+
+var report_fd: c_int = -1;
+var running_scenario: []const u8 = "";
+
+fn reportResult(status: Status, text: []const u8) void {
+    var head = [_]u8{@as(u8, @backingInt(status))};
+    _ = write(report_fd, &head, 1);
+    _ = write(report_fd, text.ptr, text.len);
+}
+
+/// The scenario's own alarm. It runs in the scenario's process, so what it reports is what that
+/// process was last blocked on.
+fn onScenarioTimeout(_: c_int) callconv(.c) void {
+    var buf: [320]u8 = undefined;
+    const text = std.mem.print(&buf, "TIMEOUT after {d}s, still waiting for {s}", .{
+        scenario_timeout_s,
+        if (net.waitingFor().len > 0) net.waitingFor() else "(nothing recorded)",
+    }) catch "TIMEOUT";
+    reportResult(.fail, text);
+    _exit(0);
+}
+
+/// Each scenario runs in a process of its own: a hang is cut off by a hard deadline that names the
+/// scenario, one scenario cannot leave state in the harness for the next, and any subset or order
+/// is the same run. The server and the stores are outside, shared, so scenarios still need names
+/// of their own on the server side.
+fn runIsolated(comptime id: []const u8, comptime run: fn () Result) Result {
+    const t_start = nowMs();
+    var r = runIsolatedInner(id, run);
+    r.ms = nowMs() - t_start;
+    return r;
+}
+
+fn nowMs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+fn runIsolatedInner(comptime id: []const u8, comptime run: fn () Result) Result {
+    var fds: [2]c_int = undefined;
+    if (pipe(&fds) != 0) return .{ .name = id, .status = .fail, .msg = "pipe failed" };
+    const pid = fork();
+    if (pid < 0) return .{ .name = id, .status = .fail, .msg = "fork failed" };
+    if (pid == 0) {
+        _ = setpgid(0, 0); // whatever the scenario spawns dies with it
+        _ = close(fds[0]);
+        _ = fcntl(fds[1], 2, @as(c_int, 1)); // F_SETFD FD_CLOEXEC: a spawned realmd must not hold the report open
+        report_fd = fds[1];
+        running_scenario = id;
+        _ = signal(14, onScenarioTimeout); // SIGALRM
+        _ = alarm(scenario_timeout_s);
+        const r = run();
+        reportResult(r.status, r.msg);
+        _exit(0);
+    }
+    _ = close(fds[1]);
+    var got: [2048]u8 = undefined;
+    var n: usize = 0;
+    // The child's own alarm fires first; this deadline only covers a child too stuck to report.
+    var deadline_ms: c_int = @intCast((scenario_timeout_s + 15) * 1000);
+    while (n < got.len) {
+        var pfd = [_]PollFd{.{ .fd = fds[0], .events = 1, .revents = 0 }};
+        const t0 = deadline_ms;
+        if (poll(&pfd, 1, t0) <= 0) break;
+        const r = read(fds[0], got[n..].ptr, got.len - n);
+        if (r <= 0) break;
+        n += @intCast(r);
+        deadline_ms = 5000;
+    }
+    _ = close(fds[0]);
+    _ = kill(-pid, 9);
+    var wstatus: c_int = 0;
+    _ = kill(pid, 9);
+    _ = waitpid(pid, &wstatus, 0);
+    if (n == 0) {
+        const sig = wstatus & 0x7f;
+        return .{ .name = id, .status = .fail, .msg = if (sig == 9) "TIMEOUT, the scenario never reported" else msg("the scenario process died (wait status {d}) before reporting", .{wstatus}) };
+    }
+    const status: Status = @fromBackingInt(@intCast(got[0]));
+    return .{ .name = id, .status = status, .msg = alloc.dupe(u8, got[1..n]) catch "(alloc failed)" };
+}
+
+const not_selected = "not in E2E_ONLY";
+
 /// `E2E_ONLY=scName[,scName...]` runs just those scenarios; the rest report as skipped.
 fn only(comptime id: []const u8, comptime run: fn () Result) Result {
     const want = envOr("E2E_ONLY", "");
-    if (want.len == 0) return run();
+    if (want.len == 0) return runIsolated(id, run);
     var it = std.mem.splitScalar(u8, want, ',');
-    while (it.next()) |w| if (std.mem.eql(u8, std.mem.trim(u8, w, " "), id)) return run();
-    return .{ .name = id, .status = .skip, .msg = "not in E2E_ONLY" };
+    while (it.next()) |w| if (std.mem.eql(u8, std.mem.trim(u8, w, " "), id)) return runIsolated(id, run);
+    return .{ .name = id, .status = .skip, .msg = not_selected };
 }
 
 pub fn main() !void {
@@ -3617,8 +3787,13 @@ pub fn main() !void {
     if (port_base != 0) {
         rc.setPortBase(port_base);
         HEALTH_PORT = port_base + 1968; // keeps the usual 6112 -> 18080 relationship
+        followPortBase(port_base);
         std.debug.print("port base overridden: bnet={d} health={d}\n", .{ rc.HOST_BNET, HEALTH_PORT });
     }
+    // Every realmd this run starts is stopped with SIGTERM, and the production drain is 5 s of
+    // waiting for the load balancer, which a test has none of.
+    _ = setenv("REALMD_SHUTDOWN_GRACE_MS", "100", 1);
+    takeRunLock();
     startStores();
     const child = try maybeStartRealmd();
     resetFixtures();
@@ -3687,6 +3862,7 @@ pub fn main() !void {
         _ = waitpid(pid, null, 0);
     }
     stopStores();
+    releaseRunLock();
 
     var npass: u32 = 0;
     var nfail: u32 = 0;
@@ -3697,7 +3873,8 @@ pub fn main() !void {
             .fail => "FAIL",
             .skip => "SKIP",
         };
-        std.debug.print("[{s}] {s}: {s}\n", .{ tag, r.name, r.msg });
+        if (r.status == .skip and std.mem.eql(u8, r.msg, not_selected)) continue;
+        std.debug.print("[{s}] {s} ({d} ms): {s}\n", .{ tag, r.name, r.ms, r.msg });
         switch (r.status) {
             .pass => npass += 1,
             .fail => nfail += 1,

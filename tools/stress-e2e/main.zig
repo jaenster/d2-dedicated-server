@@ -37,6 +37,10 @@ const Config = struct {
     dwell_ms: i64 = 3000,
     same_game: bool = false,
     keep_going: bool = false,
+    /// Skip the readiness probe and the up-front character creation: each client logs in exactly
+    /// once. For a realm whose passwords are single-use tickets, where a second login with the
+    /// same credentials is refused.
+    no_probe: bool = false,
     account: []const u8 = "tester:tester",
     /// "name:class" pairs (class = eD2PlayerClassID: 0 Amazon, 1 Sorceress, 2 Necromancer,
     /// 3 Paladin, 4 Barbarian, 5 Druid, 6 Assassin). Created on demand if the account doesn't
@@ -68,6 +72,7 @@ fn parseArgs(init_args: anytype) !Config {
         else if (std.mem.eql(u8, a, "--dwell")) cfg.dwell_ms = (std.fmt.parseInt(i64, args.next() orelse fatal("--dwell needs a value", .{}), 10) catch fatal("bad --dwell", .{})) * 1000
         else if (std.mem.eql(u8, a, "--same-game")) cfg.same_game = true
         else if (std.mem.eql(u8, a, "--keep-going")) cfg.keep_going = true
+        else if (std.mem.eql(u8, a, "--no-probe")) cfg.no_probe = true
         else if (std.mem.eql(u8, a, "--account")) cfg.account = args.next() orelse fatal("--account needs a value", .{})
         else if (std.mem.eql(u8, a, "--chars")) cfg.chars = args.next() orelse fatal("--chars needs a value", .{})
         else if (std.mem.eql(u8, a, "--wait-ms")) cfg.wait_ms = std.fmt.parseInt(i64, args.next() orelse fatal("--wait-ms needs a value", .{}), 10) catch fatal("bad --wait-ms", .{})
@@ -269,7 +274,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     if (nchars < cfg.clients) fatal("--chars only lists {d} names for {d} clients", .{ nchars, cfg.clients });
 
-    waitForStack(gpa, &cfg, chars[0..cfg.clients]);
+    if (!cfg.no_probe) waitForStack(gpa, &cfg, chars[0..cfg.clients]);
 
     std.debug.print("==> {d} rounds x {d} client(s) x {d} run(s) per login\n", .{ cfg.rounds, cfg.clients, cfg.runs });
 

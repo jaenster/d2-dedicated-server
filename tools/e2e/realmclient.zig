@@ -84,6 +84,7 @@ fn bncsSend(fd: Socket, id: u8, body: []const u8) !void {
 /// Read a BNCS packet body into `buf`; returns (id, body slice into buf).
 fn bncsRecv(fd: Socket, buf: []u8) !struct { id: u8, body: []const u8 } {
     var hdr: [4]u8 = undefined;
+    net.waitingOn("a BNCS packet from realmd (fd {d})", .{fd});
     try net.readFull(fd, &hdr);
     if (hdr[0] != 0xFF) return error.BadBncsHeader;
     const id = hdr[1];
@@ -105,6 +106,7 @@ fn mcpSend(fd: Socket, id: u8, body: []const u8) !void {
 
 fn mcpRecv(fd: Socket, buf: []u8) !struct { id: u8, body: []const u8 } {
     var hdr: [3]u8 = undefined;
+    net.waitingOn("an MCP packet from realmd (fd {d})", .{fd});
     try net.readFull(fd, &hdr);
     const ln = net.rdU16(&hdr, 0);
     const id = hdr[2];
@@ -128,6 +130,7 @@ pub const Ctl = struct { typ: u16, seq: u32, body: []const u8 };
 
 pub fn ctlRecv(fd: Socket, buf: []u8) !Ctl {
     var hdr: [8]u8 = undefined;
+    net.waitingOn("a control packet (fd {d})", .{fd});
     try net.readFull(fd, &hdr);
     const size = net.rdU16(&hdr, 0);
     const typ = net.rdU16(&hdr, 2);
@@ -549,6 +552,11 @@ pub const AdInfo = struct {
     /// Give bnet reads a deadline so a missing event fails instead of hanging.
     pub fn setBnetTimeout(self: *RealmClient, ms: u32) void {
         net.setRecvTimeout(self.bnet.?, ms);
+    }
+
+    /// The same for the realm connection, for a request the realm itself is allowed to sit on.
+    pub fn setD2csTimeout(self: *RealmClient, ms: u32) void {
+        net.setRecvTimeout(self.d2cs.?, ms);
     }
 
     pub fn connectD2cs(self: *RealmClient) !void {
