@@ -69,9 +69,9 @@ fn pathOf(req: []const u8) []const u8 {
     return req[i..j];
 }
 
-/// Body big enough for 32 games plus the per-code table; sits on the health thread's
-/// stack, so it never competes with the engine for the FOG pools.
-const body_cap = 32 * 1024;
+/// Body big enough for 32 games, the per-code table and the loaded mods' metrics; sits on the
+/// health thread's stack, so it never competes with the engine for the FOG pools.
+const body_cap = 64 * 1024;
 
 fn sendBody(cs: SOCKET, content_type: []const u8, body: []const u8) void {
     var head: [160]u8 = undefined;

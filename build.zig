@@ -507,6 +507,8 @@ pub fn build(b: *std.Build) void {
         // of keys opens. Each rule takes its rolls from the boss's seed in a fixed order, and these
         // tests pin that order, which a refactor of the engine glue could otherwise quietly change.
         .{ "apps/d2gs/runtime/feature/ubers_policy.zig", false, false },
+        // Which `--loaddll` mods /metrics asks for their own families.
+        .{ "apps/d2gs/runtime/feature/mod_metrics.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -519,6 +521,7 @@ pub fn build(b: *std.Build) void {
         mod_tests.root_module.addImport("obs", obs);
         mod_tests.root_module.addImport("resp", resp);
         mod_tests.root_module.addImport("fastcall", fastcall_mod);
+        mod_tests.root_module.addImport("gs_health", gs_health);
         mod_tests.root_module.addAnonymousImport("served_engines", .{ .root_source_file = b.path("deploy/e2e-engines.txt") });
         if (spec[1]) mod_tests.root_module.addImport("realm_infra", realm_infra);
         if (spec[2]) {

@@ -16,6 +16,7 @@ const fns = @import("../../engine/d2/functions.zig");
 const poolstat = @import("../poolstat.zig");
 const d2cs = @import("../../realmclient/d2cs.zig");
 const gs_health = @import("gs_health");
+const mod_metrics = @import("mod_metrics.zig");
 
 extern "kernel32" fn GetTickCount() callconv(.winapi) u32;
 
@@ -369,6 +370,7 @@ pub fn writeMetrics(buf: []u8) []const u8 {
         w.num(s.clients);
         w.put("\n");
     }
+    mod_metrics.append(&w);
     return w.done();
 }
 
