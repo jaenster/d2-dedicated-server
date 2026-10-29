@@ -72,14 +72,14 @@ pub const slot_size = @sizeOf(?*const anyopaque);
 
 /// The byte offset the engine indexes `slot` at, in this compilation's pointer width.
 pub fn offsetOf(comptime slot: Slot) usize {
-    return @intFromEnum(slot) / 4 * slot_size;
+    return @backingInt(slot) / 4 * slot_size;
 }
 
 comptime {
     // The engine indexes by offset, so a silent layout change corrupts dispatch. Every slot is
     // pinned, including 0x08/0x0C/0x14/0x18/0x3C — the ones both hosts depend on by name.
-    for (@typeInfo(Slot).@"enum".fields) |f| {
-        std.debug.assert(@offsetOf(D2ServerCallbackFunctions, f.name) == f.value / 4 * slot_size);
+    for (@typeInfo(Slot).@"enum".field_names, @typeInfo(Slot).@"enum".field_values) |field_name, field_value| {
+        std.debug.assert(@offsetOf(D2ServerCallbackFunctions, field_name) == field_value / 4 * slot_size);
     }
     std.debug.assert(@sizeOf(D2ServerCallbackFunctions) == 16 * slot_size);
     if (slot_size == 4) std.debug.assert(@sizeOf(D2ServerCallbackFunctions) == 0x40);

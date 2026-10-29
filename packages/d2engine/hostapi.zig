@@ -237,8 +237,8 @@ test "1.14d locates the same function by address, not ordinal" {
 }
 
 test "chat kinds are the engine's own numbers" {
-    try std.testing.expectEqual(@as(u32, 0x07), @intFromEnum(ChatKind.scroll));
-    try std.testing.expectEqual(@as(u32, 0x04), @intFromEnum(ChatKind.system));
+    try std.testing.expectEqual(@as(u32, 0x07), @backingInt(ChatKind.scroll));
+    try std.testing.expectEqual(@as(u32, 0x04), @backingInt(ChatKind.system));
 }
 
 test "client field offsets are relative to pRealm, and pRealm moves between versions" {

@@ -292,7 +292,7 @@ fn savePathFor(charname: []const u8, out: []u8) ?[:0]u8 {
     const get: *const fn ([*]u8, u32) callconv(.c) c_int = @ptrFromInt(image.at(addr.get_save_path));
     if (get(&dir, @intCast(dir.len)) == 0) return null;
     const d = std.mem.span(@as([*:0]const u8, @ptrCast(&dir)));
-    return std.fmt.bufPrintZ(out, "{s}{s}.d2s", .{ d, charname }) catch null;
+    return std.mem.printSentinel(out, "{s}{s}.d2s", .{ d, charname }, 0) catch null;
 }
 
 // the store
@@ -329,7 +329,7 @@ fn env(name: [*:0]const u8, default: []const u8) []const u8 {
 
 fn note(comptime fmt: []const u8, args: anytype) void {
     var buf: [1280]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.mem.print(&buf, fmt, args) catch return;
     _ = std.c.write(2, s.ptr, s.len);
 }
 

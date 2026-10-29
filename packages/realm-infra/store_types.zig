@@ -4,7 +4,7 @@ const std = @import("std");
 pub const max_chars = 16;
 
 pub const Name = struct {
-    buf: [32]u8 = [_]u8{0} ** 32,
+    buf: [32]u8 = @splat(0),
     len: u8 = 0,
     pub fn slice(n: *const Name) []const u8 {
         return n.buf[0..n.len];
@@ -17,7 +17,7 @@ pub const Name = struct {
 pub const version_max = 12;
 
 pub const VersionTag = struct {
-    buf: [version_max]u8 = [_]u8{0} ** version_max,
+    buf: [version_max]u8 = @splat(0),
     len: u8 = 0,
     pub fn slice(v: *const VersionTag) []const u8 {
         return v.buf[0..v.len];
@@ -53,7 +53,7 @@ pub const ext_key_max = 96;
 /// One key in an extension's keyspace, as returned by a listing. Fixed-size for the same reason
 /// `Name` is: the store hands these back into a caller-owned array and allocates nothing.
 pub const ExtKey = struct {
-    buf: [ext_key_max]u8 = [_]u8{0} ** ext_key_max,
+    buf: [ext_key_max]u8 = @splat(0),
     len: u8 = 0,
     pub fn slice(k: *const ExtKey) []const u8 {
         return k.buf[0..k.len];
@@ -88,12 +88,12 @@ pub const GameRec = struct {
     max_players: u8 = 8,
     /// Game join password (empty = open game). Stored with the record so any realmd
     /// instance can validate a join. D2 passwords are short alphanumeric (no spaces).
-    password: [16]u8 = [_]u8{0} ** 16,
+    password: [16]u8 = @splat(0),
     pw_len: u8 = 0,
     /// The creator's game description, shown beside the name on the join screen. Sized to
     /// the engine's own `szGameDescription[32]`. Unlike the password it may contain spaces,
     /// so the flat-text backends store it last, as the remainder of the record.
-    description: [32]u8 = [_]u8{0} ** 32,
+    description: [32]u8 = @splat(0),
     desc_len: u8 = 0,
 
     pub fn pw(g: *const GameRec) []const u8 {
@@ -161,7 +161,7 @@ pub const GsRec = struct {
     /// Carried on the wire AFTER the fixed 15 bytes, which is what keeps an older reader working:
     /// it stops at 15 and never sees them, and the Lua that adjusts the live count preserves the
     /// tail (`string.sub(rec,15)`) rather than truncating it.
-    labels: [labels_max]u8 = [_]u8{0} ** labels_max,
+    labels: [labels_max]u8 = @splat(0),
     labels_len: u8 = 0,
 
     pub fn setLabels(self: *GsRec, text: []const u8) void {
@@ -199,7 +199,7 @@ pub const labels_max = 96;
 /// A game enumerated from the shared store (name + record) — used to serve /admin/games
 /// when sessions/games live in redis/pg rather than the per-instance in-memory table.
 pub const NamedGame = struct {
-    name: [32]u8 = [_]u8{0} ** 32,
+    name: [32]u8 = @splat(0),
     name_len: u8 = 0,
     gameid: u32 = 0,
     gs_ip: [4]u8 = .{ 0, 0, 0, 0 },
@@ -213,7 +213,7 @@ pub const NamedGame = struct {
     status: u8 = 0,
     /// 0 Normal, 1 Nightmare, 2 Hell: the list leaves out what the viewer has not unlocked.
     difficulty: u8 = 0,
-    description: [32]u8 = [_]u8{0} ** 32,
+    description: [32]u8 = @splat(0),
     desc_len: u8 = 0,
 
     pub fn desc(g: *const NamedGame) []const u8 {

@@ -140,7 +140,7 @@ fn dispatch(gsid: u32, packet: []const u8, seq: u32) Result {
 
 fn writeHeader(buf: []u8, size: u16, typ: p.Type, seq: u32) void {
     std.mem.writeInt(u16, buf[0..2], size, .little);
-    std.mem.writeInt(u16, buf[2..4], @intFromEnum(typ), .little);
+    std.mem.writeInt(u16, buf[2..4], @backingInt(typ), .little);
     std.mem.writeInt(u32, buf[4..8], seq, .little);
 }
 
@@ -494,7 +494,7 @@ pub fn consumeEvents() void {
         const size = std.mem.readInt(u16, buf[0..2], .little);
         const typ = std.mem.readInt(u16, buf[2..4], .little);
         if (size > n or size < p.HEADER_LEN) continue;
-        apply(@enumFromInt(typ), buf[p.HEADER_LEN..size]);
+        apply(@fromBackingInt(typ), buf[p.HEADER_LEN..size]);
     }
 }
 

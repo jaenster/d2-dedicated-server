@@ -87,7 +87,7 @@ pub fn walkRebase(bytes: []const u8, visitor: anytype) !void {
         const imm: u8 = op & 0x0f;
         switch (op & 0xf0) {
             0x00 => return, // DONE
-            0x10 => kind = @enumFromInt(imm),
+            0x10 => kind = @fromBackingInt(imm),
             0x20 => {
                 seg = imm;
                 off = try r.uleb();
@@ -149,7 +149,7 @@ pub fn walkBind(bytes: []const u8, stop_at_done: bool, visitor: anytype) !void {
             0x30 => {},
             // The immediate carries weak/non-weak-definition flags. Nothing in this image is weak.
             0x40 => name = try r.cstr(),
-            0x50 => kind = @enumFromInt(imm),
+            0x50 => kind = @fromBackingInt(imm),
             0x60 => addend = try r.sleb(),
             0x70 => {
                 seg = imm;

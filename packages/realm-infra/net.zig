@@ -179,7 +179,7 @@ pub fn serve(tag: []const u8, listen_fd: Socket, handler: Handler) void {
     while (true) {
         const cfd = accept(listen_fd, null, null);
         if (cfd < 0) {
-            switch (@as(posix.E, @enumFromInt(std.c._errno().*))) {
+            switch (@as(posix.E, @fromBackingInt(@intCast(std.c._errno().*)))) {
                 // A signal interrupted accept (SIGTERM during drain) or the peer
                 // aborted before we got to it — neither is an error, retry silently.
                 .INTR, .CONNABORTED => continue,
@@ -189,7 +189,7 @@ pub fn serve(tag: []const u8, listen_fd: Socket, handler: Handler) void {
                 // fd exhaustion or anything else: log and back off so a persistent
                 // failure doesn't peg a core.
                 else => |e| {
-                    log.line(tag, "accept failed (errno {d})", .{@intFromEnum(e)});
+                    log.line(tag, "accept failed (errno {d})", .{@backingInt(e)});
                     _ = usleep(50_000); // 50ms back-off
                     continue;
                 },

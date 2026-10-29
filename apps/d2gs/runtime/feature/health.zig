@@ -27,7 +27,7 @@ const sockaddr_in = extern struct {
     family: u16 = AF_INET,
     port: u16, // network order
     addr: u32 = INADDR_ANY, // network order
-    zero: [8]u8 = .{0} ** 8,
+    zero: [8]u8 = @splat(0),
 };
 
 extern "ws2_32" fn WSAStartup(version: u16, data: *[512]u8) callconv(.winapi) i32;
@@ -75,7 +75,7 @@ const body_cap = 32 * 1024;
 
 fn sendBody(cs: SOCKET, content_type: []const u8, body: []const u8) void {
     var head: [160]u8 = undefined;
-    const h = std.fmt.bufPrint(
+    const h = std.mem.print(
         &head,
         "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{ content_type, body.len },

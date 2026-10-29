@@ -232,7 +232,7 @@ fn diabloWeights(game: *Game, ai: *anyopaque, self: *UnitAny, target_opt: ?*Unit
     const fire = GetStat(target, STAT_FIRE_RESIST, 0);
     const light = GetStat(target, STAT_LIGHT_RESIST, 0);
 
-    var w = [_]i32{0} ** 17;
+    var w: [17]i32 = @splat(0);
     if (melee) {
         w = .{ 0, 0, 40, 70, 0, 75, 24, 40, 15, 0, 0, 0, 0, 0, 0, 0, 0 }; // uber: slot 5 75, not 40
         if (LifePercent(target) < 20) w[2] = 50;
@@ -420,7 +420,7 @@ fn baalWeights(game: *Game, ai: *anyopaque, self: *UnitAny, target_opt: ?*UnitAn
     const melee = IsInMeleeRange(self, target, 0) != 0;
     const path = CollisionWithWall.call(.{ self, target }) != 0;
 
-    var w = [_]i32{0} ** 16;
+    var w: [16]i32 = @splat(0);
     if (melee) {
         w[1] = 100 - LifePercent(self);
         w[8] = 20;

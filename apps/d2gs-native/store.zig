@@ -126,9 +126,9 @@ pub fn cmdBig(head: []const []const u8, tail: []const u8) ?resp.Reply {
     const s = ensure() orelse return null;
     var tx: [1024]u8 = undefined;
     var n: usize = 0;
-    n += (std.fmt.bufPrint(tx[n..], "*{d}\r\n", .{head.len + 1}) catch return null).len;
+    n += (std.mem.print(tx[n..], "*{d}\r\n", .{head.len + 1}) catch return null).len;
     for (head) |a| {
-        n += (std.fmt.bufPrint(tx[n..], "${d}\r\n", .{a.len}) catch return null).len;
+        n += (std.mem.print(tx[n..], "${d}\r\n", .{a.len}) catch return null).len;
         if (n + a.len + 2 > tx.len) return null;
         @memcpy(tx[n..][0..a.len], a);
         n += a.len;
@@ -136,7 +136,7 @@ pub fn cmdBig(head: []const []const u8, tail: []const u8) ?resp.Reply {
         tx[n + 1] = '\n';
         n += 2;
     }
-    n += (std.fmt.bufPrint(tx[n..], "${d}\r\n", .{tail.len}) catch return null).len;
+    n += (std.mem.print(tx[n..], "${d}\r\n", .{tail.len}) catch return null).len;
     if (!sendAll(s, tx[0..n]) or !sendAll(s, tail) or !sendAll(s, "\r\n")) {
         drop();
         return null;
@@ -160,7 +160,7 @@ pub fn ping() bool {
 /// appended after the fixed part so a realm that predates labels reads the record unchanged.
 pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32, full: bool, ttl_s: u32, labels: []const u8) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:gs:{x}", .{gsid}) catch return false;
+    const key = std.mem.print(&kb, "realmd:gs:{x}", .{gsid}) catch return false;
     var vb: [15 + 96]u8 = undefined;
     @memcpy(vb[0..4], &ip);
     std.mem.writeInt(u16, vb[4..6], gs_port, .little);
@@ -171,7 +171,7 @@ pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32,
     @memcpy(vb[15..][0..nlab], labels[0..nlab]);
     const v = vb[0 .. 15 + nlab];
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const r = cmd(&.{ "SET", key, v, "PX", px }) orelse return false;
     switch (r) {
         .status, .int => {},
@@ -179,14 +179,14 @@ pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32,
         else => return false,
     }
     var ib: [16]u8 = undefined;
-    _ = cmd(&.{ "SADD", "realmd:gs", std.fmt.bufPrint(&ib, "{x}", .{gsid}) catch return false }) orelse return false;
+    _ = cmd(&.{ "SADD", "realmd:gs", std.mem.print(&ib, "{x}", .{gsid}) catch return false }) orelse return false;
     return true;
 }
 
 /// Take the next create/join queued for this server, or 0 if there is none.
 pub fn popRequest(gsid: u32, out: []u8) usize {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
+    const key = std.mem.print(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
     const r = cmd(&.{ "LPOP", key }) orelse return 0;
     return switch (r) {
         .bulk => |b| blk: {
@@ -202,10 +202,10 @@ pub fn popRequest(gsid: u32, out: []u8) usize {
 /// Answer a request on the key named by the seq that came in its header.
 pub fn putReply(seq: u32, packet: []const u8, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:gsreply:{x}", .{seq}) catch return false;
+    const key = std.mem.print(&kb, "realmd:gsreply:{x}", .{seq}) catch return false;
     const r = cmdBig(&.{ "SET", key }, packet) orelse return false;
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     _ = cmd(&.{ "PEXPIRE", key, px }) orelse return false;
     return switch (r) {
         .status, .int => true,
@@ -223,10 +223,10 @@ pub fn pushEvent(packet: []const u8, cap: u32, ttl_s: u32) bool {
         else => return false,
     }
     var cb: [16]u8 = undefined;
-    const keep = std.fmt.bufPrint(&cb, "-{d}", .{cap}) catch return false;
+    const keep = std.mem.print(&cb, "-{d}", .{cap}) catch return false;
     _ = cmd(&.{ "LTRIM", "realmd:gsev", keep, "-1" }) orelse return false;
     var pb: [16]u8 = undefined;
-    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+    const secs = std.mem.print(&pb, "{d}", .{ttl_s}) catch return false;
     _ = cmd(&.{ "EXPIRE", "realmd:gsev", secs }) orelse return false;
     return true;
 }
@@ -235,7 +235,7 @@ pub fn pushEvent(packet: []const u8, cap: u32, ttl_s: u32) bool {
 /// becomes a corrupt character and this feeds the engine directly.
 pub fn getChar(account: []const u8, charname: []const u8, out: []u8) usize {
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return 0;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return 0;
     const r = cmd(&.{ "GET", key }) orelse return 0;
     return switch (r) {
         .bulk => |b| blk: {
@@ -254,7 +254,7 @@ pub const Loaded = struct { len: usize, ver: u64 };
 /// The store's current version for a character, 0 if it has none.
 pub fn charVersion(account: []const u8, charname: []const u8) u64 {
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return 0;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return 0;
     const r = cmd(&.{ "GET", verkey }) orelse return 0;
     return switch (r) {
         .bulk => |b| blk: {
@@ -291,15 +291,15 @@ pub const SaveResult = union(enum) {
 /// from postgres — and in both cases a live session's bytes are the newest thing there is.
 pub fn putCharFenced(account: []const u8, charname: []const u8, save: []const u8, expect: u64) SaveResult {
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return .unavailable;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return .unavailable;
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return .unavailable;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return .unavailable;
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return .unavailable;
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{account}) catch return .unavailable;
     var mb: [192]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return .unavailable;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return .unavailable;
     var eb: [24]u8 = undefined;
-    const expect_s = std.fmt.bufPrint(&eb, "{d}", .{expect}) catch return .unavailable;
+    const expect_s = std.mem.print(&eb, "{d}", .{expect}) catch return .unavailable;
 
     const script =
         \\local cur = tonumber(redis.call('GET', KEYS[2]) or '0')
@@ -324,7 +324,7 @@ pub fn putCharFenced(account: []const u8, charname: []const u8, save: []const u8
 /// but nobody was told about would sit there while Postgres fell behind.
 pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) bool {
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return false;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return false;
     const set = cmdBig(&.{ "SET", key }, bytes) orelse return false;
     switch (set) {
         .status, .int => {},
@@ -332,8 +332,8 @@ pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) boo
         else => return false,
     }
     var vb: [192]u8 = undefined;
-    _ = cmd(&.{ "INCR", std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return false }) orelse return false;
+    _ = cmd(&.{ "INCR", std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return false }) orelse return false;
     var mb: [192]u8 = undefined;
-    _ = cmd(&.{ "SADD", "realmd:dirty", std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false }) orelse return false;
+    _ = cmd(&.{ "SADD", "realmd:dirty", std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return false }) orelse return false;
     return true;
 }

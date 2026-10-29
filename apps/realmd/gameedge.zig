@@ -46,9 +46,9 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
 
     // Dial the owning GS (internal address) and replay the rewritten first packet.
     var ipbuf: [16]u8 = undefined;
-    const ipz = std.fmt.bufPrintZ(&ipbuf, "{d}.{d}.{d}.{d}", .{
+    const ipz = std.mem.printSentinel(&ipbuf, "{d}.{d}.{d}.{d}", .{
         route.gs_ip[0], route.gs_ip[1], route.gs_ip[2], route.gs_ip[3],
-    }) catch return;
+    }, 0) catch return;
     const gs = net.connectTcp(ipz, route.gs_port) catch {
         log.line(tag, "game edge: dial GS {s}:{d} failed", .{ ipz, route.gs_port });
         return;

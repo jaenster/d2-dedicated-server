@@ -21,9 +21,9 @@ var start: i64 = 0;
 // Accumulated per games-live bucket, so a busy server reports cost against load rather than one
 // meaningless average over every mix it has seen.
 const MAX_BUCKET = 16;
-var ticks: [MAX_BUCKET]u32 = .{0} ** MAX_BUCKET;
-var total_us: [MAX_BUCKET]u64 = .{0} ** MAX_BUCKET;
-var worst_us: [MAX_BUCKET]u64 = .{0} ** MAX_BUCKET;
+var ticks: [MAX_BUCKET]u32 = @splat(0);
+var total_us: [MAX_BUCKET]u64 = @splat(0);
+var worst_us: [MAX_BUCKET]u64 = @splat(0);
 var since_report: u32 = 0;
 
 pub fn begin() void {

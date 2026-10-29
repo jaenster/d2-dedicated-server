@@ -130,7 +130,7 @@ fn decimalLen(v: usize) usize {
 }
 
 fn writeDecimal(buf: []u8, v: usize) usize {
-    const s = std.fmt.bufPrint(buf, "{d}", .{v}) catch unreachable;
+    const s = std.mem.print(buf, "{d}", .{v}) catch unreachable;
     return s.len;
 }
 
@@ -217,7 +217,7 @@ test "bulk values are binary safe" {
     // The bytes a .d2s save is made of: NULs, a stray \n, and a lone \r.
     const payload = "\x00\x01\nabc\r\x00";
     var buf: [64]u8 = undefined;
-    const wire = std.fmt.bufPrint(&buf, "${d}\r\n{s}\r\n", .{ payload.len, payload }) catch unreachable;
+    const wire = std.mem.print(&buf, "${d}\r\n{s}\r\n", .{ payload.len, payload }) catch unreachable;
     switch (parse(wire)) {
         .ok => |o| {
             try std.testing.expectEqualStrings(payload, o.reply.bulk.?);
@@ -238,7 +238,7 @@ test "garbage is rejected instead of scanned forever" {
     try std.testing.expectEqual(Parsed.invalid, parse("nonsense\r\n"));
     try std.testing.expectEqual(Parsed.invalid, parse(":notanumber\r\n"));
     // A long run with no terminator cannot become a valid header.
-    try std.testing.expectEqual(Parsed.invalid, parse("+" ++ ("x" ** 40)));
+    try std.testing.expectEqual(Parsed.invalid, parse("+" ++ (&@as([40]u8, @splat('x')))));
 }
 
 test "consumed lets replies be read back to back" {

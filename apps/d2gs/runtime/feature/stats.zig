@@ -44,14 +44,14 @@ var players_left: u32 = 0;
 
 var items_rolled: u32 = 0;
 /// Indexed by eD2ItemQuality (1=low … 8=crafted); slot 0 counts anything unrecognised.
-var items_by_quality: [9]u32 = .{0} ** 9;
+var items_by_quality: [9]u32 = @splat(0);
 
 /// Per item-code tallies. A fixed table with a linear probe: Items.txt has ~600 codes but
 /// one game touches a few dozen, and a scan of this many aligned words costs less than the
 /// allocation a map would need on a path the engine calls inside a drop loop.
 const CODE_SLOTS = 128;
-var code_key: [CODE_SLOTS]u32 = .{0} ** CODE_SLOTS; // packed 4-char code, 0 = free
-var code_hits: [CODE_SLOTS]u32 = .{0} ** CODE_SLOTS;
+var code_key: [CODE_SLOTS]u32 = @splat(0); // packed 4-char code, 0 = free
+var code_hits: [CODE_SLOTS]u32 = @splat(0);
 
 // live game table
 // `game` is only ever touched on the engine thread; every other field is a copy so the
@@ -63,7 +63,7 @@ const Slot = struct {
     used: u32 = 0,
     game: usize = 0,
     token: u32 = 0,
-    name: [16]u8 = .{0} ** 16,
+    name: [16]u8 = @splat(0),
     name_len: u32 = 0,
     difficulty: u32 = 0,
     clients: u32 = 0,
@@ -71,7 +71,7 @@ const Slot = struct {
     created_ms: u32 = 0,
 };
 
-var slots: [MAX_GAMES]Slot = [_]Slot{.{}} ** MAX_GAMES;
+var slots: [MAX_GAMES]Slot = @splat(.{});
 
 fn slotOf(game: usize) ?*Slot {
     for (&slots) |*s| {
@@ -133,7 +133,7 @@ pub fn itemRoll(ctx: *const GameCtx, item: *anyopaque) void {
     _ = ctx;
     items_rolled +%= 1;
     const u: *const t.UnitAny = @ptrCast(@alignCast(item));
-    if (u.dwType != @intFromEnum(t.UnitType.item)) return;
+    if (u.dwType != @backingInt(t.UnitType.item)) return;
     if (u.pUnitData) |pd| {
         const q = @as(*const t.ItemData, @ptrCast(@alignCast(pd))).dwQuality;
         items_by_quality[if (q < items_by_quality.len) q else 0] +%= 1;

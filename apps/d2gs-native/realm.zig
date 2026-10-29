@@ -791,8 +791,8 @@ fn announceBoot() void {
 
 fn onPacket(typ: u16, seq: u32, body: []const u8) void {
     switch (typ) {
-        @intFromEnum(p.Type.creategame) => onCreateGame(seq, body),
-        @intFromEnum(p.Type.joingame) => onJoinGame(seq, body),
+        @backingInt(p.Type.creategame) => onCreateGame(seq, body),
+        @backingInt(p.Type.joingame) => onJoinGame(seq, body),
         else => {},
     }
 }
@@ -931,7 +931,7 @@ fn gameFlags(difficulty: u8, expansion: bool, hardcore: bool, ladder: bool) u32 
 
 fn header(t: p.Type, size: u16) p.Header {
     seqno +%= 1;
-    return .{ .size = size, .type = @intFromEnum(t), .seqno = seqno };
+    return .{ .size = size, .type = @backingInt(t), .seqno = seqno };
 }
 
 fn writeHeader(buf: []u8, size: u16, typ: u16) void {
@@ -963,7 +963,7 @@ fn cstr(buf: []const u8) []const u8 {
 
 fn env(name: []const u8) ?[]const u8 {
     var nbuf: [64]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&nbuf, "{s}", .{name}) catch return null;
+    const z = std.mem.printSentinel(&nbuf, "{s}", .{name}, 0) catch return null;
     const v = std.c.getenv(z.ptr) orelse return null;
     const s = std.mem.span(v);
     return if (s.len == 0) null else s;
@@ -1041,7 +1041,7 @@ fn identity() u32 {
 
 fn note(comptime fmt: []const u8, args: anytype) void {
     var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.mem.print(&buf, fmt, args) catch return;
     _ = std.c.write(2, s.ptr, s.len);
 }
 

@@ -54,12 +54,12 @@ fn say(msg: []const u8) void {
 
 fn sayFmt(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    say(std.fmt.bufPrint(&buf, fmt, args) catch return);
+    say(std.mem.print(&buf, fmt, args) catch return);
 }
 
 fn sayHex(prefix: []const u8, v: usize) void {
     var buf: [128]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{s}0x{x}", .{ prefix, v }) catch return;
+    const s = std.mem.print(&buf, "{s}0x{x}", .{ prefix, v }) catch return;
     say(s);
 }
 
@@ -549,7 +549,7 @@ fn pumpCharacterLoads() void {
                 var hex: [0x60 * 3]u8 = undefined;
                 var w: usize = 0;
                 for (p.save[0..dump_len]) |b| {
-                    _ = std.fmt.bufPrint(hex[w..][0..3], "{x:0>2} ", .{b}) catch break;
+                    _ = std.mem.print(hex[w..][0..3], "{x:0>2} ", .{b}) catch break;
                     w += 3;
                 }
                 sayFmt("d2host: record head {s}", .{hex[0..w]});
@@ -727,7 +727,7 @@ fn pumpRealm() void {
     // Every request is announced, including ones we do not handle. A realm message that arrives
     // and is quietly ignored is indistinguishable from one that never arrived, and that ambiguity
     // is expensive to debug from the other end.
-    switch (@as(proto.Type, @enumFromInt(typ))) {
+    switch (@as(proto.Type, @fromBackingInt(typ))) {
         .creategame => handleCreateGame(seq, buf[proto.HEADER_LEN .. size]),
         .joingame => handleJoinGame(seq, buf[proto.HEADER_LEN .. size]),
         else => sayFmt("d2host: realm request type 0x{x} seq {d} — not handled", .{ typ, seq }),
@@ -907,13 +907,13 @@ fn cformat(buf: []u8, fmt: [*:0]const u8, ap: anytype) []const u8 {
             's' => {
                 const p = @cVaArg(ap, ?[*:0]const u8);
                 const v = if (p) |q| std.mem.sliceTo(q, 0) else "(null)";
-                n += (std.fmt.bufPrint(rest, "{s}", .{v}) catch break).len;
+                n += (std.mem.print(rest, "{s}", .{v}) catch break).len;
             },
-            'd', 'i' => n += (std.fmt.bufPrint(rest, "{d}", .{@cVaArg(ap, i32)}) catch break).len,
-            'u' => n += (std.fmt.bufPrint(rest, "{d}", .{@cVaArg(ap, u32)}) catch break).len,
-            'x' => n += (std.fmt.bufPrint(rest, "{x}", .{@cVaArg(ap, u32)}) catch break).len,
-            'X' => n += (std.fmt.bufPrint(rest, "{X}", .{@cVaArg(ap, u32)}) catch break).len,
-            'c' => n += (std.fmt.bufPrint(rest, "{c}", .{@as(u8, @truncate(@cVaArg(ap, u32)))}) catch break).len,
+            'd', 'i' => n += (std.mem.print(rest, "{d}", .{@cVaArg(ap, i32)}) catch break).len,
+            'u' => n += (std.mem.print(rest, "{d}", .{@cVaArg(ap, u32)}) catch break).len,
+            'x' => n += (std.mem.print(rest, "{x}", .{@cVaArg(ap, u32)}) catch break).len,
+            'X' => n += (std.mem.print(rest, "{X}", .{@cVaArg(ap, u32)}) catch break).len,
+            'c' => n += (std.mem.print(rest, "{c}", .{@as(u8, @truncate(@cVaArg(ap, u32)))}) catch break).len,
             else => |c| {
                 buf[n] = c;
                 n += 1;
@@ -1636,7 +1636,7 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     if (moduleHandle(&modules, "D2Net.dll")) |net| {
         if (GetProcAddress(net, "D2NET_SetEngineVersion")) |p| {
             const set: *const fn (u32) callconv(.c) i32 = @ptrCast(@alignCast(p));
-            if (set(@intFromEnum(version)) == 0)
+            if (set(@backingInt(version)) == 0)
                 sayFmt("d2host: D2Net kept its default framing for {s}", .{@tagName(version)});
         }
     }
@@ -1654,7 +1654,7 @@ fn run(comptime version: d2version.Version, install_dir: ?[*:0]const u8) !void {
     if (moduleHandle(&modules, "Fog.dll")) |fog| {
         if (GetProcAddress(fog, "FOG_SetEngineVersion")) |p| {
             const set: *const fn (u32) callconv(.c) i32 = @ptrCast(@alignCast(p));
-            if (set(@intFromEnum(version)) == 0)
+            if (set(@backingInt(version)) == 0)
                 sayFmt("d2host: Fog kept its default ABI for {s}", .{@tagName(version)});
         } else say("d2host: Fog has no FOG_SetEngineVersion — using its built-in ABI");
     }

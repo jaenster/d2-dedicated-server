@@ -62,7 +62,7 @@ fn writeFile(path: [*:0]const u8, data: []const u8) !void {
 }
 
 fn mkdirs(gpa: std.mem.Allocator, path: []const u8) !void {
-    const buf = try gpa.dupeZ(u8, path);
+    const buf = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(buf);
     var i: usize = 1;
     while (i < buf.len) : (i += 1) {
@@ -104,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const tome_path = try gpa.dupeZ(u8, argv[1]);
+    const tome_path = try gpa.dupeSentinel(u8, argv[1], 0);
     const bytes = try readFile(gpa, tome_path.ptr);
     var archive = try mpq.Archive.open(gpa, bytes);
     defer archive.deinit(gpa);
@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
     const manifest = try archive.read(gpa, installer.manifest_path);
     // The expansion's script deletes from wherever the base game already sits, which for us is
     // the directory being installed into.
-    const original = try std.fmt.allocPrint(gpa, "{s}/", .{argv[2]});
+    const original = try gpa.print("{s}/", .{argv[2]});
     const plan = try installer.parse(gpa, manifest, .{
         .platform = if (std.mem.eql(u8, platform, "macos")) .macos else .win32,
         .language = lang,
@@ -160,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
             total += data.len;
             if (list_only) continue;
 
-            const full = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ argv[2], rel }, 0);
+            const full = try gpa.printSentinel("{s}/{s}", .{ argv[2], rel }, 0);
             defer gpa.free(full);
             if (std.mem.lastIndexOfScalar(u8, full, '/')) |cut| try mkdirs(gpa, full[0..cut]);
             try writeFile(full.ptr, data);
@@ -182,7 +182,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("  delete {s}\n", .{rel});
             removed += 1;
             if (list_only) continue;
-            const full = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ argv[2], rel }, 0);
+            const full = try gpa.printSentinel("{s}/{s}", .{ argv[2], rel }, 0);
             defer gpa.free(full);
             _ = unlink(full.ptr);
         },
@@ -198,7 +198,7 @@ pub fn main(init: std.process.Init) !void {
         if (seen.contains(a.container)) continue;
         try seen.put(gpa, a.container, {});
 
-        const path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ argv[2], a.container }, 0);
+        const path = try gpa.printSentinel("{s}/{s}", .{ argv[2], a.container }, 0);
         defer gpa.free(path);
         const before = readFile(gpa, path.ptr) catch {
             std.debug.print("  warn  {s} is not here to add members to\n", .{a.container});

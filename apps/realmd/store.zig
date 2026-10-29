@@ -331,7 +331,7 @@ pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8, mode
 /// The hardcore/ladder flags the account's most recently played character of the given expansion
 /// type carries, or null if it has none of that type. Reads headers only.
 pub fn accountDefaultMode(account: []const u8, expansion: bool) ?u8 {
-    var names: [max_chars]Name = [_]Name{.{}} ** max_chars;
+    var names: [max_chars]Name = @splat(.{});
     const n = listChars(account, &names);
     var bufs: [max_chars][1024]u8 = undefined;
     var saves: [max_chars][]const u8 = undefined;
@@ -754,7 +754,7 @@ pub fn releaseGameName(name: []const u8) void {
 /// The owner id a game uses for the characters it holds. Stable across instances, because any
 /// realmd may be the one that closes the game.
 pub fn gameOwnerId(buf: []u8, gameid: u32) []const u8 {
-    return std.fmt.bufPrint(buf, "game:{d}", .{gameid}) catch buf[0..0];
+    return std.mem.print(buf, "game:{d}", .{gameid}) catch buf[0..0];
 }
 
 pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: u32) redis.SeatResult {
@@ -912,7 +912,7 @@ fn setName(n: *Name, v: []const u8) void {
 }
 
 test "mergeOldestFirst puts unflushed characters last, in name order" {
-    var names: [5]Name = [_]Name{.{}} ** 5;
+    var names: [5]Name = @splat(.{});
     setName(&names[0], "Old");
     setName(&names[1], "Older");
     var cached: [3]Name = .{ .{}, .{}, .{} };
@@ -928,7 +928,7 @@ test "mergeOldestFirst puts unflushed characters last, in name order" {
 }
 
 test "mergeOldestFirst drops the newest when the list is full" {
-    var names: [2]Name = [_]Name{.{}} ** 2;
+    var names: [2]Name = @splat(.{});
     setName(&names[0], "A");
     setName(&names[1], "B");
     var cached: [1]Name = .{.{}};

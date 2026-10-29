@@ -150,7 +150,7 @@ pub fn strlcat(dst: [*]u8, src: [*:0]const u8, size: usize) callconv(.c) usize {
 }
 
 // This file is also compiled on the development host, where the Linux spelling does not exist.
-const usableSize = switch (builtin.os.tag) {
+const usableSize = switch (builtin.target.os.tag) {
     .macos, .ios, .tvos, .watchos => struct {
         extern fn malloc_size(?*const anyopaque) usize;
     }.malloc_size,
@@ -161,7 +161,7 @@ const usableSize = switch (builtin.os.tag) {
 
 pub fn malloc_size(p: ?*const anyopaque) callconv(.c) usize {
     if (p == null) return 0;
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .macos, .ios, .tvos, .watchos => usableSize(p),
         else => usableSize(@constCast(p)),
     };

@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var lines = std.mem.tokenizeAny(u8, lf, "\r\n");
     while (lines.next()) |name| {
         n += 1;
-        const cname = gpa.dupeZ(u8, name) catch continue;
+        const cname = gpa.dupeSentinel(u8, name, 0) catch continue;
         defer gpa.free(cname);
         var hdr: [64]u8 = undefined;
         var fh: HANDLE = null;

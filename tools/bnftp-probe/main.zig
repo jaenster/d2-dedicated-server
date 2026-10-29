@@ -67,14 +67,14 @@ fn readSome(fd: Socket, buf: []u8) usize {
 
 /// TCP-connect to host:port, resolving via libc getaddrinfo.
 fn connectResolved(gpa: std.mem.Allocator, host: []const u8, port: u16) !Socket {
-    const chost = try gpa.dupeZ(u8, host);
+    const chost = try gpa.dupeSentinel(u8, host, 0);
     var pbuf: [8]u8 = undefined;
-    const cserv = std.fmt.bufPrintZ(&pbuf, "{d}", .{port}) catch unreachable;
+    const cserv = std.mem.printSentinel(&pbuf, "{d}", .{port}, 0) catch unreachable;
     var hints = std.mem.zeroes(std.c.addrinfo);
     hints.family = 0; // AF_UNSPEC
     hints.socktype = SOCK_STREAM;
     var res: ?*std.c.addrinfo = null;
-    if (@intFromEnum(std.c.getaddrinfo(chost.ptr, cserv.ptr, &hints, &res)) != 0) return error.ResolveFailed;
+    if (@backingInt(std.c.getaddrinfo(chost.ptr, cserv.ptr, &hints, &res)) != 0) return error.ResolveFailed;
     defer if (res) |r| std.c.freeaddrinfo(r);
     var ai = res;
     while (ai) |a| : (ai = a.next) {
@@ -487,9 +487,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 // into realmd-data/bnftp/ so our server serves the authentic file).
                 // Otherwise save to cwd as bnftp-<name> for ad-hoc inspection.
                 const out = if (out_dir) |d|
-                    try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ d, basename(file_to_get) }, 0)
+                    try gpa.printSentinel("{s}/{s}", .{ d, basename(file_to_get) }, 0)
                 else
-                    try std.fmt.allocPrintSentinel(gpa, "bnftp-{s}", .{basename(file_to_get)}, 0);
+                    try gpa.printSentinel("bnftp-{s}", .{basename(file_to_get)}, 0);
                 try writeFile(out.ptr, body[0..@min(body.len, fsize)]);
                 std.debug.print("  saved {d} file bytes -> {s}\n", .{ @min(body.len, fsize), out });
                 if (body.len >= 4) std.debug.print("  first 4 file bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2} (MPQ magic 'MPQ\\x1a' = 4d 50 51 1a)\n", .{ body[0], body[1], body[2], body[3] });

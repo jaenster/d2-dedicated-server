@@ -100,8 +100,8 @@ extern "c" fn inet_addr(cp: [*:0]const u8) c_uint;
 fn lastErrno() c_int {
     return std.c._errno().*;
 }
-const EAGAIN: c_int = @intFromEnum(posix.E.AGAIN);
-const EINPROGRESS: c_int = @intFromEnum(posix.E.INPROGRESS);
+const EAGAIN: c_int = @backingInt(posix.E.AGAIN);
+const EINPROGRESS: c_int = @backingInt(posix.E.INPROGRESS);
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 // REALMD_INGRESS_TRACE=1 → hexdump every spliced chunk both directions (debug; verbose).
@@ -403,7 +403,7 @@ const Gateway = struct {
     /// False if the send buffer or the waiting line is full (caller drops the connection).
     fn redisRequestRoute(g: *Gateway, c: *Conn, token: u16) bool {
         var cmd: [48]u8 = undefined;
-        const s = std.fmt.bufPrint(&cmd, "GET " ++ ROUTE_KEY_PREFIX ++ "{x}\r\n", .{token}) catch return false;
+        const s = std.mem.print(&cmd, "GET " ++ ROUTE_KEY_PREFIX ++ "{x}\r\n", .{token}) catch return false;
         if (g.pend_count >= MAX_CONN) return false;
         if (g.redis_out_len + s.len > REDIS_OUT_SZ) return false;
         @memcpy(g.redis_out[g.redis_out_len..][0..s.len], s);

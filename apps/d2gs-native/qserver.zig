@@ -97,7 +97,7 @@ pub fn install(loaded: *const macho.load.Loaded) void {
 /// jumping to the loop's next-client at 0x002f5f13 (`MOV EAX, 1` is exactly 5 bytes, EAX/flags dead).
 fn guardClosedSockets(loaded: *const macho.load.Loaded) void {
     // The guard below is i386 instructions; there is no image running anywhere else to patch.
-    if (comptime @import("builtin").cpu.arch != .x86) return;
+    if (comptime @import("builtin").target.cpu.arch != .x86) return;
 
     const jnz: [*]u8 = @ptrFromInt(loaded.at(addr.closed_socket_clear_jnz));
     jnz[0] = 0xeb;
@@ -198,6 +198,6 @@ fn running() *u8 {
 /// Unbuffered, for the same reason main.zig's is: this has to survive a fault.
 fn note(comptime fmt: []const u8, args: anytype) void {
     var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.mem.print(&buf, fmt, args) catch return;
     _ = std.c.write(2, s.ptr, s.len);
 }

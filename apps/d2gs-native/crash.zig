@@ -10,7 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const enabled = builtin.os.tag == .linux and builtin.cpu.arch == .x86;
+const enabled = builtin.target.os.tag == .linux and builtin.target.cpu.arch == .x86;
 
 var slide: usize = 0;
 var low: usize = 0;
@@ -121,7 +121,7 @@ fn onFault(sig: std.os.linux.SIG, info: *const std.os.linux.siginfo_t, ctx: ?*an
     // turn into a trap for a signal number it has no name for.
     var n: usize = 0;
     n = str(&scratch, n, "\nd2gs-native: signal ");
-    n = hex(&scratch, n, @intFromEnum(sig));
+    n = hex(&scratch, n, @backingInt(sig));
     n = str(&scratch, n, " ctx 0x");
     n = hex(&scratch, n, @intFromPtr(ctx));
     n = str(&scratch, n, "\n");

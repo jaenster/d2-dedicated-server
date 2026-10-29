@@ -145,7 +145,7 @@ pub const Reader = struct {
     }
     /// Read exactly 20 bytes (a hash); zeros on underflow (sets .bad).
     pub fn take20(r: *Reader) *const [20]u8 {
-        const zero = &[_]u8{0} ** 20;
+        const zero: *const [20]u8 = &@splat(0);
         const s = r.take(20) orelse return zero;
         return s[0..20];
     }

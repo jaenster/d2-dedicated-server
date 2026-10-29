@@ -40,7 +40,7 @@ const account_rec_len = 22;
 fn accountKey(buf: []u8, name: []const u8) ?[]const u8 {
     var nb: [64]u8 = undefined;
     const a = sanitize(name, &nb) orelse return null;
-    return std.fmt.bufPrint(buf, prefix ++ "account:{s}", .{a}) catch null;
+    return std.mem.print(buf, prefix ++ "account:{s}", .{a}) catch null;
 }
 
 fn readAccount(name: []const u8, out: *[account_rec_len]u8) bool {
@@ -88,7 +88,7 @@ fn writeAccount(name: []const u8, rec: *const [account_rec_len]u8, only_if_absen
 }
 
 pub fn createAccount(name: []const u8, pwhash: ?[20]u8) bool {
-    var rec: [account_rec_len]u8 = [_]u8{0} ** account_rec_len;
+    var rec: [account_rec_len]u8 = @splat(0);
     if (pwhash) |h| {
         rec[0] = 1;
         @memcpy(rec[1..21], &h);
@@ -182,7 +182,7 @@ fn userDataKey(buf: []u8, account: []const u8, key_: []const u8) ?[]const u8 {
         h ^= c;
         h *%= 1099511628211;
     }
-    return std.fmt.bufPrint(buf, prefix ++ "userdata:{s}:{x}", .{ a, h }) catch null;
+    return std.mem.print(buf, prefix ++ "userdata:{s}:{x}", .{ a, h }) catch null;
 }
 
 pub fn getUserData(account: []const u8, key_: []const u8, out: []u8) usize {
@@ -215,7 +215,7 @@ pub fn setUserData(account: []const u8, key_: []const u8, value: []const u8) boo
 fn guildKey(buf: []u8, name: []const u8) ?[]const u8 {
     var nb: [64]u8 = undefined;
     const g = sanitize(name, &nb) orelse return null;
-    return std.fmt.bufPrint(buf, prefix ++ "guild:{s}", .{g}) catch null;
+    return std.mem.print(buf, prefix ++ "guild:{s}", .{g}) catch null;
 }
 
 pub fn saveGuild(name: []const u8, bytes: []const u8) bool {
@@ -310,7 +310,7 @@ const Slot = struct {
     fd: ?net.Socket = null,
 };
 
-var slots = [_]Slot{.{}} ** POOL_N;
+var slots: [POOL_N]Slot = @splat(.{});
 var rotor = std.atomic.Value(u32).init(0);
 
 /// Set by `readReply` when the node answered READONLY or MASTERDOWN: the connection is to a node
@@ -511,7 +511,7 @@ const CmdBuf = struct {
 
     fn print(c: *CmdBuf, comptime fmt: []const u8, args: anytype) void {
         var tmp: [24]u8 = undefined;
-        const s = std.fmt.bufPrint(&tmp, fmt, args) catch {
+        const s = std.mem.print(&tmp, fmt, args) catch {
             c.ok = false;
             return;
         };
@@ -648,9 +648,9 @@ pub fn saveCharD2s(account: []const u8, charname: []const u8, bytes: []const u8)
     const a = sanitize(account, &ab) orelse return false;
     const c = sanitize(charname, &cb) orelse return false;
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return false;
+    const key = std.mem.print(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return false;
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, prefix ++ "chars:{s}", .{a}) catch return false;
+    const setkey = std.mem.print(&sb, prefix ++ "chars:{s}", .{a}) catch return false;
 
     const s = acquire();
     defer release(s);
@@ -669,7 +669,7 @@ pub fn getCharD2s(account: []const u8, charname: []const u8, out: []u8) usize {
     const a = sanitize(account, &ab) orelse return 0;
     const c = sanitize(charname, &cb) orelse return 0;
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return 0;
+    const key = std.mem.print(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return 0;
 
     const s = acquire();
     defer release(s);
@@ -690,17 +690,17 @@ pub fn deleteCharD2s(account: []const u8, charname: []const u8) bool {
     const a = sanitize(account, &ab) orelse return false;
     const c = sanitize(charname, &cb) orelse return false;
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return false;
+    const key = std.mem.print(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return false;
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, prefix ++ "chars:{s}", .{a}) catch return false;
+    const setkey = std.mem.print(&sb, prefix ++ "chars:{s}", .{a}) catch return false;
 
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
     var mb: [192]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ a, c }) catch return false;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ a, c }) catch return false;
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, prefix ++ "charver:{s}/{s}", .{ a, c }) catch return false;
+    const verkey = std.mem.print(&vb, prefix ++ "charver:{s}/{s}", .{ a, c }) catch return false;
 
     // Drop the save blob and remove the name from the account's char set. Mirror of
     // saveCharD2s (SET + SADD); idempotent — a missing key is fine.
@@ -720,7 +720,7 @@ pub fn listChars(account: []const u8, names: []Name) usize {
     var ab: [64]u8 = undefined;
     const a = sanitize(account, &ab) orelse return 0;
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, prefix ++ "chars:{s}", .{a}) catch return 0;
+    const setkey = std.mem.print(&sb, prefix ++ "chars:{s}", .{a}) catch return 0;
 
     const s = acquire();
     defer release(s);
@@ -760,7 +760,7 @@ pub fn listChars(account: []const u8, names: []Name) usize {
 const ext_key_buf = 192;
 
 fn extKey(buf: []u8, ext: []const u8, key: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "ext:{s}:{s}", .{ ext, key }) catch null;
+    return std.mem.print(buf, prefix ++ "ext:{s}:{s}", .{ ext, key }) catch null;
 }
 
 pub fn getExtCache(ext: []const u8, key: []const u8, out: []u8) usize {
@@ -791,7 +791,7 @@ pub fn setExtCache(ext: []const u8, key: []const u8, value: []const u8, ttl_s: u
     var r: Reader = undefined;
     const rep = if (ttl_s > 0) blk: {
         var pb: [16]u8 = undefined;
-        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
         break :blk command(s, &r, &.{ "SET", k, value, "PX", px });
     } else command(s, &r, &.{ "SET", k, value });
     return switch (rep orelse return false) {
@@ -817,7 +817,7 @@ pub fn incrExtCache(ext: []const u8, key: []const u8, by: i64, ttl_s: u32) ?i64 
     var kb: [ext_key_buf]u8 = undefined;
     const k = extKey(&kb, ext, key) orelse return null;
     var bb: [24]u8 = undefined;
-    const byv = std.fmt.bufPrint(&bb, "{d}", .{by}) catch return null;
+    const byv = std.mem.print(&bb, "{d}", .{by}) catch return null;
 
     const s = acquire();
     defer release(s);
@@ -831,7 +831,7 @@ pub fn incrExtCache(ext: []const u8, key: []const u8, by: i64, ttl_s: u32) ?i64 
     // rate-limit window slide forever for anyone who keeps hitting it.
     if (ttl_s > 0 and v == by) {
         var pb: [16]u8 = undefined;
-        const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return v;
+        const secs = std.mem.print(&pb, "{d}", .{ttl_s}) catch return v;
         var r2: Reader = undefined;
         _ = command(s, &r2, &.{ "EXPIRE", k, secs });
     }
@@ -843,19 +843,19 @@ pub fn incrExtCache(ext: []const u8, key: []const u8, by: i64, ttl_s: u32) ?i64 
 /// stops at the newline and is unaffected.
 pub fn saveSession(id: u64, account: []const u8, version: []const u8, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "session:{x}", .{id}) catch return false;
+    const key = std.mem.print(&kb, prefix ++ "session:{x}", .{id}) catch return false;
     var vb: [96]u8 = undefined;
     const val = if (version.len == 0)
         account
     else
-        std.fmt.bufPrint(&vb, "{s}\n{s}", .{ account, version }) catch account;
+        std.mem.print(&vb, "{s}\n{s}", .{ account, version }) catch account;
 
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
     const rep = if (ttl_s > 0) blk: {
         var pb: [16]u8 = undefined;
-        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
         break :blk command(s, &r, &.{ "SET", key, val, "PX", px });
     } else command(s, &r, &.{ "SET", key, val });
     return switch (rep orelse return false) {
@@ -867,7 +867,7 @@ pub fn saveSession(id: u64, account: []const u8, version: []const u8, ttl_s: u32
 /// The engine half of a session record, empty when it has none.
 pub fn versionForSession(id: u64, out: []u8) []const u8 {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "session:{x}", .{id}) catch return out[0..0];
+    const key = std.mem.print(&kb, prefix ++ "session:{x}", .{id}) catch return out[0..0];
 
     const s = acquire();
     defer release(s);
@@ -886,7 +886,7 @@ pub fn versionForSession(id: u64, out: []u8) []const u8 {
 
 pub fn accountForSession(id: u64, out: []u8) ?[]const u8 {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "session:{x}", .{id}) catch return null;
+    const key = std.mem.print(&kb, prefix ++ "session:{x}", .{id}) catch return null;
 
     const s = acquire();
     defer release(s);
@@ -909,7 +909,7 @@ pub fn accountForSession(id: u64, out: []u8) ?[]const u8 {
 // restart is a ticket that outlived its reason, so this is redis and not the store of record.
 
 fn ticketKey(buf: []u8, account: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "ticket:{s}", .{account}) catch null;
+    return std.mem.print(buf, prefix ++ "ticket:{s}", .{account}) catch null;
 }
 
 /// The outstanding tickets of an account are a list, newest last: several clients of one player start
@@ -923,7 +923,7 @@ pub fn putLoginTicket(account: []const u8, ticket: []const u8, ttl_s: u32) bool 
     defer release(s);
     var r: Reader = undefined;
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const script =
         \\if redis.call('TYPE', KEYS[1]).ok ~= 'list' then redis.call('DEL', KEYS[1]) end
         \\redis.call('RPUSH', KEYS[1], ARGV[1])
@@ -1000,7 +1000,7 @@ pub fn redeemLoginTicket(account: []const u8, ticket: []const u8) bool {
 
 pub fn expireSession(id: u64) void {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "session:{x}", .{id}) catch return;
+    const key = std.mem.print(&kb, prefix ++ "session:{x}", .{id}) catch return;
 
     const s = acquire();
     defer release(s);
@@ -1016,17 +1016,17 @@ pub fn registerGame(name: []const u8, gameid: u32, gs_ip: [4]u8, gs_port: u16, g
     const safe = gameKey(name, &nb) orelse return regFail("name is empty, too long, or has characters outside printable ASCII");
 
     var gk: [128]u8 = undefined;
-    const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
+    const gamekey = std.mem.print(&gk, prefix ++ "game:{s}", .{safe}) catch return false;
     var vb: [game_rec_max]u8 = undefined;
     const body = formatGame(&vb, .{ .gameid = gameid, .gs_ip = gs_ip, .gs_port = gs_port, .gsid = gsid, .players = players, .status = status, .difficulty = difficulty, .max_players = max_players }, password, description) orelse return regFail("record does not fit");
     var ik: [64]u8 = undefined;
-    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
+    const idkey = std.mem.print(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
     var gb: [64]u8 = undefined;
-    const gskey = std.fmt.bufPrint(&gb, prefix ++ "game:bygs:{x}", .{gsid}) catch return false;
+    const gskey = std.mem.print(&gb, prefix ++ "game:bygs:{x}", .{gsid}) catch return false;
 
     var pb: [16]u8 = undefined;
     const has_ttl = ttl_s > 0;
-    const px = if (has_ttl) (std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false) else "";
+    const px = if (has_ttl) (std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false) else "";
 
     // Writes the record + both reverse indexes; ordered against close/expire (see game_index_lock).
     game_index_lock.lock();
@@ -1098,7 +1098,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
     var c = CmdBuf{ .fd = fd };
     for (0..got) |i| {
         var gk: [128]u8 = undefined;
-        const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{names[i][0..nlen[i]]}) catch {
+        const gamekey = std.mem.print(&gk, prefix ++ "game:{s}", .{names[i][0..nlen[i]]}) catch {
             c.ok = false;
             break;
         };
@@ -1111,7 +1111,7 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
     }
 
     // Every reply must be consumed even once `out` is full, or the connection desyncs.
-    var expired = [_]bool{false} ** names.len;
+    var expired: [names.len]bool = @splat(false);
     var any_expired = false;
     var synced = true;
     var n: usize = 0;
@@ -1163,7 +1163,7 @@ pub fn findGame(name: []const u8) ?GameRec {
     var nb: [64]u8 = undefined;
     const safe = gameKey(name, &nb) orelse return null;
     var gk: [128]u8 = undefined;
-    const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{safe}) catch return null;
+    const gamekey = std.mem.print(&gk, prefix ++ "game:{s}", .{safe}) catch return null;
 
     const s = acquire();
     defer release(s);
@@ -1189,9 +1189,9 @@ fn formatGame(buf: []u8, rec: GameRec, password: []const u8, description: []cons
     const dn = @min(description.len, db.len);
     for (description[0..dn], db[0..dn]) |c, *o| o.* = if (c == '\n') ' ' else c;
     const ip = rec.gs_ip;
-    var head = std.fmt.bufPrint(buf, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{ rec.gameid, ip[0], ip[1], ip[2], ip[3], rec.gs_port, rec.gsid, rec.players, rec.status, rec.difficulty, password, db[0..dn] }) catch return null;
+    var head = std.mem.print(buf, "{d} {d}.{d}.{d}.{d} {d} {d} {d} {d} {d} {s} {s}", .{ rec.gameid, ip[0], ip[1], ip[2], ip[3], rec.gs_port, rec.gsid, rec.players, rec.status, rec.difficulty, password, db[0..dn] }) catch return null;
     if (rec.max_players != 8) {
-        const cap = std.fmt.bufPrint(buf[head.len..], "\n#{d}", .{rec.max_players}) catch return null;
+        const cap = std.mem.print(buf[head.len..], "\n#{d}", .{rec.max_players}) catch return null;
         head = buf[0 .. head.len + cap.len];
     }
     return head;
@@ -1241,7 +1241,7 @@ pub fn setGamePlayers(gameid: u32, players: u16) bool {
     // When the server last said what the count is. A join the realm counted ahead of the server
     // (see `sweepGameSeats`) is only still in the count if it happened after this.
     var ck: [64]u8 = undefined;
-    const counted = std.fmt.bufPrint(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return true;
+    const counted = std.mem.print(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return true;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -1257,7 +1257,7 @@ pub fn dropGamePlayers(gameid: u32, n: u16) bool {
 
 fn updateGamePlayers(gameid: u32, set: ?u16, drop: u16) bool {
     var ik: [64]u8 = undefined;
-    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
+    const idkey = std.mem.print(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return false;
 
     // A read-modify-write over the game index (GET the name, GET the record, SET it back).
     game_index_lock.lock();
@@ -1275,7 +1275,7 @@ fn updateGamePlayers(gameid: u32, set: ?u16, drop: u16) bool {
     if (name.len == 0 or name.len > ncopy.len) return false;
     @memcpy(ncopy[0..name.len], name);
     var gk: [128]u8 = undefined;
-    const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{ncopy[0..name.len]}) catch return false;
+    const gamekey = std.mem.print(&gk, prefix ++ "game:{s}", .{ncopy[0..name.len]}) catch return false;
 
     const rep = command(s, &r, &.{ "GET", gamekey }) orelse return false;
     const val = switch (rep) {
@@ -1296,7 +1296,7 @@ fn updateGamePlayers(gameid: u32, set: ?u16, drop: u16) bool {
 /// game record and that index entry.
 pub fn removeGameById(gameid: u32) void {
     var ik: [64]u8 = undefined;
-    const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return;
+    const idkey = std.mem.print(&ik, prefix ++ "game:byid:{x}", .{gameid}) catch return;
 
     // Resolves a name through byid, which a concurrent create may have just rebound.
     game_index_lock.lock();
@@ -1314,7 +1314,7 @@ pub fn removeGameById(gameid: u32) void {
     if (name.len == 0 or name.len > ncopy.len) return;
     @memcpy(ncopy[0..name.len], name);
     var gk: [128]u8 = undefined;
-    const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{ncopy[0..name.len]}) catch return;
+    const gamekey = std.mem.print(&gk, prefix ++ "game:{s}", .{ncopy[0..name.len]}) catch return;
     // Recover the gsid (record fields: "gameid ip port gsid players <pw>") so we can
     // also drop the name from the per-GS reverse index — otherwise dead names pile up
     // in bygs until the GS disconnects. Parse it to a value BEFORE the next command
@@ -1335,7 +1335,7 @@ pub fn removeGameById(gameid: u32) void {
     _ = command(s, &r, &.{ "SREM", prefix ++ "games", ncopy[0..name.len] });
     if (gsid) |gid| {
         var gb: [64]u8 = undefined;
-        const gskey = std.fmt.bufPrint(&gb, prefix ++ "game:bygs:{x}", .{gid}) catch return;
+        const gskey = std.mem.print(&gb, prefix ++ "game:bygs:{x}", .{gid}) catch return;
         _ = command(s, &r, &.{ "SREM", gskey, ncopy[0..name.len] });
     }
 }
@@ -1343,7 +1343,7 @@ pub fn removeGameById(gameid: u32) void {
 /// Expire every game hosted by a GS that disconnected, via its bygs set.
 pub fn expireGamesByGs(gsid: u32) void {
     var gb: [64]u8 = undefined;
-    const gskey = std.fmt.bufPrint(&gb, prefix ++ "game:bygs:{x}", .{gsid}) catch return;
+    const gskey = std.mem.print(&gb, prefix ++ "game:bygs:{x}", .{gsid}) catch return;
 
     // Bulk removal over the same index keys as create and close.
     game_index_lock.lock();
@@ -1388,7 +1388,7 @@ pub fn expireGamesByGs(gsid: u32) void {
     for (0..got) |i| {
         const gname = pending[i][0..plen[i]];
         var gk: [128]u8 = undefined;
-        const gamekey = std.fmt.bufPrint(&gk, prefix ++ "game:{s}", .{gname}) catch continue;
+        const gamekey = std.mem.print(&gk, prefix ++ "game:{s}", .{gname}) catch continue;
         // Look up the game record to recover its gameid so we can also drop the
         // byid reverse-index key. If the record is already gone, skip the byid del.
         const grep = command(s, &r, &.{ "GET", gamekey }) orelse continue;
@@ -1398,7 +1398,7 @@ pub fn expireGamesByGs(gsid: u32) void {
         }) |val| {
             if (parseGame(val)) |rec| {
                 var ik: [64]u8 = undefined;
-                const idkey = std.fmt.bufPrint(&ik, prefix ++ "game:byid:{x}", .{rec.gameid}) catch null;
+                const idkey = std.mem.print(&ik, prefix ++ "game:byid:{x}", .{rec.gameid}) catch null;
                 if (idkey) |k| _ = command(s, &r, &.{ "DEL", k });
             }
         }
@@ -1410,21 +1410,21 @@ pub fn expireGamesByGs(gsid: u32) void {
 // routes (ephemeral, PX TTL) — keyed by client source IP
 
 fn routeKey(buf: []u8, client_ip: [4]u8) []const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "route:{d}.{d}.{d}.{d}", .{ client_ip[0], client_ip[1], client_ip[2], client_ip[3] }) catch unreachable;
+    return std.mem.print(buf, prefix ++ "route:{d}.{d}.{d}.{d}", .{ client_ip[0], client_ip[1], client_ip[2], client_ip[3] }) catch unreachable;
 }
 
 pub fn recordRoute(client_ip: [4]u8, gs_ip: [4]u8, gs_port: u16, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
     const key = routeKey(&kb, client_ip);
     var vb: [64]u8 = undefined;
-    const body = std.fmt.bufPrint(&vb, "{d}.{d}.{d}.{d} {d}", .{ gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port }) catch return false;
+    const body = std.mem.print(&vb, "{d}.{d}.{d}.{d} {d}", .{ gs_ip[0], gs_ip[1], gs_ip[2], gs_ip[3], gs_port }) catch return false;
 
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
     const rep = if (ttl_s > 0) blk: {
         var pb: [16]u8 = undefined;
-        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
         break :blk command(s, &r, &.{ "SET", key, body, "PX", px });
     } else command(s, &r, &.{ "SET", key, body });
     return switch (rep orelse return false) {
@@ -1462,7 +1462,7 @@ pub fn lookupRoute(client_ip: [4]u8) ?Route {
 // token routes (ephemeral, PX TTL) — keyed by realm-global token
 
 fn tokenRouteKey(buf: []u8, token: u16) []const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "troute:{x}", .{token}) catch unreachable;
+    return std.mem.print(buf, prefix ++ "troute:{x}", .{token}) catch unreachable;
 }
 
 // save durability: Redis holds the live character, Postgres is the store of record. The window
@@ -1474,7 +1474,7 @@ fn tokenRouteKey(buf: []u8, token: u16) []const u8 {
 // (noeviction, or a dedicated instance).
 
 fn charVerKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "charver:{s}/{s}", .{ account, charname }) catch buf[0..0];
+    return std.mem.print(buf, prefix ++ "charver:{s}/{s}", .{ account, charname }) catch buf[0..0];
 }
 
 /// Record that the stored character is newer than Postgres, and return the version stamped on it.
@@ -1484,7 +1484,7 @@ pub fn markCharDirty(account: []const u8, charname: []const u8) ?u64 {
     const verkey = charVerKey(&vb, account, charname);
     if (verkey.len == 0) return null;
     var mb: [96]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return null;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return null;
 
     const s = acquire();
     defer release(s);
@@ -1518,7 +1518,7 @@ pub fn markCharDirty(account: []const u8, charname: []const u8) ?u64 {
 /// flushers may take the same name and each will write the same current bytes.
 pub fn dirtyChars(out: [][]u8, lens: []usize) usize {
     var cb: [16]u8 = undefined;
-    const cnt = std.fmt.bufPrint(&cb, "{d}", .{out.len}) catch return 0;
+    const cnt = std.mem.print(&cb, "{d}", .{out.len}) catch return 0;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -1577,9 +1577,9 @@ pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64
     const verkey = charVerKey(&vb, account, charname);
     if (verkey.len == 0) return false;
     var mb: [96]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return false;
     var nb: [24]u8 = undefined;
-    const vstr = std.fmt.bufPrint(&nb, "{d}", .{ver}) catch return false;
+    const vstr = std.mem.print(&nb, "{d}", .{ver}) catch return false;
 
     const script =
         \\if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -1609,7 +1609,7 @@ pub fn clearDirtyIfUnchanged(account: []const u8, charname: []const u8, ver: u64
 // TTL is a backstop for a holder that dies without releasing; refreshed while the game lives.
 
 fn charLockKey(buf: []u8, account: []const u8, charname: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch buf[0..0];
+    return std.mem.print(buf, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch buf[0..0];
 }
 
 /// Take the character for `owner`. False if it is held at all — including by the same game.
@@ -1624,7 +1624,7 @@ pub fn lockChar(account: []const u8, charname: []const u8, owner: []const u8, tt
     const key = charLockKey(&kb, account, charname);
     if (key.len == 0) return false;
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
 
     const s = acquire();
     defer release(s);
@@ -1648,7 +1648,7 @@ pub fn refreshCharLock(account: []const u8, charname: []const u8, owner: []const
     const key = charLockKey(&kb, account, charname);
     if (key.len == 0) return false;
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const script =
         \\if redis.call('GET', KEYS[1]) == ARGV[1] then
         \\  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
@@ -1693,9 +1693,9 @@ pub fn unlockChar(account: []const u8, charname: []const u8, owner: []const u8) 
 /// replaces this with the game record.
 pub fn reserveGameName(name: []const u8, ttl_s: u32) bool {
     var kb: [96]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamename:{s}", .{name}) catch return false;
+    const key = std.mem.print(&kb, prefix ++ "gamename:{s}", .{name}) catch return false;
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -1712,7 +1712,7 @@ pub fn reserveGameName(name: []const u8, ttl_s: u32) bool {
 /// the player.
 pub fn gameNameReserved(name: []const u8) bool {
     var kb: [96]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamename:{s}", .{name}) catch return false;
+    const key = std.mem.print(&kb, prefix ++ "gamename:{s}", .{name}) catch return false;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -1726,7 +1726,7 @@ pub fn gameNameReserved(name: []const u8) bool {
 /// Give the name back — the create failed, or the game it named has ended.
 pub fn releaseGameName(name: []const u8) void {
     var kb: [96]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamename:{s}", .{name}) catch return;
+    const key = std.mem.print(&kb, prefix ++ "gamename:{s}", .{name}) catch return;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -1743,9 +1743,9 @@ pub fn cacheCharIfAbsent(account: []const u8, charname: []const u8, bytes: []con
     const a = sanitize(account, &ab) orelse return false;
     const c = sanitize(charname, &cb) orelse return false;
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return false;
+    const key = std.mem.print(&kb, prefix ++ "char:{s}:{s}", .{ a, c }) catch return false;
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, prefix ++ "chars:{s}", .{a}) catch return false;
+    const setkey = std.mem.print(&sb, prefix ++ "chars:{s}", .{a}) catch return false;
 
     const s = acquire();
     defer release(s);
@@ -1794,13 +1794,13 @@ pub const SeatResult = enum { taken, full, failed };
 
 pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: u32) SeatResult {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .failed;
+    const key = std.mem.print(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .failed;
     var pk: [64]u8 = undefined;
-    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return .failed;
+    const pend = std.mem.print(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return .failed;
     var sk: [64]u8 = undefined;
-    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return .failed;
+    const seen = std.mem.print(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return .failed;
     var mb: [96]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return .failed;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return .failed;
     const script =
         \\if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 and redis.call('SCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
         \\redis.call('SADD', KEYS[1], ARGV[1])
@@ -1810,7 +1810,7 @@ pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: 
         \\return 1
     ;
     var xb: [16]u8 = undefined;
-    const mx = std.fmt.bufPrint(&xb, "{d}", .{max}) catch return .failed;
+    const mx = std.mem.print(&xb, "{d}", .{max}) catch return .failed;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -1827,14 +1827,14 @@ pub fn addGameChar(gameid: u32, account: []const u8, charname: []const u8, max: 
 /// player has already given up on it. A seat the game server confirmed is never taken over.
 pub fn retakePendingChar(gameid: u32, account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32) bool {
     var pk: [64]u8 = undefined;
-    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
+    const pend = std.mem.print(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
     var mb: [96]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return false;
     var kb: [128]u8 = undefined;
     const lockkey = charLockKey(&kb, account, charname);
     if (lockkey.len == 0) return false;
     var tb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const script =
         \\if redis.call('HEXISTS', KEYS[1], ARGV[2]) == 0 then return 0 end
         \\if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
@@ -1863,19 +1863,19 @@ pub fn retakePendingChar(gameid: u32, account: []const u8, charname: []const u8,
 /// never judged by their absence. Returns how many seats were confirmed.
 pub fn confirmGameChar(gameid: u32, account: []const u8, charname: []const u8, owner: []const u8, ttl_s: u32, present: bool) usize {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
+    const key = std.mem.print(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
     var pk: [64]u8 = undefined;
-    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return 0;
+    const pend = std.mem.print(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return 0;
     var sk: [64]u8 = undefined;
-    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return 0;
+    const seen = std.mem.print(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return 0;
     var gk: [64]u8 = undefined;
-    const guard = std.fmt.bufPrint(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return 0;
+    const guard = std.mem.print(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return 0;
     var mb: [96]u8 = undefined;
-    const member = if (account.len > 0) (std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return 0) else "";
+    const member = if (account.len > 0) (std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return 0) else "";
     var sb: [64]u8 = undefined;
-    const suffix = std.fmt.bufPrint(&sb, "/{s}", .{charname}) catch return 0;
+    const suffix = std.mem.print(&sb, "/{s}", .{charname}) catch return 0;
     var tb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return 0;
+    const px = std.mem.print(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return 0;
     const script =
         \\local t = redis.call('TIME')
         \\local now = t[1] * 1000 + math.floor(t[2] / 1000)
@@ -1945,21 +1945,21 @@ pub const SeatSweep = struct {
 /// never freed by this one.
 pub fn sweepGameSeats(gameid: u32, owner: []const u8, ttl_s: u32, pending_ms: u32, unreported_ms: u32) SeatSweep {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .{};
+    const key = std.mem.print(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return .{};
     var pk: [64]u8 = undefined;
-    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return .{};
+    const pend = std.mem.print(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return .{};
     var sk: [64]u8 = undefined;
-    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return .{};
+    const seen = std.mem.print(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return .{};
     var gk: [64]u8 = undefined;
-    const guard = std.fmt.bufPrint(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return .{};
+    const guard = std.mem.print(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return .{};
     var ck: [64]u8 = undefined;
-    const counted = std.fmt.bufPrint(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return .{};
+    const counted = std.mem.print(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return .{};
     var tb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return .{};
+    const px = std.mem.print(&tb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return .{};
     var pb: [16]u8 = undefined;
-    const pms = std.fmt.bufPrint(&pb, "{d}", .{pending_ms}) catch return .{};
+    const pms = std.mem.print(&pb, "{d}", .{pending_ms}) catch return .{};
     var ub: [16]u8 = undefined;
-    const ums = std.fmt.bufPrint(&ub, "{d}", .{unreported_ms}) catch return .{};
+    const ums = std.mem.print(&ub, "{d}", .{unreported_ms}) catch return .{};
     const script =
         \\local t = redis.call('TIME')
         \\local now = t[1] * 1000 + math.floor(t[2] / 1000)
@@ -2032,15 +2032,15 @@ pub fn sweepGameSeats(gameid: u32, owner: []const u8, ttl_s: u32, pending_ms: u3
 /// claimed between the check and the delete.
 pub fn releaseGameChars(gameid: u32, owner: []const u8) usize {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
+    const key = std.mem.print(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return 0;
     var pk: [64]u8 = undefined;
-    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return 0;
+    const pend = std.mem.print(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return 0;
     var sk: [64]u8 = undefined;
-    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return 0;
+    const seen = std.mem.print(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return 0;
     var gk: [64]u8 = undefined;
-    const guard = std.fmt.bufPrint(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return 0;
+    const guard = std.mem.print(&gk, prefix ++ "gamepresent:{d}", .{gameid}) catch return 0;
     var ck: [64]u8 = undefined;
-    const counted = std.fmt.bufPrint(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return 0;
+    const counted = std.mem.print(&ck, prefix ++ "gamecount:{d}", .{gameid}) catch return 0;
     const script =
         \\local n = 0
         \\for _, m in ipairs(redis.call('SMEMBERS', KEYS[1])) do
@@ -2115,18 +2115,18 @@ pub fn releaseOrphanCharLocks() usize {
 /// built, not matched, so a second character with the same name in the same game is untouched.
 pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const u8, owner: []const u8) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    const key = std.mem.print(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
     var mb: [96]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return false;
     var lb: [128]u8 = undefined;
-    const lockkey = std.fmt.bufPrint(&lb, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch return false;
+    const lockkey = std.mem.print(&lb, prefix ++ "charlock:{s}/{s}", .{ account, charname }) catch return false;
     // The lock is released only if this game still owns it — the same compare-and-swap every other
     // release does. A lapsed lease may already have been taken by somebody else, and a blind DEL
     // would free THEIR claim.
     var pk: [64]u8 = undefined;
-    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
+    const pend = std.mem.print(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
     var sk: [64]u8 = undefined;
-    const seen = std.fmt.bufPrint(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return false;
+    const seen = std.mem.print(&sk, prefix ++ "gameseen:{d}", .{gameid}) catch return false;
     const script =
         \\redis.call('HDEL', KEYS[3], ARGV[2])
         \\redis.call('HDEL', KEYS[4], ARGV[2])
@@ -2146,9 +2146,9 @@ pub fn releaseGameCharExact(gameid: u32, account: []const u8, charname: []const 
 
 pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u8) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
+    const key = std.mem.print(&kb, prefix ++ "gamechars:{d}", .{gameid}) catch return false;
     var sb: [64]u8 = undefined;
-    const suffix = std.fmt.bufPrint(&sb, "/{s}", .{charname}) catch return false;
+    const suffix = std.mem.print(&sb, "/{s}", .{charname}) catch return false;
     // Two passes, and the second only runs if the first found EXACTLY one match.
     //
     // Members are "account/charname" and the game server reports a departure by character name
@@ -2178,9 +2178,9 @@ pub fn releaseGameCharByName(gameid: u32, charname: []const u8, owner: []const u
         \\return 1
     ;
     var pk: [64]u8 = undefined;
-    const pend = std.fmt.bufPrint(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
+    const pend = std.mem.print(&pk, prefix ++ "gamepend:{d}", .{gameid}) catch return false;
     var sk2: [64]u8 = undefined;
-    const seen = std.fmt.bufPrint(&sk2, prefix ++ "gameseen:{d}", .{gameid}) catch return false;
+    const seen = std.mem.print(&sk2, prefix ++ "gameseen:{d}", .{gameid}) catch return false;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -2255,7 +2255,7 @@ pub fn mintToken() ?u16 {
 // without anyone having to notice and clean up.
 
 fn gsKey(buf: []u8, gsid: u32) []const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "gs:{x}", .{gsid}) catch buf[0..0];
+    return std.mem.print(buf, prefix ++ "gs:{x}", .{gsid}) catch buf[0..0];
 }
 
 /// Publish (or refresh) one game server. Called on registration and whenever its load changes.
@@ -2276,7 +2276,7 @@ pub fn registerGs(rec: types.GsRec, ttl_s: u32) bool {
     const val = vb[0 .. 15 + @as(usize, rec.labels_len)];
 
     var idb: [16]u8 = undefined;
-    const idstr = std.fmt.bufPrint(&idb, "{x}", .{rec.gsid}) catch return false;
+    const idstr = std.mem.print(&idb, "{x}", .{rec.gsid}) catch return false;
 
     const s = acquire();
     defer release(s);
@@ -2285,7 +2285,7 @@ pub fn registerGs(rec: types.GsRec, ttl_s: u32) bool {
     var c = CmdBuf{ .fd = fd };
     if (ttl_s > 0) {
         var pb: [16]u8 = undefined;
-        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
         c.add(&.{ "SET", key, val, "PX", px });
     } else {
         c.add(&.{ "SET", key, val });
@@ -2315,7 +2315,7 @@ pub fn removeGs(gsid: u32) void {
     const key = gsKey(&kb, gsid);
     if (key.len == 0) return;
     var idb: [16]u8 = undefined;
-    const idstr = std.fmt.bufPrint(&idb, "{x}", .{gsid}) catch return;
+    const idstr = std.mem.print(&idb, "{x}", .{gsid}) catch return;
 
     const s = acquire();
     defer release(s);
@@ -2349,11 +2349,11 @@ pub fn removeGs(gsid: u32) void {
 // to one server it is simply false, and two realmds would take each other's answers.
 
 fn gsQueueKey(buf: []u8, gsid: u32) []const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "gsq:{x}", .{gsid}) catch buf[0..0];
+    return std.mem.print(buf, prefix ++ "gsq:{x}", .{gsid}) catch buf[0..0];
 }
 
 fn gsReplyKey(buf: []u8, seq: u32) []const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "gsreply:{x}", .{seq}) catch buf[0..0];
+    return std.mem.print(buf, prefix ++ "gsreply:{x}", .{seq}) catch buf[0..0];
 }
 
 /// Hand a request to a game server. The TTL is a floor under a server that never reads its queue:
@@ -2364,7 +2364,7 @@ pub fn pushGsRequest(gsid: u32, packet: []const u8, ttl_s: u32) bool {
     const key = gsQueueKey(&kb, gsid);
     if (key.len == 0) return false;
     var pb: [16]u8 = undefined;
-    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+    const secs = std.mem.print(&pb, "{d}", .{ttl_s}) catch return false;
 
     const s = acquire();
     defer release(s);
@@ -2430,9 +2430,9 @@ const gs_event_key = prefix ++ "gsev";
 /// hour ago is not news.
 pub fn pushGsEvent(packet: []const u8, cap: u32, ttl_s: u32) bool {
     var cb: [16]u8 = undefined;
-    const keep = std.fmt.bufPrint(&cb, "-{d}", .{cap}) catch return false;
+    const keep = std.mem.print(&cb, "-{d}", .{cap}) catch return false;
     var pb: [16]u8 = undefined;
-    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+    const secs = std.mem.print(&pb, "{d}", .{ttl_s}) catch return false;
 
     const s = acquire();
     defer release(s);
@@ -2484,7 +2484,7 @@ pub const max_exclude = 64;
 fn excludeList(buf: *[max_exclude * 9]u8, exclude: []const u32) []const u8 {
     var n: usize = 0;
     for (exclude[0..@min(exclude.len, max_exclude)]) |g| {
-        const part = std.fmt.bufPrint(buf[n..], "{s}{x}", .{ if (n == 0) "" else ",", g }) catch break;
+        const part = std.mem.print(buf[n..], "{s}{x}", .{ if (n == 0) "" else ",", g }) catch break;
         n += part.len;
     }
     return buf[0..n];
@@ -2726,7 +2726,7 @@ pub fn snapshotGs(out: []types.GsRec) usize {
     var c = CmdBuf{ .fd = fd };
     for (0..got) |i| {
         var gk: [64]u8 = undefined;
-        const key = std.fmt.bufPrint(&gk, prefix ++ "gs:{s}", .{ids[i][0..idlen[i]]}) catch {
+        const key = std.mem.print(&gk, prefix ++ "gs:{s}", .{ids[i][0..idlen[i]]}) catch {
             c.ok = false;
             break;
         };
@@ -2738,7 +2738,7 @@ pub fn snapshotGs(out: []types.GsRec) usize {
         return 0;
     }
 
-    var expired = [_]bool{false} ** max_gs_snapshot;
+    var expired: [max_gs_snapshot]bool = @splat(false);
     var any_expired = false;
     var synced = true;
     var n: usize = 0;
@@ -2809,7 +2809,7 @@ pub fn recordTokenRoute(token: u16, gs_ip: [4]u8, gs_port: u16, real_gameid: u32
     var r: Reader = undefined;
     const rep = if (ttl_s > 0) blk: {
         var pb: [16]u8 = undefined;
-        const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+        const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
         break :blk command(s, &r, &.{ "SET", key, body, "PX", px });
     } else command(s, &r, &.{ "SET", key, body });
     return switch (rep orelse return false) {
@@ -2899,7 +2899,7 @@ test "the pool hands every concurrent caller its own connection slot" {
     try std.testing.expect(a != b);
     release(a);
     release(b);
-    var seen = [_]bool{false} ** POOL_N;
+    var seen: [POOL_N]bool = @splat(false);
     var held: [POOL_N]*Slot = undefined;
     for (&held) |*h| {
         h.* = acquire();
@@ -2939,11 +2939,11 @@ test "a slot's connection is dropped independently of the rest of the pool" {
 // reason to know what a statstring is.
 
 fn chanKey(buf: []u8, channel: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "chan:{s}", .{channel}) catch null;
+    return std.mem.print(buf, prefix ++ "chan:{s}", .{channel}) catch null;
 }
 
 fn chatUserKey(buf: []u8, name: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "chatuser:{s}", .{name}) catch null;
+    return std.mem.print(buf, prefix ++ "chatuser:{s}", .{name}) catch null;
 }
 
 /// Publish a member: into the channel's roster, and into a by-name index so a whisper can find
@@ -2957,7 +2957,7 @@ pub fn chatPutMember(channel: []const u8, name: []const u8, rec: []const u8, ttl
     const chan = chanKey(&ck, channel) orelse return false;
     const user = chatUserKey(&uk, name) orelse return false;
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
 
     const s = acquire();
     defer release(s);
@@ -2987,7 +2987,7 @@ pub fn chatPutIndex(name: []const u8, rec: []const u8, ttl_s: u32) bool {
     var uk: [96]u8 = undefined;
     const user = chatUserKey(&uk, name) orelse return false;
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const s = acquire();
     defer release(s);
     var r: Reader = undefined;
@@ -3093,7 +3093,7 @@ pub fn chatFindMember(name: []const u8, out: []u8) ?usize {
 }
 
 fn chatInboxKey(buf: []u8, instance: u32) ?[]const u8 {
-    return std.fmt.bufPrint(buf, prefix ++ "chatin:{x}", .{instance}) catch null;
+    return std.mem.print(buf, prefix ++ "chatin:{x}", .{instance}) catch null;
 }
 
 /// Hand an event to another instance to deliver to its own members.
@@ -3101,7 +3101,7 @@ pub fn chatPush(instance: u32, packet: []const u8, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
     const key = chatInboxKey(&kb, instance) orelse return false;
     var pb: [16]u8 = undefined;
-    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+    const secs = std.mem.print(&pb, "{d}", .{ttl_s}) catch return false;
     const s = acquire();
     defer release(s);
     const fd = s.fd orelse ensureConn(s) orelse return false;
@@ -3183,7 +3183,7 @@ test "several tickets of one account live side by side and each is spent once" {
 
     var tickets: [16][8]u8 = undefined;
     for (&tickets, 0..) |*t, i| {
-        _ = std.fmt.bufPrint(t, "tkt{d:0>5}", .{i}) catch unreachable;
+        _ = std.mem.print(t, "tkt{d:0>5}", .{i}) catch unreachable;
         try std.testing.expect(putLoginTicket(acct, t, 300));
     }
     {
@@ -3206,7 +3206,7 @@ test "several tickets of one account live side by side and each is spent once" {
     // The list holds 32: the oldest of 40 are dropped, and takeLoginTicket pops the oldest left.
     for (0..40) |i| {
         var t: [8]u8 = undefined;
-        _ = std.fmt.bufPrint(&t, "cap{d:0>5}", .{i}) catch unreachable;
+        _ = std.mem.print(&t, "cap{d:0>5}", .{i}) catch unreachable;
         try std.testing.expect(putLoginTicket(acct, &t, 300));
     }
     try std.testing.expect(!redeemLoginTicket(acct, "cap00007"));
@@ -3373,12 +3373,12 @@ fn testForget(gameid: u32, chars: []const []const u8) void {
     var kb: [5][64]u8 = undefined;
     const names = [_][]const u8{ "gamechars", "gamepend", "gameseen", "gamepresent", "gamecount" };
     for (names, 0..) |n, i| {
-        const k = std.fmt.bufPrint(&kb[i], prefix ++ "{s}:{d}", .{ n, gameid }) catch continue;
+        const k = std.mem.print(&kb[i], prefix ++ "{s}:{d}", .{ n, gameid }) catch continue;
         _ = command(s, &r, &.{ "DEL", k });
     }
     for (chars) |c| {
         var lb: [96]u8 = undefined;
-        const k = std.fmt.bufPrint(&lb, prefix ++ "charlock:acc/{s}", .{c}) catch continue;
+        const k = std.mem.print(&lb, prefix ++ "charlock:acc/{s}", .{c}) catch continue;
         _ = command(s, &r, &.{ "DEL", k });
     }
 }
@@ -3388,7 +3388,7 @@ fn testIsMember(gameid: u32, set: []const u8, member: []const u8) bool {
     defer release(s);
     var r: Reader = undefined;
     var kb: [64]u8 = undefined;
-    const k = std.fmt.bufPrint(&kb, prefix ++ "{s}:{d}", .{ set, gameid }) catch return false;
+    const k = std.mem.print(&kb, prefix ++ "{s}:{d}", .{ set, gameid }) catch return false;
     const cmd: []const u8 = if (std.mem.eql(u8, set, "gamechars")) "SISMEMBER" else "HEXISTS";
     const rep = command(s, &r, &.{ cmd, k, member }) orelse return false;
     return switch (rep) {

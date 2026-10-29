@@ -74,7 +74,7 @@ pub fn heapBusyBytes(out_heaps: *u32, out_blocks: *u32) usize {
         const heap = heaps[h];
         if (HeapLock(heap) == 0) continue;
         defer _ = HeapUnlock(heap);
-        var entry: [HEAP_ENTRY_SIZE]u8 = [_]u8{0} ** HEAP_ENTRY_SIZE;
+        var entry: [HEAP_ENTRY_SIZE]u8 = @splat(0);
         // A corrupt or enormous heap must not park the server here; the cap is generous but hard.
         var guard: u32 = 0;
         while (HeapWalk(heap, &entry) != 0 and guard < 2_000_000) : (guard += 1) {

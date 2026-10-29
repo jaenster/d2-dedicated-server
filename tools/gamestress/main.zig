@@ -53,7 +53,7 @@ pub fn main() !void {
     var i: usize = 0;
     var buf: [32]u8 = undefined;
     while (i < n) : (i += 1) {
-        const name = std.fmt.bufPrint(&buf, "stress{d}", .{i}) catch unreachable;
+        const name = std.mem.print(&buf, "stress{d}", .{i}) catch unreachable;
         if (c.createGame(name, "d")) |r| {
             std.debug.print("[{d}/{d}] create {s} -> token={d} result={d}\n", .{ i + 1, n, name, r.token, r.result });
             if (r.result == 0) ok += 1 else fail += 1;

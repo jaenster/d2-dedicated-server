@@ -41,14 +41,14 @@ fn writeAll(fd: Socket, buf: []const u8) !void {
     }
 }
 fn connectResolved(gpa: std.mem.Allocator, host: []const u8, port: u16) !Socket {
-    const chost = try gpa.dupeZ(u8, host);
+    const chost = try gpa.dupeSentinel(u8, host, 0);
     var pbuf: [8]u8 = undefined;
-    const cserv = std.fmt.bufPrintZ(&pbuf, "{d}", .{port}) catch unreachable;
+    const cserv = std.mem.printSentinel(&pbuf, "{d}", .{port}, 0) catch unreachable;
     var hints = std.mem.zeroes(std.c.addrinfo);
     hints.family = 0; // AF_UNSPEC
     hints.socktype = SOCK_STREAM;
     var res: ?*std.c.addrinfo = null;
-    if (@intFromEnum(std.c.getaddrinfo(chost.ptr, cserv.ptr, &hints, &res)) != 0) return error.ResolveFailed;
+    if (@backingInt(std.c.getaddrinfo(chost.ptr, cserv.ptr, &hints, &res)) != 0) return error.ResolveFailed;
     defer if (res) |r| std.c.freeaddrinfo(r);
     var ai = res;
     while (ai) |a| : (ai = a.next) {
@@ -502,7 +502,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const ip4 = rr[16..20];
         const mport = std.mem.readInt(u16, rr[20..22], .big);
         var ipstr: [20]u8 = undefined;
-        const ipfmt = std.fmt.bufPrint(&ipstr, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch return;
+        const ipfmt = std.mem.print(&ipstr, "{d}.{d}.{d}.{d}", .{ ip4[0], ip4[1], ip4[2], ip4[3] }) catch return;
         // Real bnet returns the d2cs server's PRIVATE (NATed) IP — unreachable externally.
         // Fall back to the gateway host (the addr we connected to), in case it proxies MCP.
         const priv = ip4[0] == 10 or (ip4[0] == 192 and ip4[1] == 168) or (ip4[0] == 172 and ip4[1] >= 16 and ip4[1] <= 31) or ip4[0] == 127 or ip4[0] == 0;
@@ -520,7 +520,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try writeAll(mfd, &[_]u8{0x01}); // MCP protocol selector
 
         // MCP_STARTUP: forward cookie+status+chunk1(8)+chunk2(48) from the realm reply
-        var sb: [64]u8 = [_]u8{0} ** 64;
+        var sb: [64]u8 = @splat(0);
         @memcpy(sb[0..16], rr[0..16]);
         if (rr.len >= 72) @memcpy(sb[16..64], rr[24..72]);
         try mcpSend(mfd, MCP_STARTUP, &sb);
@@ -644,7 +644,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const ghash = std.mem.readInt(u32, jgr[10..14], .little);
             const jresult = std.mem.readInt(u32, jgr[14..18], .little);
             var gsipbuf: [20]u8 = undefined;
-            const gsips = std.fmt.bufPrint(&gsipbuf, "{d}.{d}.{d}.{d}", .{ gsip[0], gsip[1], gsip[2], gsip[3] }) catch return;
+            const gsips = std.mem.print(&gsipbuf, "{d}.{d}.{d}.{d}", .{ gsip[0], gsip[1], gsip[2], gsip[3] }) catch return;
             std.debug.print("[MCP_JOINGAME] token=0x{x} gs={s}:{d} hash=0x{x} result=0x{x}\n", .{ gtoken, gsips, gs_port, ghash, jresult });
             if (jresult != 0) return;
 
@@ -660,7 +660,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             //   [0]=id [1..5]=nGameHash [5..7]=nGameToken [7]=nCharClass [8..12]=nVerByte
             //   [12..16]=nVersionConstant(0xED5DCC50) [16..20]=nConstant(0x91A519B6)
             //   [20]=nLanguageCode [21..37]=szCharName[16].
-            var gl: [37]u8 = [_]u8{0} ** 37;
+            var gl: [37]u8 = @splat(0);
             gl[0] = 0x68;
             std.mem.writeInt(u32, gl[1..5], ghash, .little); // nGameHash
             std.mem.writeInt(u16, gl[5..7], gtoken, .little); // nGameToken
@@ -810,7 +810,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     }
                     if (kick_arg) |k| {
                         var kb: [128]u8 = undefined;
-                        const kc = std.fmt.bufPrint(&kb, "/kick {s}", .{k}) catch k;
+                        const kc = std.mem.print(&kb, "/kick {s}", .{k}) catch k;
                         std.debug.print(">> CMD: \"{s}\"\n", .{kc});
                         sendChat(fd, kc);
                     }

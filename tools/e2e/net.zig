@@ -126,14 +126,14 @@ pub fn httpRequest(port: u16, method: []const u8, path: []const u8, auth_token: 
     defer _ = close(fd);
 
     var hbuf: [1024]u8 = undefined;
-    var req = std.fmt.bufPrint(&hbuf, "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n", .{ method, path }) catch return error.RequestTooLong;
+    var req = std.mem.print(&hbuf, "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n", .{ method, path }) catch return error.RequestTooLong;
     var w = req.len;
     if (auth_token.len > 0) {
-        const seg = std.fmt.bufPrint(hbuf[w..], "Authorization: Bearer {s}\r\n", .{auth_token}) catch return error.RequestTooLong;
+        const seg = std.mem.print(hbuf[w..], "Authorization: Bearer {s}\r\n", .{auth_token}) catch return error.RequestTooLong;
         w += seg.len;
     }
     if (body.len > 0) {
-        const seg = std.fmt.bufPrint(hbuf[w..], "Content-Type: application/json\r\nContent-Length: {d}\r\n", .{body.len}) catch return error.RequestTooLong;
+        const seg = std.mem.print(hbuf[w..], "Content-Type: application/json\r\nContent-Length: {d}\r\n", .{body.len}) catch return error.RequestTooLong;
         w += seg.len;
     }
     if (w + 2 > hbuf.len) return error.RequestTooLong;

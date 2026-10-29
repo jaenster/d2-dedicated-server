@@ -57,7 +57,7 @@ pub const Clock = struct {
 
 // ── The process's clocks ─────────────────────────────────────────────────────────────────────────
 
-const windows = builtin.os.tag == .windows;
+const windows = builtin.target.os.tag == .windows;
 
 const w = struct {
     extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.winapi) i32;

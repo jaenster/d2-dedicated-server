@@ -135,7 +135,7 @@ fn runClient(gpa: std.mem.Allocator, cfg: *const Config, game_stem: []const u8, 
         const name = if (cfg.runs == 1)
             game_stem[0..@min(game_stem.len, namebuf.len - 1)]
         else
-            std.fmt.bufPrint(&namebuf, "{s}{d}", .{ game_stem[0..@min(game_stem.len, namebuf.len - 4)], run }) catch game_stem;
+            std.mem.print(&namebuf, "{s}{d}", .{ game_stem[0..@min(game_stem.len, namebuf.len - 4)], run }) catch game_stem;
 
         const made = r.createGame(.{ .name = name }) catch |e| {
             std.debug.print("  [{s}] run {d}/{d} \"{s}\" CREATEGAME failed: {s}\n", .{ char_name, run, cfg.runs, name, @errorName(e) });
@@ -278,10 +278,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var round: u32 = 1;
     while (round <= cfg.rounds) : (round += 1) {
         var basebuf: [12]u8 = undefined;
-        const base = if (cfg.same_game) "e2estress" else std.fmt.bufPrint(&basebuf, "e2e{d}", .{round}) catch "e2e";
+        const base = if (cfg.same_game) "e2estress" else std.mem.print(&basebuf, "e2e{d}", .{round}) catch "e2e";
 
         var threads: [MAX_CLIENTS]std.Thread = undefined;
-        var outcomes: [MAX_CLIENTS]ClientOutcome = [_]ClientOutcome{.{}} ** MAX_CLIENTS;
+        var outcomes: [MAX_CLIENTS]ClientOutcome = @splat(.{});
         var stembufs: [MAX_CLIENTS][16]u8 = undefined;
 
         var i: u32 = 0;
@@ -290,7 +290,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // CREATEGAME/JOINGAME on the identical name hits a known, still-open reap-timing
             // race (a brand-new empty game can be reaped before the racing JOINGAME lands) —
             // real, but not something a regression gate should flake red on for everyone else.
-            const stem = std.fmt.bufPrint(&stembufs[i], "{s}c{d}", .{ base, i }) catch base;
+            const stem = std.mem.print(&stembufs[i], "{s}c{d}", .{ base, i }) catch base;
             threads[i] = try std.Thread.spawn(.{}, runClient, .{ gpa, &cfg, stem, chars[i], &outcomes[i] });
         }
         i = 0;

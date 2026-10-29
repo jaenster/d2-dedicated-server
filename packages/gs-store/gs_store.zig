@@ -21,7 +21,7 @@ const sockaddr_in = extern struct {
     family: u16,
     port: u16,
     addr: u32,
-    zero: [8]u8 = [_]u8{0} ** 8,
+    zero: [8]u8 = @splat(0),
 };
 
 extern "ws2_32" fn socket(af: i32, t: i32, proto: i32) callconv(.winapi) SOCKET;
@@ -66,7 +66,7 @@ fn unlock() void {
     busy.store(false, .release);
 }
 
-var host_buf: [256]u8 = [_]u8{0} ** 256;
+var host_buf: [256]u8 = @splat(0);
 var host_len: usize = 0;
 var port: u16 = 6379;
 var sock: SOCKET = INVALID_SOCKET;
@@ -219,9 +219,9 @@ pub fn commandBig(head: []const []const u8, tail: []const u8) ?Reply {
     var tx: [1024]u8 = undefined;
     var n: usize = 0;
     // Array header counts every argument, including the streamed one.
-    n += (std.fmt.bufPrint(tx[n..], "*{d}\r\n", .{head.len + 1}) catch return null).len;
+    n += (std.mem.print(tx[n..], "*{d}\r\n", .{head.len + 1}) catch return null).len;
     for (head) |a| {
-        n += (std.fmt.bufPrint(tx[n..], "${d}\r\n", .{a.len}) catch return null).len;
+        n += (std.mem.print(tx[n..], "${d}\r\n", .{a.len}) catch return null).len;
         if (n + a.len + 2 > tx.len) return null;
         @memcpy(tx[n..][0..a.len], a);
         n += a.len;
@@ -229,7 +229,7 @@ pub fn commandBig(head: []const []const u8, tail: []const u8) ?Reply {
         tx[n + 1] = '\n';
         n += 2;
     }
-    n += (std.fmt.bufPrint(tx[n..], "${d}\r\n", .{tail.len}) catch return null).len;
+    n += (std.mem.print(tx[n..], "${d}\r\n", .{tail.len}) catch return null).len;
     if (!sendAll(s, tx[0..n]) or !sendAll(s, tail) or !sendAll(s, "\r\n")) {
         drop();
         return null;
@@ -293,7 +293,7 @@ pub fn getCharVersioned(account: []const u8, charname: []const u8, out: []u8) Lo
 /// The store's current version for a character, 0 if it has none.
 pub fn charVersion(account: []const u8, charname: []const u8) u64 {
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return 0;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return 0;
     const rep = command(&.{ "GET", verkey }) orelse return 0;
     return switch (rep.value) {
         .bulk => |b| blk: {
@@ -307,7 +307,7 @@ pub fn charVersion(account: []const u8, charname: []const u8) u64 {
 /// Fetch a character save into `out`, returning its length. 0 if absent or unreadable.
 pub fn getChar(account: []const u8, charname: []const u8, out: []u8) usize {
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return 0;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return 0;
     const rep = command(&.{ "GET", key }) orelse return 0;
     return switch (rep.value) {
         .bulk => |b| blk: {
@@ -368,15 +368,15 @@ pub const SaveResult = union(enum) {
 pub fn putCharFenced(account: []const u8, charname: []const u8, save: []const u8, expect: u64) SaveResult {
     if (!keyable(account) or !keyable(charname)) return .unavailable;
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return .unavailable;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return .unavailable;
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return .unavailable;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return .unavailable;
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return .unavailable;
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{account}) catch return .unavailable;
     var mb: [192]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return .unavailable;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return .unavailable;
     var eb: [24]u8 = undefined;
-    const expect_s = std.fmt.bufPrint(&eb, "{d}", .{expect}) catch return .unavailable;
+    const expect_s = std.mem.print(&eb, "{d}", .{expect}) catch return .unavailable;
 
     // Returns the new version on success, or -(current+1) when it refuses, so the caller learns
     // what the store is actually at without a second round trip.
@@ -412,7 +412,7 @@ pub fn putCharFenced(account: []const u8, charname: []const u8, save: []const u8
 pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) bool {
     if (!keyable(account) or !keyable(charname)) return false;
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return false;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return false;
     const set = commandBig(&.{ "SET", key }, bytes) orelse return false;
     switch (set.value) {
         .status, .int => {},
@@ -420,13 +420,13 @@ pub fn putChar(account: []const u8, charname: []const u8, bytes: []const u8) boo
         else => return false,
     }
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return false;
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{account}) catch return false;
     _ = command(&.{ "SADD", setkey, charname }) orelse return false;
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return false;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return false;
     _ = command(&.{ "INCR", verkey }) orelse return false;
     var mb: [128]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return false;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return false;
     _ = command(&.{ "SADD", "realmd:dirty", member }) orelse return false;
     return true;
 }
@@ -493,7 +493,7 @@ pub fn retryPending() bool {
 /// interchangeable, and this is how the realm can ask for the right one instead of the free one.
 pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32, full: bool, ttl_s: u32, labels: []const u8) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:gs:{x}", .{gsid}) catch return false;
+    const key = std.mem.print(&kb, "realmd:gs:{x}", .{gsid}) catch return false;
     var vb: [15 + 96]u8 = undefined;
     @memcpy(vb[0..4], &ip);
     std.mem.writeInt(u16, vb[4..6], gs_port, .little);
@@ -504,7 +504,7 @@ pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32,
     @memcpy(vb[15..][0..nlab], labels[0..nlab]);
     const val = vb[0 .. 15 + nlab];
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const rep = command(&.{ "SET", key, val, "PX", px }) orelse return false;
     switch (rep.value) {
         .status, .int => {},
@@ -512,7 +512,7 @@ pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32,
         else => return false,
     }
     var idb: [16]u8 = undefined;
-    const idstr = std.fmt.bufPrint(&idb, "{x}", .{gsid}) catch return false;
+    const idstr = std.mem.print(&idb, "{x}", .{gsid}) catch return false;
     _ = command(&.{ "SADD", "realmd:gs", idstr }) orelse return false;
     return true;
 }
@@ -522,7 +522,7 @@ pub fn putHeartbeat(gsid: u32, ip: [4]u8, gs_port: u16, maxgame: u32, live: u32,
 /// Polled on the shared connection; `waitRequest` is the blocking form for a thread of its own.
 pub fn popRequest(gsid: u32, out: []u8) usize {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
+    const key = std.mem.print(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
     const rep = command(&.{ "LPOP", key }) orelse return 0;
     return copyBulk(rep.value, out);
 }
@@ -538,9 +538,9 @@ var qrx: [2048]u8 = undefined;
 /// CPU is mostly its polling.
 pub fn waitRequest(gsid: u32, out: []u8, wait_s: u32) usize {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
+    const key = std.mem.print(&kb, "realmd:gsq:{x}", .{gsid}) catch return 0;
     var wb: [16]u8 = undefined;
-    const ws = std.fmt.bufPrint(&wb, "{d}", .{wait_s}) catch return 0;
+    const ws = std.mem.print(&wb, "{d}", .{wait_s}) catch return 0;
     const s = ensureSock(&qsock, wait_s * 1000 + io_timeout_ms) orelse {
         Sleep(1000); // no store: do not spin on reconnects
         return 0;
@@ -631,9 +631,9 @@ fn copyBulk(v: resp.Reply, out: []u8) usize {
 /// on it right now, and a reply nobody collected is of no use to anyone later.
 pub fn putReply(seq: u32, packet: []const u8, ttl_s: u32) bool {
     var kb: [64]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:gsreply:{x}", .{seq}) catch return false;
+    const key = std.mem.print(&kb, "realmd:gsreply:{x}", .{seq}) catch return false;
     var pb: [16]u8 = undefined;
-    const px = std.fmt.bufPrint(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
+    const px = std.mem.print(&pb, "{d}", .{@as(u64, ttl_s) * 1000}) catch return false;
     const rep = commandBig(&.{ "SET", key }, packet) orelse return false;
     _ = command(&.{ "PEXPIRE", key, px }) orelse return false;
     return switch (rep.value) {
@@ -656,10 +656,10 @@ pub fn pushEvent(packet: []const u8, cap: u32, ttl_s: u32) bool {
         else => return false,
     }
     var cb: [16]u8 = undefined;
-    const keep = std.fmt.bufPrint(&cb, "-{d}", .{cap}) catch return false;
+    const keep = std.mem.print(&cb, "-{d}", .{cap}) catch return false;
     _ = command(&.{ "LTRIM", "realmd:gsev", keep, "-1" }) orelse return false;
     var pb: [16]u8 = undefined;
-    const secs = std.fmt.bufPrint(&pb, "{d}", .{ttl_s}) catch return false;
+    const secs = std.mem.print(&pb, "{d}", .{ttl_s}) catch return false;
     _ = command(&.{ "EXPIRE", "realmd:gsev", secs }) orelse return false;
     return true;
 }

@@ -70,7 +70,7 @@ pub fn EventN(comptime cap: usize) type {
 
         fn num(self: *Self, v: i64) void {
             var tmp: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch return;
+            const s = std.mem.print(&tmp, "{d}", .{v}) catch return;
             self.raw(s);
         }
 
@@ -130,7 +130,7 @@ pub fn EventN(comptime cap: usize) type {
         pub fn hex(self: *Self, k: []const u8, v: usize) void {
             self.key(k);
             var tmp: [16]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "\"0x{x}\"", .{v}) catch return;
+            const s = std.mem.print(&tmp, "\"0x{x}\"", .{v}) catch return;
             self.raw(s);
         }
 

@@ -23,7 +23,7 @@ zig build e2e                 # 34 clientless scenarios against a real realmd (n
 zig build stress-e2e          # rounds of real games against a real game server
 ```
 
-Zig `0.16.0` — the same version CI pins. The realm and ingress build for native Linux; the game
+Zig `0.17.0` — the same version CI pins. The realm and ingress build for native Linux; the game
 server's runtime builds for `x86-windows` because it is loaded by the game's own process.
 
 For the pre-1.14 engines, `tools/e2e-engines.sh` runs every one of them end to end against

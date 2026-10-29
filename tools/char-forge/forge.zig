@@ -121,7 +121,7 @@ pub fn stats(experience_txt: []const u8, charstats_txt: []const u8, class: u8, l
     const stamina = ((try cs.number(name, "stamina")) << 8) + gained * try cs.number(name, "StaminaPerLevel") * 64;
 
     var level_key: [4]u8 = undefined;
-    const key = std.fmt.bufPrint(&level_key, "{d}", .{level - 1}) catch unreachable;
+    const key = std.mem.print(&level_key, "{d}", .{level - 1}) catch unreachable;
     const exp = try xp.number(key, name);
 
     return .{
@@ -153,7 +153,7 @@ pub fn forge(out: []u8, experience_txt: []const u8, charstats_txt: []const u8, s
 
     var s = save.parse(fresh) catch unreachable; // the embedded save is checked by a test
     const h = &s.header;
-    h.name = [_]u8{0} ** 16;
+    h.name = @as([16]u8, @splat(0));
     @memcpy(h.name[0..spec.name.len], spec.name);
     // The same status byte the realm's own character creation writes: mandatory bit, plus hardcore and expansion.
     h.status = 0x01 | (if (spec.hardcore) @as(u8, 0x04) else 0) | (if (spec.expansion or spec.class >= 5) @as(u8, 0x20) else 0);

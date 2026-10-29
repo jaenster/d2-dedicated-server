@@ -313,7 +313,7 @@ pub fn build(b: *std.Build) void {
     // need no Node. webui.zig @embedFile's the "webui_blob" import either way.
     const webui_enabled = b.option(bool, "webui", "Build and embed the admin web UI (requires Node)") orelse false;
     const webui_blob: std.Build.LazyPath = if (webui_enabled) blk: {
-        const cmd = b.addSystemCommand(&.{ "sh", "-c", "set -e; npm --prefix \"$1\" ci && npm --prefix \"$1\" run build && cp \"$1/dist/index.html\" \"$2\"", "realmd-webui", b.pathFromRoot("webui") });
+        const cmd = b.addSystemCommand(&.{ "sh", "-c", "set -e; npm --prefix \"$1\" ci && npm --prefix \"$1\" run build && cp \"$1/dist/index.html\" \"$2\"", "realmd-webui", b.root.joinString(b.allocator, "webui") catch @panic("OOM") });
         cmd.has_side_effects = true; // npm/vite do their own incremental builds
         break :blk cmd.addOutputFileArg("index.html");
     } else b.path("apps/realmd/webui_stub.html");
@@ -658,7 +658,7 @@ pub fn build(b: *std.Build) void {
         // it (addRunArtifact alone runs from the build cache, never touching zig-out).
         const install_stress_e2e = b.addInstallArtifact(stress_e2e, .{});
         const run_stress_e2e = b.addRunArtifact(stress_e2e);
-        if (b.args) |args| run_stress_e2e.addArgs(args);
+        run_stress_e2e.addPassthruArgs();
         const stress_e2e_step = b.step("stress-e2e", "Round-loop real-GS stress test");
         stress_e2e_step.dependOn(&install_stress_e2e.step);
         stress_e2e_step.dependOn(&run_stress_e2e.step);
@@ -693,7 +693,7 @@ pub fn build(b: *std.Build) void {
     probe.root_module.addImport("libd2", libd2); // the BNFTP wire, shared with realmd's server side
     b.installArtifact(probe);
     const run_probe = b.addRunArtifact(probe);
-    if (b.args) |args| run_probe.addArgs(args);
+    run_probe.addPassthruArgs();
     b.step("bnftp-probe", "Probe a real Battle.net server's BNFTP (optionally via SOCKS5)").dependOn(&run_probe.step);
 
     // checkrev-probe — clientless BNCS *version-check* client (selector 0x01): runs
@@ -711,7 +711,7 @@ pub fn build(b: *std.Build) void {
     crprobe.root_module.addImport("libd2", libd2);
     b.installArtifact(crprobe);
     const run_crprobe = b.addRunArtifact(crprobe);
-    if (b.args) |args| run_crprobe.addArgs(args);
+    run_crprobe.addPassthruArgs();
     b.step("checkrev-probe", "Replay the BNCS version-check against a real Battle.net").dependOn(&run_crprobe.step);
 
     // char-forge - a .d2s of a given class and level from the game's own tables (tools/char-forge)
@@ -740,7 +740,7 @@ pub fn build(b: *std.Build) void {
 
     const run_realmd = b.addRunArtifact(realmd);
     run_realmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_realmd.addArgs(args);
+    run_realmd.addPassthruArgs();
     const run_step = b.step("realmd", "Run the realm server");
     run_step.dependOn(&run_realmd.step);
 }

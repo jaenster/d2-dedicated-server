@@ -46,8 +46,8 @@ pub var d2cs_port: u16 = 6112;
 // (the "@"/Blizzard-rep style ops). Set from REALMD_CHAT_OPS. Case-insensitive.
 pub var admin_accounts: []const u8 = "";
 
-const FLAG_OPERATOR: u32 = @intFromEnum(protocol.ChatUserFlag.operator);
-const FLAG_ADMIN: u32 = @intFromEnum(protocol.ChatUserFlag.bnet_admin);
+const FLAG_OPERATOR: u32 = @backingInt(protocol.ChatUserFlag.operator);
+const FLAG_ADMIN: u32 = @backingInt(protocol.ChatUserFlag.bnet_admin);
 
 fn accountListed(list: []const u8, account: []const u8) bool {
     if (list.len == 0 or account.len == 0) return false;
@@ -163,35 +163,35 @@ pub const Conn = struct {
     out: [8192]u8 = undefined,
     out_len: usize = 0,
     client_token: u32 = 0,
-    account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    account: [state.max_name + 1]u8 = @splat(0),
     account_len: u8 = 0,
     /// Set by a successful logon and by nothing else. Every command past the login screen checks
     /// it (allowedBeforeLogon); `drop` closes the connection once the current packet is answered.
     authed: bool = false,
     drop: bool = false,
     in_channel: bool = false,
-    channel: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
+    channel: [chat.max_channel]u8 = @splat(0),
     channel_len: u8 = 0,
     /// The first channel this connection joined. The client draws it at the head of its channel
     /// list by itself, so the list the realm answers leaves it out (channelList).
-    home: [chat.max_channel]u8 = [_]u8{0} ** chat.max_channel,
+    home: [chat.max_channel]u8 = @splat(0),
     home_len: u8 = 0,
     user_flags: u32 = 0, // this account's chat flags (admin/operator) in the current channel
     // The client's SID_ENTERCHAT statstring (D2: encodes the char it's on). Captured
     // on enter, replayed to other members in EID_SHOWUSER/EID_JOIN so chat shows chars.
-    stat: [chat.max_stat]u8 = [_]u8{0} ** chat.max_stat,
+    stat: [chat.max_stat]u8 = @splat(0),
     stat_len: u8 = 0,
     // The product the client named in SID_GETCHANNELLIST, as it is on the wire (D2XP reads "PX2D"). It
     // is the first four bytes of the statstring the user list is drawn from.
     product: [4]u8 = .{ 'P', 'X', '2', 'D' },
     // The `clan*charname` the client asked to be known as in SID_ENTERCHAT.
-    chat_name: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    chat_name: [state.max_name + 1]u8 = @splat(0),
     chat_name_len: u8 = 0,
     // What the client said it is, and what the realm made of it. Kept raw as well as resolved so
     // an extension can decide for itself about a client this realm has no mapping for.
     exe_version: u32 = 0,
     verbyte: u8 = 0,
-    client_version: [state.max_version]u8 = [_]u8{0} ** state.max_version,
+    client_version: [state.max_version]u8 = @splat(0),
     client_version_len: u8 = 0,
 
     fn setClientVersion(c: *Conn, v: []const u8) void {
@@ -901,7 +901,7 @@ fn onJoinChannel(c: *Conn, tag: []const u8, body: []const u8) void {
     // the user list "<text> (n)" from it. Then EID_SHOWUSER for everyone already in, the joiner
     // among them: the client finds its own name in that list to put it in front of its own talk, and
     // counts the header from the rows it is given. Then EID_JOIN to everyone else.
-    sendEvent(c, EID_CHANNEL, @intFromEnum(protocol.ChatChannelFlag.public), "", channel);
+    sendEvent(c, EID_CHANNEL, @backingInt(protocol.ChatChannelFlag.public), "", channel);
     sendEvent(c, EID_SHOWUSER, flags, c.chatName(), c.statSlice());
     const ctx = ShowUserCtx{ .c = c };
     chat.forEachInChannel(channel, c.fd, &ctx, showUserCb);
@@ -951,7 +951,7 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, "", guildErr(e));
             return true;
         };
-        const msg = std.fmt.bufPrint(&rb, "Guild '{s}' [{s}] founded — you are the Guildmaster.", .{ namev, tagv }) catch "Guild founded.";
+        const msg = std.mem.print(&rb, "Guild '{s}' [{s}] founded — you are the Guildmaster.", .{ namev, tagv }) catch "Guild founded.";
         sendEvent(c, EID_INFO, 0, "", msg);
         log.line(tag, "{s} founded guild '{s}' [{s}]", .{ acct, namev, tagv });
         return true;
@@ -967,9 +967,9 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
     if (std.mem.eql(u8, sub, "info")) {
         var g = guilds.load(gname) orelse return true;
         const msg = if (g.nextUpgradeCost()) |cost|
-            std.fmt.bufPrint(&rb, "{s} [{s}] | Hall lvl {d} | Treasury {d} (next {d}) | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, cost, g.member_count }) catch "guild"
+            std.mem.print(&rb, "{s} [{s}] | Hall lvl {d} | Treasury {d} (next {d}) | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, cost, g.member_count }) catch "guild"
         else
-            std.fmt.bufPrint(&rb, "{s} [{s}] | Hall lvl {d} (MAX) | Treasury {d} | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, g.member_count }) catch "guild";
+            std.mem.print(&rb, "{s} [{s}] | Hall lvl {d} (MAX) | Treasury {d} | {d} members", .{ g.nameSlice(), g.tagSlice(), g.hall_level, g.treasury, g.member_count }) catch "guild";
         sendEvent(c, EID_INFO, 0, "", msg);
         return true;
     }
@@ -982,7 +982,7 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, "", guildErr(e));
             return true;
         };
-        const msg = std.fmt.bufPrint(&rb, "Deposited {d} into the Steeg Stone. Treasury: {d}.", .{ gold, total }) catch "Deposited.";
+        const msg = std.mem.print(&rb, "Deposited {d} into the Steeg Stone. Treasury: {d}.", .{ gold, total }) catch "Deposited.";
         sendEvent(c, EID_INFO, 0, "", msg);
         return true;
     }
@@ -991,7 +991,7 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, "", guildErr(e));
             return true;
         };
-        const msg = std.fmt.bufPrint(&rb, "Guild Hall upgraded to level {d}!", .{lvl}) catch "Upgraded.";
+        const msg = std.mem.print(&rb, "Guild Hall upgraded to level {d}!", .{lvl}) catch "Upgraded.";
         sendEvent(c, EID_INFO, 0, "", msg);
         return true;
     }
@@ -1000,7 +1000,7 @@ fn handleGuildCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
             sendEvent(c, EID_ERROR, 0, "", guildErr(e));
             return true;
         };
-        const msg = std.fmt.bufPrint(&rb, "{s} added to the guild.", .{args}) catch "Invited.";
+        const msg = std.mem.print(&rb, "{s} added to the guild.", .{args}) catch "Invited.";
         sendEvent(c, EID_INFO, 0, "", msg);
         return true;
     }
@@ -1081,10 +1081,10 @@ fn onChatCommand(c: *Conn, tag: []const u8, body: []const u8) void {
         sendEvent(c, EID_WHISPERSENT, c.user_flags, chat.displayOf(w.target, &db) orelse w.target, w.msg);
         var rb: [192]u8 = undefined;
         if (res.dnd_len > 0) {
-            const s = std.fmt.bufPrint(&rb, "{s} is unavailable ({s})", .{ w.target, res.dndSlice() }) catch return;
+            const s = std.mem.print(&rb, "{s} is unavailable ({s})", .{ w.target, res.dndSlice() }) catch return;
             sendEvent(c, EID_INFO, 0, w.target, s);
         } else if (res.away_len > 0) {
-            const s = std.fmt.bufPrint(&rb, "{s} is away ({s})", .{ w.target, res.awaySlice() }) catch return;
+            const s = std.mem.print(&rb, "{s} is away ({s})", .{ w.target, res.awaySlice() }) catch return;
             sendEvent(c, EID_INFO, 0, w.target, s);
         }
         return;
@@ -1215,7 +1215,7 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         if (cmd.arg.len == 0) {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /ignore <name>");
         } else if (chat.addIgnore(c.fd, target)) {
-            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} has been squelched.", .{cmd.arg}) catch return true);
+            sendEvent(c, EID_INFO, 0, acct, std.mem.print(&rb, "{s} has been squelched.", .{cmd.arg}) catch return true);
         } else sendEvent(c, EID_ERROR, 0, acct, "Already squelched, or your ignore list is full.");
         return true;
     }
@@ -1226,7 +1226,7 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         if (cmd.arg.len == 0) {
             sendEvent(c, EID_ERROR, 0, acct, "Usage: /unignore <name>");
         } else if (chat.removeIgnore(c.fd, untarget)) {
-            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} is no longer squelched.", .{cmd.arg}) catch return true);
+            sendEvent(c, EID_INFO, 0, acct, std.mem.print(&rb, "{s} is no longer squelched.", .{cmd.arg}) catch return true);
         } else sendEvent(c, EID_ERROR, 0, acct, "That user was not squelched.");
         return true;
     }
@@ -1239,11 +1239,11 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         if (chat.presenceOfAnywhere(cmd.arg)) |pres| {
             const where = pres.channelSlice();
             const line = if (where.len == 0)
-                std.fmt.bufPrint(&rb, "{s} is logged on.", .{cmd.arg}) catch return true
+                std.mem.print(&rb, "{s} is logged on.", .{cmd.arg}) catch return true
             else if (pres.in_game)
-                std.fmt.bufPrint(&rb, "{s} is in the game {s}.", .{ cmd.arg, where }) catch return true
+                std.mem.print(&rb, "{s} is in the game {s}.", .{ cmd.arg, where }) catch return true
             else
-                std.fmt.bufPrint(&rb, "{s} is in channel {s}.", .{ cmd.arg, where }) catch return true;
+                std.mem.print(&rb, "{s} is in channel {s}.", .{ cmd.arg, where }) catch return true;
             sendEvent(c, EID_INFO, 0, acct, line);
         } else sendEvent(c, EID_ERROR, 0, acct, "That user is not logged on.");
         return true;
@@ -1258,7 +1258,7 @@ fn handleSocialCmd(c: *Conn, tag: []const u8, text: []const u8) bool {
         } else if (chat.fdOf(cmd.arg)) |kfd| {
             net.shutdownSocket(kfd);
             log.line(tag, "{s} kicked {s}", .{ acct, cmd.arg });
-            sendEvent(c, EID_INFO, 0, acct, std.fmt.bufPrint(&rb, "{s} was kicked.", .{cmd.arg}) catch return true);
+            sendEvent(c, EID_INFO, 0, acct, std.mem.print(&rb, "{s} was kicked.", .{cmd.arg}) catch return true);
         } else sendEvent(c, EID_ERROR, 0, acct, "That user is not logged on.");
         return true;
     }
@@ -1307,7 +1307,7 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
             const ok = friends.add(acct, target);
             log.line(tag, "{s} friend-add {s} -> {}", .{ acct, target, ok });
             if (ok) {
-                sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was added to your friends list.", .{target}) catch "Added to your friends list.");
+                sendEvent(c, EID_INFO, 0, "", std.mem.print(&rb, "{s} was added to your friends list.", .{target}) catch "Added to your friends list.");
             } else sendEvent(c, EID_ERROR, 0, "", "That user is already on your friends list, or your list is full.");
         },
         .remove => {
@@ -1316,14 +1316,14 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
             const ok = friends.remove(acct, target);
             log.line(tag, "{s} friend-remove {s} -> {}", .{ acct, target, ok });
             if (ok) {
-                sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was removed from your friends list.", .{target}) catch "Removed from your friends list.");
+                sendEvent(c, EID_INFO, 0, "", std.mem.print(&rb, "{s} was removed from your friends list.", .{target}) catch "Removed from your friends list.");
             } else sendEvent(c, EID_ERROR, 0, "", "That user is not on your friends list.");
         },
         .promote, .demote => {
             if (fc.arg.len == 0) return sendEvent(c, EID_ERROR, 0, "", "Usage: /f p|d <account>");
             const target = friendAccount(fc.arg, &nb);
             switch (friends.move(acct, target, fc.action == .promote)) {
-                .moved => sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "{s} was moved {s} your friends list.", .{ target, if (fc.action == .promote) "up" else "down" }) catch "Moved."),
+                .moved => sendEvent(c, EID_INFO, 0, "", std.mem.print(&rb, "{s} was moved {s} your friends list.", .{ target, if (fc.action == .promote) "up" else "down" }) catch "Moved."),
                 .at_edge => sendEvent(c, EID_ERROR, 0, "", "That friend is already at that end of your list."),
                 .not_found => sendEvent(c, EID_ERROR, 0, "", "That user is not on your friends list."),
             }
@@ -1347,7 +1347,7 @@ fn handleFriendCmd(c: *Conn, tag: []const u8, fc: friendcmd.Cmd) void {
             log.line(tag, "{s} friend-message to {d} friend(s)", .{ acct, sent });
             if (sent == 0) {
                 sendEvent(c, EID_INFO, 0, "", "None of your friends are online.");
-            } else sendEvent(c, EID_INFO, 0, "", std.fmt.bufPrint(&rb, "Message sent to {d} friend{s}.", .{ sent, if (sent == 1) "" else "s" }) catch "Message sent.");
+            } else sendEvent(c, EID_INFO, 0, "", std.mem.print(&rb, "Message sent to {d} friend{s}.", .{ sent, if (sent == 1) "" else "s" }) catch "Message sent.");
         },
         .list => {
             var infos: [friends.max_friends]friends.FriendInfo = undefined;
@@ -1860,7 +1860,7 @@ fn expectEvent(pkt: []const u8, eid: u32, flags: u32, user: []const u8, text: []
     const body = pkt[4..];
     try std.testing.expectEqual(eid, std.mem.readInt(u32, body[0..4], .little));
     try std.testing.expectEqual(flags, std.mem.readInt(u32, body[4..8], .little));
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 16, body[8..24]);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), body[8..24]);
     try std.testing.expectEqualStrings(user, std.mem.sliceTo(body[24..], 0));
     try std.testing.expectEqualStrings(text, std.mem.sliceTo(body[24 + user.len + 1 ..], 0));
     try std.testing.expectEqual(@as(usize, 24 + user.len + 1 + text.len + 1), body.len);

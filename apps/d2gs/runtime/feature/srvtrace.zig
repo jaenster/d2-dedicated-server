@@ -180,7 +180,7 @@ pub var gsid: u32 = 0;
 /// ~1/sec per game rather than a per-frame flood.
 const TICK_EVERY: u64 = 100;
 
-var games: [32]usize = [_]usize{0} ** 32;
+var games: [32]usize = @splat(0);
 var tick_n: u64 = 0;
 
 fn trackGame(pg: usize) void {
@@ -441,7 +441,7 @@ fn onItemSpawn(pctx: usize, _: usize, _: usize) callconv(.c) void {
         if (fns.GetItemText.call(@bitCast(g.nItemClassId))) |it| {
             e.str("code", ascii(@intFromPtr(it) + 0x80, 4));
         }
-        e.int("quality", @intFromEnum(g.eQuality));
+        e.int("quality", @backingInt(g.eQuality));
         e.int("ilvl", g.nItemLevel);
         e.int("x", g.nPosX);
         e.int("y", g.nPosY);
@@ -1300,7 +1300,7 @@ fn runSeedLoop(pGame: usize, nActs: u8, lo: u32, hi: u32) void {
 const UNITLIST_OFF: usize = 0x1120; // D2GameStrc.pUnitList[5][128]; type 0 = players
 const COLL_ROWS_BUDGET: u32 = 20000; // cells per drlg_coll line (row-strip), keeps EventN(131072) from overflowing
 
-var coll_done_games: [32]usize = [_]usize{0} ** 32;
+var coll_done_games: [32]usize = @splat(0);
 
 fn envOn(comptime name: [*:0]const u8) bool {
     var buf: [8]u8 = undefined;

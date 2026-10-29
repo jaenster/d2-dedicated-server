@@ -55,8 +55,8 @@ const P_NSIZE: usize = 32;
 /// destroy, so this array costs ~150 KB regardless of how many games run.
 pub const EXTRA: u32 = 24;
 
-var slots: [EXTRA * STRIDE]u8 align(16) = [_]u8{0} ** (EXTRA * STRIDE);
-var free_list: [EXTRA]u32 = [_]u32{0} ** EXTRA;
+var slots: [EXTRA * STRIDE]u8 align(16) = @splat(0);
+var free_list: [EXTRA]u32 = @splat(0);
 var free_count: u32 = 0;
 var next_slot: u32 = 0;
 var handed_out: u32 = 0; // ours currently in use, for the census

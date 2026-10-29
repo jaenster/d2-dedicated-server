@@ -20,9 +20,9 @@ pub const max_name = 16;
 pub const max_friends = 50;
 
 const Pair = struct {
-    owner: [max_name]u8 = [_]u8{0} ** max_name,
+    owner: [max_name]u8 = @splat(0),
     owner_len: u8 = 0,
-    friend: [max_name]u8 = [_]u8{0} ** max_name,
+    friend: [max_name]u8 = @splat(0),
     friend_len: u8 = 0,
     in_use: bool = false,
 
@@ -35,14 +35,14 @@ const Pair = struct {
 };
 
 const Presence = struct {
-    name: [max_name]u8 = [_]u8{0} ** max_name,
+    name: [max_name]u8 = @splat(0),
     name_len: u8 = 0,
     in_use: bool = false,
 };
 
 var lock: Lock = .{};
-var pairs: [4096]Pair = [_]Pair{.{}} ** 4096;
-var online: [1024]Presence = [_]Presence{.{}} ** 1024;
+var pairs: [4096]Pair = @splat(.{});
+var online: [1024]Presence = @splat(.{});
 
 fn eqi(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
@@ -50,7 +50,7 @@ fn eqi(a: []const u8, b: []const u8) bool {
 
 /// Accounts whose stored list has already been pulled into the pair table this run, so a
 /// restart repopulates lazily and a miss doesn't re-read the store on every lookup.
-var loaded: [1024]Presence = [_]Presence{.{}} ** 1024;
+var loaded: [1024]Presence = @splat(.{});
 
 fn markLoadedLocked(account: []const u8) void {
     var slot: ?*Presence = null;
@@ -218,12 +218,12 @@ pub fn move(owner: []const u8, friend: []const u8, up: bool) MoveResult {
 }
 
 pub const FriendInfo = struct {
-    name: [max_name]u8 = [_]u8{0} ** max_name,
+    name: [max_name]u8 = @splat(0),
     name_len: u8 = 0,
     online: bool = false,
     /// Where they are: the channel they are sitting in, or the game they went off to
     /// play. Empty when they are online but in neither.
-    location: [32]u8 = [_]u8{0} ** 32,
+    location: [32]u8 = @splat(0),
     location_len: u8 = 0,
     /// True when `location` names a game rather than a channel.
     in_game: bool = false,

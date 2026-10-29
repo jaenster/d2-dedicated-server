@@ -145,7 +145,7 @@ const linux = struct {
 };
 
 comptime {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         std.debug.assert(linux.AF_INET == std.c.AF.INET);
         std.debug.assert(linux.AF_INET6 == std.c.AF.INET6);
         std.debug.assert(linux.SOL_SOCKET == std.c.SOL.SOCKET);
@@ -159,7 +159,7 @@ comptime {
 
 /// Whether the constants have to be translated at all. On the development host Darwin is the host, so
 /// every table below is the identity and `--dry-run` exercises the same code without double-mapping.
-const translating = builtin.os.tag == .linux;
+const translating = builtin.target.os.tag == .linux;
 
 // struct sockaddr
 
@@ -217,7 +217,7 @@ fn familyToDarwin(family: c_int) ?c_int {
 pub fn sockaddrToLinux(src: []const u8, out: []u8) ?usize {
     if (src.len < 2 or out.len < src.len) return null;
     const family = familyToLinux(src[1]) orelse return null;
-    std.mem.writeInt(u16, out[0..2], @intCast(family), builtin.cpu.arch.endian());
+    std.mem.writeInt(u16, out[0..2], @intCast(family), builtin.target.cpu.arch.endian());
     @memcpy(out[2..src.len], src[2..src.len]);
     return src.len;
 }
@@ -226,7 +226,7 @@ pub fn sockaddrToLinux(src: []const u8, out: []u8) ?usize {
 /// definition — a caller that reads it and gets a zero walks off the end of the address.
 pub fn sockaddrToDarwin(src: []const u8, out: []u8) ?usize {
     if (src.len < 2 or out.len < src.len) return null;
-    const raw = std.mem.readInt(u16, src[0..2], builtin.cpu.arch.endian());
+    const raw = std.mem.readInt(u16, src[0..2], builtin.target.cpu.arch.endian());
     const family = familyToDarwin(raw) orelse return null;
     out[0] = @intCast(@min(src.len, 255));
     out[1] = @intCast(family);
@@ -445,7 +445,7 @@ pub const DarwinTimeval = extern struct { sec: i32, usec: i32 };
 /// on i386. `std.os.linux.timeval` models the kernel's struct rather than musl's, so it cannot be
 /// used here. This is the one `setsockopt` reads, and SO_RCVTIMEO_NEW is the option that goes with
 /// it — measured on i386 musl, where the OLD number or an eight-byte payload is refused outright.
-pub const HostTimeval = switch (builtin.os.tag) {
+pub const HostTimeval = switch (builtin.target.os.tag) {
     .linux => extern struct { sec: i64, usec: i64 },
     else => extern struct { sec: c_long, usec: i32 },
 };
@@ -456,14 +456,14 @@ pub const HostTimeval = switch (builtin.os.tag) {
 /// it always hits the legacy one. Passing 16 bytes there reads tv_usec from tv_sec's high half,
 /// so every timeout is zero and a blocking thread busy-loops forever. `setsockopt` has no second
 /// entry point, so it keeps `HostTimeval` — the two structs really do differ.
-pub const SelectTimeval = switch (builtin.os.tag) {
+pub const SelectTimeval = switch (builtin.target.os.tag) {
     .linux => extern struct { sec: c_long, usec: c_long },
     else => extern struct { sec: c_long, usec: i32 },
 };
 
 comptime {
     std.debug.assert(@sizeOf(DarwinTimeval) == 8);
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         std.debug.assert(@sizeOf(HostTimeval) == 16);
         std.debug.assert(@sizeOf(SelectTimeval) == 2 * @sizeOf(c_long));
     }
@@ -476,7 +476,7 @@ pub const FdSet = extern struct { bits: [128]u8 align(8) };
 
 comptime {
     std.debug.assert(@sizeOf(FdSet) == 128);
-    std.debug.assert(builtin.cpu.arch.endian() == .little);
+    std.debug.assert(builtin.target.cpu.arch.endian() == .little);
 }
 
 // SO_NOSIGPIPE

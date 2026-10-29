@@ -50,7 +50,7 @@ const ADMIN_TOKEN = "testtoken";
 var HEALTH_PORT: u16 = 18080;
 
 fn msg(comptime fmt: []const u8, args: anytype) []const u8 {
-    return std.fmt.allocPrint(alloc, fmt, args) catch "(alloc failed)";
+    return alloc.print(fmt, args) catch "(alloc failed)";
 }
 
 // --- crafts: minimal_d2s ---
@@ -206,7 +206,7 @@ fn scCharCopy() Result {
 
     // Clone Original -> CopyCat within the same account via the admin API.
     var jb: [160]u8 = undefined;
-    const json = std.fmt.bufPrint(&jb, "{{\"src_account\":\"{s}\",\"src_char\":\"{s}\",\"dst_char\":\"{s}\"}}", .{ acct, src, dst }) catch return fail(name, "json", .{});
+    const json = std.mem.print(&jb, "{{\"src_account\":\"{s}\",\"src_char\":\"{s}\",\"dst_char\":\"{s}\"}}", .{ acct, src, dst }) catch return fail(name, "json", .{});
     var rxbuf: [2048]u8 = undefined;
     const r = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/copy", ADMIN_TOKEN, json, &rxbuf) catch |e| return fail(name, "copy {s}", .{@errorName(e)});
     if (r.status != 200) return fail(name, "copy status={d} body={s}", .{ r.status, r.body });
@@ -975,7 +975,7 @@ fn scSeatReleasedOnLeave() Result {
     var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
     defer rcl.close();
     var gcb: [64]u8 = undefined;
-    const gamechars = std.fmt.bufPrint(&gcb, "realmd:gamechars:{d}", .{gid}) catch unreachable;
+    const gamechars = std.mem.print(&gcb, "realmd:gamechars:{d}", .{gid}) catch unreachable;
     const lockkey = "realmd:charlock:" ++ acct ++ "/" ++ char;
 
     const cg = c.createGame("seatgame", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1235,7 +1235,7 @@ fn scGameMaxPlayers() Result {
         var abuf: [9][24]u8 = undefined;
         var i: usize = 0;
         while (i < cs.seats + 1) : (i += 1) {
-            const acct = std.fmt.bufPrint(&abuf[i], "Mp{d}x{d}", .{ round, i }) catch unreachable;
+            const acct = std.mem.print(&abuf[i], "Mp{d}x{d}", .{ round, i }) catch unreachable;
             if (clients[i].d2cs != null) clients[i].close();
             openLobby(&clients[i], acct) catch |e| return fail(name, "{s}: lobby for {s}: {s}", .{ cs.game, acct, @errorName(e) });
         }
@@ -1381,7 +1381,7 @@ fn scSilentServerFallsBack() Result {
     var rcl = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
     defer rcl.close();
     var kb: [64]u8 = undefined;
-    const qk = std.fmt.bufPrint(&kb, "realmd:gsq:{x}", .{gs_a.gsid}) catch unreachable;
+    const qk = std.mem.print(&kb, "realmd:gsq:{x}", .{gs_a.gsid}) catch unreachable;
     const len = rcl.cmd(&.{ "LLEN", qk }) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
     if (len != .int or len.int != 0) return fail(name, "the silent server's request must be taken back, or it creates a stale game when it revives", .{});
     return .{ .name = name, .status = .pass, .msg = msg("silent a skipped (queue emptied), hosted on b", .{}) };
@@ -1595,7 +1595,7 @@ fn scGameListFiltered() Result {
     defer for (clients[0..opened]) |*c| c.close();
     for (list_kinds, 0..) |k, i| {
         var acct: [24]u8 = undefined;
-        const an = std.fmt.bufPrint(&acct, "ListAcct{d}", .{i}) catch unreachable;
+        const an = std.mem.print(&acct, "ListAcct{d}", .{i}) catch unreachable;
         clients[i] = clientWithChar(an, k.char, k.status) catch |e| return fail(name, "{s} {s}", .{ k.char, @errorName(e) });
         opened += 1;
         const cg = clients[i].createGame(k.game, "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
@@ -1672,12 +1672,12 @@ fn scGetFileTime() Result {
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
 
     var cmd: [512]u8 = undefined;
-    const staged = std.fmt.bufPrintZ(&cmd, "mkdir -p '{s}/bnftp' && printf gateways > '{s}/bnftp/bnserver-D2DV.ini'", .{ data_dir, data_dir }) catch
+    const staged = std.mem.printSentinel(&cmd, "mkdir -p '{s}/bnftp' && printf gateways > '{s}/bnftp/bnserver-D2DV.ini'", .{ data_dir, data_dir }, 0) catch
         return fail(name, "could not build the staging command", .{});
     const rc_stage = system(staged.ptr);
     if (rc_stage != 0) return fail(name, "staging the file failed (rc={d}): {s}", .{ rc_stage, staged });
     var vcmd: [512]u8 = undefined;
-    const verify = std.fmt.bufPrintZ(&vcmd, "test -f '{s}/bnftp/bnserver-D2DV.ini'", .{data_dir}) catch return fail(name, "fmt", .{});
+    const verify = std.mem.printSentinel(&vcmd, "test -f '{s}/bnftp/bnserver-D2DV.ini'", .{data_dir}, 0) catch return fail(name, "fmt", .{});
     if (system(verify.ptr) != 0) return fail(name, "the staged file is not there: {s}", .{verify});
 
     var c = rc.RealmClient{};
@@ -1714,7 +1714,7 @@ const StressWorker = struct {
 
     fn run(self: *StressWorker) void {
         var nb: [32]u8 = undefined;
-        const acct = std.fmt.bufPrint(&nb, "Stress{d:0>3}", .{self.index}) catch return;
+        const acct = std.mem.print(&nb, "Stress{d:0>3}", .{self.index}) catch return;
         var c = rc.RealmClient{};
         defer c.close();
         c.connectBnet() catch return;
@@ -1725,7 +1725,7 @@ const StressWorker = struct {
         // Say something, so other workers' broadcast paths run while this one is mutating
         // the registry — the contention this is here to create.
         var mb: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&mb, "worker {d} reporting", .{self.index}) catch return;
+        const line = std.mem.print(&mb, "worker {d} reporting", .{self.index}) catch return;
         c.chatCommand(line) catch return;
         c.chatCommand("/whois Stress000") catch return;
         self.ok = true;
@@ -1807,9 +1807,9 @@ fn scFriendsListLoad() Result {
     var i: usize = 0;
     while (i < want) : (i += 1) {
         var nb: [32]u8 = undefined;
-        const friend = std.fmt.bufPrint(&nb, "LoadFriend{d:0>2}xxxx", .{i}) catch return fail(name, "fmt", .{});
+        const friend = std.mem.print(&nb, "LoadFriend{d:0>2}xxxx", .{i}) catch return fail(name, "fmt", .{});
         var cb: [64]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cb, "/f add {s}", .{friend}) catch return fail(name, "fmt", .{});
+        const cmd = std.mem.print(&cb, "/f add {s}", .{friend}) catch return fail(name, "fmt", .{});
         owner.chatCommand(cmd) catch |e| return fail(name, "{s}", .{@errorName(e)});
         added += 1;
     }
@@ -1823,7 +1823,7 @@ fn scFriendsListLoad() Result {
     var k: usize = 0;
     while (k < online.len) : (k += 1) {
         var nb: [32]u8 = undefined;
-        const who = std.fmt.bufPrint(&nb, "LoadFriend{d:0>2}xxxx", .{k}) catch return fail(name, "fmt", .{});
+        const who = std.mem.print(&nb, "LoadFriend{d:0>2}xxxx", .{k}) catch return fail(name, "fmt", .{});
         online[k] = rc.RealmClient{};
         opened = k + 1;
         online[k].connectBnet() catch |e| return fail(name, "friend {s}", .{@errorName(e)});
@@ -2021,7 +2021,7 @@ fn scChatCommands() Result {
     const aliases = [_][]const u8{ "/w", "/whisper", "/m", "/msg", "/W", "/Msg" };
     for (aliases) |alias| {
         var buf: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "{s} CmdBob via{s}", .{ alias, alias }) catch return fail(name, "fmt", .{});
+        const line = std.mem.print(&buf, "{s} CmdBob via{s}", .{ alias, alias }) catch return fail(name, "fmt", .{});
         a.chatCommand(line) catch |e| return fail(name, "A {s}", .{@errorName(e)});
 
         var got = false;
@@ -2039,7 +2039,7 @@ fn scChatCommands() Result {
     const replies = [_][]const u8{ "/r", "/reply", "/R" };
     for (replies) |verb| {
         var buf: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "{s} back{s}", .{ verb, verb }) catch return fail(name, "fmt", .{});
+        const line = std.mem.print(&buf, "{s} back{s}", .{ verb, verb }) catch return fail(name, "fmt", .{});
         b.chatCommand(line) catch |e| return fail(name, "B {s}", .{@errorName(e)});
 
         var got = false;
@@ -2574,11 +2574,11 @@ fn maybeStartRealmd() !?c_int {
     // meant the base override started a child that tried to bind whatever else owned 18080,
     // failed, and left every scenario reporting ConnectFailed as though the server were broken.
     var health_buf: [8]u8 = undefined;
-    const health = envOr("REALMD_HEALTH_PORT", std.fmt.bufPrintZ(&health_buf, "{d}", .{HEALTH_PORT}) catch "18080");
+    const health = envOr("REALMD_HEALTH_PORT", std.mem.printSentinel(&health_buf, "{d}", .{HEALTH_PORT}, 0) catch "18080");
     // Fresh data dir each run — accounts/chars/games persist otherwise and break
     // isolation (e.g. a re-created account would already exist on the 2nd run).
     var rmbuf: [512]u8 = undefined;
-    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+    if (std.mem.printSentinel(&rmbuf, "rm -rf {s}", .{data_dir}, 0)) |cmd| {
         _ = system(cmd.ptr);
     } else |_| {}
     _ = mkdir(data_dir, 0o755); // ignore EEXIST; realmd creates subdirs itself
@@ -2591,7 +2591,7 @@ fn maybeStartRealmd() !?c_int {
         .{ .name = "REALMD_BNET_PORT", .port = rc.HOST_BNET },
     };
     for (ports, 0..) |pp, i| {
-        if (std.fmt.bufPrintZ(&pbuf[i], "{d}", .{pp.port})) |v| {
+        if (std.mem.printSentinel(&pbuf[i], "{d}", .{pp.port}, 0)) |v| {
             _ = setenv(pp.name, v.ptr, 1);
         } else |_| {}
     }
@@ -2681,7 +2681,7 @@ fn scBannerAd() Result {
 
     // The ad file has to be fetchable, so drop it where BNFTP serves from.
     var cmd: [512]u8 = undefined;
-    if (std.fmt.bufPrintZ(&cmd, "mkdir -p {s}/bnftp && printf 'BANNERPIXELS' > {s}/bnftp/banner.pcx", .{ data_dir, data_dir })) |c| {
+    if (std.mem.printSentinel(&cmd, "mkdir -p {s}/bnftp && printf 'BANNERPIXELS' > {s}/bnftp/banner.pcx", .{ data_dir, data_dir }, 0)) |c| {
         _ = system(c.ptr);
     } else |_| return fail(name, "could not stage the ad file", .{});
 
@@ -2768,10 +2768,10 @@ fn scSaveDurability() Result {
     var c = gsstore.Client.connect(fakegs.redis_port) catch |e| return fail(name, "redis {s}", .{@errorName(e)});
     defer c.close();
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ acct, char }) catch return fail(name, "key", .{});
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ acct, char }) catch return fail(name, "key", .{});
     _ = c.cmd(&.{ "DEL", key }) catch |e| return fail(name, "del {s}", .{@errorName(e)});
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{acct}) catch return fail(name, "key", .{});
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{acct}) catch return fail(name, "key", .{});
     _ = c.cmd(&.{ "SREM", setkey, char }) catch |e| return fail(name, "srem {s}", .{@errorName(e)});
 
     var cl = rc.RealmClient{};
@@ -2804,7 +2804,7 @@ fn scFriendsPersist() Result {
     // must not share a store with anything else, and must not depend on the main harness
     // instance (which may be a realmd the harness merely found running).
     var cmd: [256]u8 = undefined;
-    if (std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{data_dir})) |rm| _ = system(rm.ptr) else |_| {}
+    if (std.mem.printSentinel(&cmd, "rm -rf {s}", .{data_dir}, 0)) |rm| _ = system(rm.ptr) else |_| {}
 
     const base = [_]EnvVar{
         .{ .name = "REALMD_DATA_DIR", .value = data_dir },
@@ -3024,7 +3024,7 @@ fn scMultiInstance() Result {
     // Shared data dir, fresh each run (isolation: accounts/sessions persist on fs).
     const data_dir = "/tmp/e2e-realmd-shared";
     var rmbuf: [256]u8 = undefined;
-    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+    if (std.mem.printSentinel(&rmbuf, "rm -rf {s}", .{data_dir}, 0)) |cmd| {
         _ = system(cmd.ptr);
     } else |_| {}
     _ = mkdir(data_dir, 0o755);
@@ -3203,7 +3203,7 @@ fn spawnD2ingress(ingress_port: u16) !c_int {
     const bin = envOr("REALMD_D2INGRESS_BIN", "./zig-out/bin/d2ingress");
     const data_dir = envOr("REALMD_DATA_DIR", "/tmp/e2e-realmd");
     var pbuf: [8]u8 = undefined;
-    const portz = std.fmt.bufPrintZ(&pbuf, "{d}", .{ingress_port}) catch return error.BadPort;
+    const portz = std.mem.printSentinel(&pbuf, "{d}", .{ingress_port}, 0) catch return error.BadPort;
     _ = setenv("REALMD_DATA_DIR", data_dir, 1);
     _ = setenv("REALMD_INGRESS_PORT", portz.ptr, 1);
     const pid = fork();
@@ -3331,7 +3331,7 @@ fn scEmbeddedGameEdge() Result {
 
     const data_dir = "/tmp/e2e-realmd-edge";
     var rmbuf: [256]u8 = undefined;
-    if (std.fmt.bufPrintZ(&rmbuf, "rm -rf {s}", .{data_dir})) |cmd| {
+    if (std.mem.printSentinel(&rmbuf, "rm -rf {s}", .{data_dir}, 0)) |cmd| {
         _ = system(cmd.ptr);
     } else |_| {}
     _ = mkdir(data_dir, 0o755);
@@ -3431,12 +3431,12 @@ fn resetFixtures() void {
     var rxbuf: [4096]u8 = undefined;
     for (fixture_accounts) |acct| {
         var json: [128]u8 = undefined;
-        const body = std.fmt.bufPrint(&json, "{{\"name\":\"{s}\"}}", .{acct}) catch continue;
+        const body = std.mem.print(&json, "{{\"name\":\"{s}\"}}", .{acct}) catch continue;
         _ = net.httpRequest(HEALTH_PORT, "POST", "/admin/accounts/delete", ADMIN_TOKEN, body, &rxbuf) catch continue;
     }
     for (fixture_chars) |fc| {
         var json: [160]u8 = undefined;
-        const body = std.fmt.bufPrint(&json, "{{\"account\":\"{s}\",\"char\":\"{s}\"}}", .{ fc.account, fc.char }) catch continue;
+        const body = std.mem.print(&json, "{{\"account\":\"{s}\",\"char\":\"{s}\"}}", .{ fc.account, fc.char }) catch continue;
         _ = net.httpRequest(HEALTH_PORT, "POST", "/admin/chars/delete", ADMIN_TOKEN, body, &rxbuf) catch continue;
     }
 }

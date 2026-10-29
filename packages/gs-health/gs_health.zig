@@ -158,7 +158,7 @@ pub fn writeJson(snap: Snapshot, buf: []u8) []const u8 {
 /// The response head. Separate from the body so a host can send them with two writes and never
 /// need a buffer big enough for both.
 pub fn head(a: Answer, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{ a.status, a.content_type, a.body.len },
@@ -188,13 +188,13 @@ pub const Writer = struct {
 
     pub fn num(self: *Writer, v: u32) void {
         var tmp: [12]u8 = undefined;
-        self.put(std.fmt.bufPrint(&tmp, "{d}", .{v}) catch return);
+        self.put(std.mem.print(&tmp, "{d}", .{v}) catch return);
     }
 
     /// A value carried as hundredths, printed as a decimal ("2543" -> "25.43").
     pub fn fixed2(self: *Writer, v: u32) void {
         var tmp: [16]u8 = undefined;
-        self.put(std.fmt.bufPrint(&tmp, "{d}.{d:0>2}", .{ v / 100, v % 100 }) catch return);
+        self.put(std.mem.print(&tmp, "{d}.{d:0>2}", .{ v / 100, v % 100 }) catch return);
     }
 
     pub fn metric(self: *Writer, name: []const u8, kind: []const u8, help: []const u8, v: u32) void {

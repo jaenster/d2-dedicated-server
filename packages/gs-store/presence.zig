@@ -137,7 +137,7 @@ test "a full table drops the newcomer and keeps the rest" {
     var t = Table{};
     var nb: [8]u8 = undefined;
     for (0..capacity) |i| {
-        const nm = std.fmt.bufPrint(&nb, "p{d}", .{i}) catch unreachable;
+        const nm = std.mem.print(&nb, "p{d}", .{i}) catch unreachable;
         t.enter(1, "x", nm, 1, 1);
     }
     t.enter(1, "x", "late", 1, 1);

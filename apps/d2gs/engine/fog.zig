@@ -21,8 +21,8 @@ const BYTE = u8;
 /// the existing call sites). Opaque: we only pass the pointer to the pool fns.
 pub const D2PoolManagerStrc = @import("d2types.zig").D2PoolManagerStrc;
 
-const ThiscallConv = std.builtin.CallingConvention{ .x86_thiscall = .{} };
-const StdcallConv = std.builtin.CallingConvention{ .x86_stdcall = .{} };
+const ThiscallConv = std.lang.CallingConvention{ .x86_thiscall = .{} };
+const StdcallConv = std.lang.CallingConvention{ .x86_stdcall = .{} };
 
 // FOG pool function addresses (D2 1.14d, image base 0x00400000, no ASLR).
 const ADDR_INIT_POOL_SYSTEM: usize = 0x00409DD0; // stdcall (D2PoolManagerStrc**, char*, i32)
@@ -92,7 +92,7 @@ const RegistryEntry = struct {
     pool: *D2PoolManagerStrc,
     meta: *FogPoolMeta,
 };
-var pool_registry: [MAX_POOLS]?RegistryEntry = .{null} ** MAX_POOLS;
+var pool_registry: [MAX_POOLS]?RegistryEntry = @splat(null);
 
 fn findRegistryEntry(pool: *D2PoolManagerStrc) ?*RegistryEntry {
     for (&pool_registry) |*entry| {

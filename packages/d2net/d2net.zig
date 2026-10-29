@@ -75,7 +75,7 @@ fn say(msg: []const u8) void {
 
 fn sayFmt(comptime fmt: []const u8, args: anytype) void {
     var buf: [256]u8 = undefined;
-    say(std.fmt.bufPrint(&buf, fmt, args) catch return);
+    say(std.mem.print(&buf, fmt, args) catch return);
 }
 
 // ── framing ──────────────────────────────────────────────────────────────────
@@ -165,23 +165,23 @@ var op_delta: u8 = 0;
 /// cdecl and by plain name, like Fog's: the engine never calls this, only our host does, and a
 /// stdcall export would pick up mingw's `@4` decoration.
 export fn D2NET_SetEngineVersion(v: u32) callconv(.c) i32 {
-    inline for (@typeInfo(@import("d2engine").version.Version).@"enum".fields) |f| {
-        if (f.value == v) {
-            const tbl = cs.packetSizes(@enumFromInt(f.value)) orelse {
-                sayFmt("d2net: no packet table read for {s} — framing as 1.10f", .{f.name});
+    inline for (@typeInfo(@import("d2engine").version.Version).@"enum".field_names, @typeInfo(@import("d2engine").version.Version).@"enum".field_values) |field_name, field_value| {
+        if (field_value == v) {
+            const tbl = cs.packetSizes(@fromBackingInt(field_value)) orelse {
+                sayFmt("d2net: no packet table read for {s} — framing as 1.10f", .{field_name});
                 return 0;
             };
             sizes = tbl;
-            const jp = cs.joinPacket(@enumFromInt(f.value)) orelse return 0;
+            const jp = cs.joinPacket(@fromBackingInt(field_value)) orelse return 0;
                 join_op = jp.op;
                 join_len = jp.len;
-                enter_op = cs.enterGamePacket(@enumFromInt(f.value)) orelse 0x6b;
+                enter_op = cs.enterGamePacket(@fromBackingInt(field_value)) orelse 0x6b;
                 op_delta = cs.join_114d - join_op;
-            const sys = cs.systemRange(@enumFromInt(f.value)) orelse return 0;
+            const sys = cs.systemRange(@fromBackingInt(field_value)) orelse return 0;
             system_lo = sys.lo;
             system_hi = sys.hi;
             sayFmt("d2net: framing for {s} ({d} opcodes, join 0x{x}, system 0x{x}-0x{x})", .{
-                f.name, sizes.len, join_op, system_lo, system_hi,
+                field_name, sizes.len, join_op, system_lo, system_hi,
             });
             return 1;
         }

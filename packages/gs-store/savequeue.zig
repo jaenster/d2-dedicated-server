@@ -296,7 +296,7 @@ test "a full queue drops the oldest, never the newest" {
     resetForTest();
     var nb: [8]u8 = undefined;
     for (0..capacity) |i| {
-        try testing.expect(park("acct", std.fmt.bufPrint(&nb, "c{d}", .{i}) catch unreachable, "x", 0, 0));
+        try testing.expect(park("acct", std.mem.print(&nb, "c{d}", .{i}) catch unreachable, "x", 0, 0));
     }
     try testing.expectEqual(capacity, depth());
     try testing.expect(park("acct", "Newcomer", "x", 0, 0));
@@ -319,14 +319,14 @@ test "what cannot be kept is refused rather than half-kept" {
     try testing.expect(!park("", "Persist", "x", 0, 0));
     try testing.expect(!park("jaenster", "", "x", 0, 0));
     try testing.expect(!park("jaenster", "Persist", "", 0, 0));
-    const too_big = [_]u8{0} ** (max_bytes + 1);
+    const too_big: [max_bytes + 1]u8 = @splat(0);
     try testing.expect(!park("jaenster", "Persist", &too_big, 0, 0));
     try testing.expectEqual(@as(usize, 0), depth());
 }
 
 test "a save exactly at the limit is kept" {
     resetForTest();
-    const at_limit = [_]u8{7} ** max_bytes;
+    const at_limit: [max_bytes]u8 = @splat(7);
     try testing.expect(park("jaenster", "Persist", &at_limit, 0, 0));
     var a: [account_max]u8 = undefined;
     var n: [name_max]u8 = undefined;
@@ -338,7 +338,7 @@ test "a store that recovers drains the whole queue" {
     resetForTest();
     var nb: [8]u8 = undefined;
     for (0..capacity) |i| {
-        try testing.expect(park("acct", std.fmt.bufPrint(&nb, "c{d}", .{i}) catch unreachable, "xx", 0, 0));
+        try testing.expect(park("acct", std.mem.print(&nb, "c{d}", .{i}) catch unreachable, "xx", 0, 0));
     }
     var a: [account_max]u8 = undefined;
     var n: [name_max]u8 = undefined;

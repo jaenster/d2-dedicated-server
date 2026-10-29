@@ -36,7 +36,7 @@ const windows = struct {
 var soft_ticks: u32 = 0;
 
 fn ticks() u32 {
-    return if (builtin.os.tag == .windows) windows.GetTickCount() else soft_ticks;
+    return if (builtin.target.os.tag == .windows) windows.GetTickCount() else soft_ticks;
 }
 
 /// Advance the software clock. On a non-Windows host this IS the clock, so the Mac server calls it
@@ -362,11 +362,11 @@ pub fn resetForTest() void {
 const testing = std.testing;
 
 fn nameFor(buf: []u8, i: usize) []const u8 {
-    return std.fmt.bufPrint(buf, "c{d}", .{i}) catch unreachable;
+    return std.mem.print(buf, "c{d}", .{i}) catch unreachable;
 }
 
 fn acct(buf: []u8, i: usize) []const u8 {
-    return std.fmt.bufPrint(buf, "acct{d}", .{i}) catch unreachable;
+    return std.mem.print(buf, "acct{d}", .{i}) catch unreachable;
 }
 
 test "an account round-trips, and the character name is matched case-insensitively" {
@@ -486,8 +486,8 @@ test "a name that does not fit is refused rather than truncated" {
     try testing.expect(!remember(1, 100, "", "jaenster", ""));
     try testing.expect(!remember(1, 100, "Sorc", "", ""));
     try testing.expect(!remember(1, 100, "ThisNameIsFarTooLong", "jaenster", ""));
-    try testing.expect(!remember(1, 100, "Sorc", "a" ** (max_account + 1), ""));
-    try testing.expect(remember(1, 100, "a" ** max_char, "a" ** max_account, ""));
+    try testing.expect(!remember(1, 100, "Sorc", &@as([max_account + 1]u8, @splat('a')), ""));
+    try testing.expect(remember(1, 100, &@as([max_char]u8, @splat('a')), &@as([max_account]u8, @splat('a')), ""));
 }
 
 test "accountForChar refuses a buffer the account does not fit in" {

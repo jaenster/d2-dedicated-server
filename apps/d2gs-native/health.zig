@@ -26,7 +26,7 @@ const sockaddr_in = extern struct {
     family: u16 = 2, // AF_INET
     port: u16, // network order
     addr: u32 = 0, // INADDR_ANY
-    zero: [8]u8 = .{0} ** 8,
+    zero: [8]u8 = @splat(0),
 };
 
 /// Written on the tick thread, read on this one. Plain aligned words: a reader sees one value or

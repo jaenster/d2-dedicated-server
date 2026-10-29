@@ -165,7 +165,7 @@ test "an empty save is never uploaded" {
 test "a name that cannot be tracked is refused rather than half-recorded" {
     resetForTest();
     try testing.expect(!shouldUpload("", "aaaa"));
-    try testing.expect(!shouldUpload("a" ** (name_max + 1), "aaaa"));
+    try testing.expect(!shouldUpload(&@as([name_max + 1]u8, @splat('a')), "aaaa"));
 }
 
 test "leaving forgets the character, so the next session re-uploads" {
@@ -182,7 +182,7 @@ test "a full table keeps working, at worst by re-uploading" {
     resetForTest();
     var nb: [8]u8 = undefined;
     for (0..capacity) |i| {
-        const n = std.fmt.bufPrint(&nb, "c{d}", .{i}) catch unreachable;
+        const n = std.mem.print(&nb, "c{d}", .{i}) catch unreachable;
         try testing.expect(shouldUpload(n, "aaaa"));
         try testing.expect(!shouldUpload(n, "aaaa"));
     }
@@ -199,7 +199,7 @@ test "every distinct save of a long session is uploaded exactly once" {
     for (0..200) |i| {
         // The engine rewrites the save on its timer whether or not it changed; here it changes
         // every fifth write.
-        const save = std.fmt.bufPrint(&buf, "save-{d}", .{i / 5}) catch unreachable;
+        const save = std.mem.print(&buf, "save-{d}", .{i / 5}) catch unreachable;
         if (shouldUpload("Persist", save)) uploads += 1;
     }
     try testing.expectEqual(@as(usize, 40), uploads);

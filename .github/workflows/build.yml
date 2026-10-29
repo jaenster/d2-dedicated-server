@@ -220,7 +220,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      ZIG_VERSION: "0.16.0"
+      ZIG_VERSION: "0.17.0"
     steps:
       - uses: actions/checkout@v4
       - name: install zig
@@ -335,7 +335,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      ZIG_VERSION: "0.16.0"
+      ZIG_VERSION: "0.17.0"
       D2_MINIMAL_ENGINE_BASE: https://files.typeguru.nl/diablo/minimal
       CLIENTLESS: ${{ github.workspace }}/d2-clientless/zig-out/bin/clientless
     steps:

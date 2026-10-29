@@ -250,7 +250,7 @@ pub const GsInfo = struct {
     /// What the server says it IS: `k=v` pairs, newline-separated, as it published them. Held
     /// inline rather than as a slice because the snapshot these are built from is a caller's
     /// array — a slice into it would dangle the moment that caller returned.
-    labels: [labels_max]u8 = [_]u8{0} ** labels_max,
+    labels: [labels_max]u8 = @splat(0),
     labels_len: u8 = 0,
 
     /// The labels as text. Empty from a server that publishes none, which matches no requirement

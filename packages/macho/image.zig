@@ -158,7 +158,7 @@ pub fn parse(bytes: []const u8) Error!Image {
 
     var off: usize = 28;
     for (0..ncmds) |_| {
-        const cmd: Cmd = @enumFromInt(try read(u32, bytes, off));
+        const cmd: Cmd = @fromBackingInt(try read(u32, bytes, off));
         const size = try read(u32, bytes, off + 4);
         if (size < 8 or off + size > bytes.len) return Error.Truncated;
 

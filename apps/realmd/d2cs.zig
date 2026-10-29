@@ -21,49 +21,49 @@ extern "c" fn time(t: ?*c_long) c_long; // POSIX seconds-since-epoch, for the .d
 // MCP message ids (subset; everything else is logged).
 const mcp = @import("libd2").bnet.mcp;
 
-const MCP_STARTUP = @intFromEnum(mcp.Op.startup);
-const MCP_CHARCREATE = @intFromEnum(mcp.Op.charcreate);
-const MCP_CREATEGAME = @intFromEnum(mcp.Op.creategame);
-const MCP_JOINGAME = @intFromEnum(mcp.Op.joingame);
-const MCP_GAMELIST = @intFromEnum(mcp.Op.gamelist);
-const MCP_GAMEINFO = @intFromEnum(mcp.Op.gameinfo);
-const MCP_CHARLOGON = @intFromEnum(mcp.Op.charlogon);
-const MCP_CHARDELETE = @intFromEnum(mcp.Op.chardelete);
-const MCP_LADDERDATA = @intFromEnum(mcp.Op.ladderdata);
-const MCP_MOTD = @intFromEnum(mcp.Op.motd);
-const MCP_CANCELCREATE = @intFromEnum(mcp.Op.cancelcreate);
-const MCP_CHARRANK = @intFromEnum(mcp.Op.charrank);
-const MCP_CHARUPGRADE = @intFromEnum(mcp.Op.charupgrade);
-const MCP_CHARLIST2 = @intFromEnum(mcp.Op.charlist2);
+const MCP_STARTUP = @backingInt(mcp.Op.startup);
+const MCP_CHARCREATE = @backingInt(mcp.Op.charcreate);
+const MCP_CREATEGAME = @backingInt(mcp.Op.creategame);
+const MCP_JOINGAME = @backingInt(mcp.Op.joingame);
+const MCP_GAMELIST = @backingInt(mcp.Op.gamelist);
+const MCP_GAMEINFO = @backingInt(mcp.Op.gameinfo);
+const MCP_CHARLOGON = @backingInt(mcp.Op.charlogon);
+const MCP_CHARDELETE = @backingInt(mcp.Op.chardelete);
+const MCP_LADDERDATA = @backingInt(mcp.Op.ladderdata);
+const MCP_MOTD = @backingInt(mcp.Op.motd);
+const MCP_CANCELCREATE = @backingInt(mcp.Op.cancelcreate);
+const MCP_CHARRANK = @backingInt(mcp.Op.charrank);
+const MCP_CHARUPGRADE = @backingInt(mcp.Op.charupgrade);
+const MCP_CHARLIST2 = @backingInt(mcp.Op.charlist2);
 
 // MCP result codes from OOG_PollJoinCreatePump @0x441770 (D2Client/OOGUtilities.cpp), with the
 // string-table id each resolves to. A code not in this list falls to `default:`: no popup, no
 // state change, player frozen on the join screen.
 // CREATEGAME (0x03) replies:
-const CREATE_OK: u32 = @intFromEnum(mcp.CreateResult.created);
-const CREATE_INVALID_NAME: u32 = @intFromEnum(mcp.CreateResult.invalid_name); // str 0x1411 "Invalid Game Name"
-const CREATE_NAME_TAKEN: u32 = @intFromEnum(mcp.CreateResult.already_exists); // str 0x1412 "Game Already Exists"
-const CREATE_SERVER_DOWN: u32 = @intFromEnum(mcp.CreateResult.servers_down); // str 0x1413 "Server Down"
+const CREATE_OK: u32 = @backingInt(mcp.CreateResult.created);
+const CREATE_INVALID_NAME: u32 = @backingInt(mcp.CreateResult.invalid_name); // str 0x1411 "Invalid Game Name"
+const CREATE_NAME_TAKEN: u32 = @backingInt(mcp.CreateResult.already_exists); // str 0x1412 "Game Already Exists"
+const CREATE_SERVER_DOWN: u32 = @backingInt(mcp.CreateResult.servers_down); // str 0x1413 "Server Down"
 // There is NO "servers are full" code on the create path: JoinOrCreateGame @0x441500 bounds the
 // switch at 0x20 and sends everything else to str 0x1415 "Error Creating Game" (0x2b "Game is
 // Full" exists only on the JOIN path, and means that one game is full — not this). So a full
 // fleet gets the default bucket on purpose: "Error Creating Game" is vague but TRUE, whereas
 // "Server Down" would be a plain lie about servers that are up and busy.
-const CREATE_ERROR_GENERIC: u32 = @intFromEnum(mcp.CreateResult.generic); // > 0x20 -> str 0x1415 "Error Creating Game"
+const CREATE_ERROR_GENERIC: u32 = @backingInt(mcp.CreateResult.generic); // > 0x20 -> str 0x1415 "Error Creating Game"
 
 // JOINGAME (0x04) replies. NOTE the first two — they are not in the order you would
 // guess from the numbers, and realmd had them the wrong way round: 0x29 is the PASSWORD
 // failure and 0x2a is the MISSING-GAME failure.
-const JOIN_OK: u32 = @intFromEnum(mcp.JoinResult.ok);
-const JOIN_BAD_PASSWORD: u32 = @intFromEnum(mcp.JoinResult.password_incorrect); // str 0x1428 "password don't match"
-const JOIN_NO_SUCH_GAME: u32 = @intFromEnum(mcp.JoinResult.no_such_game); // str 0x1427 "Game does not exist."
-const JOIN_FULL: u32 = @intFromEnum(mcp.JoinResult.game_full); // str 0x1429 "Game is Full."
-const JOIN_HARDCORE_MIX: u32 = @intFromEnum(mcp.JoinResult.hardcore_mix); // str 0x1426 hc/normal mix
-const JOIN_CLASSIC_INTO_EXPANSION: u32 = @intFromEnum(mcp.JoinResult.classic_into_expansion); // str 0x2775
-const JOIN_EXPANSION_INTO_CLASSIC: u32 = @intFromEnum(mcp.JoinResult.expansion_into_classic); // str 0x2776
-const JOIN_LADDER_MISMATCH: u32 = @intFromEnum(mcp.JoinResult.ladder_mismatch);
-const JOIN_NEED_NIGHTMARE: u32 = @intFromEnum(mcp.JoinResult.need_nightmare); // str 0x14f4/0x5522 need Diablo/Baal kill
-const JOIN_NEED_HELL: u32 = @intFromEnum(mcp.JoinResult.need_hell); // str 0x14f3/0x5521, str 0x2ab1/0x2ab2 by ladder flag
+const JOIN_OK: u32 = @backingInt(mcp.JoinResult.ok);
+const JOIN_BAD_PASSWORD: u32 = @backingInt(mcp.JoinResult.password_incorrect); // str 0x1428 "password don't match"
+const JOIN_NO_SUCH_GAME: u32 = @backingInt(mcp.JoinResult.no_such_game); // str 0x1427 "Game does not exist."
+const JOIN_FULL: u32 = @backingInt(mcp.JoinResult.game_full); // str 0x1429 "Game is Full."
+const JOIN_HARDCORE_MIX: u32 = @backingInt(mcp.JoinResult.hardcore_mix); // str 0x1426 hc/normal mix
+const JOIN_CLASSIC_INTO_EXPANSION: u32 = @backingInt(mcp.JoinResult.classic_into_expansion); // str 0x2775
+const JOIN_EXPANSION_INTO_CLASSIC: u32 = @backingInt(mcp.JoinResult.expansion_into_classic); // str 0x2776
+const JOIN_LADDER_MISMATCH: u32 = @backingInt(mcp.JoinResult.ladder_mismatch);
+const JOIN_NEED_NIGHTMARE: u32 = @backingInt(mcp.JoinResult.need_nightmare); // str 0x14f4/0x5522 need Diablo/Baal kill
+const JOIN_NEED_HELL: u32 = @backingInt(mcp.JoinResult.need_hell); // str 0x14f3/0x5521, str 0x2ab1/0x2ab2 by ladder flag
 
 /// Character status bits as they sit in the .d2s header at 0x24 — the same bits the
 /// CharSel statstring and MCP_CHARCREATE speak in. A game stores the creator's, so a
@@ -173,13 +173,13 @@ pub const DConn = struct {
     out: [16384]u8 = undefined,
     out_len: usize = 0,
     session: u64 = 0,
-    account: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    account: [state.max_name + 1]u8 = @splat(0),
     account_len: u8 = 0,
-    char: [state.max_name + 1]u8 = [_]u8{0} ** (state.max_name + 1),
+    char: [state.max_name + 1]u8 = @splat(0),
     char_len: u8 = 0,
     // Which engine the client on the other end runs. MCP is a different connection from the login
     // that learned it, so it comes back off the session at startup rather than off the wire.
-    client_version: [state.max_version]u8 = [_]u8{0} ** state.max_version,
+    client_version: [state.max_version]u8 = @splat(0),
     client_version_len: u8 = 0,
     /// Set by a successful MCP_STARTUP and by nothing else; every other command needs it. `drop`
     /// closes the connection once the current packet is answered.
@@ -383,7 +383,7 @@ fn onCharList(c: *DConn, tag: []const u8, body: []const u8) void {
     var r = proto.Reader.init(body);
     const requested: u16 = @truncate(r.getU32());
 
-    var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
+    var names: [store.max_chars]store.Name = @splat(.{});
     const total = store.listChars(c.accountName(), &names);
     const ret: u16 = @intCast(@min(total, requested));
     log.line(tag, "charlist requested={d} (account={s}) -> total={d} returned={d}", .{ requested, c.accountName(), total, ret });
@@ -1213,7 +1213,7 @@ const ladder_max = 200;
 const ladder_entry_size: u32 = 16; // name field width
 
 const LadderEntry = struct {
-    name: [16]u8 = .{0} ** 16,
+    name: [16]u8 = @splat(0),
     stats: u32 = 0,
     experience: u32 = 0,
 };
@@ -1233,7 +1233,7 @@ fn collectLadder(out: *[ladder_max]LadderEntry) usize {
     for (accts[0..na]) |acct_buf| {
         const acct = std.mem.sliceTo(&acct_buf, 0);
         if (acct.len == 0) continue;
-        var names: [store.max_chars]store.Name = [_]store.Name{.{}} ** store.max_chars;
+        var names: [store.max_chars]store.Name = @splat(.{});
         const nc = store.listChars(acct, &names);
         for (names[0..nc]) |nm| {
             if (n >= ladder_max) return n;
@@ -1432,7 +1432,7 @@ test "a chat statstring carries the character's class, level, mode and title pro
 }
 
 test "a save's header is read into the statstring, gear or none" {
-    var save = [_]u8{0} ** 0xB0;
+    var save: [0xB0]u8 = @splat(0);
     save[0x24] = 0x28; // expansion, died bit
     save[0x25] = 15;
     save[0x28] = 1; // sorceress

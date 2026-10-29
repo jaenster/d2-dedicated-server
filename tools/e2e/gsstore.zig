@@ -37,9 +37,9 @@ pub const Client = struct {
     pub fn cmdBig(self: *Client, head: []const []const u8, tail: []const u8) !resp.Reply {
         var tx: [1024]u8 = undefined;
         var n: usize = 0;
-        n += (std.fmt.bufPrint(tx[n..], "*{d}\r\n", .{head.len + 1}) catch return error.TooLong).len;
+        n += (std.mem.print(tx[n..], "*{d}\r\n", .{head.len + 1}) catch return error.TooLong).len;
         for (head) |a| {
-            n += (std.fmt.bufPrint(tx[n..], "${d}\r\n", .{a.len}) catch return error.TooLong).len;
+            n += (std.mem.print(tx[n..], "${d}\r\n", .{a.len}) catch return error.TooLong).len;
             if (n + a.len + 2 > tx.len) return error.TooLong;
             @memcpy(tx[n..][0..a.len], a);
             n += a.len;
@@ -47,7 +47,7 @@ pub const Client = struct {
             tx[n + 1] = '\n';
             n += 2;
         }
-        n += (std.fmt.bufPrint(tx[n..], "${d}\r\n", .{tail.len}) catch return error.TooLong).len;
+        n += (std.mem.print(tx[n..], "${d}\r\n", .{tail.len}) catch return error.TooLong).len;
         try net.writeAll(self.fd, tx[0..n]);
         try net.writeAll(self.fd, tail);
         try net.writeAll(self.fd, "\r\n");

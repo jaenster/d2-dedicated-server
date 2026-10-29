@@ -44,7 +44,7 @@ fn parseMethod(req: []const u8) []const u8 {
 
 fn respond(fd: net.Socket, status: Status, body: []const u8) void {
     var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status.text, body.len, body }) catch return;
+    const msg = std.mem.print(&buf, "HTTP/1.1 {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status.text, body.len, body }) catch return;
     _ = net.writeAll(fd, msg);
 }
 
@@ -115,7 +115,7 @@ pub fn handle(fd: net.Socket, tag: []const u8) void {
     } else if (std.mem.eql(u8, path, "/readyz")) {
         if (readyReason()) |why| {
             var b: [64]u8 = undefined;
-            respond(fd, unavailable, std.fmt.bufPrint(&b, "not ready: {s}\n", .{why}) catch "not ready\n");
+            respond(fd, unavailable, std.mem.print(&b, "not ready: {s}\n", .{why}) catch "not ready\n");
         } else {
             respond(fd, ok, "ready\n");
         }

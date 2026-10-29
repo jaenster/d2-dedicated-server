@@ -173,10 +173,10 @@ pub const GameDetail = struct {
     max_players: u8 = 0,
     players: u8 = 0,
     /// Parallel to `names`: class id and level of each listed player.
-    classes: [16]u8 = [_]u8{0} ** 16,
-    levels: [16]u8 = [_]u8{0} ** 16,
+    classes: [16]u8 = @splat(0),
+    levels: [16]u8 = @splat(0),
     description: []const u8 = "",
-    names: [8][]const u8 = [_][]const u8{""} ** 8,
+    names: [8][]const u8 = @splat(""),
 };
 
 /// One row of the join-screen game list.
@@ -877,7 +877,7 @@ pub fn storeCharVersion(account: []const u8, charname: []const u8) !u64 {
     var c = try gsstore.Client.connect(fakegs.redis_port);
     defer c.close();
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
     return switch (try c.cmd(&.{ "GET", verkey })) {
         .bulk => |b| if (b) |v| std.fmt.parseInt(u64, v, 10) catch 0 else 0,
         else => 0,
@@ -894,15 +894,15 @@ pub fn storePutCharFenced(account: []const u8, charname: []const u8, d2s: []cons
     var c = try gsstore.Client.connect(fakegs.redis_port);
     defer c.close();
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
     var vb: [192]u8 = undefined;
-    const verkey = std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    const verkey = std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
     var mb: [192]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
     var eb: [24]u8 = undefined;
-    const expect_s = std.fmt.bufPrint(&eb, "{d}", .{expect}) catch return error.NameTooLong;
+    const expect_s = std.mem.print(&eb, "{d}", .{expect}) catch return error.NameTooLong;
     const script =
         \\local cur = tonumber(redis.call('GET', KEYS[2]) or '0')
         \\if cur ~= 0 and cur ~= tonumber(ARGV[1]) then return -(cur + 1) end
@@ -926,18 +926,18 @@ pub fn storePutChar(account: []const u8, charname: []const u8, d2s: []const u8) 
     var c = try gsstore.Client.connect(fakegs.redis_port);
     defer c.close();
     var kb: [192]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
+    const key = std.mem.print(&kb, "realmd:char:{s}:{s}", .{ account, charname }) catch return error.NameTooLong;
     _ = try c.cmdBig(&.{ "SET", key }, d2s);
     // The account's character set, exactly as the game server's own `putChar` writes it: that
     // set is what CHARLIST reads for anything postgres has not caught up with yet, so a harness
     // that skipped it would be testing a save path the server does not have.
     var sb: [192]u8 = undefined;
-    const setkey = std.fmt.bufPrint(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
+    const setkey = std.mem.print(&sb, "realmd:chars:{s}", .{account}) catch return error.NameTooLong;
     _ = try c.cmd(&.{ "SADD", setkey, charname });
     var vb: [192]u8 = undefined;
-    _ = try c.cmd(&.{ "INCR", std.fmt.bufPrint(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong });
+    _ = try c.cmd(&.{ "INCR", std.mem.print(&vb, "realmd:charver:{s}/{s}", .{ account, charname }) catch return error.NameTooLong });
     var mb: [128]u8 = undefined;
-    const member = std.fmt.bufPrint(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
+    const member = std.mem.print(&mb, "{s}/{s}", .{ account, charname }) catch return error.NameTooLong;
     _ = try c.cmd(&.{ "SADD", "realmd:dirty", member });
 
     var waited: u32 = 0;

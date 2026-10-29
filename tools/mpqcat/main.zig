@@ -46,7 +46,7 @@ fn writeFile(path: [*:0]const u8, data: []const u8) !void {
 
 /// Create every directory on the way to `path`, ignoring the ones already there.
 fn mkdirs(gpa: std.mem.Allocator, path: []const u8) !void {
-    const buf = try gpa.dupeZ(u8, path);
+    const buf = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(buf);
     var i: usize = 1;
     while (i < buf.len) : (i += 1) {
@@ -86,7 +86,7 @@ fn candidates(gpa: std.mem.Allocator, files: []const []const u8, cross: bool) ![
     if (cross) {
         for (dirs.keys()) |d| {
             for (leaves.keys()) |l| {
-                try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}\\{s}", .{ d, l }));
+                try out.append(gpa, try gpa.print("{s}\\{s}", .{ d, l }));
             }
         }
     }
@@ -128,7 +128,7 @@ fn cmdList(gpa: std.mem.Allocator, archive: mpq.Archive, names: []const []const 
         if (by_block[i] != null) continue;
         nameless += 1;
         var buf: [32]u8 = undefined;
-        const label = std.fmt.bufPrint(&buf, "<block {d}>", .{i}) catch "<block>";
+        const label = std.mem.print(&buf, "<block {d}>", .{i}) catch "<block>";
         // Only an ENCRYPTED member needs a key, and its key is derived from the name we do not
         // have. An unencrypted one reads out regardless, so saying "no key" about it would report
         // a problem that is not there — most of Patch_D2.mpq is exactly that case.
@@ -161,7 +161,7 @@ fn cmdExtract(gpa: std.mem.Allocator, archive: mpq.Archive, names: []const []con
                 continue;
             };
         } else {
-            rel = try std.fmt.allocPrint(gpa, "_unnamed\\block{d:0>4}.bin", .{i});
+            rel = try gpa.print("_unnamed\\block{d:0>4}.bin", .{i});
             const key: ?u32 = if (blk.flags & mpq.Flags.encrypted != 0)
                 (archive.recoverKey(gpa, index) catch null) orelse {
                     std.debug.print("  FAIL block {d}: no name and no recoverable key\n", .{i});
@@ -183,7 +183,7 @@ fn cmdExtract(gpa: std.mem.Allocator, archive: mpq.Archive, names: []const []con
         for (rel, 0..) |c, j| path[outdir.len + 1 + j] = if (c == '\\') '/' else c;
         const at = std.mem.lastIndexOfScalar(u8, path, '/').?;
         try mkdirs(gpa, path[0..at]);
-        const zpath = try gpa.dupeZ(u8, path);
+        const zpath = try gpa.dupeSentinel(u8, path, 0);
         try writeFile(zpath.ptr, data);
         ok += 1;
     }

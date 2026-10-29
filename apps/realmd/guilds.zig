@@ -59,7 +59,7 @@ pub fn save(g: *const Guild) Error!void {
 
 fn requireRank(g: *Guild, actor: []const u8, min: Rank) Error!*Member {
     const m = g.findMember(actor) orelse return error.NotMember;
-    if (@intFromEnum(m.rank) < @intFromEnum(min)) return error.Denied;
+    if (@backingInt(m.rank) < @backingInt(min)) return error.Denied;
     return m;
 }
 

@@ -72,7 +72,7 @@ const x86 = struct {
 /// Null on every host but i386: there is no portable version of this, and answering with one that
 /// only half works is the thing this file exists to avoid. Nothing runs the image off i386 anyway.
 pub fn address(name: []const u8) ?usize {
-    if (comptime builtin.cpu.arch != .x86) return null;
+    if (comptime builtin.target.cpu.arch != .x86) return null;
     if (std.mem.eql(u8, name, "setjmp")) return @intFromPtr(&x86.setjmp);
     if (std.mem.eql(u8, name, "longjmp")) return @intFromPtr(&x86.longjmp);
     return null;
@@ -84,11 +84,11 @@ const testing = std.testing;
 test "the buffer stays inside the one the caller allocated" {
     const darwin_jmp_buf_words = 18;
     try testing.expect(words <= darwin_jmp_buf_words);
-    try testing.expectEqual(@as(usize, 5), @intFromEnum(Slot.ebp));
+    try testing.expectEqual(@as(usize, 5), @backingInt(Slot.ebp));
 }
 
 test "setjmp and longjmp are answered only where the assembly is real" {
-    if (comptime builtin.cpu.arch == .x86) {
+    if (comptime builtin.target.cpu.arch == .x86) {
         try testing.expect(address("setjmp").? != 0);
         try testing.expect(address("longjmp").? != 0);
     } else {
@@ -103,7 +103,7 @@ test "setjmp and longjmp are answered only where the assembly is real" {
 var trips: u32 = 0;
 
 test "a longjmp comes back through setjmp carrying its value" {
-    if (comptime builtin.cpu.arch != .x86) return error.SkipZigTest;
+    if (comptime builtin.target.cpu.arch != .x86) return error.SkipZigTest;
 
     const Buf = [18]u32;
     const set: *const fn (*Buf) callconv(.c) c_int = @ptrCast(&x86.setjmp);

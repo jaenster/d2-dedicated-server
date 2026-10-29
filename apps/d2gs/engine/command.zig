@@ -38,7 +38,7 @@ fn copyz(dst: []u8, src: []const u8) void {
 
 /// Run pending engine commands. Called once per tick by the server thread.
 pub fn pump() void {
-    if (@atomicLoad(u32, &kind, .acquire) != @intFromEnum(Kind.create_game)) return;
+    if (@atomicLoad(u32, &kind, .acquire) != @backingInt(Kind.create_game)) return;
     r_gameid = 0;
     r_ok = server.GAME_CreateBattleNetGame(
         @ptrCast(&c_name),
@@ -50,7 +50,7 @@ pub fn pump() void {
         c_ladder,
         &r_gameid,
     );
-    @atomicStore(u32, &kind, @intFromEnum(Kind.none), .release);
+    @atomicStore(u32, &kind, @backingInt(Kind.none), .release);
     @atomicStore(u32, &done, 1, .release);
 }
 
@@ -64,7 +64,7 @@ pub fn createGame(name: []const u8, pass: []const u8, desc: []const u8, flags: u
     c_flags = flags;
     c_ladder = ladder;
     @atomicStore(u32, &done, 0, .release);
-    @atomicStore(u32, &kind, @intFromEnum(Kind.create_game), .release);
+    @atomicStore(u32, &kind, @backingInt(Kind.create_game), .release);
     var spins: u32 = 0;
     while (@atomicLoad(u32, &done, .acquire) == 0 and spins < 500) : (spins += 1) Sleep(10);
     return if (r_ok != 0) r_gameid else 0;

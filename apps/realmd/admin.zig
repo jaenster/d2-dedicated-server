@@ -126,7 +126,7 @@ fn ctEq(a: []const u8, b: []const u8) bool {
 /// shared REALMD_ADMIN_SECRET.
 fn mintSession(name: []const u8, out: []u8) ?[]const u8 {
     var pbuf: [128]u8 = undefined;
-    const payload = std.fmt.bufPrint(&pbuf, "{s}|{d}", .{ name, time(null) + session_ttl_s }) catch return null;
+    const payload = std.mem.print(&pbuf, "{s}|{d}", .{ name, time(null) + session_ttl_s }) catch return null;
     var mac: [32]u8 = undefined;
     HmacSha256.create(&mac, payload, sign_key);
     var w: usize = 0;
@@ -184,9 +184,9 @@ fn respond(fd: net.Socket, st: Status, body: []const u8) void {
 fn respondCookie(fd: net.Socket, st: Status, body: []const u8, set_cookie: []const u8) void {
     var hdr: [512]u8 = undefined;
     const h = if (set_cookie.len > 0)
-        std.fmt.bufPrint(&hdr, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nSet-Cookie: {s}\r\nConnection: close\r\n\r\n", .{ st.text, body.len, set_cookie }) catch return
+        std.mem.print(&hdr, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nSet-Cookie: {s}\r\nConnection: close\r\n\r\n", .{ st.text, body.len, set_cookie }) catch return
     else
-        std.fmt.bufPrint(&hdr, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ st.text, body.len }) catch return;
+        std.mem.print(&hdr, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ st.text, body.len }) catch return;
     _ = net.writeAll(fd, h);
     if (body.len > 0) _ = net.writeAll(fd, body);
 }
@@ -323,7 +323,7 @@ pub fn handle(fd: net.Socket, method: []const u8, path: []const u8, req: []const
     if (std.mem.eql(u8, p, "/admin/me")) {
         const a = auth orelse return respond(fd, unauthorized, "{\"error\":\"unauthorized\"}");
         var b: [128]u8 = undefined;
-        return respond(fd, ok, std.fmt.bufPrint(&b, "{{\"name\":\"{s}\",\"via\":\"{s}\"}}", .{ a.name, a.via }) catch "{}");
+        return respond(fd, ok, std.mem.print(&b, "{{\"name\":\"{s}\",\"via\":\"{s}\"}}", .{ a.name, a.via }) catch "{}");
     }
 
     if (auth == null) return respond(fd, unauthorized, "{\"error\":\"unauthorized\"}");
@@ -386,14 +386,14 @@ fn login(fd: net.Socket, req: []const u8) void {
     var tokbuf: [256]u8 = undefined;
     const sess = mintSession(name, &tokbuf) orelse return respond(fd, server_error, "{\"error\":\"sign failed\"}");
     var cbuf: [384]u8 = undefined;
-    const cookie = std.fmt.bufPrint(&cbuf, "realmd_admin={s}; HttpOnly; Path=/; SameSite=Strict; Max-Age={d}", .{ sess, session_ttl_s }) catch return respond(fd, server_error, "{\"error\":\"cookie\"}");
+    const cookie = std.mem.print(&cbuf, "realmd_admin={s}; HttpOnly; Path=/; SameSite=Strict; Max-Age={d}", .{ sess, session_ttl_s }) catch return respond(fd, server_error, "{\"error\":\"cookie\"}");
     var nb: [128]u8 = undefined;
-    respondCookie(fd, ok, std.fmt.bufPrint(&nb, "{{\"name\":\"{s}\",\"via\":\"session\"}}", .{name}) catch "{}", cookie);
+    respondCookie(fd, ok, std.mem.print(&nb, "{{\"name\":\"{s}\",\"via\":\"session\"}}", .{name}) catch "{}", cookie);
 }
 
 fn status(fd: net.Socket) void {
     var buf: [512]u8 = undefined;
-    const body = std.fmt.bufPrint(&buf, "{{\"sessions\":{d},\"games\":{d},\"gameservers\":{d},\"instance\":\"{s}\",\"durable\":\"{s}\",\"ephemeral\":\"{s}\"}}", .{
+    const body = std.mem.print(&buf, "{{\"sessions\":{d},\"games\":{d},\"gameservers\":{d},\"instance\":\"{s}\",\"durable\":\"{s}\",\"ephemeral\":\"{s}\"}}", .{
         state.global.sessionCount(),
         countGames(),
         fleet.registeredCount(),
@@ -417,7 +417,7 @@ fn gameservers(fd: net.Socket) void {
     buf[w] = '[';
     w += 1;
     for (gs[0..n], 0..) |g, i| {
-        const seg = std.fmt.bufPrint(buf[w..], "{s}{{\"gsid\":\"0x{x}\",\"addr\":\"{d}.{d}.{d}.{d}:{d}\",\"maxgame\":{d},\"live_games\":{d}}}", .{
+        const seg = std.mem.print(buf[w..], "{s}{{\"gsid\":\"0x{x}\",\"addr\":\"{d}.{d}.{d}.{d}:{d}\",\"maxgame\":{d},\"live_games\":{d}}}", .{
             if (i == 0) "" else ",",
             g.gsid,
             g.ip[0],
@@ -455,7 +455,7 @@ fn games(fd: net.Socket) void {
         // Everything an operator would want to know about a live game and, until now, had
         // no way to see: how full it is, what the creator called it, and which kind of
         // game it is — the same status bits a joining character has to match.
-        const seg = std.fmt.bufPrint(
+        const seg = std.mem.print(
             buf[w..],
             "{s}{{\"name\":\"{s}\",\"gameid\":{d},\"gsid\":\"0x{x}\",\"ip\":\"{d}.{d}.{d}.{d}:{d}\"," ++
                 "\"players\":{d},\"description\":\"{s}\",\"expansion\":{s},\"hardcore\":{s},\"ladder\":{s}}}",
@@ -495,7 +495,7 @@ fn accountsList(fd: net.Socket) void {
     w = head.len;
     for (names[0..n], 0..) |nm, i| {
         const name = std.mem.sliceTo(&nm, 0);
-        const seg = std.fmt.bufPrint(buf[w..], "{s}{{\"name\":\"{s}\",\"admin\":{}}}", .{ if (i == 0) "" else ",", name, store.accountIsAdmin(name) }) catch break;
+        const seg = std.mem.print(buf[w..], "{s}{{\"name\":\"{s}\",\"admin\":{}}}", .{ if (i == 0) "" else ",", name, store.accountIsAdmin(name) }) catch break;
         w += seg.len;
     }
     const tail = "]}";
@@ -705,7 +705,7 @@ fn setAdminEndpoint(fd: net.Socket, req: []const u8, caller: []const u8) void {
     _ = store.setAdmin(name, want);
     if (want) any_db_admin = true; // keep the API enabled across restarts
     var b: [64]u8 = undefined;
-    respond(fd, ok, std.fmt.bufPrint(&b, "{{\"name\":\"{s}\",\"admin\":{}}}", .{ name, want }) catch "{}");
+    respond(fd, ok, std.mem.print(&b, "{{\"name\":\"{s}\",\"admin\":{}}}", .{ name, want }) catch "{}");
 }
 
 fn closeGame(fd: net.Socket, path: []const u8, req: []const u8) void {

@@ -60,7 +60,7 @@ pub fn setMode(data: []u8, mode: u8) bool {
 pub const Items = struct { count: ?u16, digest: [8]u8 };
 
 pub fn items(data: []const u8) Items {
-    var out = Items{ .count = null, .digest = [_]u8{'0'} ** 8 };
+    var out = Items{ .count = null, .digest = @as([8]u8, @splat('0')) };
     const gf = std.mem.indexOf(u8, data, "gf") orelse return out;
     const sk = std.mem.indexOfPos(u8, data, gf + 2, "if") orelse return out;
     const jm = sk + 32; // the skill section is "if" plus 30 bytes
@@ -68,7 +68,7 @@ pub fn items(data: []const u8) Items {
     out.count = std.mem.readInt(u16, data[jm + 2 ..][0..2], .little);
     var h: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data[jm..], &h, .{});
-    _ = std.fmt.bufPrint(&out.digest, "{x}", .{h[0..4]}) catch {};
+    _ = std.mem.print(&out.digest, "{x}", .{h[0..4]}) catch {};
     return out;
 }
 
@@ -172,7 +172,7 @@ test "the attribute widths agree with libd2's" {
 test "attribute walks the packed list and finds experience" {
     // Build a "gf" section by hand: level(12)=87, experience(13)=1_500_000, then the
     // terminator, packed LSB-first exactly as the game writes it.
-    var save = [_]u8{0} ** 64;
+    var save: [64]u8 = @splat(0);
     @memcpy(save[0..8], "HEADERgf");
     var bit: usize = 0;
     const put = struct {
@@ -232,7 +232,7 @@ test "setMode never touches expansion or died" {
 }
 
 test "items reads the count and digests the tail" {
-    var save = [_]u8{0} ** 120;
+    var save: [120]u8 = @splat(0);
     @memcpy(save[10..12], "gf");
     @memcpy(save[40..42], "if");
     @memcpy(save[72..74], "JM");

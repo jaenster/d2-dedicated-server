@@ -101,7 +101,7 @@ fn sendJoinGameReply(seq: u32, result: u32, gameid: u32) void {
 // their redis TTL (~hours), and clients joining one get "game name and password don't match".
 const GameSlot = struct { name: [16]u8 = undefined, len: u8 = 0, gameid: u32 = 0, used: bool = false };
 var games_lock: Lock = .{};
-var games_tracked = [_]GameSlot{.{}} ** 256;
+var games_tracked: [256]GameSlot = @splat(.{});
 
 // Count of games that exist on this GS, from CREATE (recordGame, before the first
 // join) to DESTROY (takeGameId). The tick loop reads this to skip the engine's
@@ -411,7 +411,7 @@ fn handleRequest(msg: []const u8) void {
     const seq = std.mem.readInt(u32, buf[4..8], .little);
     if (size > n or size < p.HEADER_LEN) return; // truncated; nothing sensible to answer
     const body = buf[p.HEADER_LEN..size];
-    switch (@as(p.Type, @enumFromInt(typ))) {
+    switch (@as(p.Type, @fromBackingInt(typ))) {
         .creategame => handleCreateGame(seq, body),
         .joingame => handleJoinGame(seq, body),
         else => {},

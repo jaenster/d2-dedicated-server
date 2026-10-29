@@ -13,7 +13,7 @@ const log = @import("../../log.zig");
 const COMPILETXT: usize = 0x006122f0;
 const COMPILETXT_REJOIN: usize = 0x006122f9; // entry + 9 (after the relocated prologue)
 
-const StdcallConv = std.builtin.CallingConvention{ .x86_stdcall = .{} };
+const StdcallConv = std.lang.CallingConvention{ .x86_stdcall = .{} };
 const CompileTxtFn = fn (
     pMemory: ?*anyopaque,
     szTableName: [*:0]const u8,
