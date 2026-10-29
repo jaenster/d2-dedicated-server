@@ -90,6 +90,9 @@ realmd:
   # Drain window for the SIGTERM shutdown grace below.
   terminationGracePeriodSeconds: 30
   shutdownGraceMs: 10000
+  # imagePullSecret name (e.g. a dockerconfigjson secret), for a realm that runs its own realmd
+  # build from a private repository. Empty = pull anonymously.
+  pullSecret: ""
   # Anything a realm's own extensions need. The chart cannot know what they are — an extension is
   # compiled into a downstream binary and reads REALMD_EXT_<NAME>_<KEY> — so this is the seam that
   # lets a realm configure one without the chart learning about it.
@@ -113,6 +116,14 @@ realmd:
   #   extraPorts:
   #     - { containerPort: 7211, name: extlogin }
   extraPorts: []
+  # Files an extension reads at startup, e.g. template saves from a Secret.
+  #   extraVolumes:
+  #     - name: seed
+  #       secret: { secretName: my-seed-chars, optional: true }
+  #   extraVolumeMounts:
+  #     - { name: seed, mountPath: /seed, readOnly: true }
+  extraVolumes: []
+  extraVolumeMounts: []
   logJson: true
   resources:
     requests: { cpu: 50m, memory: 32Mi }

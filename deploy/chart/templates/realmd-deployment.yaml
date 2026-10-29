@@ -21,6 +21,10 @@ spec:
         {{- include "realm.selectorLabels" (dict "root" . "component" "realmd") | nindent 8 }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.realmd.terminationGracePeriodSeconds }}
+      {{- if .Values.realmd.pullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.realmd.pullSecret }}
+      {{- end }}
       containers:
         - name: realmd
           image: "{{ .Values.images.realmd.repository }}:{{ .Values.images.realmd.tag }}"
@@ -93,3 +97,11 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.realmd.resources | nindent 12 }}
+          {{- with .Values.realmd.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.realmd.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
