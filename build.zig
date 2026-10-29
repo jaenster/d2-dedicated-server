@@ -524,6 +524,8 @@ pub fn build(b: *std.Build) void {
         .{ "apps/d2gs/runtime/feature/ubers_policy.zig", false, false },
         // Which `--loaddll` mods /metrics asks for their own families.
         .{ "apps/d2gs/runtime/feature/mod_metrics.zig", false, false },
+        // Where the entry hooks read their values, and the register contract of every hooked 1.14d function.
+        .{ "apps/d2gs/runtime/feature/hook_contract.zig", false, false },
     }) |spec| {
         const mod_tests = b.addTest(.{
             .root_module = b.createModule(.{

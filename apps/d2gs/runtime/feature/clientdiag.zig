@@ -27,11 +27,11 @@ fn EntryHook(comptime addr: usize, comptime prologue_len: usize, comptime deref_
                     "call %[f:P]\n" ++
                     "add $4, %%esp\n" ++
                     "popfl\npopal\n" ++
-                    "mov %[tramp], %%eax\n" ++
-                    "jmp *(%%eax)\n"
+                    // Through the trampoline pointer in memory, so EAX reaches the client as it came.
+                    "jmp *%[tramp:P]\n"
                 :
                 : [f] "X" (&logHit),
-                  [tramp] "X" (&tramp),
+                  [tramp] "i" (&tramp),
             );
         }
 

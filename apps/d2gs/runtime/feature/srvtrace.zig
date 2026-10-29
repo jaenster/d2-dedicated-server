@@ -11,6 +11,7 @@
 const std = @import("std");
 const patch = @import("../patch.zig");
 const trampoline = @import("../trampoline.zig");
+const hook_contract = @import("hook_contract.zig");
 const log = @import("../../log.zig");
 const evlog = @import("../evlog.zig");
 const obs = @import("obs");
@@ -1636,34 +1637,8 @@ fn pinDrlgSeed() void {
 
 // hook framework
 
-/// Where a captured value comes from at function entry. `.stack` is the original
-/// [esp+k] BEFORE the shim pushed anything (we correct for pushal/pushfl + our own
-/// pushes). `.deref_*` captures the byte at [reg].
-const Src = union(enum) {
-    none,
-    ecx,
-    edx,
-    esi,
-    edi,
-    ebx,
-    deref_ecx,
-    deref_edx,
-    stack: usize,
-};
-
-fn pushAsm(comptime s: Src, comptime pushed: usize) []const u8 {
-    return switch (s) {
-        .none => "pushl $0\n",
-        .ecx => "push %ecx\n",
-        .edx => "push %edx\n",
-        .esi => "push %esi\n",
-        .edi => "push %edi\n",
-        .ebx => "push %ebx\n",
-        .deref_ecx => "movzbl (%ecx), %eax\npush %eax\n",
-        .deref_edx => "movzbl (%edx), %eax\npush %eax\n",
-        .stack => |k| std.fmt.comptimePrint("pushl {d}(%esp)\n", .{36 + pushed + k}),
-    };
-}
+const Src = hook_contract.Src;
+const pushAsm = hook_contract.pushAsm;
 
 const Handler = *const fn (usize, usize, usize) callconv(.c) void;
 
@@ -1688,6 +1663,9 @@ const Hook = struct {
 
 fn TraceHook(comptime h: Hook) type {
     return struct {
+        comptime {
+            hook_contract.checkHook(h.label, h.addr, &.{ h.game, h.a1, h.a2, h.a3 });
+        }
         var tramp: usize = 0;
 
         fn shim() callconv(.naked) void {
@@ -1703,12 +1681,13 @@ fn TraceHook(comptime h: Hook) type {
                     "call %[f:P]\n" ++
                     "add $12, %%esp\n" ++
                     "popfl\npopal\n" ++
-                    "mov %[tramp], %%eax\n" ++
-                    "jmp *(%%eax)\n"
+                    // Through the trampoline pointer in memory, so EAX reaches the engine as it came:
+                    // some hooked functions take an argument in it.
+                    "jmp *%[tramp:P]\n"
                 :
                 : [sg] "X" (&setCurGame),
                   [f] "X" (h.handler),
-                  [tramp] "X" (&tramp),
+                  [tramp] "i" (&tramp),
             );
         }
 

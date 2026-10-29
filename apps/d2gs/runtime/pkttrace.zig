@@ -125,11 +125,10 @@ fn sendShim() callconv(.naked) void {
         \\call %[f:P]
         \\add $8, %%esp
         \\popal
-        \\mov %[tramp], %%eax
-        \\jmp *(%%eax)
+        \\jmp *%[tramp:P]
         :
         : [f] "X" (&logOut),
-          [tramp] "X" (&trampoline),
+          [tramp] "i" (&trampoline),
     );
 }
 

@@ -57,8 +57,7 @@ fn handler() callconv(.naked) void {
         \\push %%eax
         \\call %[f:P]
         \\add $16, %%esp
-        \\mov %[flag], %%eax
-        \\movb (%%eax), %%al
+        \\movb %[flag:P], %%al
         \\testb %%al, %%al
         \\jnz 1f
         \\call %[fin:P]
@@ -67,7 +66,7 @@ fn handler() callconv(.naked) void {
         :
         : [f] "X" (&logHalt),
           [fin] "X" (&finish),
-          [flag] "X" (&suppress),
+          [flag] "i" (&suppress),
     );
 }
 
