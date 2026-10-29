@@ -215,7 +215,13 @@ pub const NamedGame = struct {
     difficulty: u8 = 0,
     description: [32]u8 = @splat(0),
     desc_len: u8 = 0,
+    /// The join password, so the list can leave out a private game (empty = open).
+    password: [16]u8 = @splat(0),
+    pw_len: u8 = 0,
 
+    pub fn pw(g: *const NamedGame) []const u8 {
+        return g.password[0..g.pw_len];
+    }
     pub fn desc(g: *const NamedGame) []const u8 {
         return g.description[0..g.desc_len];
     }

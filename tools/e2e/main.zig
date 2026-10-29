@@ -265,27 +265,85 @@ fn scClassicChar() Result {
     return .{ .name = name, .status = .pass, .msg = msg("classic Barbarian ok, classic Druid rejected (0x{x}), expansion Druid ok", .{cdruid}) };
 }
 
+/// A ladder character's save: `d2sWithExperience` with the status byte set (ladder 0x40,
+/// expansion 0x20, hardcore 0x04).
+fn ladderSave(buf: *[0x80]u8, name: []const u8, class_id: u8, level: u8, experience: u32, status: u8) []const u8 {
+    const out = d2sWithExperience(buf, name, class_id, level, experience);
+    buf[0x24] = status;
+    return out;
+}
+
+/// The realm ranks on a board it rebuilds every few seconds, so a character saved a moment ago
+/// shows up on the next build. Ask until `who` is on the list or the wait is clearly too long.
+fn ladderWithin(c: *rc.RealmClient, mode: u8, who: []const u8, out: []rc.LadderEntry, dst: []u8) !usize {
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        const cnt = try c.ladderData(mode, 0, out, dst);
+        for (out[0..cnt]) |e| if (std.mem.eql(u8, e.name, who)) return cnt;
+        if (tries >= 15) return cnt;
+        _ = net.usleep(1_000_000);
+    }
+}
+
+fn ladderClient(c: *rc.RealmClient, acct: []const u8) ?[]const u8 {
+    c.connectBnet() catch |e| return @errorName(e);
+    c.auth() catch |e| return @errorName(e);
+    c.login(acct) catch |e| return @errorName(e);
+    c.enterRealm() catch |e| return @errorName(e);
+    c.connectD2cs() catch |e| return @errorName(e);
+    if ((c.startup() catch 1) != 0) return "d2cs startup failed";
+    return null;
+}
+
+/// The ladder screen's lists: only ladder characters, each group and class apart, the whole list
+/// in packets the client can read (it drops one over 1024 bytes, which is what emptied the
+/// realm's ladder once it had more than about 35 characters), and the search for one name.
 fn scLadder() Result {
     const name = "ladder_list";
     const acct = "LadderAcct";
-    var d2s: [0x40]u8 = undefined;
-    const king = rc.storePutChar(acct, "LadderKing", minimalD2s(&d2s, "LadderKing", 1, 99)) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (king != 0) return fail(name, "save LadderKing result={d}", .{king});
-    const pawn = rc.storePutChar(acct, "LadderPawn", minimalD2s(&d2s, "LadderPawn", 1, 1)) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if (pawn != 0) return fail(name, "save LadderPawn result={d}", .{pawn});
+    const ladder_sc: u8 = 0x40 | 0x20;
+    var b: [0x80]u8 = undefined;
+    const saves = [_]struct { n: []const u8, class: u8, level: u8, exp: u32, status: u8 }{
+        .{ .n = "LadderKing", .class = 1, .level = 99, .exp = 3_500_000_000, .status = ladder_sc },
+        .{ .n = "LadderPawn", .class = 1, .level = 1, .exp = 0, .status = ladder_sc },
+        .{ .n = "LadderBarb", .class = 4, .level = 50, .exp = 30_000_000, .status = ladder_sc },
+        .{ .n = "LadderNot", .class = 1, .level = 98, .exp = 3_400_000_000, .status = 0x20 },
+        .{ .n = "LadderHard", .class = 1, .level = 97, .exp = 3_300_000_000, .status = ladder_sc | 0x04 },
+    };
+    for (saves) |sv| {
+        const r = rc.storePutChar(acct, sv.n, ladderSave(&b, sv.n, sv.class, sv.level, sv.exp, sv.status)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (r != 0) return fail(name, "save {s} result={d}", .{ sv.n, r });
+    }
+    // Enough ladder characters that the overall list cannot fit one 1024-byte packet, over five
+    // accounts (an account holds sixteen). The ladder walks the realm's accounts, so each is
+    // logged on once to exist.
+    var fa_i: usize = 0;
+    while (fa_i < 5) : (fa_i += 1) {
+        var ab: [16]u8 = undefined;
+        const fa = std.fmt.bufPrint(&ab, "LadFillAcct{d}", .{fa_i}) catch unreachable;
+        var lc = rc.RealmClient{};
+        defer lc.close();
+        lc.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        lc.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+        lc.login(fa) catch |e| return fail(name, "log on {s}: {s}", .{ fa, @errorName(e) });
+    }
+    var fill: usize = 0;
+    while (fill < 60) : (fill += 1) {
+        var ab: [16]u8 = undefined;
+        var nb: [16]u8 = undefined;
+        const fa = std.fmt.bufPrint(&ab, "LadFillAcct{d}", .{fill / 12}) catch unreachable;
+        const fnm = std.fmt.bufPrint(&nb, "LadFill{d:0>2}", .{fill}) catch unreachable;
+        const r = rc.storePutChar(fa, fnm, ladderSave(&b, fnm, @intCast(fill % 7), 10, @intCast(1000 + fill), ladder_sc)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        if (r != 0) return fail(name, "save {s} result={d}", .{ fnm, r });
+    }
 
     var c = rc.RealmClient{};
     defer c.close();
-    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    if (ladderClient(&c, acct)) |why| return fail(name, "{s}", .{why});
 
     var entries: [256]rc.LadderEntry = undefined;
     var dst: [8192]u8 = undefined;
-    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cnt = ladderWithin(&c, 0x1b, "LadderKing", &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     var king_rank: ?usize = null;
     var pawn_rank: ?usize = null;
     var king_level: u32 = 0;
@@ -295,12 +353,45 @@ fn scLadder() Result {
             king_level = e.level;
         }
         if (std.mem.eql(u8, e.name, "LadderPawn")) pawn_rank = i;
+        if (std.mem.eql(u8, e.name, "LadderNot")) return fail(name, "a non-ladder character is on the ladder", .{});
+        if (std.mem.eql(u8, e.name, "LadderHard")) return fail(name, "a hardcore character is on the softcore list", .{});
     }
     const kr = king_rank orelse return fail(name, "LadderKing not on ladder (cnt={d})", .{cnt});
     const pr = pawn_rank orelse return fail(name, "LadderPawn not on ladder (cnt={d})", .{cnt});
+    if (cnt < 63) return fail(name, "the list has {d} rows, want all 63 ladder characters", .{cnt});
     if (king_level != 99) return fail(name, "LadderKing level={d} want 99", .{king_level});
-    if (kr >= pr) return fail(name, "not ranked by level: King@{d} not before Pawn@{d}", .{ kr, pr });
-    return .{ .name = name, .status = .pass, .msg = msg("ladder lists {d}; LadderKing(99)@{d} ranked above LadderPawn(1)@{d}", .{ cnt, kr, pr }) };
+    if (kr >= pr) return fail(name, "not ranked: King@{d} not before Pawn@{d}", .{ kr, pr });
+
+    // One class: the Sorceress list has the King and not the Barbarian.
+    const sorcs = c.ladderData(0x1b + 2, 0, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var sorc_king = false;
+    for (entries[0..sorcs]) |e| {
+        if (e.class_id != 1) return fail(name, "{s} (class {d}) on the Sorceress list", .{ e.name, e.class_id });
+        if (std.mem.eql(u8, e.name, "LadderKing")) sorc_king = true;
+    }
+    if (!sorc_king) return fail(name, "LadderKing missing from the Sorceress list", .{});
+
+    // The hardcore list holds the hardcore character.
+    const hard = c.ladderData(0x13, 0, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var found_hard = false;
+    for (entries[0..hard]) |e| if (std.mem.eql(u8, e.name, "LadderHard")) {
+        found_hard = true;
+    };
+    if (!found_hard) return fail(name, "LadderHard missing from the hardcore list ({d} rows)", .{hard});
+
+    // The search finds a ladder character on its page, and says nobody for one that is not.
+    var base: u32 = 999;
+    const page = c.charRank(false, true, "LadderPawn", &entries, &dst, &base) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    var pawn_on_page = false;
+    for (entries[0..page]) |e| if (std.mem.eql(u8, e.name, "LadderPawn")) {
+        pawn_on_page = true;
+    };
+    if (!pawn_on_page) return fail(name, "search for LadderPawn: not on the page it was sent ({d} rows from {d})", .{ page, base });
+    if (base != pr - pr % 16) return fail(name, "search for LadderPawn (rank {d}) started at {d}, want {d}", .{ pr, base, pr - pr % 16 });
+    const none = c.charRank(false, true, "LadderNot", &entries, &dst, &base) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (none != 0) return fail(name, "search for a non-ladder character found {d} rows", .{none});
+
+    return .{ .name = name, .status = .pass, .msg = msg("{d} rows in pieces under 1024 bytes; King@{d} above Pawn@{d}; class, hardcore and search lists right", .{ cnt, kr, pr }) };
 }
 
 /// A ladder is ordered by experience, which is not in the save header — it lives in the
@@ -310,23 +401,18 @@ fn scLadderExperience() Result {
     const name = "ladder_experience";
     const acct = "ExpAcct";
     var buf: [0x80]u8 = undefined;
-    const ahead = rc.storePutChar(acct, "ExpAhead", d2sWithExperience(&buf, "ExpAhead", 1, 90, 1_900_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const ahead = rc.storePutChar(acct, "ExpAhead", ladderSave(&buf, "ExpAhead", 1, 90, 1_900_000_000, 0x60)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (ahead != 0) return fail(name, "save ExpAhead result={d}", .{ahead});
-    const behind = rc.storePutChar(acct, "ExpBehind", d2sWithExperience(&buf, "ExpBehind", 1, 90, 1_200_000_000)) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const behind = rc.storePutChar(acct, "ExpBehind", ladderSave(&buf, "ExpBehind", 1, 90, 1_200_000_000, 0x60)) catch |e| return fail(name, "{s}", .{@errorName(e)});
     if (behind != 0) return fail(name, "save ExpBehind result={d}", .{behind});
 
     var c = rc.RealmClient{};
     defer c.close();
-    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
-    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+    if (ladderClient(&c, acct)) |why| return fail(name, "{s}", .{why});
 
     var entries: [256]rc.LadderEntry = undefined;
     var dst: [8192]u8 = undefined;
-    const cnt = c.ladderData(0x23, &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    const cnt = ladderWithin(&c, 0x1b, "ExpBehind", &entries, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
     var ahead_rank: ?usize = null;
     var behind_rank: ?usize = null;
     var ahead_exp: u32 = 0;
@@ -342,6 +428,54 @@ fn scLadderExperience() Result {
     if (ahead_exp != 1_900_000_000) return fail(name, "ExpAhead experience={d}, want 1900000000 (decoded from the attribute list)", .{ahead_exp});
     if (ar >= br) return fail(name, "same level, more experience did not rank first: ExpAhead@{d} vs ExpBehind@{d}", .{ ar, br });
     return .{ .name = name, .status = .pass, .msg = msg("equal level 90: exp {d} @{d} ranked above exp 1200000000 @{d}", .{ ahead_exp, ar, br }) };
+}
+
+/// An account holds sixteen characters, and the list the game asks for (it asks for sixteen) carries
+/// all of them. A seventeenth is refused, and so is it by name: it must not exist and go unlisted.
+fn scCharsSixteen() Result {
+    const name = "chars_sixteen";
+    const acct = "SixteenAcct";
+    var c = rc.RealmClient{};
+    defer c.close();
+    c.connectBnet() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.auth() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.login(acct) catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.enterRealm() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    c.connectD2cs() catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if ((c.startup() catch 1) != 0) return fail(name, "d2cs startup failed", .{});
+
+    var names: [17][8]u8 = undefined; // "Sx00Char"
+    var n: usize = 0;
+    while (n < 17) : (n += 1) {
+        const nm = std.mem.print(&names[n], "Sx{d:0>2}Char", .{n}) catch unreachable;
+        const res = c.charCreateFresh(@intCast(n % 7), 0x20, nm) catch |e| return fail(name, "create {d}: {s}", .{ n + 1, @errorName(e) });
+        if (n < 16 and res != 0) return fail(name, "create {d} of 16 result=0x{x}", .{ n + 1, res });
+        if (n == 16) {
+            if (res == 0) return fail(name, "a seventeenth character was created", .{});
+            break;
+        }
+        // The list the game asks for is complete at every count, the ninth to the sixteenth included.
+        var chars: [16]rc.CharEntry = undefined;
+        var dst: [4096]u8 = undefined;
+        const got = c.charListAsking(16, &chars, &dst) catch |e| return fail(name, "list after {d}: {s}", .{ n + 1, @errorName(e) });
+        if (got.total != n + 1 or got.count != n + 1) return fail(name, "after {d} characters the list says total={d} returned={d}", .{ n + 1, got.total, got.count });
+    }
+    var chars: [16]rc.CharEntry = undefined;
+    var dst: [4096]u8 = undefined;
+    const got = c.charListAsking(16, &chars, &dst) catch |e| return fail(name, "final list: {s}", .{@errorName(e)});
+    if (got.total != 16 or got.count != 16) return fail(name, "refused seventeenth changed the list: total={d} returned={d}", .{ got.total, got.count });
+    var gone: [17]bool = @splat(false);
+    for (chars[0..got.count]) |e| {
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            if (std.mem.eql(u8, e.name, &names[i])) gone[i] = true;
+        }
+    }
+    for (gone[0..16], 0..) |g, i| if (!g) return fail(name, "character {d} is missing from the list of sixteen", .{i + 1});
+    // The old request of eight still gets eight, the rest left for a client that asks for more.
+    const eight = c.charListAsking(8, &chars, &dst) catch |e| return fail(name, "list of eight: {s}", .{@errorName(e)});
+    if (eight.total != 16 or eight.count != 8) return fail(name, "asked for 8: total={d} returned={d}", .{ eight.total, eight.count });
+    return .{ .name = name, .status = .pass, .msg = msg("1..16 created and listed at every count; the 17th refused; a request of 8 returns 8 of 16", .{}) };
 }
 
 /// CHARUPGRADE has to actually convert the save. It used to ack success and change
@@ -1622,7 +1756,33 @@ fn scGameListFiltered() Result {
         const info = clients[i].gameInfo(other, &d) catch |e| return fail(name, "{s}", .{@errorName(e)});
         if (info.token != 0xFFFF_FFFF) return fail(name, "{s}: game info of '{s}' answered (token 0x{x})", .{ k.char, other, info.token });
     }
-    return .{ .name = name, .status = .pass, .msg = msg("classic/expansion x ladder x hardcore: each of 6 kinds lists only its own game, and no detail for the others", .{}) };
+
+    // A game with a password is left out of everyone's list, still joins with the password, and
+    // refuses a wrong one.
+    var owner = clientWithChar("PrivOwner", "PrivOwnerC", 0x00) catch |e| return fail(name, "owner {s}", .{@errorName(e)});
+    defer owner.close();
+    var friend = clientWithChar("PrivFriend", "PrivFriendC", 0x00) catch |e| return fail(name, "friend {s}", .{@errorName(e)});
+    defer friend.close();
+    const pg = owner.createGameWithPassword("p-private", "d", "sesame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (pg.result != 0) return fail(name, "private create result={d}", .{pg.result});
+    const og = owner.createGame("p-open", "d") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    _ = og;
+    for ([_]*rc.RealmClient{ &friend, &clients[0] }) |viewer| {
+        var rows: [512]rc.GameEntry = undefined;
+        var dst: [32768]u8 = undefined;
+        const n = viewer.gameList(&rows, &dst) catch |e| return fail(name, "{s}", .{@errorName(e)});
+        var open_seen = false;
+        for (rows[0..n]) |g| {
+            if (std.mem.eql(u8, g.name, "p-private")) return fail(name, "a password game is in the list", .{});
+            if (std.mem.eql(u8, g.name, "p-open")) open_seen = true;
+        }
+        if (!open_seen) return fail(name, "the open game left the list too", .{});
+    }
+    const wrong = friend.joinGameWithPassword("p-private", "nope") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (wrong.result != 0x29) return fail(name, "wrong password -> 0x{x}, want 0x29", .{wrong.result});
+    const right = friend.joinGameWithPassword("p-private", "sesame") catch |e| return fail(name, "{s}", .{@errorName(e)});
+    if (right.result != 0) return fail(name, "right password -> 0x{x}, want 0", .{right.result});
+    return .{ .name = name, .status = .pass, .msg = msg("classic/expansion x ladder x hardcore: each of 6 kinds lists only its own game, and no detail for the others; a password game is unlisted but joins by name and password", .{}) };
 }
 
 /// An expansion character that asks to join a classic game by name is told so with the code the
@@ -3495,6 +3655,7 @@ pub fn main() !void {
         only("scLadder", scLadder),
         only("scLadderExperience", scLadderExperience),
         only("scCharUpgrade", scCharUpgrade),
+        only("scCharsSixteen", scCharsSixteen),
         only("scCharDelete", scCharDelete),
         only("scCharCopy", scCharCopy),
         only("scLobbyChatAtoB", scLobbyChatAtoB),

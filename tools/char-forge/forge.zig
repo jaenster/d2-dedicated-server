@@ -155,8 +155,8 @@ pub fn forge(out: []u8, experience_txt: []const u8, charstats_txt: []const u8, s
     const h = &s.header;
     h.name = @as([16]u8, @splat(0));
     @memcpy(h.name[0..spec.name.len], spec.name);
-    // The same status byte the realm's own character creation writes: mandatory bit, plus hardcore and expansion.
-    h.status = 0x01 | (if (spec.hardcore) @as(u8, 0x04) else 0) | (if (spec.expansion or spec.class >= 5) @as(u8, 0x20) else 0);
+    // Hardcore and expansion only. Bit 0x01 marks a new, header-only character; 1.14d refuses a full save that carries it.
+    h.status = (if (spec.hardcore) @as(u8, 0x04) else 0) | (if (spec.expansion or spec.class >= 5) @as(u8, 0x20) else 0);
     h.class = spec.class;
     h.level = spec.level;
     h.created = spec.created;
@@ -276,7 +276,7 @@ test "a forged level-9 hardcore expansion save reads back as written, by two rea
     // and the realm's own narrow reader, which is what the ladder reads, finds the same numbers
     try std.testing.expectEqual(@as(?u32, 9), realm_d2s.attribute(out, realm_d2s.stat_level));
     try std.testing.expectEqual(@as(?u32, 44396), realm_d2s.attribute(out, realm_d2s.stat_experience));
-    try std.testing.expectEqual(@as(?u8, 0x25), realm_d2s.status(out));
+    try std.testing.expectEqual(@as(?u8, 0x24), realm_d2s.status(out));
 
     // the body is the engine's: the sections are byte-identical to the engine-written template
     const t = try save.parse(fresh);

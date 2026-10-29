@@ -390,7 +390,9 @@ fn disconnect(c: *Conn, fd: net.Socket, tag: []const u8) void {
     if (c.in_channel) broadcastEvent(c, EID_LEAVE, c.user_flags, c.chatName(), "");
     c.in_channel = false;
     chat.leave(fd);
-    if (c.account_len > 0) friends.setOffline(c.accountName());
+    // Not while another connection of the player's is still here: the realm connection closes as the
+    // game opens, and the chat link the game keeps is what makes them online.
+    if (c.account_len > 0 and !chat.held(c.accountName())) friends.setOffline(c.accountName());
     log.line(tag, "client disconnected ({s})", .{c.accountName()});
 }
 
@@ -773,6 +775,13 @@ fn onNotifyJoin(c: *Conn, tag: []const u8, body: []const u8) void {
     const game_name = r.getStr();
     const was_in_channel = c.in_channel;
     c.in_channel = false;
+    // A connection that never joined a channel (the chat link a game opens after its realm connection
+    // closed) is registered here, in no channel, so whispers and /f find it by name.
+    if (!chat.registered(c.fd)) {
+        const flags = chatUserFlags(admin_accounts, c.accountName());
+        c.user_flags = flags;
+        _ = chat.joinShared(c.fd, c.accountName(), c.chatName(), "", flags, c.statSlice());
+    }
     // Recorded before announced, for the same reason as leaving chat: a watcher who reacts to
     // the EID_LEAVE must find them already in the game, not still in the channel.
     chat.setGame(c.fd, game_name);

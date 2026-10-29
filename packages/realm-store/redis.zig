@@ -1163,6 +1163,8 @@ pub fn snapshotGames(out: []types.NamedGame) usize {
         const rec = parseGame(val) orelse continue;
         var ng = types.NamedGame{ .gameid = rec.gameid, .gs_ip = rec.gs_ip, .gs_port = rec.gs_port, .gsid = rec.gsid, .players = rec.players, .status = rec.status, .difficulty = rec.difficulty };
         ng.setDesc(rec.desc());
+        ng.password = rec.password;
+        ng.pw_len = rec.pw_len;
         const gname = names[i][0..nlen[i]];
         const cl: u8 = @intCast(@min(gname.len, ng.name.len));
         @memcpy(ng.name[0..cl], gname[0..cl]);

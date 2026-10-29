@@ -329,7 +329,8 @@ pub fn importChar(account: []const u8, name: []const u8, bytes: []const u8, mode
     var buf: [max_d2s]u8 = undefined;
     @memcpy(buf[0..bytes.len], bytes);
     if (!d2s.setName(buf[0..bytes.len], name)) return false;
-    if (!d2s.setMode(buf[0..bytes.len], mode)) return false; // also repairs the checksum
+    // clears the new-character bit on a full save, sets the mode, repairs the checksum
+    if (!d2s.prepareImport(buf[0..bytes.len], mode)) return false;
     return saveCharD2s(account, name, buf[0..bytes.len]);
 }
 

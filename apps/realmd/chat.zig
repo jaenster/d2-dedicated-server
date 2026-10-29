@@ -176,12 +176,37 @@ pub fn leave(fd: net.Socket) void {
                 break;
             }
         }
+        // The same player on another connection of ours (the chat link a game keeps after the realm
+        // connection closed, or the realm connection that replaced it): what is shared under their
+        // name is theirs now, not this connection's to take down.
+        if (name_len > 0 and heldByLocked(name[0..name_len])) return;
     }
     // Outside the lock: a disconnect must not hold up the channel it is leaving. `gone` — the
     // connection is over, so the by-name index goes too and a whisper stops finding them.
     if (name_len > 0) unpublish(chan[0..chan_len], name[0..name_len], true);
     var kb: [max_name + 2]u8 = undefined;
     if (aliasKey(&kb, disp[0..disp_len])) |k| store.chatDelMember(chan[0..chan_len], k, true);
+}
+
+fn heldByLocked(name: []const u8) bool {
+    for (&reg.members) |*m| {
+        if (m.in_use and std.ascii.eqlIgnoreCase(m.nameSlice(), name)) return true;
+    }
+    return false;
+}
+
+/// Is a connection of this instance registered under `name` (an account)?
+pub fn held(name: []const u8) bool {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    return heldByLocked(name);
+}
+
+/// Is this connection registered (it joined a channel, or went into a game)?
+pub fn registered(fd: net.Socket) bool {
+    reg.lock.lock();
+    defer reg.lock.unlock();
+    return findByFdLocked(fd) != null;
 }
 
 /// Write bytes to a member under its send_lock.
@@ -862,4 +887,19 @@ fn refreshAll() void {
     // Snapshot first, then publish outside the lock: refreshing a busy channel would otherwise
     // hold every broadcast on this instance for one store round trip per member.
     for (fds[0..n]) |fd| publishByFd(fd);
+}
+
+test "a player on a second connection stays held when the first one leaves" {
+    const a: net.Socket = 9001;
+    const b: net.Socket = 9002;
+    try std.testing.expect(!registered(a));
+    _ = join(a, "Holder", "Holder", "", 0, "");
+    _ = join(b, "holder", "Holder", "", 0, "");
+    try std.testing.expect(registered(a));
+    try std.testing.expect(held("Holder"));
+    // The first connection's slot is freed and the shared state under the name is left alone.
+    leave(a);
+    try std.testing.expect(!registered(a));
+    try std.testing.expect(held("Holder"));
+    try std.testing.expect(registered(b));
 }

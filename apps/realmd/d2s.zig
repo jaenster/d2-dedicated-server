@@ -53,6 +53,19 @@ pub fn setMode(data: []u8, mode: u8) bool {
     return true;
 }
 
+/// Set by the realm's character creation on a header-only save: the game writes the body on first join.
+/// 1.14d refuses a full save that still carries it ("Bad header").
+pub const status_new: u8 = 0x01;
+
+/// Get a save that arrived from outside ready for the store: hardcore/ladder set to `mode` and the
+/// checksum repaired, as `setMode` does. A save longer than a header-only one has a body, so the
+/// new-character bit is cleared; a header-only save keeps it. False if the buffer is not a save.
+pub fn prepareImport(data: []u8, mode: u8) bool {
+    const st = status(data) orelse return false;
+    if (data.len > new_save_size) setStatus(data, st & ~status_new);
+    return setMode(data, mode);
+}
+
 /// What a character's item section holds, for the audit line an operator action leaves behind:
 /// how many items the player's own list declares, and a digest of everything from that list to
 /// the end of the file (belt, corpse, mercenary, golem). Moving a character between ladder and
@@ -229,6 +242,22 @@ test "setMode never touches expansion or died" {
     const st = status(&save).?;
     try std.testing.expect(st & status_expansion != 0 and st & status_died != 0);
     try std.testing.expectEqual(status_ladder | status_hardcore, st & mode_mask);
+}
+
+test "prepareImport clears the new-character bit on a full save only" {
+    var full: [new_save_size + 64]u8 = undefined;
+    @memset(&full, 0);
+    try std.testing.expect(newSave(full[0..new_save_size], "Imp", 3, status_expansion, 1));
+    try std.testing.expect(status(&full).? & status_new != 0);
+    try std.testing.expect(prepareImport(&full, status_ladder));
+    try std.testing.expectEqual(status_expansion | status_ladder, status(&full).?);
+    try std.testing.expect(formats.d2s.verifyChecksum(&full));
+
+    var header: [new_save_size]u8 = undefined;
+    try std.testing.expect(newSave(&header, "Imp", 3, status_expansion, 1));
+    try std.testing.expect(prepareImport(&header, 0));
+    try std.testing.expectEqual(status_new | status_expansion, status(&header).?);
+    try std.testing.expect(formats.d2s.verifyChecksum(&header));
 }
 
 test "items reads the count and digests the tail" {

@@ -55,6 +55,9 @@ pub const guilds = @import("guilds.zig");
 pub const friends = @import("friends.zig");
 pub const proto = @import("proto.zig");
 pub const d2s = @import("d2s.zig");
+/// The ladder every reader shares: the game's ladder screen through d2cs, and an extension that
+/// shows it elsewhere.
+pub const ladder = @import("ladder.zig");
 pub const Config = config.Config;
 
 fn hashStr(s: []const u8) u32 {

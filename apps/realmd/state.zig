@@ -423,7 +423,12 @@ pub const GameInfo = struct {
     difficulty: u8 = 0,
     description: [32]u8 = @splat(0),
     desc_len: u8 = 0,
+    password: [16]u8 = @splat(0),
+    pw_len: u8 = 0,
 
+    pub fn pw(g: *const GameInfo) []const u8 {
+        return g.password[0..g.pw_len];
+    }
     pub fn name_slice(g: *const GameInfo) []const u8 {
         return g.name[0..g.name_len];
     }
@@ -442,7 +447,7 @@ pub fn snapshotGames(buf: []GameInfo) usize {
         const cap = @min(buf.len, tmp.len);
         const m = store.snapshotGames(tmp[0..cap]);
         for (tmp[0..m], 0..) |ng, i| {
-            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port, .players = ng.players, .status = ng.status, .difficulty = ng.difficulty };
+            var gi = GameInfo{ .gameid = ng.gameid, .gsid = ng.gsid, .ip = ng.gs_ip, .port = ng.gs_port, .players = ng.players, .status = ng.status, .difficulty = ng.difficulty, .password = ng.password, .pw_len = ng.pw_len };
             const ln: u8 = @intCast(@min(ng.name_len, max_name));
             @memcpy(gi.name[0..ln], ng.name[0..ln]);
             gi.name_len = ln;
@@ -459,7 +464,7 @@ pub fn snapshotGames(buf: []GameInfo) usize {
     for (&global.games) |*g| {
         if (n >= buf.len) break;
         if (!g.in_use) continue;
-        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .players = g.players, .status = g.status, .difficulty = g.difficulty, .name_len = g.name_len, .desc_len = g.desc_len };
+        var gi = GameInfo{ .gameid = g.gameid, .gsid = g.gsid, .ip = g.gs_ip, .port = g.gs_port, .players = g.players, .status = g.status, .difficulty = g.difficulty, .name_len = g.name_len, .desc_len = g.desc_len, .password = g.password, .pw_len = g.pw_len };
         @memcpy(gi.name[0..g.name_len], g.name[0..g.name_len]);
         @memcpy(gi.description[0..g.desc_len], g.description[0..g.desc_len]);
         buf[n] = gi;
